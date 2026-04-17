@@ -89,6 +89,25 @@ fn render_inner_select(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     ctx.sql.push_str("SELECT ");
+    if !root.args.distinct_on.is_empty() {
+        ctx.sql.push_str("DISTINCT ON (");
+        for (i, col_name) in root.args.distinct_on.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+                path: format!("{}.distinct_on.{col_name}", root.alias),
+                message: format!("unknown column '{col_name}' on '{}'", root.table),
+            })?;
+            write!(
+                ctx.sql,
+                "{table_alias}.{}",
+                quote_ident(&col.physical_name)
+            )
+            .unwrap();
+        }
+        ctx.sql.push_str(") ");
+    }
     for (i, field) in selection.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -462,27 +481,38 @@ fn render_order_by(
     table_alias: &str,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    if args.order_by.is_empty() {
+    let mut prefix: Vec<(String, crate::ast::OrderDir)> = Vec::new();
+    for d in &args.distinct_on {
+        let already = args.order_by.iter().any(|ob| ob.column == *d);
+        if !already {
+            prefix.push((d.clone(), crate::ast::OrderDir::Asc));
+        }
+    }
+    if prefix.is_empty() && args.order_by.is_empty() {
         return Ok(());
     }
     ctx.sql.push_str(" ORDER BY ");
-    for (i, ob) in args.order_by.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (col_name, dir) in prefix
+        .iter()
+        .map(|(c, d)| (c.as_str(), *d))
+        .chain(args.order_by.iter().map(|ob| (ob.column.as_str(), ob.direction)))
+    {
+        if !first {
             ctx.sql.push_str(", ");
         }
-        let col = table
-            .find_column(&ob.column)
-            .ok_or_else(|| Error::Validate {
-                path: format!("order_by.{}", ob.column),
-                message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
-            })?;
-        let dir = match ob.direction {
+        first = false;
+        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+            path: format!("order_by.{col_name}"),
+            message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
+        })?;
+        let dir_s = match dir {
             crate::ast::OrderDir::Asc => "ASC",
             crate::ast::OrderDir::Desc => "DESC",
         };
         write!(
             ctx.sql,
-            "{table_alias}.{} {dir}",
+            "{table_alias}.{} {dir_s}",
             quote_ident(&col.physical_name)
         )
         .unwrap();
@@ -1052,6 +1082,28 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+    #[test]
+    fn render_distinct_on_auto_prepends_order_by() {
+        use crate::ast::RootBody;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs {
+                distinct_on: vec!["name".into()],
+                ..Default::default()
+            },
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub struct QueryArgs {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub distinct_on: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

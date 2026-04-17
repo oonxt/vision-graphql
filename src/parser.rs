@@ -271,6 +271,31 @@ fn lower_args(
             "offset" => {
                 out.offset = Some(gql_u64(v, vars, &format!("{parent_path}.offset"))?);
             }
+            "distinct_on" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.distinct_on"))?;
+                let items = match &json {
+                    Value::Array(xs) => xs.clone(),
+                    single => vec![single.clone()],
+                };
+                let mut cols = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    let s = item.as_str().ok_or_else(|| Error::Validate {
+                        path: format!("{parent_path}.distinct_on[{i}]"),
+                        message: "expected column name (enum or string)".into(),
+                    })?;
+                    if table.find_column(s).is_none() {
+                        return Err(Error::Validate {
+                            path: format!("{parent_path}.distinct_on[{i}]"),
+                            message: format!(
+                                "unknown column '{s}' on '{}'",
+                                table.exposed_name
+                            ),
+                        });
+                    }
+                    cols.push(s.to_string());
+                }
+                out.distinct_on = cols;
+            }
             _ => {
                 return Err(Error::Validate {
                     path: format!("{parent_path}.{name}"),
@@ -832,6 +857,19 @@ mod tests {
             }
             _ => panic!("expected Aggregate"),
         }
+    }
+
+    #[test]
+    fn parse_distinct_on_list() {
+        let op = parse_and_lower(
+            "query { users(distinct_on: [name]) { id } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        assert_eq!(roots[0].args.distinct_on, vec!["name".to_string()]);
     }
 
     #[test]
