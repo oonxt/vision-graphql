@@ -515,9 +515,7 @@ impl UpdateBuilder {
         MutationField::Update {
             alias: self.alias,
             table: self.table,
-            where_: self
-                .where_
-                .expect("update builder: where clause required"),
+            where_: self.where_.expect("update builder: where clause required"),
             set: self.set,
             returning: self.returning,
         }
@@ -610,9 +608,7 @@ impl DeleteBuilder {
         MutationField::Delete {
             alias: self.alias,
             table: self.table,
-            where_: self
-                .where_
-                .expect("delete builder: where clause required"),
+            where_: self.where_.expect("delete builder: where clause required"),
             returning: self.returning,
         }
     }
