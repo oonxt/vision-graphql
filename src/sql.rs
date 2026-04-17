@@ -215,14 +215,18 @@ fn render_bool_expr(
                 if i > 0 {
                     ctx.sql.push_str(" AND ");
                 }
-                let l = table.find_column(local_col).ok_or_else(|| Error::Validate {
-                    path: format!("where.{name}"),
-                    message: format!("relation mapping: unknown local column '{local_col}'"),
-                })?;
-                let r = target.find_column(remote_col).ok_or_else(|| Error::Validate {
-                    path: format!("where.{name}"),
-                    message: format!("relation mapping: unknown remote column '{remote_col}'"),
-                })?;
+                let l = table
+                    .find_column(local_col)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("where.{name}"),
+                        message: format!("relation mapping: unknown local column '{local_col}'"),
+                    })?;
+                let r = target
+                    .find_column(remote_col)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("where.{name}"),
+                        message: format!("relation mapping: unknown remote column '{remote_col}'"),
+                    })?;
                 write!(
                     ctx.sql,
                     "{remote_alias}.{} = {table_alias}.{}",
@@ -317,10 +321,15 @@ fn render_relation_field(
                 physical,
                 alias: fa,
             } => {
-                let col = target.find_column(physical).ok_or_else(|| Error::Validate {
-                    path: format!("{parent_path}.{alias}.{fa}"),
-                    message: format!("unknown column '{physical}' on '{}'", target.exposed_name),
-                })?;
+                let col = target
+                    .find_column(physical)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("{parent_path}.{alias}.{fa}"),
+                        message: format!(
+                            "unknown column '{physical}' on '{}'",
+                            target.exposed_name
+                        ),
+                    })?;
                 write!(
                     ctx.sql,
                     r#"{remote_alias}.{} AS "{}""#,
@@ -371,13 +380,15 @@ fn render_relation_field(
                     parent_table.exposed_name
                 ),
             })?;
-        let r = target.find_column(remote_col).ok_or_else(|| Error::Validate {
-            path: format!("{parent_path}.{alias}"),
-            message: format!(
-                "relation mapping: unknown remote column '{remote_col}' on '{}'",
-                target.exposed_name
-            ),
-        })?;
+        let r = target
+            .find_column(remote_col)
+            .ok_or_else(|| Error::Validate {
+                path: format!("{parent_path}.{alias}"),
+                message: format!(
+                    "relation mapping: unknown remote column '{remote_col}' on '{}'",
+                    target.exposed_name
+                ),
+            })?;
         write!(
             ctx.sql,
             "{remote_alias}.{} = {parent_alias}.{}",

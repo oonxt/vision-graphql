@@ -270,8 +270,7 @@ fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Resu
                                     rel.target_table
                                 ),
                             })?;
-                    let inner =
-                        lower_where(v, target, schema, &format!("{path}.{col_name}"))?;
+                    let inner = lower_where(v, target, schema, &format!("{path}.{col_name}"))?;
                     parts.push(BoolExpr::Relation {
                         name: col_name.to_string(),
                         inner: Box::new(inner),

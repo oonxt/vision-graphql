@@ -227,10 +227,7 @@ mod tests {
         let rel = users.find_relation("posts").unwrap();
         assert_eq!(rel.kind, RelKind::Array);
         assert_eq!(rel.target_table, "posts");
-        assert_eq!(
-            rel.mapping,
-            vec![("id".to_string(), "user_id".to_string())]
-        );
+        assert_eq!(rel.mapping, vec![("id".to_string(), "user_id".to_string())]);
 
         let posts = schema.table("posts").unwrap();
         let rel = posts.find_relation("user").unwrap();
