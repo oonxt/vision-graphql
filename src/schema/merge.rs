@@ -271,6 +271,33 @@ mod tests {
     }
 
     #[test]
+    fn chained_merge_preserves_all_layers() {
+        use crate::schema::config::ConfigOverlay;
+        use crate::schema::{Schema, Table};
+
+        let db = fixture_with_posts_to_users();
+        let sb = build_from_introspection(db);
+
+        let cfg = ConfigOverlay::default();
+        let sb = apply_config(sb, &cfg);
+
+        let sb = sb.table(
+            Table::new("widgets", "public", "widgets")
+                .column("id", "id", crate::schema::PgType::Int4, false),
+        );
+
+        let schema: Schema = sb.build();
+        assert!(schema.table("users").is_some());
+        assert!(schema.table("posts").is_some());
+        assert!(schema.table("widgets").is_some());
+        assert!(schema
+            .table("users")
+            .unwrap()
+            .find_relation("posts")
+            .is_some());
+    }
+
+    #[test]
     fn apply_config_renames_and_hides_and_adds_relation() {
         use crate::schema::config::{
             ConfigOverlay, RelationKindOverlay, RelationOverlay, TableOverlay,
