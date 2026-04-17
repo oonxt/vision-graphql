@@ -50,7 +50,13 @@ impl Table {
         }
     }
 
-    pub fn column(mut self, exposed: &str, physical: &str, pg_type: PgType, nullable: bool) -> Self {
+    pub fn column(
+        mut self,
+        exposed: &str,
+        physical: &str,
+        pg_type: PgType,
+        nullable: bool,
+    ) -> Self {
         self.columns_by_exposed.insert(
             exposed.into(),
             Column {
@@ -80,7 +86,9 @@ pub struct Schema {
 
 impl Schema {
     pub fn builder() -> SchemaBuilder {
-        SchemaBuilder { tables: HashMap::new() }
+        SchemaBuilder {
+            tables: HashMap::new(),
+        }
     }
 
     pub fn table(&self, exposed: &str) -> Option<&Arc<Table>> {
@@ -99,7 +107,9 @@ impl SchemaBuilder {
     }
 
     pub fn build(self) -> Schema {
-        Schema { tables_by_exposed: self.tables }
+        Schema {
+            tables_by_exposed: self.tables,
+        }
     }
 }
 

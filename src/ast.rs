@@ -51,7 +51,11 @@ pub enum BoolExpr {
     And(Vec<BoolExpr>),
     Or(Vec<BoolExpr>),
     Not(Box<BoolExpr>),
-    Compare { column: String, op: CmpOp, value: Value },
+    Compare {
+        column: String,
+        op: CmpOp,
+        value: Value,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +81,14 @@ mod tests {
             kind: RootKind::List,
             args: QueryArgs::default(),
             selection: vec![
-                Field::Column { physical: "id".into(), alias: "id".into() },
-                Field::Column { physical: "name".into(), alias: "name".into() },
+                Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                },
+                Field::Column {
+                    physical: "name".into(),
+                    alias: "name".into(),
+                },
             ],
         };
         assert_eq!(root.table, "users");

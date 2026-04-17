@@ -1,6 +1,8 @@
 //! GraphQL string → IR.
 
-use crate::ast::{BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField, RootKind};
+use crate::ast::{
+    BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField, RootKind,
+};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
@@ -102,11 +104,7 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
     Ok(Operation::Query(roots))
 }
 
-fn lower_selection_set(
-    set: &SelectionSet,
-    table: &Table,
-    parent_path: &str,
-) -> Result<Vec<Field>> {
+fn lower_selection_set(set: &SelectionSet, table: &Table, parent_path: &str) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     for sel in &set.items {
         match &sel.node {
@@ -214,10 +212,7 @@ fn lower_where(json: &Value, table: &Table, path: &str) -> Result<BoolExpr> {
             col_name => {
                 let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
                     path: format!("{path}.{col_name}"),
-                    message: format!(
-                        "unknown column '{col_name}' on '{}'",
-                        table.exposed_name
-                    ),
+                    message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
                 })?;
                 let op_obj = v.as_object().ok_or_else(|| Error::Validate {
                     path: format!("{path}.{col_name}"),
@@ -322,7 +317,10 @@ fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
         GqlValue::Object(kv) => {
             let mut out = serde_json::Map::new();
             for (k, val) in kv {
-                out.insert(k.to_string(), gql_to_json(val, vars, &format!("{path}.{k}"))?);
+                out.insert(
+                    k.to_string(),
+                    gql_to_json(val, vars, &format!("{path}.{k}"))?,
+                );
             }
             Ok(Value::Object(out))
         }
@@ -356,13 +354,8 @@ mod tests {
 
     #[test]
     fn parse_plain_list() {
-        let op = parse_and_lower(
-            "query { users { id name } }",
-            &json!({}),
-            None,
-            &schema(),
-        )
-        .unwrap();
+        let op =
+            parse_and_lower("query { users { id name } }", &json!({}), None, &schema()).unwrap();
         match op {
             Operation::Query(roots) => {
                 assert_eq!(roots.len(), 1);
@@ -382,13 +375,8 @@ mod tests {
 
     #[test]
     fn parse_respects_field_alias() {
-        let op = parse_and_lower(
-            "query { users { uid: id } }",
-            &json!({}),
-            None,
-            &schema(),
-        )
-        .unwrap();
+        let op =
+            parse_and_lower("query { users { uid: id } }", &json!({}), None, &schema()).unwrap();
         let Operation::Query(roots) = op;
         match &roots[0].selection[0] {
             Field::Column { physical, alias } => {
@@ -400,25 +388,15 @@ mod tests {
 
     #[test]
     fn parse_rejects_unknown_table() {
-        let err = parse_and_lower(
-            "query { widgets { id } }",
-            &json!({}),
-            None,
-            &schema(),
-        )
-        .unwrap_err();
+        let err =
+            parse_and_lower("query { widgets { id } }", &json!({}), None, &schema()).unwrap_err();
         assert!(format!("{err}").contains("unknown root field 'widgets'"));
     }
 
     #[test]
     fn parse_rejects_unknown_column() {
-        let err = parse_and_lower(
-            "query { users { bogus } }",
-            &json!({}),
-            None,
-            &schema(),
-        )
-        .unwrap_err();
+        let err =
+            parse_and_lower("query { users { bogus } }", &json!({}), None, &schema()).unwrap_err();
         assert!(format!("{err}").contains("unknown column 'bogus'"));
     }
 

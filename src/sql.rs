@@ -44,12 +44,10 @@ fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Re
 }
 
 fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result<()> {
-    let table = schema
-        .table(&root.table)
-        .ok_or_else(|| Error::Validate {
-            path: root.alias.clone(),
-            message: format!("unknown table '{}'", root.table),
-        })?;
+    let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
+        path: root.alias.clone(),
+        message: format!("unknown table '{}'", root.table),
+    })?;
     match root.kind {
         RootKind::List => render_list(root, table, schema, ctx),
     }
@@ -148,12 +146,11 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let bind = crate::types::json_to_bind(value, &col.pg_type).map_err(|e| {
-                Error::Validate {
+            let bind =
+                crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
                     path: format!("where.{column}"),
                     message: format!("{e}"),
-                }
-            })?;
+                })?;
             ctx.binds.push(bind);
             let placeholder = format!("${}", ctx.binds.len());
             let op_str = match op {
@@ -212,13 +209,12 @@ fn render_order_by(
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        let col = table.find_column(&ob.column).ok_or_else(|| Error::Validate {
-            path: format!("order_by.{}", ob.column),
-            message: format!(
-                "unknown column '{}' on '{}'",
-                ob.column, table.exposed_name
-            ),
-        })?;
+        let col = table
+            .find_column(&ob.column)
+            .ok_or_else(|| Error::Validate {
+                path: format!("order_by.{}", ob.column),
+                message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
+            })?;
         let dir = match ob.direction {
             crate::ast::OrderDir::Asc => "ASC",
             crate::ast::OrderDir::Desc => "DESC",
@@ -283,8 +279,14 @@ mod tests {
             kind: RootKind::List,
             args: QueryArgs::default(),
             selection: vec![
-                Field::Column { physical: "id".into(), alias: "id".into() },
-                Field::Column { physical: "name".into(), alias: "name".into() },
+                Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                },
+                Field::Column {
+                    physical: "name".into(),
+                    alias: "name".into(),
+                },
             ],
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
@@ -364,8 +366,14 @@ mod tests {
             kind: RootKind::List,
             args: QueryArgs {
                 order_by: vec![
-                    OrderBy { column: "name".into(), direction: OrderDir::Asc },
-                    OrderBy { column: "id".into(), direction: OrderDir::Desc },
+                    OrderBy {
+                        column: "name".into(),
+                        direction: OrderDir::Asc,
+                    },
+                    OrderBy {
+                        column: "id".into(),
+                        direction: OrderDir::Desc,
+                    },
                 ],
                 limit: Some(10),
                 offset: Some(5),

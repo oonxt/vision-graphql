@@ -13,8 +13,7 @@ pub async fn execute(pool: &Pool, sql: &str, binds: &[Bind]) -> Result<Value> {
     let client = pool.get().await?;
     let stmt = client.prepare_cached(sql).await?;
 
-    let params: Vec<&(dyn ToSql + Sync)> =
-        binds.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
+    let params: Vec<&(dyn ToSql + Sync)> = binds.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
 
     let row = client.query_one(&stmt, &params).await?;
 

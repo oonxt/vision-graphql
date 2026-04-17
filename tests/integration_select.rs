@@ -38,9 +38,7 @@ async fn setup() -> (
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
-    let pool = cfg
-        .create_pool(Some(Runtime::Tokio1), NoTls)
-        .expect("pool");
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).expect("pool");
 
     {
         let client = pool.get().await.expect("client");
