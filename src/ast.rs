@@ -11,14 +11,13 @@ pub enum Operation {
 pub struct RootField {
     pub table: String,
     pub alias: String,
-    pub kind: RootKind,
     pub args: QueryArgs,
-    pub selection: Vec<Field>,
+    pub body: RootBody,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RootKind {
-    List,
+#[derive(Debug, Clone)]
+pub enum RootBody {
+    List { selection: Vec<Field> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,21 +92,24 @@ mod tests {
         let root = RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs::default(),
-            selection: vec![
-                Field::Column {
-                    physical: "id".into(),
-                    alias: "id".into(),
-                },
-                Field::Column {
-                    physical: "name".into(),
-                    alias: "name".into(),
-                },
-            ],
+            body: RootBody::List {
+                selection: vec![
+                    Field::Column {
+                        physical: "id".into(),
+                        alias: "id".into(),
+                    },
+                    Field::Column {
+                        physical: "name".into(),
+                        alias: "name".into(),
+                    },
+                ],
+            },
         };
         assert_eq!(root.table, "users");
-        assert_eq!(root.selection.len(), 2);
+        match root.body {
+            RootBody::List { selection } => assert_eq!(selection.len(), 2),
+        }
     }
 
     #[test]

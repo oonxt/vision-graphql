@@ -1,6 +1,6 @@
 //! SQL generation from IR.
 
-use crate::ast::{Field, Operation, QueryArgs, RootField, RootKind};
+use crate::ast::{Field, Operation, QueryArgs, RootField};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use crate::types::Bind;
@@ -48,13 +48,16 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         path: root.alias.clone(),
         message: format!("unknown table '{}'", root.table),
     })?;
-    match root.kind {
-        RootKind::List => render_list(root, table, schema, ctx),
+    match &root.body {
+        crate::ast::RootBody::List { selection } => {
+            render_list(root, selection, table, schema, ctx)
+        }
     }
 }
 
 fn render_list(
     root: &RootField,
+    selection: &[Field],
     table: &Table,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -64,7 +67,7 @@ fn render_list(
     ctx.sql.push_str("(SELECT coalesce(json_agg(row_to_json(");
     ctx.sql.push_str(&row_alias);
     ctx.sql.push_str(")), '[]'::json) FROM (");
-    render_inner_select(root, table, &inner_alias, schema, ctx)?;
+    render_inner_select(root, selection, table, &inner_alias, schema, ctx)?;
     ctx.sql.push_str(") ");
     ctx.sql.push_str(&row_alias);
     ctx.sql.push(')');
@@ -73,13 +76,14 @@ fn render_list(
 
 fn render_inner_select(
     root: &RootField,
+    selection: &[Field],
     table: &Table,
     table_alias: &str,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     ctx.sql.push_str("SELECT ");
-    for (i, field) in root.selection.iter().enumerate() {
+    for (i, field) in selection.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
@@ -509,7 +513,7 @@ fn escape_string_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Field, Operation, QueryArgs, RootField, RootKind};
+    use crate::ast::{Field, Operation, QueryArgs, RootBody, RootField};
     use crate::schema::{PgType, Schema, Table};
 
     fn users_schema() -> Schema {
@@ -527,18 +531,19 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs::default(),
-            selection: vec![
-                Field::Column {
-                    physical: "id".into(),
-                    alias: "id".into(),
-                },
-                Field::Column {
-                    physical: "name".into(),
-                    alias: "name".into(),
-                },
-            ],
+            body: RootBody::List {
+                selection: vec![
+                    Field::Column {
+                        physical: "id".into(),
+                        alias: "id".into(),
+                    },
+                    Field::Column {
+                        physical: "name".into(),
+                        alias: "name".into(),
+                    },
+                ],
+            },
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -553,7 +558,6 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs {
                 where_: Some(BoolExpr::Compare {
                     column: "id".into(),
@@ -562,10 +566,12 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            selection: vec![Field::Column {
-                physical: "id".into(),
-                alias: "id".into(),
-            }],
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -581,7 +587,6 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs {
                 where_: Some(BoolExpr::And(vec![
                     BoolExpr::Compare {
@@ -597,10 +602,12 @@ mod tests {
                 ])),
                 ..Default::default()
             },
-            selection: vec![Field::Column {
-                physical: "id".into(),
-                alias: "id".into(),
-            }],
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -614,7 +621,6 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs {
                 order_by: vec![
                     OrderBy {
@@ -630,10 +636,12 @@ mod tests {
                 offset: Some(5),
                 ..Default::default()
             },
-            selection: vec![Field::Column {
-                physical: "id".into(),
-                alias: "id".into(),
-            }],
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
         }]);
         let (sql, _binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -666,7 +674,6 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs {
                 where_: Some(BoolExpr::Relation {
                     name: "posts".into(),
@@ -678,10 +685,12 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            selection: vec![Field::Column {
-                physical: "id".into(),
-                alias: "id".into(),
-            }],
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
         }]);
         let (sql, binds) = render(&op, &users_posts_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -693,23 +702,24 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "posts".into(),
             alias: "posts".into(),
-            kind: RootKind::List,
             args: QueryArgs::default(),
-            selection: vec![
-                Field::Column {
-                    physical: "title".into(),
-                    alias: "title".into(),
-                },
-                Field::Relation {
-                    name: "user".into(),
-                    alias: "user".into(),
-                    args: QueryArgs::default(),
-                    selection: vec![Field::Column {
-                        physical: "name".into(),
-                        alias: "name".into(),
-                    }],
-                },
-            ],
+            body: RootBody::List {
+                selection: vec![
+                    Field::Column {
+                        physical: "title".into(),
+                        alias: "title".into(),
+                    },
+                    Field::Relation {
+                        name: "user".into(),
+                        alias: "user".into(),
+                        args: QueryArgs::default(),
+                        selection: vec![Field::Column {
+                            physical: "name".into(),
+                            alias: "name".into(),
+                        }],
+                    },
+                ],
+            },
         }]);
         let (sql, _binds) = render(&op, &users_posts_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -720,23 +730,24 @@ mod tests {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs::default(),
-            selection: vec![
-                Field::Column {
-                    physical: "id".into(),
-                    alias: "id".into(),
-                },
-                Field::Relation {
-                    name: "posts".into(),
-                    alias: "posts".into(),
-                    args: QueryArgs::default(),
-                    selection: vec![Field::Column {
-                        physical: "title".into(),
-                        alias: "title".into(),
-                    }],
-                },
-            ],
+            body: RootBody::List {
+                selection: vec![
+                    Field::Column {
+                        physical: "id".into(),
+                        alias: "id".into(),
+                    },
+                    Field::Relation {
+                        name: "posts".into(),
+                        alias: "posts".into(),
+                        args: QueryArgs::default(),
+                        selection: vec![Field::Column {
+                            physical: "title".into(),
+                            alias: "title".into(),
+                        }],
+                    },
+                ],
+            },
         }]);
         let (sql, binds) = render(&op, &users_posts_schema()).unwrap();
         insta::assert_snapshot!(sql);

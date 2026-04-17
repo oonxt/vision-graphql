@@ -1,7 +1,7 @@
 //! GraphQL string → IR.
 
 use crate::ast::{
-    BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField, RootKind,
+    BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField,
 };
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
@@ -90,9 +90,8 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                 roots.push(RootField {
                     table: name.to_string(),
                     alias,
-                    kind: RootKind::List,
                     args,
-                    selection,
+                    body: crate::ast::RootBody::List { selection },
                 });
             }
             _ => {
@@ -406,7 +405,7 @@ fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Field, Operation, RootKind};
+    use crate::ast::{Field, Operation};
     use crate::schema::{PgType, Schema, Table};
     use serde_json::json;
 
@@ -429,9 +428,11 @@ mod tests {
                 assert_eq!(roots.len(), 1);
                 assert_eq!(roots[0].table, "users");
                 assert_eq!(roots[0].alias, "users");
-                assert!(matches!(roots[0].kind, RootKind::List));
-                assert_eq!(roots[0].selection.len(), 2);
-                match &roots[0].selection[0] {
+                let crate::ast::RootBody::List { selection } = &roots[0].body else {
+                    panic!("expected List");
+                };
+                assert_eq!(selection.len(), 2);
+                match &selection[0] {
                     Field::Column { physical, alias } => {
                         assert_eq!(physical, "id");
                         assert_eq!(alias, "id");
@@ -447,7 +448,10 @@ mod tests {
         let op =
             parse_and_lower("query { users { uid: id } }", &json!({}), None, &schema()).unwrap();
         let Operation::Query(roots) = op;
-        match &roots[0].selection[0] {
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        match &selection[0] {
             Field::Column { physical, alias } => {
                 assert_eq!(physical, "id");
                 assert_eq!(alias, "uid");
@@ -555,8 +559,11 @@ mod tests {
         )
         .unwrap();
         let Operation::Query(roots) = op;
-        assert_eq!(roots[0].selection.len(), 2);
-        match &roots[0].selection[1] {
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        assert_eq!(selection.len(), 2);
+        match &selection[1] {
             Field::Relation {
                 name,
                 args,
@@ -605,7 +612,10 @@ mod tests {
         )
         .unwrap();
         let Operation::Query(roots) = op;
-        match &roots[0].selection[1] {
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        match &selection[1] {
             Field::Relation { name, .. } => assert_eq!(name, "user"),
             _ => panic!("expected Relation"),
         }
