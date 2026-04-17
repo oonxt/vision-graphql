@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_build_object('users_aggregate', (SELECT json_build_object('aggregate', json_build_object('count', count(*), 'sum', json_build_object('id', sum(t0."id"))), 'nodes', coalesce(json_agg(json_build_object('name', t0."name")), '[]'::json)) FROM (SELECT "id", "name" FROM "public"."users") t0)) AS result

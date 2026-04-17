@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_build_object('users_aggregate', (SELECT json_build_object('aggregate', json_build_object('count', count(*))) FROM (SELECT 1 FROM "public"."users") t0)) AS result

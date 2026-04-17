@@ -52,10 +52,9 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::List { selection } => {
             render_list(root, selection, table, schema, ctx)
         }
-        crate::ast::RootBody::Aggregate { .. } => Err(Error::Validate {
-            path: root.alias.clone(),
-            message: "Aggregate not yet implemented".into(),
-        }),
+        crate::ast::RootBody::Aggregate { ops, nodes } => {
+            render_aggregate(root, ops, nodes.as_deref(), table, schema, ctx)
+        }
     }
 }
 
@@ -514,6 +513,302 @@ fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+fn render_aggregate(
+    root: &RootField,
+    ops: &[crate::ast::AggOp],
+    nodes: Option<&[Field]>,
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let inner_alias = ctx.next_alias("t");
+
+    ctx.sql.push_str("(SELECT json_build_object(");
+    ctx.sql.push_str("'aggregate', json_build_object(");
+    for (i, op) in ops.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        render_agg_op(op, &inner_alias, table, ctx)?;
+    }
+    ctx.sql.push(')');
+
+    if let Some(node_fields) = nodes {
+        ctx.sql.push_str(", 'nodes', coalesce(json_agg(");
+        render_json_build_object_for_nodes(node_fields, &inner_alias, table, &root.alias, ctx)?;
+        ctx.sql.push_str("), '[]'::json)");
+    }
+
+    ctx.sql.push_str(") FROM (");
+    render_aggregate_source(root, ops, nodes, table, schema, ctx)?;
+    ctx.sql.push_str(") ");
+    ctx.sql.push_str(&inner_alias);
+    ctx.sql.push(')');
+    Ok(())
+}
+
+fn render_agg_op(
+    op: &crate::ast::AggOp,
+    table_alias: &str,
+    table: &Table,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::AggOp;
+    match op {
+        AggOp::Count => {
+            ctx.sql.push_str("'count', count(*)");
+            Ok(())
+        }
+        AggOp::Sum { columns } => render_agg_func("sum", "sum", columns, table_alias, table, ctx),
+        AggOp::Avg { columns } => render_agg_func("avg", "avg", columns, table_alias, table, ctx),
+        AggOp::Max { columns } => render_agg_func("max", "max", columns, table_alias, table, ctx),
+        AggOp::Min { columns } => render_agg_func("min", "min", columns, table_alias, table, ctx),
+    }
+}
+
+fn render_agg_func(
+    key: &str,
+    pg_func: &str,
+    columns: &[String],
+    table_alias: &str,
+    table: &Table,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    write!(ctx.sql, "'{key}', json_build_object(").unwrap();
+    for (i, col_exposed) in columns.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(col_exposed).ok_or_else(|| Error::Validate {
+            path: format!("aggregate.{key}.{col_exposed}"),
+            message: format!(
+                "unknown column '{col_exposed}' on '{}'",
+                table.exposed_name
+            ),
+        })?;
+        write!(
+            ctx.sql,
+            "'{col_exposed}', {pg_func}({table_alias}.{})",
+            quote_ident(&col.physical_name)
+        )
+        .unwrap();
+    }
+    ctx.sql.push(')');
+    Ok(())
+}
+
+fn render_json_build_object_for_nodes(
+    fields: &[Field],
+    table_alias: &str,
+    table: &Table,
+    parent_path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    ctx.sql.push_str("json_build_object(");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        match f {
+            Field::Column { physical, alias } => {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.nodes.{alias}"),
+                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                })?;
+                write!(
+                    ctx.sql,
+                    "'{alias}', {table_alias}.{}",
+                    quote_ident(&col.physical_name)
+                )
+                .unwrap();
+            }
+            Field::Relation { .. } => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.nodes"),
+                    message: "relations inside aggregate nodes not yet supported".into(),
+                });
+            }
+        }
+    }
+    ctx.sql.push(')');
+    Ok(())
+}
+
+fn render_aggregate_source(
+    root: &RootField,
+    ops: &[crate::ast::AggOp],
+    nodes: Option<&[Field]>,
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::AggOp;
+    use std::collections::BTreeSet;
+
+    let mut cols_needed: BTreeSet<String> = BTreeSet::new();
+    for op in ops {
+        let columns = match op {
+            AggOp::Count => continue,
+            AggOp::Sum { columns }
+            | AggOp::Avg { columns }
+            | AggOp::Max { columns }
+            | AggOp::Min { columns } => columns,
+        };
+        for c in columns {
+            let col = table.find_column(c).ok_or_else(|| Error::Validate {
+                path: format!("{}.aggregate", root.alias),
+                message: format!("unknown column '{c}' on '{}'", table.exposed_name),
+            })?;
+            cols_needed.insert(col.physical_name.clone());
+        }
+    }
+    if let Some(fields) = nodes {
+        for f in fields {
+            if let Field::Column { physical, .. } = f {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{}.nodes", root.alias),
+                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                })?;
+                cols_needed.insert(col.physical_name.clone());
+            }
+        }
+    }
+
+    ctx.sql.push_str("SELECT ");
+    if cols_needed.is_empty() {
+        ctx.sql.push('1');
+    } else {
+        let mut first = true;
+        for c in &cols_needed {
+            if !first {
+                ctx.sql.push_str(", ");
+            }
+            first = false;
+            ctx.sql.push_str(&quote_ident(c));
+        }
+    }
+    write!(
+        ctx.sql,
+        " FROM {}.{}",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+
+    if let Some(expr) = root.args.where_.as_ref() {
+        ctx.sql.push_str(" WHERE ");
+        render_bool_expr_no_alias(expr, table, schema, ctx)?;
+    }
+    if !root.args.order_by.is_empty() {
+        ctx.sql.push_str(" ORDER BY ");
+        for (i, ob) in root.args.order_by.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            let col = table
+                .find_column(&ob.column)
+                .ok_or_else(|| Error::Validate {
+                    path: format!("{}.order_by.{}", root.alias, ob.column),
+                    message: format!(
+                        "unknown column '{}' on '{}'",
+                        ob.column, table.exposed_name
+                    ),
+                })?;
+            let dir = match ob.direction {
+                crate::ast::OrderDir::Asc => "ASC",
+                crate::ast::OrderDir::Desc => "DESC",
+            };
+            write!(ctx.sql, "{} {dir}", quote_ident(&col.physical_name)).unwrap();
+        }
+    }
+    if let Some(n) = root.args.limit {
+        write!(ctx.sql, " LIMIT {n}").unwrap();
+    }
+    if let Some(n) = root.args.offset {
+        write!(ctx.sql, " OFFSET {n}").unwrap();
+    }
+    Ok(())
+}
+
+fn render_bool_expr_no_alias(
+    expr: &crate::ast::BoolExpr,
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::{BoolExpr, CmpOp};
+    match expr {
+        BoolExpr::And(parts) => {
+            if parts.is_empty() {
+                ctx.sql.push_str("TRUE");
+                return Ok(());
+            }
+            ctx.sql.push('(');
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    ctx.sql.push_str(" AND ");
+                }
+                render_bool_expr_no_alias(p, table, schema, ctx)?;
+            }
+            ctx.sql.push(')');
+            Ok(())
+        }
+        BoolExpr::Or(parts) => {
+            if parts.is_empty() {
+                ctx.sql.push_str("FALSE");
+                return Ok(());
+            }
+            ctx.sql.push('(');
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    ctx.sql.push_str(" OR ");
+                }
+                render_bool_expr_no_alias(p, table, schema, ctx)?;
+            }
+            ctx.sql.push(')');
+            Ok(())
+        }
+        BoolExpr::Not(inner) => {
+            ctx.sql.push_str("(NOT ");
+            render_bool_expr_no_alias(inner, table, schema, ctx)?;
+            ctx.sql.push(')');
+            Ok(())
+        }
+        BoolExpr::Compare { column, op, value } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            let bind =
+                crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                    path: format!("where.{column}"),
+                    message: format!("{e}"),
+                })?;
+            ctx.binds.push(bind);
+            let placeholder = format!("${}", ctx.binds.len());
+            let op_str = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Neq => "<>",
+                CmpOp::Gt => ">",
+                CmpOp::Gte => ">=",
+                CmpOp::Lt => "<",
+                CmpOp::Lte => "<=",
+            };
+            write!(
+                ctx.sql,
+                "{} {op_str} {placeholder}",
+                quote_ident(&col.physical_name)
+            )
+            .unwrap();
+            Ok(())
+        }
+        BoolExpr::Relation { .. } => Err(Error::Validate {
+            path: "where".into(),
+            message: "relation filters not supported inside aggregate source".into(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +963,48 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+    #[test]
+    fn render_aggregate_count_and_sum() {
+        use crate::ast::{AggOp, RootBody};
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![
+                    AggOp::Count,
+                    AggOp::Sum {
+                        columns: vec!["id".into()],
+                    },
+                ],
+                nodes: Some(vec![Field::Column {
+                    physical: "name".into(),
+                    alias: "name".into(),
+                }]),
+            },
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn render_aggregate_no_nodes() {
+        use crate::ast::{AggOp, RootBody};
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![AggOp::Count],
+                nodes: None,
+            },
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
     }
 
     #[test]
