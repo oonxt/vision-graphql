@@ -2,8 +2,24 @@
 name = "vision-graphql"
 version = "0.1.0"
 edition = "2021"
-description = "Hasura-style ORM for PostgreSQL in Rust"
+description = "Hasura-style GraphQL ORM for PostgreSQL — one SQL per request via json_agg."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/oonxt/vision-graphql"
+homepage = "https://github.com/oonxt/vision-graphql"
+documentation = "https://docs.rs/vision-graphql"
+readme = "README.md"
+keywords = ["graphql", "orm", "postgres", "hasura", "database"]
+categories = ["database", "api-bindings"]
+rust-version = "1.85"
+
+# Exclude files unrelated to the library from the published tarball.
+exclude = [
+    "docs/**",
+    "tests/**",
+    "benches/**",
+    ".github/**",
+    "*.png",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
