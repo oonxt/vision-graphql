@@ -151,6 +151,14 @@ impl Table {
     pub fn find_relation(&self, name: &str) -> Option<&Relation> {
         self.relations_by_name.get(name)
     }
+
+    pub(crate) fn columns_iter(&self) -> impl Iterator<Item = &Column> {
+        self.columns_by_exposed.values()
+    }
+
+    pub(crate) fn relations_iter(&self) -> impl Iterator<Item = (&String, &Relation)> {
+        self.relations_by_name.iter()
+    }
 }
 
 #[derive(Debug)]
@@ -178,7 +186,7 @@ impl Schema {
 }
 
 pub struct SchemaBuilder {
-    tables: HashMap<String, Arc<Table>>,
+    pub(crate) tables: HashMap<String, Arc<Table>>,
 }
 
 impl SchemaBuilder {
@@ -191,6 +199,27 @@ impl SchemaBuilder {
         Schema {
             tables_by_exposed: self.tables,
         }
+    }
+
+    pub(crate) fn insert_raw(&mut self, exposed: String, t: Arc<Table>) {
+        self.tables.insert(exposed, t);
+    }
+
+    pub(crate) fn remove_raw(&mut self, exposed: &str) -> Option<Arc<Table>> {
+        self.tables.remove(exposed)
+    }
+
+    /// Load a TOML config file and apply it as an overlay.
+    pub fn load_config<P: AsRef<std::path::Path>>(self, path: P) -> crate::error::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| crate::error::Error::Schema(format!("cannot read config: {e}")))?;
+        let cfg = crate::schema::config::parse(&text)?;
+        Ok(crate::schema::merge::apply_config(self, &cfg))
+    }
+
+    /// Apply a pre-parsed config overlay.
+    pub fn apply_config(self, cfg: &crate::schema::config::ConfigOverlay) -> Self {
+        crate::schema::merge::apply_config(self, cfg)
     }
 }
 

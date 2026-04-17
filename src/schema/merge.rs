@@ -33,6 +33,91 @@ pub async fn introspect_into_builder(
     Ok(build_from_introspection(db))
 }
 
+pub fn apply_config(
+    mut sb: SchemaBuilder,
+    cfg: &crate::schema::config::ConfigOverlay,
+) -> SchemaBuilder {
+    use crate::schema::config::RelationKindOverlay;
+    use std::sync::Arc;
+
+    let rename_map: BTreeMap<String, String> = cfg
+        .tables
+        .iter()
+        .filter_map(|(old, o)| o.expose_as.clone().map(|new| (old.clone(), new)))
+        .collect();
+
+    let keys: Vec<String> = sb.tables.keys().cloned().collect();
+    for exposed in keys {
+        let Some(old) = sb.remove_raw(&exposed) else {
+            continue;
+        };
+        let old_physical_schema = old.physical_schema.clone();
+        let old_physical_name = old.physical_name.clone();
+        let old_pk = old.primary_key.clone();
+
+        let overlay = cfg.tables.get(&exposed);
+        let new_exposed = overlay
+            .and_then(|o| o.expose_as.clone())
+            .unwrap_or_else(|| exposed.clone());
+
+        let mut t = Table::new(&new_exposed, &old_physical_schema, &old_physical_name);
+
+        let hidden: std::collections::BTreeSet<&str> = overlay
+            .map(|o| o.hide_columns.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        for col in old.columns_iter() {
+            if hidden.contains(col.exposed_name.as_str()) {
+                continue;
+            }
+            t = t.column(
+                &col.exposed_name,
+                &col.physical_name,
+                col.pg_type.clone(),
+                col.nullable,
+            );
+        }
+
+        if !old_pk.is_empty() {
+            let refs: Vec<&str> = old_pk.iter().map(String::as_str).collect();
+            t = t.primary_key(&refs);
+        }
+
+        let overlay_rel_names: std::collections::BTreeSet<&str> = overlay
+            .map(|o| o.relations.iter().map(|r| r.name.as_str()).collect())
+            .unwrap_or_default();
+        for (name, rel) in old.relations_iter() {
+            if overlay_rel_names.contains(name.as_str()) {
+                continue;
+            }
+            let mut r = rel.clone();
+            if let Some(new_target) = rename_map.get(&r.target_table) {
+                r.target_table = new_target.clone();
+            }
+            t = t.relation(name, r);
+        }
+
+        if let Some(o) = overlay {
+            for r in &o.relations {
+                let kind = match r.kind {
+                    RelationKindOverlay::Object => RelKind::Object,
+                    RelationKindOverlay::Array => RelKind::Array,
+                };
+                t = t.relation(
+                    &r.name,
+                    Relation {
+                        kind,
+                        target_table: r.target.clone(),
+                        mapping: r.mapping.clone(),
+                    },
+                );
+            }
+        }
+
+        sb.insert_raw(new_exposed, Arc::new(t));
+    }
+    sb
+}
+
 /// For each `(source_table, target_table)` pair that has exactly one foreign key
 /// connecting them, derive an Object relation on the source and an Array
 /// relation on the target. Pairs with multiple FKs are skipped with a warning.
@@ -183,6 +268,34 @@ mod tests {
         assert!(rels
             .iter()
             .any(|(src, name, r)| src == "users" && name == "posts" && r.kind == RelKind::Array));
+    }
+
+    #[test]
+    fn apply_config_renames_and_hides_and_adds_relation() {
+        use crate::schema::config::{
+            ConfigOverlay, RelationKindOverlay, RelationOverlay, TableOverlay,
+        };
+
+        let db = fixture_with_posts_to_users();
+        let sb = build_from_introspection(db);
+
+        let mut cfg = ConfigOverlay::default();
+        let mut users_overlay = TableOverlay::default();
+        users_overlay.expose_as = Some("profiles".into());
+        users_overlay.relations.push(RelationOverlay {
+            name: "followers".into(),
+            kind: RelationKindOverlay::Array,
+            target: "profiles".into(),
+            mapping: vec![("id".into(), "followed_id".into())],
+        });
+        cfg.tables.insert("users".into(), users_overlay);
+
+        let sb = apply_config(sb, &cfg);
+        let schema = sb.build();
+        assert!(schema.table("users").is_none());
+        let profiles = schema.table("profiles").expect("profiles table");
+        assert!(profiles.find_relation("posts").is_some());
+        assert!(profiles.find_relation("followers").is_some());
     }
 
     #[test]
