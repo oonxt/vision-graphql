@@ -199,15 +199,48 @@ fn render_bool_list(
 }
 
 fn render_order_by(
-    _args: &QueryArgs,
-    _table: &Table,
-    _table_alias: &str,
-    _ctx: &mut RenderCtx,
+    args: &QueryArgs,
+    table: &Table,
+    table_alias: &str,
+    ctx: &mut RenderCtx,
 ) -> Result<()> {
+    if args.order_by.is_empty() {
+        return Ok(());
+    }
+    ctx.sql.push_str(" ORDER BY ");
+    for (i, ob) in args.order_by.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(&ob.column).ok_or_else(|| Error::Validate {
+            path: format!("order_by.{}", ob.column),
+            message: format!(
+                "unknown column '{}' on '{}'",
+                ob.column, table.exposed_name
+            ),
+        })?;
+        let dir = match ob.direction {
+            crate::ast::OrderDir::Asc => "ASC",
+            crate::ast::OrderDir::Desc => "DESC",
+        };
+        write!(
+            ctx.sql,
+            "{table_alias}.{} {dir}",
+            quote_ident(&col.physical_name)
+        )
+        .unwrap();
+    }
     Ok(())
 }
 
-fn render_limit_offset(_args: &QueryArgs, _ctx: &mut RenderCtx) {}
+fn render_limit_offset(args: &QueryArgs, ctx: &mut RenderCtx) {
+    if let Some(n) = args.limit {
+        write!(ctx.sql, " LIMIT {n}").unwrap();
+    }
+    if let Some(n) = args.offset {
+        write!(ctx.sql, " OFFSET {n}").unwrap();
+    }
+}
 
 fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -319,5 +352,31 @@ mod tests {
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
         assert_eq!(binds.len(), 2);
+    }
+
+    #[test]
+    fn render_order_limit_offset() {
+        use crate::ast::{OrderBy, OrderDir};
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            kind: RootKind::List,
+            args: QueryArgs {
+                order_by: vec![
+                    OrderBy { column: "name".into(), direction: OrderDir::Asc },
+                    OrderBy { column: "id".into(), direction: OrderDir::Desc },
+                ],
+                limit: Some(10),
+                offset: Some(5),
+                ..Default::default()
+            },
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
     }
 }
