@@ -206,7 +206,9 @@ pub fn derive_relations_from_fks(db: &IntrospectedDb) -> Vec<(String, String, Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::introspect::{IntrospectedColumn, IntrospectedForeignKey, IntrospectedTable};
+    use crate::schema::introspect::{
+        IntrospectedColumn, IntrospectedForeignKey, IntrospectedTable,
+    };
     use crate::schema::PgType;
 
     fn fixture_with_posts_to_users() -> IntrospectedDb {
@@ -281,10 +283,12 @@ mod tests {
         let cfg = ConfigOverlay::default();
         let sb = apply_config(sb, &cfg);
 
-        let sb = sb.table(
-            Table::new("widgets", "public", "widgets")
-                .column("id", "id", crate::schema::PgType::Int4, false),
-        );
+        let sb = sb.table(Table::new("widgets", "public", "widgets").column(
+            "id",
+            "id",
+            crate::schema::PgType::Int4,
+            false,
+        ));
 
         let schema: Schema = sb.build();
         assert!(schema.table("users").is_some());
@@ -307,14 +311,16 @@ mod tests {
         let sb = build_from_introspection(db);
 
         let mut cfg = ConfigOverlay::default();
-        let mut users_overlay = TableOverlay::default();
-        users_overlay.expose_as = Some("profiles".into());
-        users_overlay.relations.push(RelationOverlay {
-            name: "followers".into(),
-            kind: RelationKindOverlay::Array,
-            target: "profiles".into(),
-            mapping: vec![("id".into(), "followed_id".into())],
-        });
+        let users_overlay = TableOverlay {
+            expose_as: Some("profiles".into()),
+            hide_columns: Vec::new(),
+            relations: vec![RelationOverlay {
+                name: "followers".into(),
+                kind: RelationKindOverlay::Array,
+                target: "profiles".into(),
+                mapping: vec![("id".into(), "followed_id".into())],
+            }],
+        };
         cfg.tables.insert("users".into(), users_overlay);
 
         let sb = apply_config(sb, &cfg);
@@ -328,7 +334,10 @@ mod tests {
     #[test]
     fn multiple_fks_to_same_target_skipped() {
         let mut db = fixture_with_posts_to_users();
-        let posts = db.tables.get_mut(&("public".into(), "posts".into())).unwrap();
+        let posts = db
+            .tables
+            .get_mut(&("public".into(), "posts".into()))
+            .unwrap();
         posts.columns.push(IntrospectedColumn {
             name: "editor_id".into(),
             pg_type: PgType::Int4,

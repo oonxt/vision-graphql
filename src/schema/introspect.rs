@@ -195,15 +195,13 @@ pub async fn introspect(pool: &Pool) -> Result<IntrospectedDb> {
         let f_table: String = row.get(5);
         let f_col: String = row.get(6);
         let key = (schema.clone(), tname.clone(), constraint.clone());
-        let fk = fk_acc
-            .entry(key)
-            .or_insert_with(|| IntrospectedForeignKey {
-                constraint_name: constraint.clone(),
-                from_columns: Vec::new(),
-                to_schema: f_schema.clone(),
-                to_table: f_table.clone(),
-                to_columns: Vec::new(),
-            });
+        let fk = fk_acc.entry(key).or_insert_with(|| IntrospectedForeignKey {
+            constraint_name: constraint.clone(),
+            from_columns: Vec::new(),
+            to_schema: f_schema.clone(),
+            to_table: f_table.clone(),
+            to_columns: Vec::new(),
+        });
         fk.from_columns.push(cname);
         fk.to_columns.push(f_col);
     }
