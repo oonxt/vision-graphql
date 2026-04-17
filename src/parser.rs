@@ -83,8 +83,9 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                     path: alias.clone(),
                     message: format!("unknown root field '{name}'"),
                 })?;
-                let args = lower_args(&field.arguments, table, vars, &alias)?;
-                let selection = lower_selection_set(&field.selection_set.node, table, &alias)?;
+                let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
+                let selection =
+                    lower_selection_set(&field.selection_set.node, table, schema, vars, &alias)?;
 
                 roots.push(RootField {
                     table: name.to_string(),
@@ -104,7 +105,13 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
     Ok(Operation::Query(roots))
 }
 
-fn lower_selection_set(set: &SelectionSet, table: &Table, parent_path: &str) -> Result<Vec<Field>> {
+fn lower_selection_set(
+    set: &SelectionSet,
+    table: &Table,
+    schema: &Schema,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     for sel in &set.items {
         match &sel.node {
@@ -116,6 +123,41 @@ fn lower_selection_set(set: &SelectionSet, table: &Table, parent_path: &str) -> 
                     .as_ref()
                     .map(|a| a.node.as_str().to_string())
                     .unwrap_or_else(|| name.to_string());
+
+                if let Some(rel) = table.find_relation(name) {
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: format!("{parent_path}.{alias}"),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
+                    let args = lower_args(
+                        &field.arguments,
+                        target,
+                        schema,
+                        vars,
+                        &format!("{parent_path}.{alias}"),
+                    )?;
+                    let selection = lower_selection_set(
+                        &field.selection_set.node,
+                        target,
+                        schema,
+                        vars,
+                        &format!("{parent_path}.{alias}"),
+                    )?;
+                    out.push(Field::Relation {
+                        name: name.to_string(),
+                        alias,
+                        args,
+                        selection,
+                    });
+                    continue;
+                }
+
                 let col = table.find_column(name).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.{alias}"),
                     message: format!("unknown column '{name}' on '{}'", table.exposed_name),
@@ -127,7 +169,7 @@ fn lower_selection_set(set: &SelectionSet, table: &Table, parent_path: &str) -> 
             }
             _ => {
                 return Err(Error::Parse(
-                    "fragments are not supported in Phase 1".into(),
+                    "fragments are not supported in Phase 2".into(),
                 ))
             }
         }
@@ -138,6 +180,7 @@ fn lower_selection_set(set: &SelectionSet, table: &Table, parent_path: &str) -> 
 fn lower_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
+    schema: &Schema,
     vars: &Value,
     parent_path: &str,
 ) -> Result<QueryArgs> {
@@ -148,7 +191,12 @@ fn lower_args(
         match name {
             "where" => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.where"))?;
-                out.where_ = Some(lower_where(&json, table, &format!("{parent_path}.where"))?);
+                out.where_ = Some(lower_where(
+                    &json,
+                    table,
+                    schema,
+                    &format!("{parent_path}.where"),
+                )?);
             }
             "order_by" => {
                 out.order_by = lower_order_by(v, vars, &format!("{parent_path}.order_by"))?;
@@ -170,7 +218,7 @@ fn lower_args(
     Ok(out)
 }
 
-fn lower_where(json: &Value, table: &Table, path: &str) -> Result<BoolExpr> {
+fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Result<BoolExpr> {
     let obj = json.as_object().ok_or_else(|| Error::Validate {
         path: path.into(),
         message: "expected object".into(),
@@ -186,7 +234,7 @@ fn lower_where(json: &Value, table: &Table, path: &str) -> Result<BoolExpr> {
                 let inner: Result<Vec<BoolExpr>> = arr
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| lower_where(x, table, &format!("{path}._and[{i}]")))
+                    .map(|(i, x)| lower_where(x, table, schema, &format!("{path}._and[{i}]")))
                     .collect();
                 parts.push(BoolExpr::And(inner?));
             }
@@ -198,7 +246,7 @@ fn lower_where(json: &Value, table: &Table, path: &str) -> Result<BoolExpr> {
                 let inner: Result<Vec<BoolExpr>> = arr
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| lower_where(x, table, &format!("{path}._or[{i}]")))
+                    .map(|(i, x)| lower_where(x, table, schema, &format!("{path}._or[{i}]")))
                     .collect();
                 parts.push(BoolExpr::Or(inner?));
             }
@@ -206,10 +254,30 @@ fn lower_where(json: &Value, table: &Table, path: &str) -> Result<BoolExpr> {
                 parts.push(BoolExpr::Not(Box::new(lower_where(
                     v,
                     table,
+                    schema,
                     &format!("{path}._not"),
                 )?)));
             }
             col_name => {
+                if let Some(rel) = table.find_relation(col_name) {
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}"),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
+                    let inner = lower_where(v, target, schema, &format!("{path}.{col_name}"))?;
+                    parts.push(BoolExpr::Relation {
+                        name: col_name.to_string(),
+                        inner: Box::new(inner),
+                    });
+                    continue;
+                }
+
                 let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
                     path: format!("{path}.{col_name}"),
                     message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
@@ -368,6 +436,7 @@ mod tests {
                         assert_eq!(physical, "id");
                         assert_eq!(alias, "id");
                     }
+                    _ => panic!("expected Column"),
                 }
             }
         }
@@ -383,6 +452,7 @@ mod tests {
                 assert_eq!(physical, "id");
                 assert_eq!(alias, "uid");
             }
+            _ => panic!("expected Column"),
         }
     }
 
@@ -454,6 +524,91 @@ mod tests {
             roots[0].args.order_by[0].direction,
             crate::ast::OrderDir::Asc
         ));
+    }
+
+    fn schema_with_relations() -> Schema {
+        use crate::schema::Relation;
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("name", "name", PgType::Text, true)
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("title", "title", PgType::Text, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build()
+    }
+
+    #[test]
+    fn parse_nested_array_relation() {
+        let op = parse_and_lower(
+            "query { users { id posts(limit: 3) { title } } }",
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        assert_eq!(roots[0].selection.len(), 2);
+        match &roots[0].selection[1] {
+            Field::Relation {
+                name,
+                args,
+                selection,
+                ..
+            } => {
+                assert_eq!(name, "posts");
+                assert_eq!(args.limit, Some(3));
+                assert_eq!(selection.len(), 1);
+            }
+            _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn parse_where_relation_exists() {
+        let op = parse_and_lower(
+            r#"query { users(where: {posts: {title: {_eq: "hello"}}}) { id } }"#,
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        match roots[0].args.where_.as_ref().unwrap() {
+            crate::ast::BoolExpr::Relation { name, inner } => {
+                assert_eq!(name, "posts");
+                match inner.as_ref() {
+                    crate::ast::BoolExpr::Compare { column, .. } => {
+                        assert_eq!(column, "title");
+                    }
+                    _ => panic!("expected Compare"),
+                }
+            }
+            _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn parse_nested_object_relation() {
+        let op = parse_and_lower(
+            "query { posts { title user { name } } }",
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        match &roots[0].selection[1] {
+            Field::Relation { name, .. } => assert_eq!(name, "user"),
+            _ => panic!("expected Relation"),
+        }
     }
 
     #[test]

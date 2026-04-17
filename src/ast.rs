@@ -43,7 +43,17 @@ pub enum OrderDir {
 
 #[derive(Debug, Clone)]
 pub enum Field {
-    Column { physical: String, alias: String },
+    Column {
+        physical: String,
+        alias: String,
+    },
+    Relation {
+        /// Name of the relation on the parent table (resolved via schema at render).
+        name: String,
+        alias: String,
+        args: QueryArgs,
+        selection: Vec<Field>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +65,11 @@ pub enum BoolExpr {
         column: String,
         op: CmpOp,
         value: Value,
+    },
+    /// Match rows where the named relation has at least one matching row.
+    Relation {
+        name: String,
+        inner: Box<BoolExpr>,
     },
 }
 
@@ -105,6 +120,44 @@ mod tests {
         match expr {
             BoolExpr::Compare { op: CmpOp::Eq, .. } => {}
             _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn build_field_relation() {
+        let f = Field::Relation {
+            name: "posts".into(),
+            alias: "posts".into(),
+            args: QueryArgs::default(),
+            selection: vec![Field::Column {
+                physical: "title".into(),
+                alias: "title".into(),
+            }],
+        };
+        match f {
+            Field::Relation {
+                name, selection, ..
+            } => {
+                assert_eq!(name, "posts");
+                assert_eq!(selection.len(), 1);
+            }
+            _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn build_bool_expr_relation() {
+        let e = BoolExpr::Relation {
+            name: "posts".into(),
+            inner: Box::new(BoolExpr::Compare {
+                column: "published".into(),
+                op: CmpOp::Eq,
+                value: json!(true),
+            }),
+        };
+        match e {
+            BoolExpr::Relation { name, .. } => assert_eq!(name, "posts"),
+            _ => panic!("expected Relation"),
         }
     }
 }
