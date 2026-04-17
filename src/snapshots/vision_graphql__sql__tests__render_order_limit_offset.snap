@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_build_object('users', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."id" AS "id" FROM "public"."users" t0 ORDER BY t0."name" ASC, t0."id" DESC LIMIT 10 OFFSET 5) r1)) AS result

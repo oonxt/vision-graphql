@@ -1,0 +1,25 @@
+[package]
+name = "vision-graphql"
+version = "0.1.0"
+edition = "2021"
+description = "Hasura-style ORM for PostgreSQL in Rust"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+async-graphql-parser = "7"
+async-graphql-value = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tracing = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
+pretty_assertions = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
