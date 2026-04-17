@@ -7,6 +7,7 @@ use crate::types::Bind;
 use std::fmt::Write as _;
 
 /// Render an [`Operation`] into a single SQL statement plus bound parameters.
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
     let mut ctx = RenderCtx::default();
     match op {
