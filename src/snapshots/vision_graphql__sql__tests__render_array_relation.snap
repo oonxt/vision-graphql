@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_build_object('users', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."id" AS "id", (SELECT coalesce(json_agg(row_to_json(r3)), '[]'::json) FROM (SELECT t2."title" AS "title" FROM "public"."posts" t2 WHERE t2."user_id" = t0."id") r3) AS "posts" FROM "public"."users" t0) r1)) AS result
