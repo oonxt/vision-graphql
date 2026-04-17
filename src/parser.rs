@@ -49,9 +49,19 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
                 selection_set: &op.node.selection_set.node,
             })
         }
-        (DocumentOperations::Multiple(_), None) => Err(Error::Parse(
-            "document has multiple operations; operation_name required".into(),
-        )),
+        (DocumentOperations::Multiple(ops), None) => {
+            if ops.len() == 1 {
+                let (_, op) = ops.iter().next().unwrap();
+                Ok(OpInfo {
+                    ty: op.node.ty,
+                    selection_set: &op.node.selection_set.node,
+                })
+            } else {
+                Err(Error::Parse(
+                    "document has multiple operations; operation_name required".into(),
+                ))
+            }
+        }
     }
 }
 
