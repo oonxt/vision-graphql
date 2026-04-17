@@ -30,4 +30,12 @@ impl Engine {
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
     }
+
+    /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
+    pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
+        let operation = op.into_operation();
+        let (sql, binds) = render(&operation, &self.schema)?;
+        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
+        crate::executor::execute(&self.pool, &sql, &binds).await
+    }
 }
