@@ -1,7 +1,12 @@
 //! Schema data structures.
 //!
-//! In Phase 1 the schema is constructed manually via [`Schema::builder`].
-//! Introspection arrives in Phase 5.
+//! The schema can be built manually via [`Schema::builder`], introspected from
+//! a live database via [`Schema::introspect`], or loaded from a TOML config
+//! via [`SchemaBuilder::load_config`].
+
+pub mod config;
+pub mod introspect;
+pub mod merge;
 
 use std::collections::HashMap;
 use std::sync::Arc;
