@@ -88,6 +88,10 @@ pub enum BoolExpr {
         op: CmpOp,
         value: Value,
     },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
     /// Match rows where the named relation has at least one matching row.
     Relation {
         name: String,
@@ -103,6 +107,10 @@ pub enum CmpOp {
     Gte,
     Lt,
     Lte,
+    Like,
+    ILike,
+    NLike,
+    NILike,
 }
 
 #[allow(clippy::large_enum_variant)]
