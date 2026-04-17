@@ -156,6 +156,46 @@ impl QueryBuilder {
         self
     }
 
+    pub fn where_in(mut self, col: impl Into<String>, values: &[Value]) -> Self {
+        let column = col.into();
+        let parts: Vec<BoolExpr> = values
+            .iter()
+            .map(|v| BoolExpr::Compare {
+                column: column.clone(),
+                op: CmpOp::Eq,
+                value: v.clone(),
+            })
+            .collect();
+        self.args.where_ = Some(merge_and(self.args.where_.take(), BoolExpr::Or(parts)));
+        self
+    }
+
+    pub fn where_like(self, col: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.where_cmp(col, CmpOp::Like, Value::String(pattern.into()))
+    }
+
+    pub fn where_ilike(self, col: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.where_cmp(col, CmpOp::ILike, Value::String(pattern.into()))
+    }
+
+    pub fn where_is_null(mut self, col: impl Into<String>) -> Self {
+        let e = BoolExpr::IsNull {
+            column: col.into(),
+            negated: false,
+        };
+        self.args.where_ = Some(merge_and(self.args.where_.take(), e));
+        self
+    }
+
+    pub fn where_is_not_null(mut self, col: impl Into<String>) -> Self {
+        let e = BoolExpr::IsNull {
+            column: col.into(),
+            negated: true,
+        };
+        self.args.where_ = Some(merge_and(self.args.where_.take(), e));
+        self
+    }
+
     pub fn build(self) -> RootField {
         RootField {
             table: self.table,
@@ -735,6 +775,35 @@ mod tests {
         };
         assert_eq!(pk[0].1, json!(7));
         assert_eq!(selection.len(), 1);
+    }
+
+    #[test]
+    fn query_builder_where_in() {
+        let rf = Query::from("users")
+            .where_in("id", &[json!(1), json!(2)])
+            .build();
+        match rf.args.where_.as_ref().unwrap() {
+            BoolExpr::Or(parts) => assert_eq!(parts.len(), 2),
+            _ => panic!("expected Or"),
+        }
+    }
+
+    #[test]
+    fn query_builder_where_like() {
+        let rf = Query::from("users").where_like("name", "a%").build();
+        match rf.args.where_.as_ref().unwrap() {
+            BoolExpr::Compare { op, .. } => assert!(matches!(op, CmpOp::Like)),
+            _ => panic!("expected Compare"),
+        }
+    }
+
+    #[test]
+    fn query_builder_where_is_null() {
+        let rf = Query::from("users").where_is_null("name").build();
+        match rf.args.where_.as_ref().unwrap() {
+            BoolExpr::IsNull { negated, .. } => assert!(!negated),
+            _ => panic!("expected IsNull"),
+        }
     }
 
     #[test]
