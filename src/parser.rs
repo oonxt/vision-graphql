@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
 
+#[tracing::instrument(level = "trace", skip_all)]
 pub fn parse_and_lower(
     source: &str,
     variables: &Value,

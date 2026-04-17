@@ -23,6 +23,7 @@ impl Engine {
 
     /// Parse a GraphQL query string, execute against PostgreSQL, return the
     /// Hasura-shaped `data` object as `serde_json::Value`.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let op = parse_and_lower(source, &vars, None, &self.schema)?;
@@ -32,6 +33,7 @@ impl Engine {
     }
 
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         let operation = op.into_operation();
         let (sql, binds) = render(&operation, &self.schema)?;
