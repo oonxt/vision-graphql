@@ -114,11 +114,87 @@ fn render_inner_select(
 }
 
 fn render_where(
-    _args: &QueryArgs,
-    _table: &Table,
-    _table_alias: &str,
-    _ctx: &mut RenderCtx,
+    args: &QueryArgs,
+    table: &Table,
+    table_alias: &str,
+    ctx: &mut RenderCtx,
 ) -> Result<()> {
+    let Some(expr) = args.where_.as_ref() else {
+        return Ok(());
+    };
+    ctx.sql.push_str(" WHERE ");
+    render_bool_expr(expr, table, table_alias, ctx)?;
+    Ok(())
+}
+
+fn render_bool_expr(
+    expr: &crate::ast::BoolExpr,
+    table: &Table,
+    table_alias: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::{BoolExpr, CmpOp};
+    match expr {
+        BoolExpr::And(parts) => render_bool_list(parts, "AND", table, table_alias, ctx),
+        BoolExpr::Or(parts) => render_bool_list(parts, "OR", table, table_alias, ctx),
+        BoolExpr::Not(inner) => {
+            ctx.sql.push_str("(NOT ");
+            render_bool_expr(inner, table, table_alias, ctx)?;
+            ctx.sql.push(')');
+            Ok(())
+        }
+        BoolExpr::Compare { column, op, value } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            let bind = crate::types::json_to_bind(value, &col.pg_type).map_err(|e| {
+                Error::Validate {
+                    path: format!("where.{column}"),
+                    message: format!("{e}"),
+                }
+            })?;
+            ctx.binds.push(bind);
+            let placeholder = format!("${}", ctx.binds.len());
+            let op_str = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Neq => "<>",
+                CmpOp::Gt => ">",
+                CmpOp::Gte => ">=",
+                CmpOp::Lt => "<",
+                CmpOp::Lte => "<=",
+            };
+            write!(
+                ctx.sql,
+                "{table_alias}.{} {op_str} {placeholder}",
+                quote_ident(&col.physical_name)
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+}
+
+fn render_bool_list(
+    parts: &[crate::ast::BoolExpr],
+    joiner: &str,
+    table: &Table,
+    table_alias: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    if parts.is_empty() {
+        ctx.sql
+            .push_str(if joiner == "AND" { "TRUE" } else { "FALSE" });
+        return Ok(());
+    }
+    ctx.sql.push('(');
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            write!(ctx.sql, " {joiner} ").unwrap();
+        }
+        render_bool_expr(p, table, table_alias, ctx)?;
+    }
+    ctx.sql.push(')');
     Ok(())
 }
 
@@ -181,5 +257,67 @@ mod tests {
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
         assert!(binds.is_empty());
+    }
+
+    #[test]
+    fn render_where_eq_int() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            kind: RootKind::List,
+            args: QueryArgs {
+                where_: Some(BoolExpr::Compare {
+                    column: "id".into(),
+                    op: CmpOp::Eq,
+                    value: json!(42),
+                }),
+                ..Default::default()
+            },
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(binds[0], crate::types::Bind::Int4(42)));
+    }
+
+    #[test]
+    fn render_where_and_of_ops() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            kind: RootKind::List,
+            args: QueryArgs {
+                where_: Some(BoolExpr::And(vec![
+                    BoolExpr::Compare {
+                        column: "id".into(),
+                        op: CmpOp::Gt,
+                        value: json!(1),
+                    },
+                    BoolExpr::Compare {
+                        column: "name".into(),
+                        op: CmpOp::Neq,
+                        value: json!("bob"),
+                    },
+                ])),
+                ..Default::default()
+            },
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 2);
     }
 }
