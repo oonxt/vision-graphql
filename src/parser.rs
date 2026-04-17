@@ -5,7 +5,8 @@ use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
-    DocumentOperations, ExecutableDocument, OperationType, Selection, SelectionSet,
+    DocumentOperations, ExecutableDocument, Field as GqlField, OperationType, Selection,
+    SelectionSet,
 };
 use async_graphql_parser::Positioned;
 use async_graphql_value::{Name, Value as GqlValue};
@@ -21,9 +22,7 @@ pub fn parse_and_lower(
     let op = pick_operation(&doc, operation_name)?;
     match op.ty {
         OperationType::Query => lower_query(op.selection_set, schema, variables),
-        OperationType::Mutation => Err(Error::Parse(
-            "mutations are not supported in Phase 1".into(),
-        )),
+        OperationType::Mutation => lower_mutation(op.selection_set, schema, variables),
         OperationType::Subscription => Err(Error::Parse("subscriptions are not supported".into())),
     }
 }
@@ -162,6 +161,481 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
         }
     }
     Ok(Operation::Query(roots))
+}
+
+fn lower_mutation(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Operation> {
+    let mut fields: Vec<crate::ast::MutationField> = Vec::new();
+    for sel in &set.items {
+        let Selection::Field(f) = &sel.node else {
+            return Err(Error::Parse(
+                "fragments are not supported in mutations".into(),
+            ));
+        };
+        let field = &f.node;
+        let name = field.name.node.as_str();
+        let alias = field
+            .alias
+            .as_ref()
+            .map(|a| a.node.as_str().to_string())
+            .unwrap_or_else(|| name.to_string());
+        let mf = lower_mutation_field(name, &alias, field, schema, vars)?;
+        fields.push(mf);
+    }
+    Ok(Operation::Mutation(fields))
+}
+
+fn lower_mutation_field(
+    name: &str,
+    alias: &str,
+    field: &GqlField,
+    schema: &Schema,
+    vars: &Value,
+) -> Result<crate::ast::MutationField> {
+    use crate::ast::MutationField;
+
+    // insert_<table>_one
+    if let Some(base) = name.strip_suffix("_one") {
+        if let Some(base_name) = base.strip_prefix("insert_") {
+            if let Some(table) = schema.table(base_name) {
+                let (objects, on_conflict) =
+                    parse_insert_args(&field.arguments, table, schema, vars, alias, true)?;
+                let returning =
+                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                return Ok(MutationField::Insert {
+                    alias: alias.to_string(),
+                    table: base_name.to_string(),
+                    objects,
+                    on_conflict,
+                    returning,
+                    one: true,
+                });
+            }
+        }
+    }
+
+    // insert_<table>
+    if let Some(base_name) = name.strip_prefix("insert_") {
+        if let Some(table) = schema.table(base_name) {
+            let (objects, on_conflict) =
+                parse_insert_args(&field.arguments, table, schema, vars, alias, false)?;
+            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            return Ok(MutationField::Insert {
+                alias: alias.to_string(),
+                table: base_name.to_string(),
+                objects,
+                on_conflict,
+                returning,
+                one: false,
+            });
+        }
+    }
+
+    // update_<table>_by_pk
+    if let Some(base) = name.strip_suffix("_by_pk") {
+        if let Some(base_name) = base.strip_prefix("update_") {
+            if let Some(table) = schema.table(base_name) {
+                if table.primary_key.is_empty() {
+                    return Err(Error::Validate {
+                        path: alias.into(),
+                        message: format!(
+                            "table '{}' has no primary key; _by_pk not available",
+                            table.exposed_name
+                        ),
+                    });
+                }
+                let (pk, set) = parse_update_by_pk_args(&field.arguments, table, vars, alias)?;
+                let selection =
+                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                return Ok(MutationField::UpdateByPk {
+                    alias: alias.to_string(),
+                    table: base_name.to_string(),
+                    pk,
+                    set,
+                    selection,
+                });
+            }
+        }
+    }
+
+    // update_<table>
+    if let Some(base_name) = name.strip_prefix("update_") {
+        if let Some(table) = schema.table(base_name) {
+            let (where_, set) = parse_update_args(&field.arguments, table, schema, vars, alias)?;
+            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            return Ok(MutationField::Update {
+                alias: alias.to_string(),
+                table: base_name.to_string(),
+                where_,
+                set,
+                returning,
+            });
+        }
+    }
+
+    // delete_<table>_by_pk
+    if let Some(base) = name.strip_suffix("_by_pk") {
+        if let Some(base_name) = base.strip_prefix("delete_") {
+            if let Some(table) = schema.table(base_name) {
+                if table.primary_key.is_empty() {
+                    return Err(Error::Validate {
+                        path: alias.into(),
+                        message: format!(
+                            "table '{}' has no primary key; _by_pk not available",
+                            table.exposed_name
+                        ),
+                    });
+                }
+                let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+                for pk_col in &table.primary_key {
+                    let found = field
+                        .arguments
+                        .iter()
+                        .find(|(n, _)| n.node.as_str() == pk_col);
+                    let (_, value_p) = found.ok_or_else(|| Error::Validate {
+                        path: alias.into(),
+                        message: format!("required primary key argument '{pk_col}' missing"),
+                    })?;
+                    let json = gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
+                    pk.push((pk_col.clone(), json));
+                }
+                let selection =
+                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                return Ok(MutationField::DeleteByPk {
+                    alias: alias.to_string(),
+                    table: base_name.to_string(),
+                    pk,
+                    selection,
+                });
+            }
+        }
+    }
+
+    // delete_<table>
+    if let Some(base_name) = name.strip_prefix("delete_") {
+        if let Some(table) = schema.table(base_name) {
+            let mut where_: Option<crate::ast::BoolExpr> = None;
+            for (name_p, value_p) in &field.arguments {
+                let aname = name_p.node.as_str();
+                let v = &value_p.node;
+                if aname == "where" {
+                    let json = gql_to_json(v, vars, &format!("{alias}.where"))?;
+                    where_ = Some(lower_where(
+                        &json,
+                        table,
+                        schema,
+                        &format!("{alias}.where"),
+                    )?);
+                } else {
+                    return Err(Error::Validate {
+                        path: format!("{alias}.{aname}"),
+                        message: format!("unknown argument '{aname}'"),
+                    });
+                }
+            }
+            let where_ = where_.ok_or_else(|| Error::Validate {
+                path: alias.into(),
+                message: "delete requires 'where'".into(),
+            })?;
+            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            return Ok(MutationField::Delete {
+                alias: alias.to_string(),
+                table: base_name.to_string(),
+                where_,
+                returning,
+            });
+        }
+    }
+
+    Err(Error::Validate {
+        path: alias.into(),
+        message: format!("mutation field '{name}' not yet supported"),
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_insert_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    schema: &Schema,
+    vars: &Value,
+    parent_path: &str,
+    single: bool,
+) -> Result<(
+    Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+    Option<crate::ast::OnConflict>,
+)> {
+    use std::collections::BTreeMap;
+    let mut objects: Vec<BTreeMap<String, serde_json::Value>> = Vec::new();
+    let mut on_conflict: Option<crate::ast::OnConflict> = None;
+    let _ = schema;
+
+    for (name_p, value_p) in args {
+        let aname = name_p.node.as_str();
+        let v = &value_p.node;
+        match aname {
+            "object" if single => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.object"))?;
+                let obj = json_object_to_map(&json, table, &format!("{parent_path}.object"))?;
+                objects.push(obj);
+            }
+            "objects" if !single => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.objects"))?;
+                let arr = json.as_array().ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.objects"),
+                    message: "expected array".into(),
+                })?;
+                for (i, item) in arr.iter().enumerate() {
+                    let obj =
+                        json_object_to_map(item, table, &format!("{parent_path}.objects[{i}]"))?;
+                    objects.push(obj);
+                }
+            }
+            "on_conflict" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.on_conflict"))?;
+                on_conflict = Some(parse_on_conflict(
+                    &json,
+                    table,
+                    &format!("{parent_path}.on_conflict"),
+                )?);
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown argument '{other}'"),
+                });
+            }
+        }
+    }
+    if objects.is_empty() {
+        return Err(Error::Validate {
+            path: parent_path.into(),
+            message: if single {
+                "missing required argument 'object'".into()
+            } else {
+                "missing required argument 'objects'".into()
+            },
+        });
+    }
+    Ok((objects, on_conflict))
+}
+
+fn json_object_to_map(
+    json: &Value,
+    table: &Table,
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    use std::collections::BTreeMap;
+    let obj = json.as_object().ok_or_else(|| Error::Validate {
+        path: path.into(),
+        message: "expected object".into(),
+    })?;
+    let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (k, v) in obj {
+        if table.find_column(k).is_none() {
+            return Err(Error::Validate {
+                path: format!("{path}.{k}"),
+                message: format!("unknown column '{k}' on '{}'", table.exposed_name),
+            });
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    if out.is_empty() {
+        return Err(Error::Validate {
+            path: path.into(),
+            message: "insert row must set at least one column".into(),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_on_conflict(json: &Value, table: &Table, path: &str) -> Result<crate::ast::OnConflict> {
+    let obj = json.as_object().ok_or_else(|| Error::Validate {
+        path: path.into(),
+        message: "expected object".into(),
+    })?;
+    let constraint = obj
+        .get("constraint")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Validate {
+            path: format!("{path}.constraint"),
+            message: "missing or non-string 'constraint'".into(),
+        })?
+        .to_string();
+    let mut update_columns: Vec<String> = Vec::new();
+    if let Some(cols) = obj.get("update_columns") {
+        let arr = cols.as_array().ok_or_else(|| Error::Validate {
+            path: format!("{path}.update_columns"),
+            message: "expected array".into(),
+        })?;
+        for (i, c) in arr.iter().enumerate() {
+            let cn = c.as_str().ok_or_else(|| Error::Validate {
+                path: format!("{path}.update_columns[{i}]"),
+                message: "expected string".into(),
+            })?;
+            if table.find_column(cn).is_none() {
+                return Err(Error::Validate {
+                    path: format!("{path}.update_columns[{i}]"),
+                    message: format!("unknown column '{cn}' on '{}'", table.exposed_name),
+                });
+            }
+            update_columns.push(cn.to_string());
+        }
+    }
+    let where_ = obj
+        .get("where")
+        .map(|w| {
+            lower_where(
+                w,
+                table,
+                &Schema::builder().build(),
+                &format!("{path}.where"),
+            )
+        })
+        .transpose()?;
+    Ok(crate::ast::OnConflict {
+        constraint,
+        update_columns,
+        where_,
+    })
+}
+
+fn parse_update_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    schema: &Schema,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<(
+    crate::ast::BoolExpr,
+    std::collections::BTreeMap<String, serde_json::Value>,
+)> {
+    use std::collections::BTreeMap;
+    let mut where_: Option<crate::ast::BoolExpr> = None;
+    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name_p, value_p) in args {
+        let aname = name_p.node.as_str();
+        let v = &value_p.node;
+        match aname {
+            "where" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.where"))?;
+                where_ = Some(lower_where(
+                    &json,
+                    table,
+                    schema,
+                    &format!("{parent_path}.where"),
+                )?);
+            }
+            "_set" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
+                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown argument '{other}'"),
+                });
+            }
+        }
+    }
+    let w = where_.ok_or_else(|| Error::Validate {
+        path: parent_path.into(),
+        message: "update requires 'where'".into(),
+    })?;
+    if set.is_empty() {
+        return Err(Error::Validate {
+            path: parent_path.into(),
+            message: "update requires non-empty '_set'".into(),
+        });
+    }
+    Ok((w, set))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_update_by_pk_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<(
+    Vec<(String, serde_json::Value)>,
+    std::collections::BTreeMap<String, serde_json::Value>,
+)> {
+    use std::collections::BTreeMap;
+    let mut pk_obj: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name_p, value_p) in args {
+        let aname = name_p.node.as_str();
+        let v = &value_p.node;
+        match aname {
+            "pk_columns" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.pk_columns"))?;
+                let obj = json.as_object().ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.pk_columns"),
+                    message: "expected object".into(),
+                })?;
+                pk_obj = Some(obj.clone());
+            }
+            "_set" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
+                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown argument '{other}'"),
+                });
+            }
+        }
+    }
+    let pk_obj = pk_obj.ok_or_else(|| Error::Validate {
+        path: parent_path.into(),
+        message: "missing required 'pk_columns'".into(),
+    })?;
+    if set.is_empty() {
+        return Err(Error::Validate {
+            path: parent_path.into(),
+            message: "update_by_pk requires non-empty '_set'".into(),
+        });
+    }
+    let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+    for pk_col in &table.primary_key {
+        let v = pk_obj.get(pk_col).ok_or_else(|| Error::Validate {
+            path: format!("{parent_path}.pk_columns.{pk_col}"),
+            message: format!("missing primary key value '{pk_col}'"),
+        })?;
+        pk.push((pk_col.clone(), v.clone()));
+    }
+    Ok((pk, set))
+}
+
+fn parse_returning(set: &SelectionSet, table: &Table, parent_path: &str) -> Result<Vec<Field>> {
+    let mut returning: Vec<Field> = Vec::new();
+    for sel in &set.items {
+        let Selection::Field(f) = &sel.node else {
+            return Err(Error::Parse(
+                "fragments not supported in mutation return".into(),
+            ));
+        };
+        let field = &f.node;
+        let fname = field.name.node.as_str();
+        match fname {
+            "affected_rows" => {}
+            "returning" => {
+                returning = lower_selection_columns_only(
+                    &field.selection_set.node,
+                    table,
+                    &format!("{parent_path}.returning"),
+                )?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown mutation return field '{other}'"),
+                });
+            }
+        }
+    }
+    Ok(returning)
 }
 
 fn lower_selection_set(
@@ -623,22 +1097,23 @@ mod tests {
     fn parse_plain_list() {
         let op =
             parse_and_lower("query { users { id name } }", &json!({}), None, &schema()).unwrap();
-        match op {
-            Operation::Query(roots) => {
-                assert_eq!(roots.len(), 1);
-                assert_eq!(roots[0].table, "users");
-                assert_eq!(roots[0].alias, "users");
-                let crate::ast::RootBody::List { selection } = &roots[0].body else {
-                    panic!("expected List");
-                };
-                assert_eq!(selection.len(), 2);
-                match &selection[0] {
-                    Field::Column { physical, alias } => {
-                        assert_eq!(physical, "id");
-                        assert_eq!(alias, "id");
-                    }
-                    _ => panic!("expected Column"),
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        {
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].table, "users");
+            assert_eq!(roots[0].alias, "users");
+            let crate::ast::RootBody::List { selection } = &roots[0].body else {
+                panic!("expected List");
+            };
+            assert_eq!(selection.len(), 2);
+            match &selection[0] {
+                Field::Column { physical, alias } => {
+                    assert_eq!(physical, "id");
+                    assert_eq!(alias, "id");
                 }
+                _ => panic!("expected Column"),
             }
         }
     }
@@ -647,7 +1122,9 @@ mod tests {
     fn parse_respects_field_alias() {
         let op =
             parse_and_lower("query { users { uid: id } }", &json!({}), None, &schema()).unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -683,7 +1160,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let args = &roots[0].args;
         assert_eq!(args.limit, Some(10));
         match args.where_.as_ref().unwrap() {
@@ -705,7 +1184,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match roots[0].args.where_.as_ref().unwrap() {
             crate::ast::BoolExpr::And(parts) => assert_eq!(parts.len(), 2),
             _ => panic!("expected And"),
@@ -721,7 +1202,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].args.order_by.len(), 2);
         assert_eq!(roots[0].args.order_by[0].column, "name");
         assert!(matches!(
@@ -758,7 +1241,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -787,7 +1272,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match roots[0].args.where_.as_ref().unwrap() {
             crate::ast::BoolExpr::Relation { name, inner } => {
                 assert_eq!(name, "posts");
@@ -811,7 +1298,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -830,7 +1319,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
             crate::ast::RootBody::Aggregate { ops, nodes } => {
@@ -849,6 +1340,75 @@ mod tests {
     }
 
     #[test]
+    fn parse_insert_array() {
+        let op = parse_and_lower(
+            r#"mutation { insert_users(objects: [{name: "a"}, {name: "b"}]) { affected_rows returning { id } } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        match op {
+            Operation::Mutation(fields) => {
+                assert_eq!(fields.len(), 1);
+                match &fields[0] {
+                    crate::ast::MutationField::Insert {
+                        objects,
+                        returning,
+                        one,
+                        ..
+                    } => {
+                        assert_eq!(objects.len(), 2);
+                        assert_eq!(returning.len(), 1);
+                        assert!(!one);
+                    }
+                    _ => panic!("expected Insert"),
+                }
+            }
+            _ => panic!("expected Mutation"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_one() {
+        let op = parse_and_lower(
+            r#"mutation { insert_users_one(object: {name: "a"}) { id name } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        match op {
+            Operation::Mutation(fields) => match &fields[0] {
+                crate::ast::MutationField::Insert {
+                    objects,
+                    returning,
+                    one,
+                    ..
+                } => {
+                    assert_eq!(objects.len(), 1);
+                    assert_eq!(returning.len(), 2);
+                    assert!(one);
+                }
+                _ => panic!("expected Insert"),
+            },
+            _ => panic!("expected Mutation"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_rejects_unknown_column() {
+        let err = parse_and_lower(
+            r#"mutation { insert_users(objects: [{bogus: 1}]) { affected_rows } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown column 'bogus'"));
+    }
+
+    #[test]
     fn parse_distinct_on_list() {
         let op = parse_and_lower(
             "query { users(distinct_on: [name]) { id } }",
@@ -857,7 +1417,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].args.distinct_on, vec!["name".to_string()]);
     }
 
@@ -870,7 +1432,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
             crate::ast::RootBody::ByPk { pk, selection } => {
@@ -892,7 +1456,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match &roots[0].body {
             crate::ast::RootBody::ByPk { pk, .. } => {
                 assert_eq!(pk[0].1, json!(42));
@@ -922,7 +1488,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match &roots[0].body {
             crate::ast::RootBody::Aggregate { ops, nodes } => {
                 assert_eq!(ops.len(), 1);

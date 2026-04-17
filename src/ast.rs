@@ -5,6 +5,7 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub enum Operation {
     Query(Vec<RootField>),
+    Mutation(Vec<MutationField>),
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,56 @@ pub enum CmpOp {
     Lte,
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum MutationField {
+    Insert {
+        alias: String,
+        table: String,
+        /// Each inner map is `{ exposed_column -> value }` for one row to insert.
+        objects: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+        on_conflict: Option<OnConflict>,
+        returning: Vec<Field>,
+        /// true for `insert_users_one` (single object result); false for `insert_users`
+        /// (array result wrapped in `{affected_rows, returning}`).
+        one: bool,
+    },
+    Update {
+        alias: String,
+        table: String,
+        where_: BoolExpr,
+        /// `{ exposed_column -> new_value }`
+        set: std::collections::BTreeMap<String, serde_json::Value>,
+        returning: Vec<Field>,
+    },
+    UpdateByPk {
+        alias: String,
+        table: String,
+        pk: Vec<(String, serde_json::Value)>,
+        set: std::collections::BTreeMap<String, serde_json::Value>,
+        selection: Vec<Field>,
+    },
+    Delete {
+        alias: String,
+        table: String,
+        where_: BoolExpr,
+        returning: Vec<Field>,
+    },
+    DeleteByPk {
+        alias: String,
+        table: String,
+        pk: Vec<(String, serde_json::Value)>,
+        selection: Vec<Field>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct OnConflict {
+    pub constraint: String,
+    pub update_columns: Vec<String>,
+    pub where_: Option<BoolExpr>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +241,28 @@ mod tests {
                 assert!(nodes.is_some());
             }
             _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn build_insert_mutation() {
+        use std::collections::BTreeMap;
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let m = MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![obj],
+            on_conflict: None,
+            returning: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            one: false,
+        };
+        match m {
+            MutationField::Insert { objects, .. } => assert_eq!(objects.len(), 1),
+            _ => panic!("expected Insert"),
         }
     }
 
