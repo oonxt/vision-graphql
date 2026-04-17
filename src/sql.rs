@@ -190,10 +190,52 @@ fn render_bool_expr(
             .unwrap();
             Ok(())
         }
-        BoolExpr::Relation { .. } => Err(Error::Validate {
-            path: "where".into(),
-            message: "BoolExpr::Relation not yet implemented".into(),
-        }),
+        BoolExpr::Relation { name, inner } => {
+            let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
+                path: format!("where.{name}"),
+                message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
+            })?;
+            let target = schema
+                .table(&rel.target_table)
+                .ok_or_else(|| Error::Validate {
+                    path: format!("where.{name}"),
+                    message: format!("relation target table '{}' missing", rel.target_table),
+                })?;
+            let remote_alias = ctx.next_alias("e");
+            ctx.sql.push_str("EXISTS (SELECT 1 FROM ");
+            write!(
+                ctx.sql,
+                "{}.{} {remote_alias}",
+                quote_ident(&target.physical_schema),
+                quote_ident(&target.physical_name),
+            )
+            .unwrap();
+            ctx.sql.push_str(" WHERE ");
+            for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
+                if i > 0 {
+                    ctx.sql.push_str(" AND ");
+                }
+                let l = table.find_column(local_col).ok_or_else(|| Error::Validate {
+                    path: format!("where.{name}"),
+                    message: format!("relation mapping: unknown local column '{local_col}'"),
+                })?;
+                let r = target.find_column(remote_col).ok_or_else(|| Error::Validate {
+                    path: format!("where.{name}"),
+                    message: format!("relation mapping: unknown remote column '{remote_col}'"),
+                })?;
+                write!(
+                    ctx.sql,
+                    "{remote_alias}.{} = {table_alias}.{}",
+                    quote_ident(&r.physical_name),
+                    quote_ident(&l.physical_name),
+                )
+                .unwrap();
+            }
+            ctx.sql.push_str(" AND ");
+            render_bool_expr(inner, target, &remote_alias, schema, ctx)?;
+            ctx.sql.push(')');
+            Ok(())
+        }
     }
 }
 
@@ -603,6 +645,36 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+    #[test]
+    fn render_where_relation_exists() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            kind: RootKind::List,
+            args: QueryArgs {
+                where_: Some(BoolExpr::Relation {
+                    name: "posts".into(),
+                    inner: Box::new(BoolExpr::Compare {
+                        column: "title".into(),
+                        op: CmpOp::Eq,
+                        value: json!("hello"),
+                    }),
+                }),
+                ..Default::default()
+            },
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+        }]);
+        let (sql, binds) = render(&op, &users_posts_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
     }
 
     #[test]
