@@ -79,6 +79,23 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                     .as_ref()
                     .map(|a| a.node.as_str().to_string())
                     .unwrap_or_else(|| name.to_string());
+
+                // Aggregate root: "<table>_aggregate"
+                if let Some(base_name) = name.strip_suffix("_aggregate") {
+                    if let Some(table) = schema.table(base_name) {
+                        let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
+                        let (ops, nodes) =
+                            lower_aggregate_selection(&field.selection_set.node, table, &alias)?;
+                        roots.push(RootField {
+                            table: base_name.to_string(),
+                            alias,
+                            args,
+                            body: crate::ast::RootBody::Aggregate { ops, nodes },
+                        });
+                        continue;
+                    }
+                }
+
                 let table = schema.table(name).ok_or_else(|| Error::Validate {
                     path: alias.clone(),
                     message: format!("unknown root field '{name}'"),
@@ -96,7 +113,7 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
             }
             _ => {
                 return Err(Error::Parse(
-                    "fragments are not supported in Phase 1".into(),
+                    "fragments are not supported in Phase 3".into(),
                 ))
             }
         }
@@ -402,6 +419,126 @@ fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
     }
 }
 
+fn lower_aggregate_selection(
+    set: &SelectionSet,
+    table: &Table,
+    parent_path: &str,
+) -> Result<(Vec<crate::ast::AggOp>, Option<Vec<Field>>)> {
+    let mut ops: Vec<crate::ast::AggOp> = Vec::new();
+    let mut nodes: Option<Vec<Field>> = None;
+
+    for sel in &set.items {
+        let Selection::Field(f) = &sel.node else {
+            return Err(Error::Parse(
+                "fragments are not supported in Phase 3".into(),
+            ));
+        };
+        let field = &f.node;
+        let key = field.name.node.as_str();
+        match key {
+            "aggregate" => {
+                for s in &field.selection_set.node.items {
+                    let Selection::Field(sf) = &s.node else {
+                        return Err(Error::Parse(
+                            "fragments not supported inside aggregate".into(),
+                        ));
+                    };
+                    let sf = &sf.node;
+                    let op_name = sf.name.node.as_str();
+                    match op_name {
+                        "count" => {
+                            ops.push(crate::ast::AggOp::Count);
+                        }
+                        "sum" | "avg" | "max" | "min" => {
+                            let mut columns = Vec::new();
+                            for cs in &sf.selection_set.node.items {
+                                let Selection::Field(cf) = &cs.node else {
+                                    return Err(Error::Parse(
+                                        "fragments not supported inside aggregate".into(),
+                                    ));
+                                };
+                                let cname = cf.node.name.node.as_str();
+                                let col = table.find_column(cname).ok_or_else(|| {
+                                    Error::Validate {
+                                        path: format!(
+                                            "{parent_path}.aggregate.{op_name}.{cname}"
+                                        ),
+                                        message: format!(
+                                            "unknown column '{cname}' on '{}'",
+                                            table.exposed_name
+                                        ),
+                                    }
+                                })?;
+                                columns.push(col.exposed_name.clone());
+                            }
+                            let op = match op_name {
+                                "sum" => crate::ast::AggOp::Sum { columns },
+                                "avg" => crate::ast::AggOp::Avg { columns },
+                                "max" => crate::ast::AggOp::Max { columns },
+                                "min" => crate::ast::AggOp::Min { columns },
+                                _ => unreachable!(),
+                            };
+                            ops.push(op);
+                        }
+                        other => {
+                            return Err(Error::Validate {
+                                path: format!("{parent_path}.aggregate.{other}"),
+                                message: format!("unsupported aggregate '{other}'"),
+                            });
+                        }
+                    }
+                }
+            }
+            "nodes" => {
+                let fields = lower_selection_columns_only(
+                    &field.selection_set.node,
+                    table,
+                    &format!("{parent_path}.nodes"),
+                )?;
+                nodes = Some(fields);
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown aggregate subfield '{other}'"),
+                });
+            }
+        }
+    }
+    Ok((ops, nodes))
+}
+
+fn lower_selection_columns_only(
+    set: &SelectionSet,
+    table: &Table,
+    parent_path: &str,
+) -> Result<Vec<Field>> {
+    let mut out = Vec::new();
+    for sel in &set.items {
+        let Selection::Field(f) = &sel.node else {
+            return Err(Error::Parse(
+                "fragments not supported inside aggregate nodes".into(),
+            ));
+        };
+        let field = &f.node;
+        let name = field.name.node.as_str();
+        let alias = field
+            .alias
+            .as_ref()
+            .map(|a| a.node.as_str().to_string())
+            .unwrap_or_else(|| name.to_string());
+        let col = table.find_column(name).ok_or_else(|| Error::Validate {
+            path: format!("{parent_path}.{alias}"),
+            message: format!("unknown column '{name}' on '{}'", table.exposed_name),
+        })?;
+        out.push(Field::Column {
+            physical: col.physical_name.clone(),
+            alias,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +756,53 @@ mod tests {
             Field::Relation { name, .. } => assert_eq!(name, "user"),
             _ => panic!("expected Relation"),
         }
+    }
+
+    #[test]
+    fn parse_aggregate_basic() {
+        let op = parse_and_lower(
+            "query { users_aggregate { aggregate { count, sum { id } } nodes { id } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        assert_eq!(roots[0].table, "users");
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate { ops, nodes } => {
+                assert_eq!(ops.len(), 2);
+                assert!(matches!(ops[0], crate::ast::AggOp::Count));
+                match &ops[1] {
+                    crate::ast::AggOp::Sum { columns } => {
+                        assert_eq!(columns, &vec!["id".to_string()])
+                    }
+                    _ => panic!("expected Sum"),
+                }
+                assert_eq!(nodes.as_ref().map(|n| n.len()).unwrap_or(0), 1);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_aggregate_count_only() {
+        let op = parse_and_lower(
+            "query { users_aggregate(where: {id: {_gt: 0}}) { aggregate { count } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate { ops, nodes } => {
+                assert_eq!(ops.len(), 1);
+                assert!(nodes.is_none());
+            }
+            _ => panic!("expected Aggregate"),
+        }
+        assert!(roots[0].args.where_.is_some());
     }
 
     #[test]
