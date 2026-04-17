@@ -12,7 +12,6 @@ pub mod schema;
 pub mod sql;
 pub mod types;
 
-// Re-exports wired up in later tasks as types arrive.
-// pub use engine::Engine;
-// pub use error::Error;
-// pub use schema::Schema;
+pub use engine::Engine;
+pub use error::Error;
+pub use schema::Schema;
