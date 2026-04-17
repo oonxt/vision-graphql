@@ -11,14 +11,33 @@ pub enum Operation {
 pub struct RootField {
     pub table: String,
     pub alias: String,
-    pub kind: RootKind,
     pub args: QueryArgs,
-    pub selection: Vec<Field>,
+    pub body: RootBody,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RootKind {
-    List,
+#[derive(Debug, Clone)]
+pub enum RootBody {
+    List {
+        selection: Vec<Field>,
+    },
+    Aggregate {
+        ops: Vec<AggOp>,
+        nodes: Option<Vec<Field>>,
+    },
+    ByPk {
+        /// `(exposed_column, value)` pairs. All PK columns must be present.
+        pk: Vec<(String, serde_json::Value)>,
+        selection: Vec<Field>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum AggOp {
+    Count,
+    Sum { columns: Vec<String> },
+    Avg { columns: Vec<String> },
+    Max { columns: Vec<String> },
+    Min { columns: Vec<String> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +46,7 @@ pub struct QueryArgs {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub distinct_on: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +61,7 @@ pub enum OrderDir {
     Desc,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Field {
     Column {
@@ -93,21 +114,25 @@ mod tests {
         let root = RootField {
             table: "users".into(),
             alias: "users".into(),
-            kind: RootKind::List,
             args: QueryArgs::default(),
-            selection: vec![
-                Field::Column {
-                    physical: "id".into(),
-                    alias: "id".into(),
-                },
-                Field::Column {
-                    physical: "name".into(),
-                    alias: "name".into(),
-                },
-            ],
+            body: RootBody::List {
+                selection: vec![
+                    Field::Column {
+                        physical: "id".into(),
+                        alias: "id".into(),
+                    },
+                    Field::Column {
+                        physical: "name".into(),
+                        alias: "name".into(),
+                    },
+                ],
+            },
         };
         assert_eq!(root.table, "users");
-        assert_eq!(root.selection.len(), 2);
+        match root.body {
+            RootBody::List { selection } => assert_eq!(selection.len(), 2),
+            _ => panic!("expected List"),
+        }
     }
 
     #[test]
@@ -142,6 +167,29 @@ mod tests {
                 assert_eq!(selection.len(), 1);
             }
             _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn build_aggregate_root() {
+        let body = RootBody::Aggregate {
+            ops: vec![
+                AggOp::Count,
+                AggOp::Sum {
+                    columns: vec!["age".into()],
+                },
+            ],
+            nodes: Some(vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }]),
+        };
+        match body {
+            RootBody::Aggregate { ops, nodes } => {
+                assert_eq!(ops.len(), 2);
+                assert!(nodes.is_some());
+            }
+            _ => panic!("expected Aggregate"),
         }
     }
 
