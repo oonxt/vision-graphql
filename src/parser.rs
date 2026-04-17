@@ -5,7 +5,8 @@ use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
-    DocumentOperations, ExecutableDocument, OperationType, Selection, SelectionSet,
+    DocumentOperations, ExecutableDocument, Field as GqlField, OperationType, Selection,
+    SelectionSet,
 };
 use async_graphql_parser::Positioned;
 use async_graphql_value::{Name, Value as GqlValue};
@@ -21,9 +22,7 @@ pub fn parse_and_lower(
     let op = pick_operation(&doc, operation_name)?;
     match op.ty {
         OperationType::Query => lower_query(op.selection_set, schema, variables),
-        OperationType::Mutation => Err(Error::Parse(
-            "mutations are not supported in Phase 1".into(),
-        )),
+        OperationType::Mutation => lower_mutation(op.selection_set, schema, variables),
         OperationType::Subscription => Err(Error::Parse("subscriptions are not supported".into())),
     }
 }
@@ -162,6 +161,40 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
         }
     }
     Ok(Operation::Query(roots))
+}
+
+fn lower_mutation(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Operation> {
+    let mut fields: Vec<crate::ast::MutationField> = Vec::new();
+    for sel in &set.items {
+        let Selection::Field(f) = &sel.node else {
+            return Err(Error::Parse(
+                "fragments are not supported in mutations".into(),
+            ));
+        };
+        let field = &f.node;
+        let name = field.name.node.as_str();
+        let alias = field
+            .alias
+            .as_ref()
+            .map(|a| a.node.as_str().to_string())
+            .unwrap_or_else(|| name.to_string());
+        let mf = lower_mutation_field(name, &alias, field, schema, vars)?;
+        fields.push(mf);
+    }
+    Ok(Operation::Mutation(fields))
+}
+
+fn lower_mutation_field(
+    name: &str,
+    alias: &str,
+    _field: &GqlField,
+    _schema: &Schema,
+    _vars: &Value,
+) -> Result<crate::ast::MutationField> {
+    Err(Error::Validate {
+        path: alias.into(),
+        message: format!("mutation field '{name}' not yet supported"),
+    })
 }
 
 fn lower_selection_set(
