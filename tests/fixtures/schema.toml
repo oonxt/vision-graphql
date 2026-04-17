@@ -1,0 +1,3 @@
+[tables.users]
+expose_as = "profiles"
+hide_columns = ["secret"]
