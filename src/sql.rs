@@ -11,10 +11,7 @@ pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
     let mut ctx = RenderCtx::default();
     match op {
         Operation::Query(roots) => render_query(roots, schema, &mut ctx),
-        Operation::Mutation(_) => Err(Error::Validate {
-            path: "mutation".into(),
-            message: "mutation rendering not yet implemented".into(),
-        }),
+        Operation::Mutation(fields) => render_mutation(fields, schema, &mut ctx),
     }?;
     Ok((ctx.sql, ctx.binds))
 }
@@ -631,6 +628,492 @@ fn render_by_pk(
     Ok(())
 }
 
+fn render_mutation(
+    fields: &[crate::ast::MutationField],
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::MutationField;
+    ctx.sql.push_str("WITH ");
+    for (i, mf) in fields.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let cte = format!("m{i}");
+        match mf {
+            MutationField::Insert {
+                table,
+                objects,
+                on_conflict,
+                ..
+            } => {
+                render_insert_cte(&cte, table, objects, on_conflict.as_ref(), schema, ctx)?;
+            }
+            MutationField::Update {
+                table, where_, set, ..
+            } => {
+                render_update_cte(&cte, table, where_, set, schema, ctx)?;
+            }
+            MutationField::UpdateByPk {
+                table, pk, set, ..
+            } => {
+                render_update_by_pk_cte(&cte, table, pk, set, schema, ctx)?;
+            }
+            MutationField::Delete { table, where_, .. } => {
+                render_delete_cte(&cte, table, where_, schema, ctx)?;
+            }
+            MutationField::DeleteByPk { table, pk, .. } => {
+                render_delete_by_pk_cte(&cte, table, pk, schema, ctx)?;
+            }
+        }
+    }
+    ctx.sql.push(' ');
+    ctx.sql.push_str("SELECT json_build_object(");
+    for (i, mf) in fields.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let cte = format!("m{i}");
+        render_mutation_output_for(mf, &cte, schema, ctx)?;
+    }
+    ctx.sql.push_str(") AS result");
+    Ok(())
+}
+
+fn render_insert_cte(
+    cte: &str,
+    table_name: &str,
+    objects: &[std::collections::BTreeMap<String, serde_json::Value>],
+    on_conflict: Option<&crate::ast::OnConflict>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+
+    use std::collections::BTreeSet;
+    let mut col_set: BTreeSet<String> = BTreeSet::new();
+    for obj in objects {
+        for k in obj.keys() {
+            col_set.insert(k.clone());
+        }
+    }
+    let cols: Vec<String> = col_set.into_iter().collect();
+
+    write!(
+        ctx.sql,
+        "{cte} AS (INSERT INTO {}.{} (",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    for (i, exposed) in cols.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+            path: format!("{cte}.{exposed}"),
+            message: format!("unknown column '{exposed}'"),
+        })?;
+        ctx.sql.push_str(&quote_ident(&col.physical_name));
+    }
+    ctx.sql.push_str(") VALUES ");
+
+    for (r, obj) in objects.iter().enumerate() {
+        if r > 0 {
+            ctx.sql.push_str(", ");
+        }
+        ctx.sql.push('(');
+        for (i, exposed) in cols.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            let value = obj.get(exposed);
+            let col = table.find_column(exposed).unwrap();
+            match value {
+                None => {
+                    ctx.sql.push_str("DEFAULT");
+                }
+                Some(v) => {
+                    let bind = crate::types::json_to_bind(v, &col.pg_type).map_err(|e| {
+                        Error::Validate {
+                            path: format!("{cte}.objects[{r}].{exposed}"),
+                            message: format!("{e}"),
+                        }
+                    })?;
+                    ctx.binds.push(bind);
+                    write!(ctx.sql, "${}", ctx.binds.len()).unwrap();
+                }
+            }
+        }
+        ctx.sql.push(')');
+    }
+
+    if let Some(oc) = on_conflict {
+        render_on_conflict(oc, table, schema, ctx)?;
+    }
+
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+fn render_on_conflict(
+    oc: &crate::ast::OnConflict,
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    write!(
+        ctx.sql,
+        " ON CONFLICT ON CONSTRAINT {} ",
+        quote_ident(&oc.constraint)
+    )
+    .unwrap();
+    if oc.update_columns.is_empty() {
+        ctx.sql.push_str("DO NOTHING");
+    } else {
+        ctx.sql.push_str("DO UPDATE SET ");
+        for (i, exposed) in oc.update_columns.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+                path: format!("on_conflict.update_columns.{exposed}"),
+                message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
+            })?;
+            write!(
+                ctx.sql,
+                "{} = EXCLUDED.{}",
+                quote_ident(&col.physical_name),
+                quote_ident(&col.physical_name),
+            )
+            .unwrap();
+        }
+        if let Some(expr) = oc.where_.as_ref() {
+            ctx.sql.push_str(" WHERE ");
+            render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+fn render_update_cte(
+    cte: &str,
+    table_name: &str,
+    where_: &crate::ast::BoolExpr,
+    set: &std::collections::BTreeMap<String, serde_json::Value>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+    write!(
+        ctx.sql,
+        "{cte} AS (UPDATE {}.{} SET ",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    for (i, (exposed, value)) in set.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+            path: format!("{cte}._set.{exposed}"),
+            message: format!("unknown column '{exposed}'"),
+        })?;
+        let bind =
+            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                path: format!("{cte}._set.{exposed}"),
+                message: format!("{e}"),
+            })?;
+        ctx.binds.push(bind);
+        write!(
+            ctx.sql,
+            "{} = ${}",
+            quote_ident(&col.physical_name),
+            ctx.binds.len()
+        )
+        .unwrap();
+    }
+    ctx.sql.push_str(" WHERE ");
+    render_bool_expr_no_alias(where_, table, schema, ctx)?;
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+fn render_update_by_pk_cte(
+    cte: &str,
+    table_name: &str,
+    pk: &[(String, serde_json::Value)],
+    set: &std::collections::BTreeMap<String, serde_json::Value>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+    write!(
+        ctx.sql,
+        "{cte} AS (UPDATE {}.{} SET ",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    for (i, (exposed, value)) in set.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+            path: format!("{cte}._set.{exposed}"),
+            message: format!("unknown column '{exposed}'"),
+        })?;
+        let bind =
+            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                path: format!("{cte}._set.{exposed}"),
+                message: format!("{e}"),
+            })?;
+        ctx.binds.push(bind);
+        write!(
+            ctx.sql,
+            "{} = ${}",
+            quote_ident(&col.physical_name),
+            ctx.binds.len()
+        )
+        .unwrap();
+    }
+    ctx.sql.push_str(" WHERE ");
+    for (i, (col_name, value)) in pk.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(" AND ");
+        }
+        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+            path: format!("{cte}.pk.{col_name}"),
+            message: format!("unknown column '{col_name}'"),
+        })?;
+        let bind =
+            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                path: format!("{cte}.pk.{col_name}"),
+                message: format!("{e}"),
+            })?;
+        ctx.binds.push(bind);
+        write!(
+            ctx.sql,
+            "{} = ${}",
+            quote_ident(&col.physical_name),
+            ctx.binds.len()
+        )
+        .unwrap();
+    }
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+fn render_delete_cte(
+    cte: &str,
+    table_name: &str,
+    where_: &crate::ast::BoolExpr,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+    write!(
+        ctx.sql,
+        "{cte} AS (DELETE FROM {}.{} WHERE ",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    render_bool_expr_no_alias(where_, table, schema, ctx)?;
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+fn render_delete_by_pk_cte(
+    cte: &str,
+    table_name: &str,
+    pk: &[(String, serde_json::Value)],
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+    write!(
+        ctx.sql,
+        "{cte} AS (DELETE FROM {}.{} WHERE ",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    for (i, (col_name, value)) in pk.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(" AND ");
+        }
+        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+            path: format!("{cte}.pk.{col_name}"),
+            message: format!("unknown column '{col_name}'"),
+        })?;
+        let bind =
+            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                path: format!("{cte}.pk.{col_name}"),
+                message: format!("{e}"),
+            })?;
+        ctx.binds.push(bind);
+        write!(
+            ctx.sql,
+            "{} = ${}",
+            quote_ident(&col.physical_name),
+            ctx.binds.len()
+        )
+        .unwrap();
+    }
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+fn render_mutation_output_for(
+    mf: &crate::ast::MutationField,
+    cte: &str,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::MutationField;
+    match mf {
+        MutationField::Insert {
+            alias,
+            table,
+            returning,
+            one,
+            ..
+        } => {
+            let tbl = schema.table(table).ok_or_else(|| Error::Validate {
+                path: alias.clone(),
+                message: format!("unknown table '{table}'"),
+            })?;
+            write!(ctx.sql, "'{}', ", escape_string_literal(alias)).unwrap();
+            if *one {
+                ctx.sql.push_str("(SELECT ");
+                if returning.is_empty() {
+                    ctx.sql.push_str("'{}'::json");
+                } else {
+                    render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                }
+                write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
+            } else {
+                ctx.sql.push_str("json_build_object(");
+                write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
+                if !returning.is_empty() {
+                    ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                    render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                    write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+                } else {
+                    ctx.sql.push_str(", 'returning', '[]'::json");
+                }
+                ctx.sql.push(')');
+            }
+        }
+        MutationField::Update {
+            alias,
+            table,
+            returning,
+            ..
+        } => {
+            let tbl = schema.table(table).ok_or_else(|| Error::Validate {
+                path: alias.clone(),
+                message: format!("unknown table '{table}'"),
+            })?;
+            write!(
+                ctx.sql,
+                "'{}', json_build_object(",
+                escape_string_literal(alias)
+            )
+            .unwrap();
+            write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
+            if !returning.is_empty() {
+                ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+            } else {
+                ctx.sql.push_str(", 'returning', '[]'::json");
+            }
+            ctx.sql.push(')');
+        }
+        MutationField::UpdateByPk {
+            alias,
+            table,
+            selection,
+            ..
+        } => {
+            let tbl = schema.table(table).ok_or_else(|| Error::Validate {
+                path: alias.clone(),
+                message: format!("unknown table '{table}'"),
+            })?;
+            write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
+            if selection.is_empty() {
+                ctx.sql.push_str("'{}'::json");
+            } else {
+                render_json_build_object_for_nodes(selection, cte, tbl, alias, ctx)?;
+            }
+            write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
+        }
+        MutationField::Delete {
+            alias,
+            table,
+            returning,
+            ..
+        } => {
+            let tbl = schema.table(table).ok_or_else(|| Error::Validate {
+                path: alias.clone(),
+                message: format!("unknown table '{table}'"),
+            })?;
+            write!(
+                ctx.sql,
+                "'{}', json_build_object(",
+                escape_string_literal(alias)
+            )
+            .unwrap();
+            write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
+            if !returning.is_empty() {
+                ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+            } else {
+                ctx.sql.push_str(", 'returning', '[]'::json");
+            }
+            ctx.sql.push(')');
+        }
+        MutationField::DeleteByPk {
+            alias,
+            table,
+            selection,
+            ..
+        } => {
+            let tbl = schema.table(table).ok_or_else(|| Error::Validate {
+                path: alias.clone(),
+                message: format!("unknown table '{table}'"),
+            })?;
+            write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
+            if selection.is_empty() {
+                ctx.sql.push_str("'{}'::json");
+            } else {
+                render_json_build_object_for_nodes(selection, cte, tbl, alias, ctx)?;
+            }
+            write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
+        }
+    }
+    Ok(())
+}
+
 fn render_aggregate(
     root: &RootField,
     ops: &[crate::ast::AggOp],
@@ -1078,6 +1561,51 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+    #[test]
+    fn render_insert_array_with_returning() {
+        use crate::ast::MutationField;
+        use std::collections::BTreeMap;
+
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![obj],
+            on_conflict: None,
+            returning: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            one: false,
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
+    }
+
+    #[test]
+    fn render_insert_one() {
+        use crate::ast::MutationField;
+        use std::collections::BTreeMap;
+
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users_one".into(),
+            table: "users".into(),
+            objects: vec![obj],
+            on_conflict: None,
+            returning: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            one: true,
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+WITH m0 AS (INSERT INTO "public"."users" ("name") VALUES ($1) RETURNING *) SELECT json_build_object('insert_users', json_build_object('affected_rows', (SELECT count(*) FROM m0), 'returning', (SELECT coalesce(json_agg(json_build_object('id', m0."id")), '[]'::json) FROM m0))) AS result
