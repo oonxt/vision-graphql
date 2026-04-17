@@ -24,6 +24,11 @@ pub enum RootBody {
         ops: Vec<AggOp>,
         nodes: Option<Vec<Field>>,
     },
+    ByPk {
+        /// `(exposed_column, value)` pairs. All PK columns must be present.
+        pk: Vec<(String, serde_json::Value)>,
+        selection: Vec<Field>,
+    },
 }
 
 #[derive(Debug, Clone)]

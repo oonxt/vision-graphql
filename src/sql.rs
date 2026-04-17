@@ -55,6 +55,9 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::Aggregate { ops, nodes } => {
             render_aggregate(root, ops, nodes.as_deref(), table, schema, ctx)
         }
+        crate::ast::RootBody::ByPk { pk, selection } => {
+            render_by_pk(root, pk, selection, table, schema, ctx)
+        }
     }
 }
 
@@ -513,6 +516,92 @@ fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+fn render_by_pk(
+    root: &RootField,
+    pk: &[(String, serde_json::Value)],
+    selection: &[Field],
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let inner_alias = ctx.next_alias("t");
+    let row_alias = ctx.next_alias("r");
+    ctx.sql.push_str("(SELECT row_to_json(");
+    ctx.sql.push_str(&row_alias);
+    ctx.sql.push_str(") FROM (SELECT ");
+    for (i, field) in selection.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        match field {
+            Field::Column { physical, alias } => {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{}.{}", root.alias, alias),
+                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                })?;
+                write!(
+                    ctx.sql,
+                    r#"{inner_alias}.{} AS "{}""#,
+                    quote_ident(&col.physical_name),
+                    alias
+                )
+                .unwrap();
+            }
+            Field::Relation {
+                name,
+                alias,
+                args,
+                selection,
+            } => {
+                render_relation_field(
+                    name,
+                    alias,
+                    args,
+                    selection,
+                    table,
+                    &inner_alias,
+                    schema,
+                    &root.alias,
+                    ctx,
+                )?;
+            }
+        }
+    }
+    write!(
+        ctx.sql,
+        " FROM {}.{} {inner_alias} WHERE ",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+    for (i, (col_name, value)) in pk.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(" AND ");
+        }
+        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+            path: format!("{}.pk.{col_name}", root.alias),
+            message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
+        })?;
+        let bind =
+            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
+                path: format!("{}.pk.{col_name}", root.alias),
+                message: format!("{e}"),
+            })?;
+        ctx.binds.push(bind);
+        let ph = format!("${}", ctx.binds.len());
+        write!(
+            ctx.sql,
+            "{inner_alias}.{} = {ph}",
+            quote_ident(&col.physical_name)
+        )
+        .unwrap();
+    }
+    ctx.sql.push_str(" LIMIT 1) ");
+    ctx.sql.push_str(&row_alias);
+    ctx.sql.push(')');
+    Ok(())
+}
+
 fn render_aggregate(
     root: &RootField,
     ops: &[crate::ast::AggOp],
@@ -963,6 +1052,28 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+    #[test]
+    fn render_by_pk_single_col() {
+        use crate::ast::RootBody;
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_by_pk".into(),
+            args: QueryArgs::default(),
+            body: RootBody::ByPk {
+                pk: vec![("id".into(), json!(7))],
+                selection: vec![Field::Column {
+                    physical: "name".into(),
+                    alias: "name".into(),
+                }],
+            },
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
     }
 
     #[test]
