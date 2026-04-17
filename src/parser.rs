@@ -230,6 +230,117 @@ fn lower_mutation_field(
         }
     }
 
+    // update_<table>_by_pk
+    if let Some(base) = name.strip_suffix("_by_pk") {
+        if let Some(base_name) = base.strip_prefix("update_") {
+            if let Some(table) = schema.table(base_name) {
+                if table.primary_key.is_empty() {
+                    return Err(Error::Validate {
+                        path: alias.into(),
+                        message: format!(
+                            "table '{}' has no primary key; _by_pk not available",
+                            table.exposed_name
+                        ),
+                    });
+                }
+                let (pk, set) = parse_update_by_pk_args(&field.arguments, table, vars, alias)?;
+                let selection =
+                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                return Ok(MutationField::UpdateByPk {
+                    alias: alias.to_string(),
+                    table: base_name.to_string(),
+                    pk,
+                    set,
+                    selection,
+                });
+            }
+        }
+    }
+
+    // update_<table>
+    if let Some(base_name) = name.strip_prefix("update_") {
+        if let Some(table) = schema.table(base_name) {
+            let (where_, set) = parse_update_args(&field.arguments, table, schema, vars, alias)?;
+            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            return Ok(MutationField::Update {
+                alias: alias.to_string(),
+                table: base_name.to_string(),
+                where_,
+                set,
+                returning,
+            });
+        }
+    }
+
+    // delete_<table>_by_pk
+    if let Some(base) = name.strip_suffix("_by_pk") {
+        if let Some(base_name) = base.strip_prefix("delete_") {
+            if let Some(table) = schema.table(base_name) {
+                if table.primary_key.is_empty() {
+                    return Err(Error::Validate {
+                        path: alias.into(),
+                        message: format!(
+                            "table '{}' has no primary key; _by_pk not available",
+                            table.exposed_name
+                        ),
+                    });
+                }
+                let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+                for pk_col in &table.primary_key {
+                    let found = field
+                        .arguments
+                        .iter()
+                        .find(|(n, _)| n.node.as_str() == pk_col);
+                    let (_, value_p) = found.ok_or_else(|| Error::Validate {
+                        path: alias.into(),
+                        message: format!("required primary key argument '{pk_col}' missing"),
+                    })?;
+                    let json = gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
+                    pk.push((pk_col.clone(), json));
+                }
+                let selection =
+                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                return Ok(MutationField::DeleteByPk {
+                    alias: alias.to_string(),
+                    table: base_name.to_string(),
+                    pk,
+                    selection,
+                });
+            }
+        }
+    }
+
+    // delete_<table>
+    if let Some(base_name) = name.strip_prefix("delete_") {
+        if let Some(table) = schema.table(base_name) {
+            let mut where_: Option<crate::ast::BoolExpr> = None;
+            for (name_p, value_p) in &field.arguments {
+                let aname = name_p.node.as_str();
+                let v = &value_p.node;
+                if aname == "where" {
+                    let json = gql_to_json(v, vars, &format!("{alias}.where"))?;
+                    where_ = Some(lower_where(&json, table, schema, &format!("{alias}.where"))?);
+                } else {
+                    return Err(Error::Validate {
+                        path: format!("{alias}.{aname}"),
+                        message: format!("unknown argument '{aname}'"),
+                    });
+                }
+            }
+            let where_ = where_.ok_or_else(|| Error::Validate {
+                path: alias.into(),
+                message: "delete requires 'where'".into(),
+            })?;
+            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            return Ok(MutationField::Delete {
+                alias: alias.to_string(),
+                table: base_name.to_string(),
+                where_,
+                returning,
+            });
+        }
+    }
+
     Err(Error::Validate {
         path: alias.into(),
         message: format!("mutation field '{name}' not yet supported"),
@@ -377,6 +488,114 @@ fn parse_on_conflict(
         update_columns,
         where_,
     })
+}
+
+fn parse_update_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    schema: &Schema,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<(
+    crate::ast::BoolExpr,
+    std::collections::BTreeMap<String, serde_json::Value>,
+)> {
+    use std::collections::BTreeMap;
+    let mut where_: Option<crate::ast::BoolExpr> = None;
+    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name_p, value_p) in args {
+        let aname = name_p.node.as_str();
+        let v = &value_p.node;
+        match aname {
+            "where" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.where"))?;
+                where_ = Some(lower_where(
+                    &json,
+                    table,
+                    schema,
+                    &format!("{parent_path}.where"),
+                )?);
+            }
+            "_set" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
+                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown argument '{other}'"),
+                });
+            }
+        }
+    }
+    let w = where_.ok_or_else(|| Error::Validate {
+        path: parent_path.into(),
+        message: "update requires 'where'".into(),
+    })?;
+    if set.is_empty() {
+        return Err(Error::Validate {
+            path: parent_path.into(),
+            message: "update requires non-empty '_set'".into(),
+        });
+    }
+    Ok((w, set))
+}
+
+fn parse_update_by_pk_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<(
+    Vec<(String, serde_json::Value)>,
+    std::collections::BTreeMap<String, serde_json::Value>,
+)> {
+    use std::collections::BTreeMap;
+    let mut pk_obj: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name_p, value_p) in args {
+        let aname = name_p.node.as_str();
+        let v = &value_p.node;
+        match aname {
+            "pk_columns" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}.pk_columns"))?;
+                let obj = json.as_object().ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.pk_columns"),
+                    message: "expected object".into(),
+                })?;
+                pk_obj = Some(obj.clone());
+            }
+            "_set" => {
+                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
+                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{other}"),
+                    message: format!("unknown argument '{other}'"),
+                });
+            }
+        }
+    }
+    let pk_obj = pk_obj.ok_or_else(|| Error::Validate {
+        path: parent_path.into(),
+        message: "missing required 'pk_columns'".into(),
+    })?;
+    if set.is_empty() {
+        return Err(Error::Validate {
+            path: parent_path.into(),
+            message: "update_by_pk requires non-empty '_set'".into(),
+        });
+    }
+    let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+    for pk_col in &table.primary_key {
+        let v = pk_obj.get(pk_col).ok_or_else(|| Error::Validate {
+            path: format!("{parent_path}.pk_columns.{pk_col}"),
+            message: format!("missing primary key value '{pk_col}'"),
+        })?;
+        pk.push((pk_col.clone(), v.clone()));
+    }
+    Ok((pk, set))
 }
 
 fn parse_returning(
