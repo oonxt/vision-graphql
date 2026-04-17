@@ -842,25 +842,104 @@ fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Resu
                     message: "expected operator object".into(),
                 })?;
                 for (op_name, op_val) in op_obj {
-                    let op = match op_name.as_str() {
-                        "_eq" => CmpOp::Eq,
-                        "_neq" => CmpOp::Neq,
-                        "_gt" => CmpOp::Gt,
-                        "_gte" => CmpOp::Gte,
-                        "_lt" => CmpOp::Lt,
-                        "_lte" => CmpOp::Lte,
+                    match op_name.as_str() {
+                        "_eq" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Eq,
+                            value: op_val.clone(),
+                        }),
+                        "_neq" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Neq,
+                            value: op_val.clone(),
+                        }),
+                        "_gt" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Gt,
+                            value: op_val.clone(),
+                        }),
+                        "_gte" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Gte,
+                            value: op_val.clone(),
+                        }),
+                        "_lt" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Lt,
+                            value: op_val.clone(),
+                        }),
+                        "_lte" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Lte,
+                            value: op_val.clone(),
+                        }),
+                        "_like" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Like,
+                            value: op_val.clone(),
+                        }),
+                        "_ilike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::ILike,
+                            value: op_val.clone(),
+                        }),
+                        "_nlike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::NLike,
+                            value: op_val.clone(),
+                        }),
+                        "_nilike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::NILike,
+                            value: op_val.clone(),
+                        }),
+                        "_is_null" => {
+                            let b = op_val.as_bool().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._is_null"),
+                                message: "expected boolean".into(),
+                            })?;
+                            parts.push(BoolExpr::IsNull {
+                                column: col.exposed_name.clone(),
+                                negated: !b,
+                            });
+                        }
+                        "_in" => {
+                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._in"),
+                                message: "expected array".into(),
+                            })?;
+                            let inner: Vec<BoolExpr> = arr
+                                .iter()
+                                .map(|v| BoolExpr::Compare {
+                                    column: col.exposed_name.clone(),
+                                    op: CmpOp::Eq,
+                                    value: v.clone(),
+                                })
+                                .collect();
+                            parts.push(BoolExpr::Or(inner));
+                        }
+                        "_nin" => {
+                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._nin"),
+                                message: "expected array".into(),
+                            })?;
+                            let inner: Vec<BoolExpr> = arr
+                                .iter()
+                                .map(|v| BoolExpr::Compare {
+                                    column: col.exposed_name.clone(),
+                                    op: CmpOp::Neq,
+                                    value: v.clone(),
+                                })
+                                .collect();
+                            parts.push(BoolExpr::And(inner));
+                        }
                         other => {
                             return Err(Error::Validate {
                                 path: format!("{path}.{col_name}"),
                                 message: format!("unsupported operator '{other}'"),
-                            })
+                            });
                         }
-                    };
-                    parts.push(BoolExpr::Compare {
-                        column: col.exposed_name.clone(),
-                        op,
-                        value: op_val.clone(),
-                    });
+                    }
                 }
             }
         }
