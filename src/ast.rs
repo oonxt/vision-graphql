@@ -61,6 +61,7 @@ pub enum OrderDir {
     Desc,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Field {
     Column {

@@ -1,8 +1,6 @@
 //! GraphQL string → IR.
 
-use crate::ast::{
-    BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField,
-};
+use crate::ast::{BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
@@ -120,11 +118,8 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                                     "required primary key argument '{pk_col}' missing"
                                 ),
                             })?;
-                            let json = gql_to_json(
-                                &value_p.node,
-                                vars,
-                                &format!("{alias}.{pk_col}"),
-                            )?;
+                            let json =
+                                gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
                             pk.push((pk_col.clone(), json));
                         }
                         let selection = lower_selection_set(
@@ -286,10 +281,7 @@ fn lower_args(
                     if table.find_column(s).is_none() {
                         return Err(Error::Validate {
                             path: format!("{parent_path}.distinct_on[{i}]"),
-                            message: format!(
-                                "unknown column '{s}' on '{}'",
-                                table.exposed_name
-                            ),
+                            message: format!("unknown column '{s}' on '{}'", table.exposed_name),
                         });
                     }
                     cols.push(s.to_string());
@@ -531,17 +523,14 @@ fn lower_aggregate_selection(
                                     ));
                                 };
                                 let cname = cf.node.name.node.as_str();
-                                let col = table.find_column(cname).ok_or_else(|| {
-                                    Error::Validate {
-                                        path: format!(
-                                            "{parent_path}.aggregate.{op_name}.{cname}"
-                                        ),
+                                let col =
+                                    table.find_column(cname).ok_or_else(|| Error::Validate {
+                                        path: format!("{parent_path}.aggregate.{op_name}.{cname}"),
                                         message: format!(
                                             "unknown column '{cname}' on '{}'",
                                             table.exposed_name
                                         ),
-                                    }
-                                })?;
+                                    })?;
                                 columns.push(col.exposed_name.clone());
                             }
                             let op = match op_name {

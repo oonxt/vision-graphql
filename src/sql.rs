@@ -99,12 +99,7 @@ fn render_inner_select(
                 path: format!("{}.distinct_on.{col_name}", root.alias),
                 message: format!("unknown column '{col_name}' on '{}'", root.table),
             })?;
-            write!(
-                ctx.sql,
-                "{table_alias}.{}",
-                quote_ident(&col.physical_name)
-            )
-            .unwrap();
+            write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
         }
         ctx.sql.push_str(") ");
     }
@@ -493,11 +488,11 @@ fn render_order_by(
     }
     ctx.sql.push_str(" ORDER BY ");
     let mut first = true;
-    for (col_name, dir) in prefix
-        .iter()
-        .map(|(c, d)| (c.as_str(), *d))
-        .chain(args.order_by.iter().map(|ob| (ob.column.as_str(), ob.direction)))
-    {
+    for (col_name, dir) in prefix.iter().map(|(c, d)| (c.as_str(), *d)).chain(
+        args.order_by
+            .iter()
+            .map(|ob| (ob.column.as_str(), ob.direction)),
+    ) {
         if !first {
             ctx.sql.push_str(", ");
         }
@@ -698,13 +693,12 @@ fn render_agg_func(
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        let col = table.find_column(col_exposed).ok_or_else(|| Error::Validate {
-            path: format!("aggregate.{key}.{col_exposed}"),
-            message: format!(
-                "unknown column '{col_exposed}' on '{}'",
-                table.exposed_name
-            ),
-        })?;
+        let col = table
+            .find_column(col_exposed)
+            .ok_or_else(|| Error::Validate {
+                path: format!("aggregate.{key}.{col_exposed}"),
+                message: format!("unknown column '{col_exposed}' on '{}'", table.exposed_name),
+            })?;
         write!(
             ctx.sql,
             "'{col_exposed}', {pg_func}({table_alias}.{})",
@@ -828,10 +822,7 @@ fn render_aggregate_source(
                 .find_column(&ob.column)
                 .ok_or_else(|| Error::Validate {
                     path: format!("{}.order_by.{}", root.alias, ob.column),
-                    message: format!(
-                        "unknown column '{}' on '{}'",
-                        ob.column, table.exposed_name
-                    ),
+                    message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
                 })?;
             let dir = match ob.direction {
                 crate::ast::OrderDir::Asc => "ASC",
@@ -849,6 +840,7 @@ fn render_aggregate_source(
     Ok(())
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn render_bool_expr_no_alias(
     expr: &crate::ast::BoolExpr,
     table: &Table,
