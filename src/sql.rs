@@ -606,6 +606,33 @@ mod tests {
     }
 
     #[test]
+    fn render_object_relation() {
+        let op = Operation::Query(vec![RootField {
+            table: "posts".into(),
+            alias: "posts".into(),
+            kind: RootKind::List,
+            args: QueryArgs::default(),
+            selection: vec![
+                Field::Column {
+                    physical: "title".into(),
+                    alias: "title".into(),
+                },
+                Field::Relation {
+                    name: "user".into(),
+                    alias: "user".into(),
+                    args: QueryArgs::default(),
+                    selection: vec![Field::Column {
+                        physical: "name".into(),
+                        alias: "name".into(),
+                    }],
+                },
+            ],
+        }]);
+        let (sql, _binds) = render(&op, &users_posts_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+    }
+
+    #[test]
     fn render_array_relation() {
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
