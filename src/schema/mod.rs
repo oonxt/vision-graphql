@@ -168,6 +168,13 @@ impl Schema {
     pub fn table(&self, exposed: &str) -> Option<&Arc<Table>> {
         self.tables_by_exposed.get(exposed)
     }
+
+    /// Introspect the database and return a ready-to-customize builder.
+    pub async fn introspect(
+        pool: &deadpool_postgres::Pool,
+    ) -> crate::error::Result<SchemaBuilder> {
+        crate::schema::merge::introspect_into_builder(pool).await
+    }
 }
 
 pub struct SchemaBuilder {

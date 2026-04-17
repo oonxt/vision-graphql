@@ -1,8 +1,37 @@
 //! Merge introspection results and TOML overlays into SchemaBuilder.
 
-use crate::schema::introspect::{IntrospectedDb, IntrospectedForeignKey, IntrospectedTable};
-use crate::schema::{RelKind, Relation};
+use crate::schema::introspect::IntrospectedDb;
+use crate::schema::{RelKind, Relation, SchemaBuilder, Table};
 use std::collections::BTreeMap;
+
+pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
+    let rels = derive_relations_from_fks(&db);
+    let mut sb = crate::schema::Schema::builder();
+    for ((_, tname), it) in &db.tables {
+        let mut t = Table::new(tname, &it.schema, tname);
+        for col in &it.columns {
+            t = t.column(&col.name, &col.name, col.pg_type.clone(), col.nullable);
+        }
+        if !it.primary_key.is_empty() {
+            let refs: Vec<&str> = it.primary_key.iter().map(String::as_str).collect();
+            t = t.primary_key(&refs);
+        }
+        for (src, name, rel) in &rels {
+            if src == tname {
+                t = t.relation(name, rel.clone());
+            }
+        }
+        sb = sb.table(t);
+    }
+    sb
+}
+
+pub async fn introspect_into_builder(
+    pool: &deadpool_postgres::Pool,
+) -> crate::error::Result<SchemaBuilder> {
+    let db = crate::schema::introspect::introspect(pool).await?;
+    Ok(build_from_introspection(db))
+}
 
 /// For each `(source_table, target_table)` pair that has exactly one foreign key
 /// connecting them, derive an Object relation on the source and an Array
@@ -92,7 +121,7 @@ pub fn derive_relations_from_fks(db: &IntrospectedDb) -> Vec<(String, String, Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::introspect::IntrospectedColumn;
+    use crate::schema::introspect::{IntrospectedColumn, IntrospectedForeignKey, IntrospectedTable};
     use crate::schema::PgType;
 
     fn fixture_with_posts_to_users() -> IntrospectedDb {
