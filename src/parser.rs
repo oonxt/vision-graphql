@@ -259,6 +259,26 @@ fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Resu
                 )?)));
             }
             col_name => {
+                if let Some(rel) = table.find_relation(col_name) {
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}"),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
+                    let inner =
+                        lower_where(v, target, schema, &format!("{path}.{col_name}"))?;
+                    parts.push(BoolExpr::Relation {
+                        name: col_name.to_string(),
+                        inner: Box::new(inner),
+                    });
+                    continue;
+                }
+
                 let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
                     path: format!("{path}.{col_name}"),
                     message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
@@ -547,6 +567,30 @@ mod tests {
                 assert_eq!(name, "posts");
                 assert_eq!(args.limit, Some(3));
                 assert_eq!(selection.len(), 1);
+            }
+            _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn parse_where_relation_exists() {
+        let op = parse_and_lower(
+            r#"query { users(where: {posts: {title: {_eq: "hello"}}}) { id } }"#,
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        match roots[0].args.where_.as_ref().unwrap() {
+            crate::ast::BoolExpr::Relation { name, inner } => {
+                assert_eq!(name, "posts");
+                match inner.as_ref() {
+                    crate::ast::BoolExpr::Compare { column, .. } => {
+                        assert_eq!(column, "title");
+                    }
+                    _ => panic!("expected Compare"),
+                }
             }
             _ => panic!("expected Relation"),
         }
