@@ -319,7 +319,12 @@ fn lower_mutation_field(
                 let v = &value_p.node;
                 if aname == "where" {
                     let json = gql_to_json(v, vars, &format!("{alias}.where"))?;
-                    where_ = Some(lower_where(&json, table, schema, &format!("{alias}.where"))?);
+                    where_ = Some(lower_where(
+                        &json,
+                        table,
+                        schema,
+                        &format!("{alias}.where"),
+                    )?);
                 } else {
                     return Err(Error::Validate {
                         path: format!("{alias}.{aname}"),
@@ -347,6 +352,7 @@ fn lower_mutation_field(
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_insert_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
@@ -442,11 +448,7 @@ fn json_object_to_map(
     Ok(out)
 }
 
-fn parse_on_conflict(
-    json: &Value,
-    table: &Table,
-    path: &str,
-) -> Result<crate::ast::OnConflict> {
+fn parse_on_conflict(json: &Value, table: &Table, path: &str) -> Result<crate::ast::OnConflict> {
     let obj = json.as_object().ok_or_else(|| Error::Validate {
         path: path.into(),
         message: "expected object".into(),
@@ -481,7 +483,14 @@ fn parse_on_conflict(
     }
     let where_ = obj
         .get("where")
-        .map(|w| lower_where(w, table, &Schema::builder().build(), &format!("{path}.where")))
+        .map(|w| {
+            lower_where(
+                w,
+                table,
+                &Schema::builder().build(),
+                &format!("{path}.where"),
+            )
+        })
         .transpose()?;
     Ok(crate::ast::OnConflict {
         constraint,
@@ -541,6 +550,7 @@ fn parse_update_args(
     Ok((w, set))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_update_by_pk_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
@@ -598,11 +608,7 @@ fn parse_update_by_pk_args(
     Ok((pk, set))
 }
 
-fn parse_returning(
-    set: &SelectionSet,
-    table: &Table,
-    parent_path: &str,
-) -> Result<Vec<Field>> {
+fn parse_returning(set: &SelectionSet, table: &Table, parent_path: &str) -> Result<Vec<Field>> {
     let mut returning: Vec<Field> = Vec::new();
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {

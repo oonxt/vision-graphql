@@ -654,9 +654,7 @@ fn render_mutation(
             } => {
                 render_update_cte(&cte, table, where_, set, schema, ctx)?;
             }
-            MutationField::UpdateByPk {
-                table, pk, set, ..
-            } => {
+            MutationField::UpdateByPk { table, pk, set, .. } => {
                 render_update_by_pk_cte(&cte, table, pk, set, schema, ctx)?;
             }
             MutationField::Delete { table, where_, .. } => {
@@ -1013,7 +1011,8 @@ fn render_mutation_output_for(
                 ctx.sql.push_str("json_build_object(");
                 write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
                 if !returning.is_empty() {
-                    ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                    ctx.sql
+                        .push_str(", 'returning', (SELECT coalesce(json_agg(");
                     render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
                     write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
                 } else {
@@ -1040,7 +1039,8 @@ fn render_mutation_output_for(
             .unwrap();
             write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
             if !returning.is_empty() {
-                ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                ctx.sql
+                    .push_str(", 'returning', (SELECT coalesce(json_agg(");
                 render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
                 write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
             } else {
@@ -1084,7 +1084,8 @@ fn render_mutation_output_for(
             .unwrap();
             write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
             if !returning.is_empty() {
-                ctx.sql.push_str(", 'returning', (SELECT coalesce(json_agg(");
+                ctx.sql
+                    .push_str(", 'returning', (SELECT coalesce(json_agg(");
                 render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
                 write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
             } else {

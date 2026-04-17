@@ -195,10 +195,7 @@ async fn delete_by_where() {
 async fn delete_by_pk_missing_returns_null() {
     let (engine, _c) = setup().await;
     let v: Value = engine
-        .query(
-            r#"mutation { delete_users_by_pk(id: 99999) { id } }"#,
-            None,
-        )
+        .query(r#"mutation { delete_users_by_pk(id: 99999) { id } }"#, None)
         .await
         .expect("mutation ok");
     assert!(v["delete_users_by_pk"].is_null());
