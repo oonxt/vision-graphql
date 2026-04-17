@@ -623,22 +623,23 @@ mod tests {
     fn parse_plain_list() {
         let op =
             parse_and_lower("query { users { id name } }", &json!({}), None, &schema()).unwrap();
-        match op {
-            Operation::Query(roots) => {
-                assert_eq!(roots.len(), 1);
-                assert_eq!(roots[0].table, "users");
-                assert_eq!(roots[0].alias, "users");
-                let crate::ast::RootBody::List { selection } = &roots[0].body else {
-                    panic!("expected List");
-                };
-                assert_eq!(selection.len(), 2);
-                match &selection[0] {
-                    Field::Column { physical, alias } => {
-                        assert_eq!(physical, "id");
-                        assert_eq!(alias, "id");
-                    }
-                    _ => panic!("expected Column"),
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        {
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].table, "users");
+            assert_eq!(roots[0].alias, "users");
+            let crate::ast::RootBody::List { selection } = &roots[0].body else {
+                panic!("expected List");
+            };
+            assert_eq!(selection.len(), 2);
+            match &selection[0] {
+                Field::Column { physical, alias } => {
+                    assert_eq!(physical, "id");
+                    assert_eq!(alias, "id");
                 }
+                _ => panic!("expected Column"),
             }
         }
     }
@@ -647,7 +648,9 @@ mod tests {
     fn parse_respects_field_alias() {
         let op =
             parse_and_lower("query { users { uid: id } }", &json!({}), None, &schema()).unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -683,7 +686,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let args = &roots[0].args;
         assert_eq!(args.limit, Some(10));
         match args.where_.as_ref().unwrap() {
@@ -705,7 +710,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match roots[0].args.where_.as_ref().unwrap() {
             crate::ast::BoolExpr::And(parts) => assert_eq!(parts.len(), 2),
             _ => panic!("expected And"),
@@ -721,7 +728,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].args.order_by.len(), 2);
         assert_eq!(roots[0].args.order_by[0].column, "name");
         assert!(matches!(
@@ -758,7 +767,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -787,7 +798,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match roots[0].args.where_.as_ref().unwrap() {
             crate::ast::BoolExpr::Relation { name, inner } => {
                 assert_eq!(name, "posts");
@@ -811,7 +824,9 @@ mod tests {
             &schema_with_relations(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         let crate::ast::RootBody::List { selection } = &roots[0].body else {
             panic!("expected List");
         };
@@ -830,7 +845,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
             crate::ast::RootBody::Aggregate { ops, nodes } => {
@@ -857,7 +874,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].args.distinct_on, vec!["name".to_string()]);
     }
 
@@ -870,7 +889,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
             crate::ast::RootBody::ByPk { pk, selection } => {
@@ -892,7 +913,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match &roots[0].body {
             crate::ast::RootBody::ByPk { pk, .. } => {
                 assert_eq!(pk[0].1, json!(42));
@@ -922,7 +945,9 @@ mod tests {
             &schema(),
         )
         .unwrap();
-        let Operation::Query(roots) = op;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
         match &roots[0].body {
             crate::ast::RootBody::Aggregate { ops, nodes } => {
                 assert_eq!(ops.len(), 1);

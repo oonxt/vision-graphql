@@ -11,6 +11,10 @@ pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
     let mut ctx = RenderCtx::default();
     match op {
         Operation::Query(roots) => render_query(roots, schema, &mut ctx),
+        Operation::Mutation(_) => Err(Error::Validate {
+            path: "mutation".into(),
+            message: "mutation rendering not yet implemented".into(),
+        }),
     }?;
     Ok((ctx.sql, ctx.binds))
 }
