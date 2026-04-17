@@ -206,10 +206,28 @@ fn render_bool_expr(
                 CmpOp::Gte => ">=",
                 CmpOp::Lt => "<",
                 CmpOp::Lte => "<=",
+                CmpOp::Like => "LIKE",
+                CmpOp::ILike => "ILIKE",
+                CmpOp::NLike => "NOT LIKE",
+                CmpOp::NILike => "NOT ILIKE",
             };
             write!(
                 ctx.sql,
                 "{table_alias}.{} {op_str} {placeholder}",
+                quote_ident(&col.physical_name)
+            )
+            .unwrap();
+            Ok(())
+        }
+        BoolExpr::IsNull { column, negated } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            let pred = if *negated { "IS NOT NULL" } else { "IS NULL" };
+            write!(
+                ctx.sql,
+                "{table_alias}.{} {pred}",
                 quote_ident(&col.physical_name)
             )
             .unwrap();
@@ -1392,6 +1410,10 @@ fn render_bool_expr_no_alias(
                 CmpOp::Gte => ">=",
                 CmpOp::Lt => "<",
                 CmpOp::Lte => "<=",
+                CmpOp::Like => "LIKE",
+                CmpOp::ILike => "ILIKE",
+                CmpOp::NLike => "NOT LIKE",
+                CmpOp::NILike => "NOT ILIKE",
             };
             write!(
                 ctx.sql,
@@ -1399,6 +1421,15 @@ fn render_bool_expr_no_alias(
                 quote_ident(&col.physical_name)
             )
             .unwrap();
+            Ok(())
+        }
+        BoolExpr::IsNull { column, negated } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            let pred = if *negated { "IS NOT NULL" } else { "IS NULL" };
+            write!(ctx.sql, "{} {pred}", quote_ident(&col.physical_name)).unwrap();
             Ok(())
         }
         BoolExpr::Relation { .. } => Err(Error::Validate {

@@ -5,12 +5,15 @@ use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
-    DocumentOperations, ExecutableDocument, Field as GqlField, OperationType, Selection,
-    SelectionSet,
+    DocumentOperations, ExecutableDocument, Field as GqlField, FragmentDefinition, OperationType,
+    Selection, SelectionSet,
 };
 use async_graphql_parser::Positioned;
 use async_graphql_value::{Name, Value as GqlValue};
 use serde_json::Value;
+use std::collections::HashMap;
+
+type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
 
 pub fn parse_and_lower(
     source: &str,
@@ -19,10 +22,14 @@ pub fn parse_and_lower(
     schema: &Schema,
 ) -> Result<Operation> {
     let doc = parse_query(source).map_err(|e| Error::Parse(e.to_string()))?;
+    let mut fragments: Fragments<'_> = HashMap::new();
+    for (name, def) in &doc.fragments {
+        fragments.insert(name.as_str().to_string(), &def.node);
+    }
     let op = pick_operation(&doc, operation_name)?;
     match op.ty {
-        OperationType::Query => lower_query(op.selection_set, schema, variables),
-        OperationType::Mutation => lower_mutation(op.selection_set, schema, variables),
+        OperationType::Query => lower_query(op.selection_set, schema, variables, &fragments),
+        OperationType::Mutation => lower_mutation(op.selection_set, schema, variables, &fragments),
         OperationType::Subscription => Err(Error::Parse("subscriptions are not supported".into())),
     }
 }
@@ -64,10 +71,36 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
     }
 }
 
-fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Operation> {
+fn lower_query(
+    set: &SelectionSet,
+    schema: &Schema,
+    vars: &Value,
+    fragments: &Fragments<'_>,
+) -> Result<Operation> {
     let mut roots = Vec::new();
     for sel in &set.items {
         match &sel.node {
+            Selection::FragmentSpread(fs) => {
+                let name = fs.node.fragment_name.node.as_str();
+                let frag = fragments.get(name).ok_or_else(|| Error::Validate {
+                    path: "query".into(),
+                    message: format!("unknown fragment '{name}'"),
+                })?;
+                if let Operation::Query(mut inner_roots) =
+                    lower_query(&frag.selection_set.node, schema, vars, fragments)?
+                {
+                    roots.append(&mut inner_roots);
+                }
+                continue;
+            }
+            Selection::InlineFragment(ifr) => {
+                if let Operation::Query(mut inner_roots) =
+                    lower_query(&ifr.node.selection_set.node, schema, vars, fragments)?
+                {
+                    roots.append(&mut inner_roots);
+                }
+                continue;
+            }
             Selection::Field(f) => {
                 let field = &f.node;
                 let name = field.name.node.as_str();
@@ -126,6 +159,7 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                             table,
                             schema,
                             vars,
+                            fragments,
                             &alias,
                         )?;
                         roots.push(RootField {
@@ -143,8 +177,14 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                     message: format!("unknown root field '{name}'"),
                 })?;
                 let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
-                let selection =
-                    lower_selection_set(&field.selection_set.node, table, schema, vars, &alias)?;
+                let selection = lower_selection_set(
+                    &field.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    &alias,
+                )?;
 
                 roots.push(RootField {
                     table: name.to_string(),
@@ -153,23 +193,42 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                     body: crate::ast::RootBody::List { selection },
                 });
             }
-            _ => {
-                return Err(Error::Parse(
-                    "fragments are not supported in Phase 3".into(),
-                ))
-            }
         }
     }
     Ok(Operation::Query(roots))
 }
 
-fn lower_mutation(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Operation> {
+fn lower_mutation(
+    set: &SelectionSet,
+    schema: &Schema,
+    vars: &Value,
+    fragments: &Fragments<'_>,
+) -> Result<Operation> {
     let mut fields: Vec<crate::ast::MutationField> = Vec::new();
     for sel in &set.items {
-        let Selection::Field(f) = &sel.node else {
-            return Err(Error::Parse(
-                "fragments are not supported in mutations".into(),
-            ));
+        let f = match &sel.node {
+            Selection::Field(f) => f,
+            Selection::FragmentSpread(fs) => {
+                let name = fs.node.fragment_name.node.as_str();
+                let frag = fragments.get(name).ok_or_else(|| Error::Validate {
+                    path: "mutation".into(),
+                    message: format!("unknown fragment '{name}'"),
+                })?;
+                if let Operation::Mutation(mut inner) =
+                    lower_mutation(&frag.selection_set.node, schema, vars, fragments)?
+                {
+                    fields.append(&mut inner);
+                }
+                continue;
+            }
+            Selection::InlineFragment(ifr) => {
+                if let Operation::Mutation(mut inner) =
+                    lower_mutation(&ifr.node.selection_set.node, schema, vars, fragments)?
+                {
+                    fields.append(&mut inner);
+                }
+                continue;
+            }
         };
         let field = &f.node;
         let name = field.name.node.as_str();
@@ -643,11 +702,41 @@ fn lower_selection_set(
     table: &Table,
     schema: &Schema,
     vars: &Value,
+    fragments: &Fragments<'_>,
     parent_path: &str,
 ) -> Result<Vec<Field>> {
     let mut out = Vec::new();
     for sel in &set.items {
         match &sel.node {
+            Selection::FragmentSpread(fs) => {
+                let name = fs.node.fragment_name.node.as_str();
+                let frag = fragments.get(name).ok_or_else(|| Error::Validate {
+                    path: parent_path.into(),
+                    message: format!("unknown fragment '{name}'"),
+                })?;
+                let mut inner = lower_selection_set(
+                    &frag.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    parent_path,
+                )?;
+                out.append(&mut inner);
+                continue;
+            }
+            Selection::InlineFragment(ifr) => {
+                let mut inner = lower_selection_set(
+                    &ifr.node.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    parent_path,
+                )?;
+                out.append(&mut inner);
+                continue;
+            }
             Selection::Field(f) => {
                 let field = &f.node;
                 let name = field.name.node.as_str();
@@ -680,6 +769,7 @@ fn lower_selection_set(
                         target,
                         schema,
                         vars,
+                        fragments,
                         &format!("{parent_path}.{alias}"),
                     )?;
                     out.push(Field::Relation {
@@ -699,11 +789,6 @@ fn lower_selection_set(
                     physical: col.physical_name.clone(),
                     alias,
                 });
-            }
-            _ => {
-                return Err(Error::Parse(
-                    "fragments are not supported in Phase 2".into(),
-                ))
             }
         }
     }
@@ -842,25 +927,104 @@ fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Resu
                     message: "expected operator object".into(),
                 })?;
                 for (op_name, op_val) in op_obj {
-                    let op = match op_name.as_str() {
-                        "_eq" => CmpOp::Eq,
-                        "_neq" => CmpOp::Neq,
-                        "_gt" => CmpOp::Gt,
-                        "_gte" => CmpOp::Gte,
-                        "_lt" => CmpOp::Lt,
-                        "_lte" => CmpOp::Lte,
+                    match op_name.as_str() {
+                        "_eq" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Eq,
+                            value: op_val.clone(),
+                        }),
+                        "_neq" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Neq,
+                            value: op_val.clone(),
+                        }),
+                        "_gt" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Gt,
+                            value: op_val.clone(),
+                        }),
+                        "_gte" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Gte,
+                            value: op_val.clone(),
+                        }),
+                        "_lt" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Lt,
+                            value: op_val.clone(),
+                        }),
+                        "_lte" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Lte,
+                            value: op_val.clone(),
+                        }),
+                        "_like" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::Like,
+                            value: op_val.clone(),
+                        }),
+                        "_ilike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::ILike,
+                            value: op_val.clone(),
+                        }),
+                        "_nlike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::NLike,
+                            value: op_val.clone(),
+                        }),
+                        "_nilike" => parts.push(BoolExpr::Compare {
+                            column: col.exposed_name.clone(),
+                            op: CmpOp::NILike,
+                            value: op_val.clone(),
+                        }),
+                        "_is_null" => {
+                            let b = op_val.as_bool().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._is_null"),
+                                message: "expected boolean".into(),
+                            })?;
+                            parts.push(BoolExpr::IsNull {
+                                column: col.exposed_name.clone(),
+                                negated: !b,
+                            });
+                        }
+                        "_in" => {
+                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._in"),
+                                message: "expected array".into(),
+                            })?;
+                            let inner: Vec<BoolExpr> = arr
+                                .iter()
+                                .map(|v| BoolExpr::Compare {
+                                    column: col.exposed_name.clone(),
+                                    op: CmpOp::Eq,
+                                    value: v.clone(),
+                                })
+                                .collect();
+                            parts.push(BoolExpr::Or(inner));
+                        }
+                        "_nin" => {
+                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{col_name}._nin"),
+                                message: "expected array".into(),
+                            })?;
+                            let inner: Vec<BoolExpr> = arr
+                                .iter()
+                                .map(|v| BoolExpr::Compare {
+                                    column: col.exposed_name.clone(),
+                                    op: CmpOp::Neq,
+                                    value: v.clone(),
+                                })
+                                .collect();
+                            parts.push(BoolExpr::And(inner));
+                        }
                         other => {
                             return Err(Error::Validate {
                                 path: format!("{path}.{col_name}"),
                                 message: format!("unsupported operator '{other}'"),
-                            })
+                            });
                         }
-                    };
-                    parts.push(BoolExpr::Compare {
-                        column: col.exposed_name.clone(),
-                        op,
-                        value: op_val.clone(),
-                    });
+                    }
                 }
             }
         }
@@ -1406,6 +1570,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("unknown column 'bogus'"));
+    }
+
+    #[test]
+    fn parse_where_like() {
+        let op = parse_and_lower(
+            r#"query { users(where: {name: {_like: "a%"}}) { id } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        match roots[0].args.where_.as_ref().unwrap() {
+            crate::ast::BoolExpr::Compare { op, .. } => {
+                assert!(matches!(op, crate::ast::CmpOp::Like));
+            }
+            _ => panic!("expected Compare"),
+        }
+    }
+
+    #[test]
+    fn parse_where_is_null() {
+        let op = parse_and_lower(
+            r#"query { users(where: {name: {_is_null: true}}) { id } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        match roots[0].args.where_.as_ref().unwrap() {
+            crate::ast::BoolExpr::IsNull { column, negated } => {
+                assert_eq!(column, "name");
+                assert!(!negated);
+            }
+            _ => panic!("expected IsNull"),
+        }
+    }
+
+    #[test]
+    fn parse_where_in_expands_to_or() {
+        let op = parse_and_lower(
+            r#"query { users(where: {id: {_in: [1, 2, 3]}}) { id } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        match roots[0].args.where_.as_ref().unwrap() {
+            crate::ast::BoolExpr::Or(parts) => assert_eq!(parts.len(), 3),
+            _ => panic!("expected Or chain"),
+        }
+    }
+
+    #[test]
+    fn parse_named_fragment() {
+        let op = parse_and_lower(
+            r#"
+            fragment UserFields on users { id name }
+            query { users { ...UserFields } }
+            "#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        assert_eq!(selection.len(), 2);
+    }
+
+    #[test]
+    fn parse_inline_fragment() {
+        let op = parse_and_lower(
+            r#"query { users { ... on users { id name } } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        assert_eq!(selection.len(), 2);
+    }
+
+    #[test]
+    fn parse_unknown_fragment_errors() {
+        let err = parse_and_lower(
+            r#"query { users { ...MissingFragment } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("MissingFragment"));
     }
 
     #[test]
