@@ -96,6 +96,54 @@ fn lower_query(set: &SelectionSet, schema: &Schema, vars: &Value) -> Result<Oper
                     }
                 }
 
+                // By-PK root: "<table>_by_pk"
+                if let Some(base_name) = name.strip_suffix("_by_pk") {
+                    if let Some(table) = schema.table(base_name) {
+                        if table.primary_key.is_empty() {
+                            return Err(Error::Validate {
+                                path: alias.clone(),
+                                message: format!(
+                                    "table '{}' has no primary key; _by_pk not available",
+                                    table.exposed_name
+                                ),
+                            });
+                        }
+                        let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+                        for pk_col in &table.primary_key {
+                            let found = field
+                                .arguments
+                                .iter()
+                                .find(|(n, _)| n.node.as_str() == pk_col);
+                            let (_, value_p) = found.ok_or_else(|| Error::Validate {
+                                path: alias.clone(),
+                                message: format!(
+                                    "required primary key argument '{pk_col}' missing"
+                                ),
+                            })?;
+                            let json = gql_to_json(
+                                &value_p.node,
+                                vars,
+                                &format!("{alias}.{pk_col}"),
+                            )?;
+                            pk.push((pk_col.clone(), json));
+                        }
+                        let selection = lower_selection_set(
+                            &field.selection_set.node,
+                            table,
+                            schema,
+                            vars,
+                            &alias,
+                        )?;
+                        roots.push(RootField {
+                            table: base_name.to_string(),
+                            alias,
+                            args: QueryArgs::default(),
+                            body: crate::ast::RootBody::ByPk { pk, selection },
+                        });
+                        continue;
+                    }
+                }
+
                 let table = schema.table(name).ok_or_else(|| Error::Validate {
                     path: alias.clone(),
                     message: format!("unknown root field '{name}'"),
@@ -551,7 +599,8 @@ mod tests {
             .table(
                 Table::new("users", "public", "users")
                     .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true),
+                    .column("name", "name", PgType::Text, true)
+                    .primary_key(&["id"]),
             )
             .build()
     }
@@ -783,6 +832,58 @@ mod tests {
             }
             _ => panic!("expected Aggregate"),
         }
+    }
+
+    #[test]
+    fn parse_by_pk_single_col() {
+        let op = parse_and_lower(
+            "query { users_by_pk(id: 7) { id name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        assert_eq!(roots[0].table, "users");
+        match &roots[0].body {
+            crate::ast::RootBody::ByPk { pk, selection } => {
+                assert_eq!(pk.len(), 1);
+                assert_eq!(pk[0].0, "id");
+                assert_eq!(pk[0].1, json!(7));
+                assert_eq!(selection.len(), 2);
+            }
+            _ => panic!("expected ByPk"),
+        }
+    }
+
+    #[test]
+    fn parse_by_pk_with_variable() {
+        let op = parse_and_lower(
+            "query Q($uid: Int!) { users_by_pk(id: $uid) { name } }",
+            &json!({"uid": 42}),
+            Some("Q"),
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op;
+        match &roots[0].body {
+            crate::ast::RootBody::ByPk { pk, .. } => {
+                assert_eq!(pk[0].1, json!(42));
+            }
+            _ => panic!("expected ByPk"),
+        }
+    }
+
+    #[test]
+    fn parse_by_pk_missing_required_pk_errors() {
+        let err = parse_and_lower(
+            "query { users_by_pk { name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("required primary key"));
     }
 
     #[test]
