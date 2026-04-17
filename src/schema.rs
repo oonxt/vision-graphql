@@ -30,6 +30,64 @@ pub struct Column {
     pub nullable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelKind {
+    Object,
+    Array,
+}
+
+#[derive(Debug, Clone)]
+pub struct Relation {
+    pub kind: RelKind,
+    pub target_table: String,
+    /// `(local_exposed_column, remote_exposed_column)` pairs. Join condition is
+    /// AND of equalities across all pairs.
+    pub mapping: Vec<(String, String)>,
+}
+
+impl Relation {
+    pub fn object(target: &str) -> RelationBuilder {
+        RelationBuilder {
+            kind: RelKind::Object,
+            target: target.into(),
+            mapping: Vec::new(),
+        }
+    }
+
+    pub fn array(target: &str) -> RelationBuilder {
+        RelationBuilder {
+            kind: RelKind::Array,
+            target: target.into(),
+            mapping: Vec::new(),
+        }
+    }
+}
+
+pub struct RelationBuilder {
+    kind: RelKind,
+    target: String,
+    mapping: Vec<(String, String)>,
+}
+
+impl RelationBuilder {
+    pub fn on<I, A, B>(mut self, pairs: I) -> Relation
+    where
+        I: IntoIterator<Item = (A, B)>,
+        A: Into<String>,
+        B: Into<String>,
+    {
+        self.mapping = pairs
+            .into_iter()
+            .map(|(a, b)| (a.into(), b.into()))
+            .collect();
+        Relation {
+            kind: self.kind,
+            target_table: self.target,
+            mapping: self.mapping,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Table {
     pub exposed_name: String,
@@ -37,6 +95,7 @@ pub struct Table {
     pub physical_name: String,
     columns_by_exposed: HashMap<String, Column>,
     pub primary_key: Vec<String>,
+    relations_by_name: HashMap<String, Relation>,
 }
 
 impl Table {
@@ -47,6 +106,7 @@ impl Table {
             physical_name: physical.into(),
             columns_by_exposed: HashMap::new(),
             primary_key: Vec::new(),
+            relations_by_name: HashMap::new(),
         }
     }
 
@@ -74,8 +134,17 @@ impl Table {
         self
     }
 
+    pub fn relation(mut self, name: &str, rel: Relation) -> Self {
+        self.relations_by_name.insert(name.into(), rel);
+        self
+    }
+
     pub fn find_column(&self, exposed: &str) -> Option<&Column> {
         self.columns_by_exposed.get(exposed)
+    }
+
+    pub fn find_relation(&self, name: &str) -> Option<&Relation> {
+        self.relations_by_name.get(name)
     }
 }
 
@@ -132,5 +201,39 @@ mod tests {
         assert_eq!(users.physical_name, "users");
         assert!(users.find_column("id").is_some());
         assert!(users.find_column("missing").is_none());
+    }
+
+    #[test]
+    fn build_users_posts_relations() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("name", "name", PgType::Text, true)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("title", "title", PgType::Text, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build();
+
+        let users = schema.table("users").unwrap();
+        let rel = users.find_relation("posts").unwrap();
+        assert_eq!(rel.kind, RelKind::Array);
+        assert_eq!(rel.target_table, "posts");
+        assert_eq!(
+            rel.mapping,
+            vec![("id".to_string(), "user_id".to_string())]
+        );
+
+        let posts = schema.table("posts").unwrap();
+        let rel = posts.find_relation("user").unwrap();
+        assert_eq!(rel.kind, RelKind::Object);
     }
 }
