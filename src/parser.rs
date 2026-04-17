@@ -368,6 +368,7 @@ mod tests {
                         assert_eq!(physical, "id");
                         assert_eq!(alias, "id");
                     }
+                    _ => panic!("expected Column"),
                 }
             }
         }
@@ -383,6 +384,7 @@ mod tests {
                 assert_eq!(physical, "id");
                 assert_eq!(alias, "uid");
             }
+            _ => panic!("expected Column"),
         }
     }
 

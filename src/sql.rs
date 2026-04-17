@@ -96,6 +96,12 @@ fn render_inner_select(
                 )
                 .unwrap();
             }
+            Field::Relation { .. } => {
+                return Err(Error::Validate {
+                    path: root.alias.clone(),
+                    message: "Field::Relation not yet implemented".into(),
+                });
+            }
         }
     }
     write!(
@@ -169,6 +175,10 @@ fn render_bool_expr(
             .unwrap();
             Ok(())
         }
+        BoolExpr::Relation { .. } => Err(Error::Validate {
+            path: "where".into(),
+            message: "BoolExpr::Relation not yet implemented".into(),
+        }),
     }
 }
 
