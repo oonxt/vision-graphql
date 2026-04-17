@@ -52,6 +52,10 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::List { selection } => {
             render_list(root, selection, table, schema, ctx)
         }
+        crate::ast::RootBody::Aggregate { .. } => Err(Error::Validate {
+            path: root.alias.clone(),
+            message: "Aggregate not yet implemented".into(),
+        }),
     }
 }
 

@@ -17,7 +17,22 @@ pub struct RootField {
 
 #[derive(Debug, Clone)]
 pub enum RootBody {
-    List { selection: Vec<Field> },
+    List {
+        selection: Vec<Field>,
+    },
+    Aggregate {
+        ops: Vec<AggOp>,
+        nodes: Option<Vec<Field>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum AggOp {
+    Count,
+    Sum { columns: Vec<String> },
+    Avg { columns: Vec<String> },
+    Max { columns: Vec<String> },
+    Min { columns: Vec<String> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,6 +124,7 @@ mod tests {
         assert_eq!(root.table, "users");
         match root.body {
             RootBody::List { selection } => assert_eq!(selection.len(), 2),
+            _ => panic!("expected List"),
         }
     }
 
@@ -144,6 +160,29 @@ mod tests {
                 assert_eq!(selection.len(), 1);
             }
             _ => panic!("expected Relation"),
+        }
+    }
+
+    #[test]
+    fn build_aggregate_root() {
+        let body = RootBody::Aggregate {
+            ops: vec![
+                AggOp::Count,
+                AggOp::Sum {
+                    columns: vec!["age".into()],
+                },
+            ],
+            nodes: Some(vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }]),
+        };
+        match body {
+            RootBody::Aggregate { ops, nodes } => {
+                assert_eq!(ops.len(), 2);
+                assert!(nodes.is_some());
+            }
+            _ => panic!("expected Aggregate"),
         }
     }
 
