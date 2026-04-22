@@ -189,3 +189,41 @@ async fn nested_on_conflict_missing_constraint_is_error() {
         "error should mention missing constraint; was: {msg}"
     );
 }
+
+#[tokio::test]
+async fn nested_object_on_conflict_do_update_updates_existing() {
+    let (engine, _c) = setup().await;
+
+    let seeded: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users_one(object: { name: "alice", email: "old@e.com" }) { id }
+               }"#,
+            None,
+        )
+        .await
+        .expect("seed ok");
+    let alice_id = seeded["insert_users_one"]["id"].as_i64().unwrap();
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "p1",
+                   user: {
+                     data: { name: "alice", email: "new@e.com" },
+                     on_conflict: { constraint: "users_name_key", update_columns: ["email"] }
+                   }
+                 }]) {
+                   returning { title user { id email } }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    let row = &v["insert_posts"]["returning"][0];
+    assert_eq!(row["title"], json!("p1"));
+    assert_eq!(row["user"]["id"].as_i64().unwrap(), alice_id);
+    assert_eq!(row["user"]["email"], json!("new@e.com"));
+}
