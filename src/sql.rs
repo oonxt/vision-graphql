@@ -407,13 +407,17 @@ fn render_relation_subquery(
             }
         }
     }
-    write!(
-        ctx.sql,
-        " FROM {}.{} {remote_alias}",
-        quote_ident(&target.physical_schema),
-        quote_ident(&target.physical_name),
-    )
-    .unwrap();
+    if let Some(cte_alias) = ctx.inserted_ctes.get(&rel.target_table).cloned() {
+        write!(ctx.sql, " FROM {cte_alias} {remote_alias}").unwrap();
+    } else {
+        write!(
+            ctx.sql,
+            " FROM {}.{} {remote_alias}",
+            quote_ident(&target.physical_schema),
+            quote_ident(&target.physical_name),
+        )
+        .unwrap();
+    }
 
     ctx.sql.push_str(" WHERE ");
     for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
