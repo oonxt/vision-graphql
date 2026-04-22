@@ -443,3 +443,35 @@ async fn nested_insert_one_with_children() {
         .collect();
     assert_eq!(titles, vec![json!("p1"), json!("p2")]);
 }
+
+#[tokio::test]
+async fn nested_insert_rolls_back_on_child_failure() {
+    let (engine, _c) = setup().await;
+
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "rb",
+                   posts: { data: [{
+                     title: "t",
+                     comments: { data: [{ body: null }] }
+                   }] }
+                 }]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected DB error");
+    let _ = err;
+
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_eq: "rb"}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("lookup ok");
+    assert_eq!(v["users"], json!([]));
+}
