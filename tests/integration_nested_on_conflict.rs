@@ -499,3 +499,26 @@ async fn sibling_object_and_array_with_on_conflict() {
         .collect();
     assert_eq!(bodies, vec![json!("c1"), json!("c2")]);
 }
+
+#[tokio::test]
+async fn nested_on_conflict_divergent_across_batch_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "p1", user: { data: { name: "a1" }, on_conflict: { constraint: "users_name_key", update_columns: [] } } },
+                   { title: "p2", user: { data: { name: "a2" }, on_conflict: { constraint: "users_name_key", update_columns: ["email"] } } }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("identical across all rows"),
+        "error should mention batch uniformity; was: {msg}"
+    );
+}

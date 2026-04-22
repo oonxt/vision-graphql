@@ -527,6 +527,45 @@ fn parse_insert_args(
                 });
             }
         }
+
+        // Batch-uniform rule for on_conflict on object relations: all rows must
+        // carry the same on_conflict (or lack thereof) for a given relation,
+        // because the renderer emits a single child INSERT CTE per relation and
+        // cannot honor divergent clauses.
+        for rel_name in objects[0].nested_objects.keys() {
+            let first_oc = &objects[0].nested_objects[rel_name].on_conflict;
+            for (i, obj) in objects.iter().enumerate().skip(1) {
+                let these_oc = &obj.nested_objects[rel_name].on_conflict;
+                if format!("{:?}", these_oc) != format!("{:?}", first_oc) {
+                    return Err(Error::Validate {
+                        path: format!("{parent_path}.objects[{i}].{rel_name}.on_conflict"),
+                        message: format!(
+                            "nested on_conflict for object-relation '{rel_name}' must be identical across all rows in the batch"
+                        ),
+                    });
+                }
+            }
+        }
+        // Same check for array relations: when the same array-relation key is
+        // present in two or more rows, their on_conflicts must match.
+        use std::collections::BTreeMap;
+        let mut first_array_oc: BTreeMap<&str, &Option<crate::ast::OnConflict>> = BTreeMap::new();
+        for obj in objects.iter() {
+            for (rel_name, nai) in &obj.nested_arrays {
+                if let Some(existing) = first_array_oc.get(rel_name.as_str()) {
+                    if format!("{:?}", *existing) != format!("{:?}", &nai.on_conflict) {
+                        return Err(Error::Validate {
+                            path: format!("{parent_path}.objects.{rel_name}.on_conflict"),
+                            message: format!(
+                                "nested on_conflict for array-relation '{rel_name}' must be identical across all rows in the batch that include it"
+                            ),
+                        });
+                    }
+                } else {
+                    first_array_oc.insert(rel_name.as_str(), &nai.on_conflict);
+                }
+            }
+        }
     }
 
     Ok((objects, on_conflict))
