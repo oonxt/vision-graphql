@@ -211,3 +211,32 @@ async fn nested_object_mixed_batch_is_error() {
         "error was: {msg}"
     );
 }
+
+#[tokio::test]
+async fn insert_batch_with_nested_users() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "p1", user: { data: { name: "alice" } } },
+                   { title: "p2", user: { data: { name: "bob"   } } }
+                 ]) {
+                   affected_rows
+                   returning { title user { name } }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_posts"]["affected_rows"], json!(4));
+    let rows = v["insert_posts"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let p1 = rows.iter().find(|r| r["title"] == json!("p1")).expect("p1");
+    assert_eq!(p1["user"]["name"], json!("alice"));
+
+    let p2 = rows.iter().find(|r| r["title"] == json!("p2")).expect("p2");
+    assert_eq!(p2["user"]["name"], json!("bob"));
+}
