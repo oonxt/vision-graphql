@@ -364,3 +364,34 @@ async fn nested_array_on_conflict_do_nothing_preserves_existing() {
         .expect("bob-fresh present");
     assert_eq!(fresh["user_id"].as_i64().unwrap(), bob_id);
 }
+
+#[tokio::test]
+async fn top_level_on_conflict_do_nothing_unchanged() {
+    let (engine, _c) = setup().await;
+
+    let _: Value = engine
+        .query(
+            r#"mutation { insert_users_one(object: { name: "dup" }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed dup");
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(
+                   objects: [{ name: "dup" }],
+                   on_conflict: { constraint: "users_name_key", update_columns: [] }
+                 ) {
+                   affected_rows
+                   returning { name }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(0));
+    assert_eq!(v["insert_users"]["returning"], json!([]));
+}
