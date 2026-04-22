@@ -373,3 +373,35 @@ async fn insert_post_one_with_nested_user() {
     assert_eq!(one["title"], json!("solo"));
     assert_eq!(one["user"]["name"], json!("solo-user"));
 }
+
+#[tokio::test]
+async fn nested_object_rolls_back_on_parent_failure() {
+    let (engine, _c) = setup().await;
+
+    // Violate NOT NULL on users.name (set it null). Whole mutation must fail;
+    // neither the post nor any user should persist.
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "rb",
+                   user: { data: { name: null } }
+                 }]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected DB error");
+    let _ = err;
+
+    // Verify no orphan post with title="rb".
+    let v: Value = engine
+        .query(
+            r#"query { posts(where: { title: {_eq: "rb"} }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("lookup ok");
+    assert_eq!(v["posts"], json!([]));
+}
