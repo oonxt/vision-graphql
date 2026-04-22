@@ -240,3 +240,39 @@ async fn insert_batch_with_nested_users() {
     let p2 = rows.iter().find(|r| r["title"] == json!("p2")).expect("p2");
     assert_eq!(p2["user"]["name"], json!("bob"));
 }
+
+#[tokio::test]
+async fn insert_post_with_nested_user_and_comments() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "p1",
+                   user:     { data: { name: "alice" } },
+                   comments: { data: [{ body: "c1" }, { body: "c2" }] }
+                 }]) {
+                   affected_rows
+                   returning {
+                     title
+                     user { name }
+                     comments(order_by: [{ id: asc }]) { body }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_posts"]["affected_rows"], json!(4));
+    let row = &v["insert_posts"]["returning"][0];
+    assert_eq!(row["title"], json!("p1"));
+    assert_eq!(row["user"]["name"], json!("alice"));
+    let bodies: Vec<_> = row["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["body"].clone())
+        .collect();
+    assert_eq!(bodies, vec![json!("c1"), json!("c2")]);
+}
