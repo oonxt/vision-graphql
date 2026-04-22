@@ -232,3 +232,47 @@ async fn nested_insert_multi_parent_correlation() {
         .collect();
     assert_eq!(u2_titles, vec![json!("u2-p1")]);
 }
+
+#[tokio::test]
+async fn nested_insert_correlation_stress() {
+    let (engine, _c) = setup().await;
+
+    let mutation = r#"mutation {
+        insert_users(objects: [
+          { name: "a", posts: { data: [{ title: "a-child" }] } },
+          { name: "b", posts: { data: [{ title: "b-child" }] } },
+          { name: "c", posts: { data: [{ title: "c-child" }] } },
+          { name: "d", posts: { data: [{ title: "d-child" }] } },
+          { name: "e", posts: { data: [{ title: "e-child" }] } }
+        ]) {
+          affected_rows
+          returning { id name }
+        }
+      }"#;
+    let v: Value = engine.query(mutation, None).await.expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(10));
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+
+    for r in rows {
+        let name = r["name"].as_str().unwrap().to_string();
+        let id = r["id"].as_i64().unwrap();
+
+        let v2: Value = engine
+            .query(
+                &format!(
+                    r#"query {{ posts(where: {{ user_id: {{_eq: {id} }} }}) {{ title }} }}"#
+                ),
+                None,
+            )
+            .await
+            .expect("lookup ok");
+        let titles: Vec<_> = v2["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["title"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(titles, vec![format!("{name}-child")]);
+    }
+}
