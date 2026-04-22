@@ -1053,6 +1053,14 @@ fn render_insert_cte_recursive(
         .unwrap();
     }
 
+    // For top-level and object-relation inserts (not child inserts), explicit
+    // ORDER BY input ord so PG preserves input order through RETURNING. This
+    // keeps the downstream ROW_NUMBER() OVER () correlation robust. Child
+    // inserts don't need it — their correlation is via the JOIN not order.
+    if parent_link.is_none() {
+        ctx.sql.push_str(" ORDER BY c.ord");
+    }
+
     if let Some(oc) = on_conflict {
         render_on_conflict(oc, table, schema, ctx)?;
     }

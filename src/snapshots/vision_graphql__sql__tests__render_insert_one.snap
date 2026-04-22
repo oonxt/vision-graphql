@@ -2,4 +2,4 @@
 source: src/sql.rs
 expression: sql
 ---
-WITH m0_input AS (SELECT * FROM (VALUES (1, $1::text)) AS t(ord, "name")), m0 AS (INSERT INTO "public"."users" ("name") SELECT c."name" FROM m0_input c RETURNING *), m0_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM m0) SELECT json_build_object('insert_users_one', (SELECT json_build_object('id', m0."id") FROM m0 LIMIT 1)) AS result
+WITH m0_input AS (SELECT * FROM (VALUES (1, $1::text)) AS t(ord, "name")), m0 AS (INSERT INTO "public"."users" ("name") SELECT c."name" FROM m0_input c ORDER BY c.ord RETURNING *), m0_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM m0) SELECT json_build_object('insert_users_one', (SELECT json_build_object('id', m0."id") FROM m0 LIMIT 1)) AS result
