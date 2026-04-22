@@ -291,3 +291,76 @@ async fn nested_array_on_conflict_do_update_updates_existing() {
         assert_eq!(p["user_id"].as_i64().unwrap(), carol_id);
     }
 }
+
+#[tokio::test]
+async fn nested_array_on_conflict_do_nothing_preserves_existing() {
+    let (engine, _c) = setup().await;
+
+    let seeded: Value = engine
+        .query(
+            r#"mutation { insert_users_one(object: { name: "alice" }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed alice");
+    let alice_id = seeded["insert_users_one"]["id"].as_i64().unwrap();
+    let _: Value = engine
+        .query(
+            &format!(
+                r#"mutation {{
+                     insert_posts_one(object: {{ title: "already-there", user_id: {alice_id} }}) {{ id }}
+                   }}"#
+            ),
+            None,
+        )
+        .await
+        .expect("seed existing post");
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "bob",
+                   posts: {
+                     data: [
+                       { title: "already-there" },
+                       { title: "bob-fresh" }
+                     ],
+                     on_conflict: { constraint: "posts_title_key", update_columns: [] }
+                   }
+                 }]) {
+                   returning {
+                     id
+                     name
+                     posts(order_by: [{ title: asc }]) { title user_id }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+
+    let row = &v["insert_users"]["returning"][0];
+    assert_eq!(row["name"], json!("bob"));
+    let bob_id = row["id"].as_i64().unwrap();
+
+    let posts = row["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 2);
+
+    let already = posts
+        .iter()
+        .find(|p| p["title"] == json!("already-there"))
+        .expect("already-there present");
+    assert_eq!(
+        already["user_id"].as_i64().unwrap(),
+        alice_id,
+        "DO NOTHING preserves original owner"
+    );
+
+    let fresh = posts
+        .iter()
+        .find(|p| p["title"] == json!("bob-fresh"))
+        .expect("bob-fresh present");
+    assert_eq!(fresh["user_id"].as_i64().unwrap(), bob_id);
+}
