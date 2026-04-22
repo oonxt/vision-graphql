@@ -227,3 +227,67 @@ async fn nested_object_on_conflict_do_update_updates_existing() {
     assert_eq!(row["user"]["id"].as_i64().unwrap(), alice_id);
     assert_eq!(row["user"]["email"], json!("new@e.com"));
 }
+
+#[tokio::test]
+async fn nested_array_on_conflict_do_update_updates_existing() {
+    let (engine, _c) = setup().await;
+
+    let seeded_bob: Value = engine
+        .query(
+            r#"mutation { insert_users_one(object: { name: "bob" }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed bob");
+    let bob_id = seeded_bob["insert_users_one"]["id"].as_i64().unwrap();
+
+    let _: Value = engine
+        .query(
+            &format!(
+                r#"mutation {{
+                     insert_posts_one(object: {{ title: "fixed-slug", user_id: {bob_id} }}) {{ id }}
+                   }}"#
+            ),
+            None,
+        )
+        .await
+        .expect("seed post");
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "carol",
+                   posts: {
+                     data: [
+                       { title: "fixed-slug" },
+                       { title: "carol-fresh" }
+                     ],
+                     on_conflict: {
+                       constraint: "posts_title_key",
+                       update_columns: ["user_id"]
+                     }
+                   }
+                 }]) {
+                   returning {
+                     id
+                     name
+                     posts(order_by: [{ title: asc }]) { title user_id }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+
+    let row = &v["insert_users"]["returning"][0];
+    assert_eq!(row["name"], json!("carol"));
+    let carol_id = row["id"].as_i64().unwrap();
+    let posts = row["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 2);
+    // Both posts should now belong to carol — the existing post was DO UPDATE'd.
+    for p in posts {
+        assert_eq!(p["user_id"].as_i64().unwrap(), carol_id);
+    }
+}
