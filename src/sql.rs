@@ -2474,4 +2474,71 @@ mod tests {
         let (sql, _binds) = render(&op, &schema).unwrap();
         insta::assert_snapshot!(sql);
     }
+
+    #[test]
+    fn render_nested_on_conflict_do_nothing_rewrite() {
+        use crate::ast::{InsertObject, MutationField, NestedObjectInsert, OnConflict};
+        use crate::schema::Relation;
+        use std::collections::BTreeMap;
+
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("name", "name", PgType::Text, false)
+                    .primary_key(&["id"]),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("title", "title", PgType::Text, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build();
+
+        let mut parent_cols = BTreeMap::new();
+        parent_cols.insert("title".into(), serde_json::json!("p1"));
+
+        let mut child_cols = BTreeMap::new();
+        child_cols.insert("name".into(), serde_json::json!("alice"));
+
+        let mut nested_objects = BTreeMap::new();
+        nested_objects.insert(
+            "user".into(),
+            NestedObjectInsert {
+                table: "users".into(),
+                row: InsertObject {
+                    columns: child_cols,
+                    nested_arrays: BTreeMap::new(),
+                    nested_objects: BTreeMap::new(),
+                },
+                on_conflict: Some(OnConflict {
+                    constraint: "users_name_key".into(),
+                    update_columns: vec![],
+                    where_: None,
+                }),
+            },
+        );
+
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_posts".into(),
+            table: "posts".into(),
+            objects: vec![InsertObject {
+                columns: parent_cols,
+                nested_arrays: BTreeMap::new(),
+                nested_objects,
+            }],
+            on_conflict: None,
+            returning: vec![Field::Column {
+                physical: "title".into(),
+                alias: "title".into(),
+            }],
+            one: false,
+        }]);
+
+        let (sql, _binds) = render(&op, &schema).unwrap();
+        insta::assert_snapshot!(sql);
+    }
 }
