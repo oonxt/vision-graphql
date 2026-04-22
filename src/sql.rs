@@ -2149,4 +2149,75 @@ mod tests {
         let (sql, _binds) = render(&op, &schema).unwrap();
         insta::assert_snapshot!(sql);
     }
+
+    #[test]
+    fn render_insert_with_nested_children() {
+        use crate::ast::{InsertObject, MutationField, NestedArrayInsert};
+        use crate::schema::Relation;
+        use std::collections::BTreeMap;
+
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("name", "name", PgType::Text, true)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("title", "title", PgType::Text, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+
+        let mut parent_cols = BTreeMap::new();
+        parent_cols.insert("name".into(), serde_json::json!("alice"));
+
+        let mut child_cols = BTreeMap::new();
+        child_cols.insert("title".into(), serde_json::json!("p1"));
+
+        let mut nested = BTreeMap::new();
+        nested.insert(
+            "posts".into(),
+            NestedArrayInsert {
+                table: "posts".into(),
+                rows: vec![InsertObject {
+                    columns: child_cols,
+                    nested: BTreeMap::new(),
+                }],
+            },
+        );
+
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![InsertObject {
+                columns: parent_cols,
+                nested,
+            }],
+            on_conflict: None,
+            returning: vec![
+                Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                },
+                Field::Relation {
+                    name: "posts".into(),
+                    alias: "posts".into(),
+                    args: QueryArgs::default(),
+                    selection: vec![Field::Column {
+                        physical: "title".into(),
+                        alias: "title".into(),
+                    }],
+                },
+            ],
+            one: false,
+        }]);
+
+        let (sql, _binds) = render(&op, &schema).unwrap();
+        insta::assert_snapshot!(sql);
+    }
 }
