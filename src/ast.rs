@@ -190,8 +190,10 @@ pub struct NestedArrayInsert {
     pub rows: Vec<InsertObject>,
     /// Optional Hasura-style on_conflict applied when emitting this
     /// nested INSERT. When present with `update_columns: []`, the renderer
-    /// transparently rewrites `DO NOTHING` → `DO UPDATE SET pk = EXCLUDED.pk`
-    /// to keep RETURNING correlated 1:1 with input ords.
+    /// transparently rewrites `DO NOTHING` → `DO UPDATE SET pk = table.pk`
+    /// (a true no-op referencing the existing row's value, NOT EXCLUDED.pk
+    /// which would change it to the proposed sequence id) to keep
+    /// RETURNING correlated 1:1 with input ords.
     pub on_conflict: Option<OnConflict>,
 }
 
