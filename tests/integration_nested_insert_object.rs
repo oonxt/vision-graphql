@@ -350,3 +350,26 @@ async fn nested_object_correlation_stress() {
         );
     }
 }
+
+#[tokio::test]
+async fn insert_post_one_with_nested_user() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts_one(object: {
+                   title: "solo",
+                   user: { data: { name: "solo-user" } }
+                 }) {
+                   title
+                   user { name }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    let one = &v["insert_posts_one"];
+    assert_eq!(one["title"], json!("solo"));
+    assert_eq!(one["user"]["name"], json!("solo-user"));
+}
