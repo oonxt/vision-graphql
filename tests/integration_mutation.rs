@@ -334,3 +334,35 @@ async fn update_by_pk_selection_with_nested_relation() {
     assert_eq!(one["name"], json!("seed_a3"));
     assert!(one["posts"].as_array().unwrap().len() >= 1);
 }
+
+#[tokio::test]
+async fn delete_returning_with_nested_relation() {
+    let (engine, _c) = setup().await;
+    engine
+        .query(
+            r#"mutation { insert_users_one(object: {name: "tmp"}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed ok");
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 delete_users(where: {name: {_eq: "tmp"}}) {
+                   affected_rows
+                   returning {
+                     name
+                     posts { title }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["delete_users"]["affected_rows"], json!(1));
+    let rows = v["delete_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows[0]["name"], json!("tmp"));
+    assert_eq!(rows[0]["posts"], json!([]));
+}
