@@ -96,6 +96,34 @@ target = "profiles"
 mapping = [["id", "followed_id"]]
 ```
 
+## Mutations
+
+All mutation root fields (`insert_*`, `insert_*_one`, `update_*`, `update_*_by_pk`, `delete_*`, `delete_*_by_pk`) support a `returning` clause. Relation fields in `returning` work exactly like relation fields in `SELECT` queries — they expand to correlated subqueries with no N+1:
+
+```graphql
+mutation {
+  insert_users(objects: [{ name: "alice" }]) {
+    affected_rows
+    returning {
+      id
+      name
+      posts(order_by: [{ id: asc }]) { title }
+    }
+  }
+}
+```
+
+The same nesting is supported on `_by_pk` variants:
+
+```graphql
+mutation {
+  update_users_by_pk(pk_columns: { id: 1 }, _set: { name: "bob" }) {
+    id
+    posts { title }
+  }
+}
+```
+
 ## License
 
 MIT OR Apache-2.0
