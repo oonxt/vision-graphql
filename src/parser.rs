@@ -494,6 +494,41 @@ fn parse_insert_args(
             },
         });
     }
+
+    // Batch-uniform rule for nested_objects: every row must have the same
+    // set of object-relation keys (either all rows nest a given relation,
+    // or none do). Mixed is rejected to keep the renderer's JOIN clean.
+    if objects.len() > 1 {
+        let first_keys: std::collections::BTreeSet<&str> = objects[0]
+            .nested_objects
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        for (i, obj) in objects.iter().enumerate().skip(1) {
+            let these: std::collections::BTreeSet<&str> = obj
+                .nested_objects
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            if these != first_keys {
+                // Find a specific offender for the error message.
+                let missing: Vec<&&str> = first_keys.difference(&these).collect();
+                let extra: Vec<&&str> = these.difference(&first_keys).collect();
+                let detail = if !missing.is_empty() {
+                    format!("row 0 nests '{}' but row {i} does not", missing[0])
+                } else {
+                    format!("row {i} nests '{}' but row 0 does not", extra[0])
+                };
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.objects"),
+                    message: format!(
+                        "nested object-relation usage must be uniform across all rows in the batch: {detail}"
+                    ),
+                });
+            }
+        }
+    }
+
     Ok((objects, on_conflict))
 }
 
