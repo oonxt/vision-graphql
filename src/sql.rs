@@ -787,6 +787,7 @@ fn render_insert_cte(
         &parent_ords,
         on_conflict,
         None,
+        false, // top-level: NOT nested
         schema,
         ctx,
     )
@@ -800,6 +801,7 @@ fn render_insert_cte_recursive(
     parent_ords: &[i64],
     on_conflict: Option<&crate::ast::OnConflict>,
     parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
+    is_nested_cte: bool,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -872,14 +874,22 @@ fn render_insert_cte_recursive(
             .collect();
         // Object-relation child uses parent ordinals as its own ordinals (1:1).
         let child_ords: Vec<i64> = parent_ords.to_vec();
+        // Read on_conflict from objects[0]'s nested_objects[rel_name] — the
+        // GraphQL input attaches one wrapper per relation per parent row,
+        // and the batch-uniform rule means all rows have the same shape.
+        let child_on_conflict = objects
+            .first()
+            .and_then(|o| o.nested_objects.get(rel_name))
+            .and_then(|noi| noi.on_conflict.clone());
         let child_cte = format!("{cte}_{rel_name}");
         render_insert_cte_recursive(
             &child_cte,
             &rel.target_table,
             &child_rows,
             &child_ords,
-            None, // object-relation children don't carry on_conflict in Phase 3A
+            child_on_conflict.as_ref(),
             None, // NOT a child-of-parent; this is a prerequisite insert
+            true, // this is a nested CTE
             schema,
             ctx,
         )?;
@@ -1062,7 +1072,7 @@ fn render_insert_cte_recursive(
     }
 
     if let Some(oc) = on_conflict {
-        render_on_conflict(oc, table, schema, ctx)?;
+        render_on_conflict(oc, table, schema, is_nested_cte, ctx)?;
     }
     ctx.sql.push_str(" RETURNING *)");
 
@@ -1101,6 +1111,13 @@ fn render_insert_cte_recursive(
                 path: cte.into(),
                 message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
             })?;
+            // Find the first parent row that has this array relation; read its on_conflict.
+            // Array relations can be present in some parent rows and absent in others
+            // (unlike object relations which are batch-uniform), so we scan all parents.
+            let child_on_conflict = objects
+                .iter()
+                .find_map(|o| o.nested_arrays.get(rel_name))
+                .and_then(|nai| nai.on_conflict.clone());
             let child_cte = format!("{cte}_{rel_name}");
             let parent_ord_cte_name = format!("{cte}_ord");
             ctx.sql.push_str(", ");
@@ -1109,8 +1126,9 @@ fn render_insert_cte_recursive(
                 &rel.target_table,
                 &child_rows,
                 &child_ords,
-                None,
+                child_on_conflict.as_ref(),
                 Some((&parent_ord_cte_name, rel, table)),
+                true, // this is a nested CTE
                 schema,
                 ctx,
             )?;
@@ -1124,6 +1142,7 @@ fn render_on_conflict(
     oc: &crate::ast::OnConflict,
     table: &Table,
     schema: &Schema,
+    nested_context: bool,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     write!(
@@ -1133,7 +1152,37 @@ fn render_on_conflict(
     )
     .unwrap();
     if oc.update_columns.is_empty() {
-        ctx.sql.push_str("DO NOTHING");
+        if nested_context {
+            // Rewrite DO NOTHING → DO UPDATE SET pk = EXCLUDED.pk so
+            // RETURNING includes conflict rows and the downstream
+            // ROW_NUMBER() ord correlation stays 1:1 with input.
+            let pk_name = table.primary_key.first().ok_or_else(|| Error::Validate {
+                path: "on_conflict".into(),
+                message: format!(
+                    "nested DO NOTHING on-conflict requires a primary key on table '{}'",
+                    table.exposed_name
+                ),
+            })?;
+            let pk_col = table.find_column(pk_name).ok_or_else(|| Error::Validate {
+                path: "on_conflict".into(),
+                message: format!(
+                    "primary key column '{pk_name}' missing on '{}'",
+                    table.exposed_name
+                ),
+            })?;
+            // Reference the table's own column (not EXCLUDED) so the update
+            // is a true no-op: the existing PK value is preserved. Using
+            // EXCLUDED.pk would set it to the new-row's serial value instead.
+            write!(
+                ctx.sql,
+                "DO UPDATE SET {pk_phys} = {tbl}.{pk_phys}",
+                pk_phys = quote_ident(&pk_col.physical_name),
+                tbl = quote_ident(&table.physical_name),
+            )
+            .unwrap();
+        } else {
+            ctx.sql.push_str("DO NOTHING");
+        }
     } else {
         ctx.sql.push_str("DO UPDATE SET ");
         for (i, exposed) in oc.update_columns.iter().enumerate() {
