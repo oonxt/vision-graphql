@@ -121,3 +121,93 @@ async fn insert_post_with_nested_user() {
     assert_eq!(rows[0]["title"], json!("p1"));
     assert_eq!(rows[0]["user"]["name"], json!("alice"));
 }
+
+#[tokio::test]
+async fn nested_object_missing_data_key_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{ title: "t", user: {} }]) {
+                   affected_rows
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(msg.contains("'data'"), "error was: {msg}");
+}
+
+#[tokio::test]
+async fn nested_object_array_data_is_error() {
+    let (engine, _c) = setup().await;
+    // object-relation 'data' must be an object, not an array.
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "t", user: { data: [{ name: "x" }] } }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be a single object, not an array"),
+        "error was: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn nested_object_fk_and_nested_both_set_is_error() {
+    let (engine, _c) = setup().await;
+    // Can't both set user_id AND provide a nested user.
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "t", user_id: 99, user: { data: { name: "x" } } }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("populated from the nested object"),
+        "error was: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn nested_object_mixed_batch_is_error() {
+    let (engine, _c) = setup().await;
+    // Row 1 uses nested `user`, row 2 uses explicit user_id — rejected.
+    // Note: user_id=99 doesn't exist, but the parser should reject BEFORE executing SQL.
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "p1", user: { data: { name: "alice" } } },
+                   { title: "p2", user_id: 99 }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be uniform"),
+        "error was: {msg}"
+    );
+}
