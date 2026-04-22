@@ -364,3 +364,29 @@ async fn nested_insert_sibling_array_relations() {
         .collect();
     assert_eq!(kinds, vec![json!("like"), json!("wow")]);
 }
+
+#[tokio::test]
+async fn nested_insert_unrelated_sibling_returns_empty() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "a",
+                   posts: { data: [{ title: "p1" }] }
+                 }]) {
+                   returning {
+                     name
+                     posts     { title }
+                     reactions { kind }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows[0]["posts"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["reactions"], json!([]));
+}
