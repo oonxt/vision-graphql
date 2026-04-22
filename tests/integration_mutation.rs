@@ -366,3 +366,29 @@ async fn delete_returning_with_nested_relation() {
     assert_eq!(rows[0]["name"], json!("tmp"));
     assert_eq!(rows[0]["posts"], json!([]));
 }
+
+#[tokio::test]
+async fn delete_by_pk_selection_with_nested_relation() {
+    let (engine, _c) = setup().await;
+    let seeded: Value = engine
+        .query(
+            r#"mutation { insert_users_one(object: {name: "tmp2"}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed ok");
+    let id = seeded["insert_users_one"]["id"].as_i64().unwrap();
+
+    let mutation = format!(
+        r#"mutation {{
+             delete_users_by_pk(id: {id}) {{
+               name
+               posts {{ title }}
+             }}
+           }}"#
+    );
+    let v: Value = engine.query(&mutation, None).await.expect("mutation ok");
+    let one = &v["delete_users_by_pk"];
+    assert_eq!(one["name"], json!("tmp2"));
+    assert_eq!(one["posts"], json!([]));
+}
