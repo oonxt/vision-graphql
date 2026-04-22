@@ -312,7 +312,7 @@ fn render_bool_list(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_relation_field(
+fn render_relation_subquery(
     name: &str,
     alias: &str,
     args: &QueryArgs,
@@ -485,8 +485,35 @@ fn render_relation_field(
 
     ctx.sql.push_str(") ");
     ctx.sql.push_str(&row_alias);
-    write!(ctx.sql, r#") AS "{alias}""#).unwrap();
+    ctx.sql.push(')');
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_relation_field(
+    name: &str,
+    alias: &str,
+    args: &QueryArgs,
+    selection: &[Field],
+    parent_table: &Table,
+    parent_alias: &str,
+    schema: &Schema,
+    parent_path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    render_relation_subquery(
+        name,
+        alias,
+        args,
+        selection,
+        parent_table,
+        parent_alias,
+        schema,
+        parent_path,
+        ctx,
+    )?;
+    write!(ctx.sql, r#" AS "{alias}""#).unwrap();
     Ok(())
 }
 
@@ -1023,7 +1050,7 @@ fn render_mutation_output_for(
                 if returning.is_empty() {
                     ctx.sql.push_str("'{}'::json");
                 } else {
-                    render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                    render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
                 }
                 write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
             } else {
@@ -1032,7 +1059,7 @@ fn render_mutation_output_for(
                 if !returning.is_empty() {
                     ctx.sql
                         .push_str(", 'returning', (SELECT coalesce(json_agg(");
-                    render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                    render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
                     write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
                 } else {
                     ctx.sql.push_str(", 'returning', '[]'::json");
@@ -1060,7 +1087,7 @@ fn render_mutation_output_for(
             if !returning.is_empty() {
                 ctx.sql
                     .push_str(", 'returning', (SELECT coalesce(json_agg(");
-                render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
                 write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
@@ -1081,7 +1108,7 @@ fn render_mutation_output_for(
             if selection.is_empty() {
                 ctx.sql.push_str("'{}'::json");
             } else {
-                render_json_build_object_for_nodes(selection, cte, tbl, alias, ctx)?;
+                render_json_build_object_for_nodes(selection, cte, tbl, alias, schema, ctx)?;
             }
             write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
         }
@@ -1105,7 +1132,7 @@ fn render_mutation_output_for(
             if !returning.is_empty() {
                 ctx.sql
                     .push_str(", 'returning', (SELECT coalesce(json_agg(");
-                render_json_build_object_for_nodes(returning, cte, tbl, alias, ctx)?;
+                render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
                 write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
@@ -1126,7 +1153,7 @@ fn render_mutation_output_for(
             if selection.is_empty() {
                 ctx.sql.push_str("'{}'::json");
             } else {
-                render_json_build_object_for_nodes(selection, cte, tbl, alias, ctx)?;
+                render_json_build_object_for_nodes(selection, cte, tbl, alias, schema, ctx)?;
             }
             write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
         }
@@ -1156,7 +1183,7 @@ fn render_aggregate(
 
     if let Some(node_fields) = nodes {
         ctx.sql.push_str(", 'nodes', coalesce(json_agg(");
-        render_json_build_object_for_nodes(node_fields, &inner_alias, table, &root.alias, ctx)?;
+        render_json_build_object_for_nodes(node_fields, &inner_alias, table, &root.alias, schema, ctx)?;
         ctx.sql.push_str("), '[]'::json)");
     }
 
@@ -1222,6 +1249,7 @@ fn render_json_build_object_for_nodes(
     table_alias: &str,
     table: &Table,
     parent_path: &str,
+    schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     ctx.sql.push_str("json_build_object(");
@@ -1242,11 +1270,24 @@ fn render_json_build_object_for_nodes(
                 )
                 .unwrap();
             }
-            Field::Relation { .. } => {
-                return Err(Error::Validate {
-                    path: format!("{parent_path}.nodes"),
-                    message: "relations inside aggregate nodes not yet supported".into(),
-                });
+            Field::Relation {
+                name,
+                alias: rel_alias,
+                args,
+                selection,
+            } => {
+                write!(ctx.sql, "'{rel_alias}', ").unwrap();
+                render_relation_subquery(
+                    name,
+                    rel_alias,
+                    args,
+                    selection,
+                    table,
+                    table_alias,
+                    schema,
+                    parent_path,
+                    ctx,
+                )?;
             }
         }
     }
