@@ -248,3 +248,24 @@ async fn insert_array_returning_with_nested_relation() {
     // Newly-inserted user has no posts yet — must be an empty array, not null or missing.
     assert_eq!(rows[0]["posts"], json!([]));
 }
+
+#[tokio::test]
+async fn insert_one_returning_with_nested_relation() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users_one(object: {name: "eve"}) {
+                   id
+                   name
+                   posts { title }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    let one = &v["insert_users_one"];
+    assert_eq!(one["name"], json!("eve"));
+    assert_eq!(one["posts"], json!([]));
+}
