@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use tokio_postgres::NoTls;
-use vision_graphql::schema::{PgType, Schema, Table};
+use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
 
 fn schema() -> Schema {
@@ -13,7 +13,17 @@ fn schema() -> Schema {
                 .column("id", "id", PgType::Int4, false)
                 .column("name", "name", PgType::Text, false)
                 .column("age", "age", PgType::Int4, true)
-                .primary_key(&["id"]),
+                .primary_key(&["id"])
+                .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+        )
+        .table(
+            Table::new("posts", "public", "posts")
+                .column("id", "id", PgType::Int4, false)
+                .column("title", "title", PgType::Text, false)
+                .column("user_id", "user_id", PgType::Int4, false)
+                .column("published", "published", PgType::Bool, false)
+                .primary_key(&["id"])
+                .relation("user", Relation::object("users").on([("user_id", "id")])),
         )
         .build()
 }
@@ -45,9 +55,20 @@ async fn setup() -> (
                 r#"
                 CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL CONSTRAINT users_name_key UNIQUE,
                     age INT
                 );
+                CREATE TABLE posts (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    user_id INT NOT NULL REFERENCES users(id),
+                    published BOOL NOT NULL
+                );
+                INSERT INTO users (name) VALUES ('seed_a'), ('seed_b');
+                INSERT INTO posts (title, user_id, published) VALUES
+                    ('a1', 1, TRUE),
+                    ('a2', 1, FALSE),
+                    ('b1', 2, TRUE);
                 "#,
             )
             .await
@@ -199,4 +220,31 @@ async fn delete_by_pk_missing_returns_null() {
         .await
         .expect("mutation ok");
     assert!(v["delete_users_by_pk"].is_null());
+}
+
+#[tokio::test]
+async fn insert_array_returning_with_nested_relation() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{name: "dora"}]) {
+                   affected_rows
+                   returning {
+                     id
+                     name
+                     posts(order_by: [{id: asc}]) { title }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(1));
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], json!("dora"));
+    // Newly-inserted user has no posts yet — must be an empty array, not null or missing.
+    assert_eq!(rows[0]["posts"], json!([]));
 }
