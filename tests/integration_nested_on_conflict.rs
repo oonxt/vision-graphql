@@ -140,3 +140,52 @@ async fn nested_object_on_conflict_do_nothing_links_to_existing() {
     // Email unchanged — DO NOTHING means existing row wins.
     assert_eq!(row["user"]["email"], json!("old@e.com"));
 }
+
+#[tokio::test]
+async fn nested_wrapper_unknown_key_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "t",
+                   user: { data: { name: "alice" }, foo: "bar" }
+                 }]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("'data' and 'on_conflict'"),
+        "error should mention both supported keys; was: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn nested_on_conflict_missing_constraint_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "t",
+                   user: {
+                     data: { name: "alice" },
+                     on_conflict: { update_columns: [] }
+                   }
+                 }]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("'constraint'"),
+        "error should mention missing constraint; was: {msg}"
+    );
+}
