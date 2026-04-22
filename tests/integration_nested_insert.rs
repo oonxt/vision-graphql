@@ -390,3 +390,26 @@ async fn nested_insert_unrelated_sibling_returns_empty() {
     assert_eq!(rows[0]["posts"].as_array().unwrap().len(), 1);
     assert_eq!(rows[0]["reactions"], json!([]));
 }
+
+#[tokio::test]
+async fn nested_insert_empty_children_array() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "a",
+                   posts: { data: [] }
+                 }]) {
+                   affected_rows
+                   returning { name posts { title } }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(1));
+    assert_eq!(v["insert_users"]["returning"][0]["name"], json!("a"));
+    assert_eq!(v["insert_users"]["returning"][0]["posts"], json!([]));
+}
