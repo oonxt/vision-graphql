@@ -475,3 +475,85 @@ async fn nested_insert_rolls_back_on_child_failure() {
         .expect("lookup ok");
     assert_eq!(v["users"], json!([]));
 }
+
+#[tokio::test]
+async fn multi_field_mutation_returning_reads_real_table_not_prior_insert_cte() {
+    let (engine, _c) = setup().await;
+
+    // Seed: insert a user directly via a mutation (pre-existing data),
+    // then give them a post via a separate mutation. After setup, the
+    // database contains user "seed" with one post titled "seeded-post".
+    let setup_v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users_one(object: { name: "seed" }) { id }
+               }"#,
+            None,
+        )
+        .await
+        .expect("seed user");
+    let seed_user_id = setup_v["insert_users_one"]["id"].as_i64().unwrap();
+
+    let _: Value = engine
+        .query(
+            &format!(
+                r#"mutation {{
+                     insert_posts_one(object: {{ title: "seeded-post", user_id: {seed_user_id} }}) {{ id }}
+                   }}"#
+            ),
+            None,
+        )
+        .await
+        .expect("seed post");
+
+    // The bug-triggering mutation: two fields.
+    // Field 1 (alpha): insert_users with nested posts — populates
+    //   ctx.inserted_ctes["posts"] = "m0_posts"
+    // Field 2 (beta): update_users_by_pk on the SEED user — its returning
+    //   selects posts{title}. Without the fix, the posts subquery reads
+    //   from m0_posts (alpha's freshly-inserted posts), which is wrong;
+    //   it should read from public.posts and return the "seeded-post".
+    let mutation = format!(
+        r#"mutation {{
+             alpha: insert_users(objects: [{{
+               name: "alpha",
+               posts: {{ data: [{{ title: "alpha-p1" }}] }}
+             }}]) {{
+               returning {{ name posts {{ title }} }}
+             }}
+             beta: update_users_by_pk(
+               pk_columns: {{ id: {seed_user_id} }},
+               _set: {{ name: "seed-renamed" }}
+             ) {{
+               name
+               posts {{ title }}
+             }}
+           }}"#
+    );
+    let v: Value = engine.query(&mutation, None).await.expect("mutation ok");
+
+    // Alpha is fine — its nested returning should show the post it just inserted.
+    let alpha_titles: Vec<_> = v["alpha"]["returning"][0]["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(alpha_titles, vec![json!("alpha-p1")]);
+
+    // Beta is the bug scenario. Its posts{title} should show "seeded-post"
+    // (pre-existing data read from the real table), NOT "alpha-p1" (which
+    // would mean it incorrectly read from alpha's insert CTE).
+    assert_eq!(v["beta"]["name"], json!("seed-renamed"));
+    let beta_titles: Vec<_> = v["beta"]["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(
+        beta_titles,
+        vec![json!("seeded-post")],
+        "beta should see its own pre-existing post, not alpha's newly-inserted one"
+    );
+}
