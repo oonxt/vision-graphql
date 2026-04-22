@@ -260,8 +260,14 @@ fn lower_mutation_field(
             if let Some(table) = schema.table(base_name) {
                 let (objects, on_conflict) =
                     parse_insert_args(&field.arguments, table, schema, vars, alias, true)?;
-                let returning =
-                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                let returning = lower_selection_set(
+                    &field.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    alias,
+                )?;
                 return Ok(MutationField::Insert {
                     alias: alias.to_string(),
                     table: base_name.to_string(),
@@ -305,8 +311,14 @@ fn lower_mutation_field(
                     });
                 }
                 let (pk, set) = parse_update_by_pk_args(&field.arguments, table, vars, alias)?;
-                let selection =
-                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                let selection = lower_selection_set(
+                    &field.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    alias,
+                )?;
                 return Ok(MutationField::UpdateByPk {
                     alias: alias.to_string(),
                     table: base_name.to_string(),
@@ -359,8 +371,14 @@ fn lower_mutation_field(
                     let json = gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
                     pk.push((pk_col.clone(), json));
                 }
-                let selection =
-                    lower_selection_columns_only(&field.selection_set.node, table, alias)?;
+                let selection = lower_selection_set(
+                    &field.selection_set.node,
+                    table,
+                    schema,
+                    vars,
+                    fragments,
+                    alias,
+                )?;
                 return Ok(MutationField::DeleteByPk {
                     alias: alias.to_string(),
                     table: base_name.to_string(),
@@ -689,9 +707,12 @@ fn parse_returning(
         match fname {
             "affected_rows" => {}
             "returning" => {
-                returning = lower_selection_columns_only(
+                returning = lower_selection_set(
                     &field.selection_set.node,
                     table,
+                    schema,
+                    vars,
+                    fragments,
                     &format!("{parent_path}.returning"),
                 )?;
             }
