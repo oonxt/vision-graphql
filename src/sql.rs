@@ -799,8 +799,6 @@ fn render_insert_cte_recursive(
     objects: &[crate::ast::InsertObject],
     parent_ords: &[i64],
     on_conflict: Option<&crate::ast::OnConflict>,
-    // Some((parent_ord_cte_alias, relation, parent_table))
-    // when this call is a child insert.
     parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -816,8 +814,7 @@ fn render_insert_cte_recursive(
 
     if objects.is_empty() {
         // Nothing to insert at this level — emit a no-op CTE so later CTEs
-        // can still reference {cte} without type errors. Use a SELECT of an
-        // empty, correctly-typed row set.
+        // can still reference {cte} without type errors.
         write!(
             ctx.sql,
             "{cte} AS (SELECT * FROM {}.{} WHERE FALSE)",
@@ -826,10 +823,16 @@ fn render_insert_cte_recursive(
         )
         .unwrap();
         ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
+        // Also emit a no-op _ord so callers that JOIN against it don't break.
+        write!(
+            ctx.sql,
+            ", {cte}_ord AS (SELECT *, 0::bigint AS ord FROM {cte})"
+        )
+        .unwrap();
         return Ok(());
     }
 
-    // 1. Collect all columns appearing in any row.
+    // 1. Collect parent columns.
     let mut col_set: BTreeSet<String> = BTreeSet::new();
     for obj in objects {
         for k in obj.columns.keys() {
@@ -838,7 +841,52 @@ fn render_insert_cte_recursive(
     }
     let cols: Vec<String> = col_set.into_iter().collect();
 
-    // 2. Emit the `{cte}_input` VALUES CTE with the ord column and each column value.
+    // 2. Emit object-relation CTE chains BEFORE the parent input/insert.
+    //    Batch-uniform rule (enforced at parse): if any row has `nested_objects[k]`,
+    //    all rows do. Collect the rows and recursively emit each.
+    let mut object_rel_names: Vec<String> = Vec::new();
+    if let Some(first) = objects.first() {
+        for k in first.nested_objects.keys() {
+            object_rel_names.push(k.clone());
+        }
+    }
+
+    for rel_name in &object_rel_names {
+        let rel = table.find_relation(rel_name).ok_or_else(|| Error::Validate {
+            path: cte.into(),
+            message: format!(
+                "unknown relation '{rel_name}' on '{}'",
+                table.exposed_name
+            ),
+        })?;
+        // Gather the N object-rows (one per parent row), in parent ord order.
+        let child_rows: Vec<crate::ast::InsertObject> = objects
+            .iter()
+            .map(|o| {
+                o.nested_objects
+                    .get(rel_name)
+                    .expect("batch-uniform guarantees presence")
+                    .row
+                    .clone()
+            })
+            .collect();
+        // Object-relation child uses parent ordinals as its own ordinals (1:1).
+        let child_ords: Vec<i64> = parent_ords.to_vec();
+        let child_cte = format!("{cte}_{rel_name}");
+        render_insert_cte_recursive(
+            &child_cte,
+            &rel.target_table,
+            &child_rows,
+            &child_ords,
+            None, // object-relation children don't carry on_conflict in Phase 3A
+            None, // NOT a child-of-parent; this is a prerequisite insert
+            schema,
+            ctx,
+        )?;
+        ctx.sql.push_str(", ");
+    }
+
+    // 3. Emit the parent's `{cte}_input` VALUES CTE with ord + column values.
     let input_cte = format!("{cte}_input");
     let ord_col_name = if parent_link.is_some() { "parent_ord" } else { "ord" };
 
@@ -848,9 +896,7 @@ fn render_insert_cte_recursive(
             ctx.sql.push_str(", ");
         }
         ctx.sql.push('(');
-        // First column: the ordinal.
         write!(ctx.sql, "{}", parent_ords[r]).unwrap();
-        // Remaining columns: each value (or NULL cast to the correct type).
         for exposed in &cols {
             ctx.sql.push_str(", ");
             let col = table
@@ -879,11 +925,9 @@ fn render_insert_cte_recursive(
     }
     ctx.sql.push_str(")), ");
 
-    // 3. Emit the actual INSERT CTE.
-    //    If this is a child, we INSERT (<columns>, <fk_cols_from_parent>)
-    //    SELECT <cols>, p.<parent_pk_cols> FROM {input_cte} c JOIN {parent_ord_cte} p ON p.ord = c.parent_ord.
-    //    If this is top-level, we INSERT (<columns>)
-    //    SELECT <cols> FROM {input_cte} ORDER BY ord.
+    // 4. Emit the parent INSERT CTE. Column list = parent columns +
+    //    FK columns from parent_link (array-child case) + FK columns
+    //    from each object_rel in object_rel_names.
     write!(
         ctx.sql,
         "{cte} AS (INSERT INTO {}.{} (",
@@ -892,7 +936,6 @@ fn render_insert_cte_recursive(
     )
     .unwrap();
 
-    // Physical column list for INSERT target.
     let mut first = true;
     for exposed in &cols {
         if !first {
@@ -902,7 +945,7 @@ fn render_insert_cte_recursive(
         let col = table.find_column(exposed).unwrap();
         ctx.sql.push_str(&quote_ident(&col.physical_name));
     }
-    // Add FK columns when this is a child insert.
+    // FK columns from parent_link (Phase 2's array-child case).
     if let Some((_, rel, _)) = parent_link {
         for (_, child_col) in &rel.mapping {
             if !first {
@@ -916,53 +959,98 @@ fn render_insert_cte_recursive(
             ctx.sql.push_str(&quote_ident(&col.physical_name));
         }
     }
+    // FK columns from object relations (Phase 3A).
+    for rel_name in &object_rel_names {
+        let rel = table.find_relation(rel_name).unwrap();
+        for (parent_fk_col, _) in &rel.mapping {
+            if !first {
+                ctx.sql.push_str(", ");
+            }
+            first = false;
+            let col = table.find_column(parent_fk_col).ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!("mapped FK column '{parent_fk_col}' missing on '{}'", table.exposed_name),
+            })?;
+            ctx.sql.push_str(&quote_ident(&col.physical_name));
+        }
+    }
     ctx.sql.push(')');
 
     // SELECT source.
-    match parent_link {
-        None => {
-            ctx.sql.push_str(" SELECT ");
-            let mut first_sel = true;
-            for exposed in &cols {
-                if !first_sel {
-                    ctx.sql.push_str(", ");
-                }
-                first_sel = false;
-                ctx.sql.push_str(&quote_ident(exposed));
-            }
-            write!(ctx.sql, " FROM {input_cte} ORDER BY ord").unwrap();
+    ctx.sql.push_str(" SELECT ");
+    let mut first_sel = true;
+    for exposed in &cols {
+        if !first_sel {
+            ctx.sql.push_str(", ");
         }
-        Some((parent_ord_cte_alias, rel, parent_table)) => {
-            ctx.sql.push_str(" SELECT ");
-            let mut first_sel = true;
-            for exposed in &cols {
-                if !first_sel {
-                    ctx.sql.push_str(", ");
-                }
-                first_sel = false;
-                write!(ctx.sql, "c.{}", quote_ident(exposed)).unwrap();
+        first_sel = false;
+        write!(ctx.sql, "c.{}", quote_ident(exposed)).unwrap();
+    }
+    // FK from parent_link (array-child case).
+    if let Some((_, rel, parent_table)) = parent_link {
+        for (parent_col, _) in &rel.mapping {
+            if !first_sel {
+                ctx.sql.push_str(", ");
             }
-            // FK columns come from the parent ord CTE.
-            for (parent_col, _) in &rel.mapping {
-                if !first_sel {
-                    ctx.sql.push_str(", ");
-                }
-                first_sel = false;
-                let pcol = parent_table.find_column(parent_col).ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!(
-                        "mapped parent column '{parent_col}' missing on '{}'",
-                        parent_table.exposed_name
-                    ),
-                })?;
-                write!(ctx.sql, "p.{}", quote_ident(&pcol.physical_name)).unwrap();
+            first_sel = false;
+            let pcol = parent_table.find_column(parent_col).ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!(
+                    "mapped parent column '{parent_col}' missing on '{}'",
+                    parent_table.exposed_name
+                ),
+            })?;
+            write!(ctx.sql, "p.{}", quote_ident(&pcol.physical_name)).unwrap();
+        }
+    }
+    // FK from each object relation (Phase 3A). Alias for each object-ord join
+    // is `o_{rel_name}` — unique per object relation.
+    for rel_name in &object_rel_names {
+        let rel = table.find_relation(rel_name).unwrap();
+        let obj_target = schema.table(&rel.target_table).ok_or_else(|| Error::Validate {
+            path: cte.into(),
+            message: format!("object-relation target '{}' missing", rel.target_table),
+        })?;
+        for (_, target_col) in &rel.mapping {
+            if !first_sel {
+                ctx.sql.push_str(", ");
             }
+            first_sel = false;
+            let tcol = obj_target.find_column(target_col).ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!(
+                    "mapped target column '{target_col}' missing on '{}'",
+                    obj_target.exposed_name
+                ),
+            })?;
             write!(
                 ctx.sql,
-                " FROM {input_cte} c JOIN {parent_ord_cte_alias} p ON p.ord = c.parent_ord"
+                "o_{rel_name}.{}",
+                quote_ident(&tcol.physical_name)
             )
             .unwrap();
         }
+    }
+
+    // FROM clause. Base is the input CTE. Add JOINs for parent_link
+    // (Phase 2) and each object relation (Phase 3A).
+    write!(ctx.sql, " FROM {input_cte} c").unwrap();
+
+    if let Some((parent_ord_cte_alias, _rel, _parent_table)) = parent_link {
+        write!(
+            ctx.sql,
+            " JOIN {parent_ord_cte_alias} p ON p.ord = c.parent_ord"
+        )
+        .unwrap();
+    }
+
+    for rel_name in &object_rel_names {
+        let obj_ord_cte = format!("{cte}_{rel_name}_ord");
+        write!(
+            ctx.sql,
+            " JOIN {obj_ord_cte} o_{rel_name} ON o_{rel_name}.ord = c.ord"
+        )
+        .unwrap();
     }
 
     if let Some(oc) = on_conflict {
@@ -970,21 +1058,20 @@ fn render_insert_cte_recursive(
     }
     ctx.sql.push_str(" RETURNING *)");
 
-    // Track this CTE for returning-visibility lookup.
+    // 5. Track this CTE for returning-visibility lookup.
     ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
 
-    // 4. For each nested array relation, emit the parent-ord CTE first
-    //    (because children need to JOIN against it), then the child chain.
+    // 6. Always emit `{cte}_ord` so any consumer (array-children or object-relation
+    //    parents) can JOIN against it.
+    write!(
+        ctx.sql,
+        ", {cte}_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM {cte})"
+    )
+    .unwrap();
+
+    // 7. For each nested array relation, emit the child chain.
     let any_nested_arrays = objects.iter().any(|o| !o.nested_arrays.is_empty());
     if any_nested_arrays {
-        write!(
-            ctx.sql,
-            ", {cte}_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM {cte})"
-        )
-        .unwrap();
-
-        // Group children by relation name across all parent objects, tracking
-        // which parent_ord each child row belongs to.
         use std::collections::BTreeMap;
         let mut per_relation: BTreeMap<&str, (Vec<i64>, Vec<crate::ast::InsertObject>)> =
             BTreeMap::new();
@@ -1006,7 +1093,6 @@ fn render_insert_cte_recursive(
                 path: cte.into(),
                 message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
             })?;
-            // Child CTE alias: `{cte}_{rel_name}`.
             let child_cte = format!("{cte}_{rel_name}");
             let parent_ord_cte_name = format!("{cte}_ord");
             ctx.sql.push_str(", ");
@@ -1015,7 +1101,7 @@ fn render_insert_cte_recursive(
                 &rel.target_table,
                 &child_rows,
                 &child_ords,
-                None, // nested children don't carry their own on_conflict in Phase 2
+                None,
                 Some((&parent_ord_cte_name, rel, table)),
                 schema,
                 ctx,
