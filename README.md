@@ -124,6 +124,37 @@ mutation {
 }
 ```
 
+### Nested one-to-many insert
+
+Array relations can be inserted alongside their parent in a single atomic
+mutation. The input uses Hasura's `{ data: [...] }` shape so that `on_conflict`
+can be added as a sibling in a future release without a breaking change.
+
+```graphql
+mutation {
+  insert_users(objects: [
+    {
+      name: "alice",
+      posts: { data: [
+        { title: "p1" },
+        { title: "p2", published: true }
+      ]}
+    }
+  ]) {
+    affected_rows          # includes parents + every descendant
+    returning {
+      id
+      name
+      posts { title }      # sees freshly-inserted children
+    }
+  }
+}
+```
+
+Nesting is arbitrary-depth (e.g. users → posts → comments). Object-relation
+nested insert (e.g. `insert_posts(objects: [{ title, user: { data: {...} } }])`)
+is not yet supported — use a separate mutation for now.
+
 ## License
 
 MIT OR Apache-2.0
