@@ -1153,9 +1153,11 @@ fn render_on_conflict(
     .unwrap();
     if oc.update_columns.is_empty() {
         if nested_context {
-            // Rewrite DO NOTHING → DO UPDATE SET pk = EXCLUDED.pk so
-            // RETURNING includes conflict rows and the downstream
-            // ROW_NUMBER() ord correlation stays 1:1 with input.
+            // Rewrite DO NOTHING → DO UPDATE SET pk = table.pk (a true no-op
+            // referencing the existing row's value; NOT EXCLUDED.pk which
+            // would change the value to the proposed sequence id) so RETURNING
+            // includes conflict rows and the downstream ROW_NUMBER() ord
+            // correlation stays 1:1 with input.
             let pk_name = table.primary_key.first().ok_or_else(|| Error::Validate {
                 path: "on_conflict".into(),
                 message: format!(
