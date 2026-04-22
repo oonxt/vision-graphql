@@ -269,3 +269,37 @@ async fn insert_one_returning_with_nested_relation() {
     assert_eq!(one["name"], json!("eve"));
     assert_eq!(one["posts"], json!([]));
 }
+
+#[tokio::test]
+async fn update_returning_with_nested_relation() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 update_users(
+                   where: {name: {_eq: "seed_a"}},
+                   _set: {name: "seed_a2"}
+                 ) {
+                   affected_rows
+                   returning {
+                     name
+                     posts(order_by: [{id: asc}]) { title }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["update_users"]["affected_rows"], json!(1));
+    let rows = v["update_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], json!("seed_a2"));
+    let titles: Vec<_> = rows[0]["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(titles, vec![json!("a1"), json!("a2")]);
+}
