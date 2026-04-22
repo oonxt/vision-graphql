@@ -583,17 +583,28 @@ fn parse_insert_object(
                         message: "expected array".into(),
                     })?;
 
-                    // Reject any extra keys in the wrapper (e.g. stray on_conflict, which is Phase 3).
+                    // Reject any extra keys in the wrapper.
                     for other_k in wrapper.keys() {
-                        if other_k != "data" {
+                        if other_k != "data" && other_k != "on_conflict" {
                             return Err(Error::Validate {
                                 path: format!("{path}.{k}.{other_k}"),
                                 message: format!(
-                                    "unknown key '{other_k}' in nested array insert; only 'data' is supported"
+                                    "unknown key '{other_k}' in nested array insert; only 'data' and 'on_conflict' are supported"
                                 ),
                             });
                         }
                     }
+
+                    // Parse optional on_conflict against the CHILD table.
+                    let on_conflict = if let Some(oc_json) = wrapper.get("on_conflict") {
+                        Some(parse_on_conflict(
+                            oc_json,
+                            target,
+                            &format!("{path}.{k}.on_conflict"),
+                        )?)
+                    } else {
+                        None
+                    };
 
                     // Recurse into each child row.
                     let mut rows = Vec::with_capacity(data_arr.len());
@@ -626,7 +637,7 @@ fn parse_insert_object(
                         crate::ast::NestedArrayInsert {
                             table: rel.target_table.clone(),
                             rows,
-                            on_conflict: None,
+                            on_conflict,
                         },
                     );
                     continue;
@@ -666,17 +677,28 @@ fn parse_insert_object(
                         });
                     }
 
-                    // Reject extra keys in the wrapper (leaves room for Phase 3B on_conflict).
+                    // Reject extra keys in the wrapper.
                     for other_k in wrapper.keys() {
-                        if other_k != "data" {
+                        if other_k != "data" && other_k != "on_conflict" {
                             return Err(Error::Validate {
                                 path: format!("{path}.{k}.{other_k}"),
                                 message: format!(
-                                    "unknown key '{other_k}' in nested object insert; only 'data' is supported"
+                                    "unknown key '{other_k}' in nested object insert; only 'data' and 'on_conflict' are supported"
                                 ),
                             });
                         }
                     }
+
+                    // Parse optional on_conflict against the CHILD table.
+                    let on_conflict = if let Some(oc_json) = wrapper.get("on_conflict") {
+                        Some(parse_on_conflict(
+                            oc_json,
+                            target,
+                            &format!("{path}.{k}.on_conflict"),
+                        )?)
+                    } else {
+                        None
+                    };
 
                     // Reject FK-column-also-set conflict: the parent row must not
                     // specify the mapped FK column when it's also providing nested
@@ -705,7 +727,7 @@ fn parse_insert_object(
                         crate::ast::NestedObjectInsert {
                             table: rel.target_table.clone(),
                             row: child,
-                            on_conflict: None,
+                            on_conflict,
                         },
                     );
                     continue;
