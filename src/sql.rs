@@ -2315,6 +2315,7 @@ mod tests {
                     nested_arrays: BTreeMap::new(),
                     nested_objects: BTreeMap::new(),
                 }],
+                on_conflict: None,
             },
         );
 
@@ -2388,6 +2389,7 @@ mod tests {
                     nested_arrays: BTreeMap::new(),
                     nested_objects: BTreeMap::new(),
                 },
+                on_conflict: None,
             },
         );
 

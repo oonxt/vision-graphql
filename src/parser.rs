@@ -626,6 +626,7 @@ fn parse_insert_object(
                         crate::ast::NestedArrayInsert {
                             table: rel.target_table.clone(),
                             rows,
+                            on_conflict: None,
                         },
                     );
                     continue;
@@ -704,6 +705,7 @@ fn parse_insert_object(
                         crate::ast::NestedObjectInsert {
                             table: rel.target_table.clone(),
                             row: child,
+                            on_conflict: None,
                         },
                     );
                     continue;

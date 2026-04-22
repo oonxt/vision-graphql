@@ -188,6 +188,11 @@ pub struct NestedArrayInsert {
     /// Rows to insert as children. Each element is itself an `InsertObject`,
     /// so this recurses arbitrarily deep.
     pub rows: Vec<InsertObject>,
+    /// Optional Hasura-style on_conflict applied when emitting this
+    /// nested INSERT. When present with `update_columns: []`, the renderer
+    /// transparently rewrites `DO NOTHING` → `DO UPDATE SET pk = EXCLUDED.pk`
+    /// to keep RETURNING correlated 1:1 with input ords.
+    pub on_conflict: Option<OnConflict>,
 }
 
 /// A nested `user: { data: {...} }` block attached to one parent row.
@@ -199,6 +204,9 @@ pub struct NestedObjectInsert {
     /// The row to insert. The engine inserts this BEFORE the parent row
     /// and uses its PK as the parent's FK.
     pub row: InsertObject,
+    /// Optional Hasura-style on_conflict. Same rewrite semantics as
+    /// NestedArrayInsert.
+    pub on_conflict: Option<OnConflict>,
 }
 
 #[cfg(test)]
