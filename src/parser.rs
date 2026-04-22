@@ -238,7 +238,7 @@ fn lower_mutation(
             .as_ref()
             .map(|a| a.node.as_str().to_string())
             .unwrap_or_else(|| name.to_string());
-        let mf = lower_mutation_field(name, &alias, field, schema, vars)?;
+        let mf = lower_mutation_field(name, &alias, field, schema, vars, fragments)?;
         fields.push(mf);
     }
     Ok(Operation::Mutation(fields))
@@ -250,6 +250,7 @@ fn lower_mutation_field(
     field: &GqlField,
     schema: &Schema,
     vars: &Value,
+    fragments: &Fragments<'_>,
 ) -> Result<crate::ast::MutationField> {
     use crate::ast::MutationField;
 
@@ -278,7 +279,7 @@ fn lower_mutation_field(
         if let Some(table) = schema.table(base_name) {
             let (objects, on_conflict) =
                 parse_insert_args(&field.arguments, table, schema, vars, alias, false)?;
-            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
             return Ok(MutationField::Insert {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -321,7 +322,7 @@ fn lower_mutation_field(
     if let Some(base_name) = name.strip_prefix("update_") {
         if let Some(table) = schema.table(base_name) {
             let (where_, set) = parse_update_args(&field.arguments, table, schema, vars, alias)?;
-            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
             return Ok(MutationField::Update {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -396,7 +397,7 @@ fn lower_mutation_field(
                 path: alias.into(),
                 message: "delete requires 'where'".into(),
             })?;
-            let returning = parse_returning(&field.selection_set.node, table, alias)?;
+            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
             return Ok(MutationField::Delete {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -668,7 +669,14 @@ fn parse_update_by_pk_args(
     Ok((pk, set))
 }
 
-fn parse_returning(set: &SelectionSet, table: &Table, parent_path: &str) -> Result<Vec<Field>> {
+fn parse_returning(
+    set: &SelectionSet,
+    table: &Table,
+    schema: &Schema,
+    vars: &Value,
+    fragments: &Fragments<'_>,
+    parent_path: &str,
+) -> Result<Vec<Field>> {
     let mut returning: Vec<Field> = Vec::new();
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
