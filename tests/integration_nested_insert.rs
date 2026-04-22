@@ -413,3 +413,33 @@ async fn nested_insert_empty_children_array() {
     assert_eq!(v["insert_users"]["returning"][0]["name"], json!("a"));
     assert_eq!(v["insert_users"]["returning"][0]["posts"], json!([]));
 }
+
+#[tokio::test]
+async fn nested_insert_one_with_children() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users_one(object: {
+                   name: "solo",
+                   posts: { data: [{ title: "p1" }, { title: "p2" }] }
+                 }) {
+                   id
+                   name
+                   posts(order_by: [{ id: asc }]) { title }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    let one = &v["insert_users_one"];
+    assert_eq!(one["name"], json!("solo"));
+    let titles: Vec<_> = one["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(titles, vec![json!("p1"), json!("p2")]);
+}
