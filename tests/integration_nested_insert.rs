@@ -13,7 +13,8 @@ fn schema() -> Schema {
                 .column("id", "id", PgType::Int4, false)
                 .column("name", "name", PgType::Text, false)
                 .primary_key(&["id"])
-                .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+                .relation("posts", Relation::array("posts").on([("id", "user_id")]))
+                .relation("reactions", Relation::array("reactions").on([("id", "user_id")])),
         )
         .table(
             Table::new("posts", "public", "posts")
@@ -30,6 +31,13 @@ fn schema() -> Schema {
                 .column("id", "id", PgType::Int4, false)
                 .column("body", "body", PgType::Text, false)
                 .column("post_id", "post_id", PgType::Int4, false)
+                .primary_key(&["id"]),
+        )
+        .table(
+            Table::new("reactions", "public", "reactions")
+                .column("id", "id", PgType::Int4, false)
+                .column("kind", "kind", PgType::Text, false)
+                .column("user_id", "user_id", PgType::Int4, false)
                 .primary_key(&["id"]),
         )
         .build()
@@ -74,6 +82,11 @@ async fn setup() -> (
                     id SERIAL PRIMARY KEY,
                     body TEXT NOT NULL,
                     post_id INT NOT NULL REFERENCES posts(id)
+                );
+                CREATE TABLE reactions (
+                    id SERIAL PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    user_id INT NOT NULL REFERENCES users(id)
                 );
                 "#,
             )
@@ -315,4 +328,39 @@ async fn nested_insert_three_levels() {
     assert_eq!(comments.len(), 2);
     assert_eq!(comments[0]["body"], json!("c1"));
     assert_eq!(comments[1]["body"], json!("c2"));
+}
+
+#[tokio::test]
+async fn nested_insert_sibling_array_relations() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "a",
+                   posts:     { data: [{ title: "p1" }] },
+                   reactions: { data: [{ kind: "like" }, { kind: "wow" }] }
+                 }]) {
+                   affected_rows
+                   returning {
+                     name
+                     posts     { title }
+                     reactions(order_by: [{ id: asc }]) { kind }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(4));
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows[0]["posts"].as_array().unwrap().len(), 1);
+    let kinds: Vec<_> = rows[0]["reactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["kind"].clone())
+        .collect();
+    assert_eq!(kinds, vec![json!("like"), json!("wow")]);
 }
