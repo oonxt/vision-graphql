@@ -439,3 +439,52 @@ async fn two_level_nested_on_conflict_on_innermost() {
     assert_eq!(row["user"]["organization"]["id"].as_i64().unwrap(), acme_id);
     assert_eq!(row["user"]["organization"]["name"], json!("acme"));
 }
+
+#[tokio::test]
+async fn sibling_object_and_array_with_on_conflict() {
+    let (engine, _c) = setup().await;
+
+    let seeded: Value = engine
+        .query(
+            r#"mutation { insert_users_one(object: { name: "alice", email: "old@e.com" }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed alice");
+    let alice_id = seeded["insert_users_one"]["id"].as_i64().unwrap();
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "sibling-post",
+                   user: {
+                     data: { name: "alice" },
+                     on_conflict: { constraint: "users_name_key", update_columns: [] }
+                   },
+                   comments: { data: [{ body: "c1" }, { body: "c2" }] }
+                 }]) {
+                   returning {
+                     title
+                     user { id email }
+                     comments(order_by: [{ id: asc }]) { body }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+
+    let row = &v["insert_posts"]["returning"][0];
+    assert_eq!(row["title"], json!("sibling-post"));
+    assert_eq!(row["user"]["id"].as_i64().unwrap(), alice_id);
+    assert_eq!(row["user"]["email"], json!("old@e.com"));
+    let bodies: Vec<_> = row["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["body"].clone())
+        .collect();
+    assert_eq!(bodies, vec![json!("c1"), json!("c2")]);
+}
