@@ -109,3 +109,82 @@ async fn insert_one_parent_with_one_child() {
     assert_eq!(posts.len(), 1);
     assert_eq!(posts[0]["title"], json!("p1"));
 }
+
+#[tokio::test]
+async fn nested_insert_missing_data_key_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{ name: "x", posts: {} }]) {
+                   affected_rows
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(msg.contains("'data'"), "error was: {msg}");
+}
+
+#[tokio::test]
+async fn nested_insert_non_array_data_is_error() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{ name: "x", posts: { data: {} } }]) {
+                   affected_rows
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(msg.contains("expected array"), "error was: {msg}");
+}
+
+#[tokio::test]
+async fn nested_insert_child_fk_column_rejected() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [
+                   { name: "x", posts: { data: [{ title: "t", user_id: 99 }] } }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(msg.contains("populated from the parent"), "error was: {msg}");
+}
+
+#[tokio::test]
+async fn nested_insert_object_relation_rejected() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [
+                   { title: "t", user: { data: { name: "x" } } }
+                 ]) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .err()
+        .expect("expected error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("object-relation nested insert for 'user'"),
+        "error was: {msg}"
+    );
+}
