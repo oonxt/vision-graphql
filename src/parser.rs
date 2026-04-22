@@ -439,12 +439,9 @@ fn parse_insert_args(
     vars: &Value,
     parent_path: &str,
     single: bool,
-) -> Result<(
-    Vec<std::collections::BTreeMap<String, serde_json::Value>>,
-    Option<crate::ast::OnConflict>,
-)> {
+) -> Result<(Vec<crate::ast::InsertObject>, Option<crate::ast::OnConflict>)> {
     use std::collections::BTreeMap;
-    let mut objects: Vec<BTreeMap<String, serde_json::Value>> = Vec::new();
+    let mut objects: Vec<crate::ast::InsertObject> = Vec::new();
     let mut on_conflict: Option<crate::ast::OnConflict> = None;
     let _ = schema;
 
@@ -455,7 +452,10 @@ fn parse_insert_args(
             "object" if single => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.object"))?;
                 let obj = json_object_to_map(&json, table, &format!("{parent_path}.object"))?;
-                objects.push(obj);
+                objects.push(crate::ast::InsertObject {
+                    columns: obj,
+                    nested: BTreeMap::new(),
+                });
             }
             "objects" if !single => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.objects"))?;
@@ -464,9 +464,15 @@ fn parse_insert_args(
                     message: "expected array".into(),
                 })?;
                 for (i, item) in arr.iter().enumerate() {
-                    let obj =
-                        json_object_to_map(item, table, &format!("{parent_path}.objects[{i}]"))?;
-                    objects.push(obj);
+                    let obj = json_object_to_map(
+                        item,
+                        table,
+                        &format!("{parent_path}.objects[{i}]"),
+                    )?;
+                    objects.push(crate::ast::InsertObject {
+                        columns: obj,
+                        nested: BTreeMap::new(),
+                    });
                 }
             }
             "on_conflict" => {

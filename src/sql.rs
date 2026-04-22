@@ -727,7 +727,7 @@ fn render_mutation(
 fn render_insert_cte(
     cte: &str,
     table_name: &str,
-    objects: &[std::collections::BTreeMap<String, serde_json::Value>],
+    objects: &[crate::ast::InsertObject],
     on_conflict: Option<&crate::ast::OnConflict>,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -740,7 +740,7 @@ fn render_insert_cte(
     use std::collections::BTreeSet;
     let mut col_set: BTreeSet<String> = BTreeSet::new();
     for obj in objects {
-        for k in obj.keys() {
+        for k in obj.columns.keys() {
             col_set.insert(k.clone());
         }
     }
@@ -774,7 +774,7 @@ fn render_insert_cte(
             if i > 0 {
                 ctx.sql.push_str(", ");
             }
-            let value = obj.get(exposed);
+            let value = obj.columns.get(exposed);
             let col = table.find_column(exposed).unwrap();
             match value {
                 None => {
@@ -1639,15 +1639,18 @@ mod tests {
 
     #[test]
     fn render_insert_array_with_returning() {
-        use crate::ast::MutationField;
+        use crate::ast::{InsertObject, MutationField};
         use std::collections::BTreeMap;
 
-        let mut obj = BTreeMap::new();
-        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
-            objects: vec![obj],
+            objects: vec![InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            }],
             on_conflict: None,
             returning: vec![Field::Column {
                 physical: "id".into(),
@@ -1662,15 +1665,18 @@ mod tests {
 
     #[test]
     fn render_insert_one() {
-        use crate::ast::MutationField;
+        use crate::ast::{InsertObject, MutationField};
         use std::collections::BTreeMap;
 
-        let mut obj = BTreeMap::new();
-        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users_one".into(),
             table: "users".into(),
-            objects: vec![obj],
+            objects: vec![InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            }],
             on_conflict: None,
             returning: vec![Field::Column {
                 physical: "id".into(),
@@ -1858,7 +1864,7 @@ mod tests {
 
     #[test]
     fn render_insert_array_with_nested_relation_returning() {
-        use crate::ast::MutationField;
+        use crate::ast::{InsertObject, MutationField};
         use crate::schema::Relation;
         use std::collections::BTreeMap;
 
@@ -1879,12 +1885,15 @@ mod tests {
             )
             .build();
 
-        let mut obj = BTreeMap::new();
-        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
-            objects: vec![obj],
+            objects: vec![InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            }],
             on_conflict: None,
             returning: vec![
                 Field::Column {

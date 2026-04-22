@@ -119,8 +119,8 @@ pub enum MutationField {
     Insert {
         alias: String,
         table: String,
-        /// Each inner map is `{ exposed_column -> value }` for one row to insert.
-        objects: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+        /// Each element is one parent row with its optional nested children.
+        objects: Vec<InsertObject>,
         on_conflict: Option<OnConflict>,
         returning: Vec<Field>,
         /// true for `insert_users_one` (single object result); false for `insert_users`
@@ -161,6 +161,27 @@ pub struct OnConflict {
     pub constraint: String,
     pub update_columns: Vec<String>,
     pub where_: Option<BoolExpr>,
+}
+
+/// One row being inserted. Carries regular column values plus any
+/// nested array-relation inserts that should happen as children.
+#[derive(Debug, Clone, Default)]
+pub struct InsertObject {
+    /// `{ exposed_column -> value }` for this parent row.
+    pub columns: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Nested array-relation inserts, keyed by the parent-side relation name.
+    /// Each value carries the rows to insert as children of *this* parent row.
+    pub nested: std::collections::BTreeMap<String, NestedArrayInsert>,
+}
+
+/// A nested `posts: { data: [...] }` block attached to one parent row.
+#[derive(Debug, Clone)]
+pub struct NestedArrayInsert {
+    /// Target table name (resolved from the parent relation's `target_table`).
+    pub table: String,
+    /// Rows to insert as children. Each element is itself an `InsertObject`,
+    /// so this recurses arbitrarily deep.
+    pub rows: Vec<InsertObject>,
 }
 
 #[cfg(test)]
@@ -255,12 +276,15 @@ mod tests {
     #[test]
     fn build_insert_mutation() {
         use std::collections::BTreeMap;
-        let mut obj = BTreeMap::new();
-        obj.insert("name".to_string(), serde_json::json!("alice"));
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
         let m = MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
-            objects: vec![obj],
+            objects: vec![InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            }],
             on_conflict: None,
             returning: vec![Field::Column {
                 physical: "id".into(),

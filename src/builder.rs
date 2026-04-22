@@ -4,8 +4,8 @@
 //! so the engine runs them through the same pipeline.
 
 use crate::ast::{
-    AggOp, BoolExpr, CmpOp, Field, MutationField, OnConflict, Operation, OrderBy, OrderDir,
-    QueryArgs, RootBody, RootField,
+    AggOp, BoolExpr, CmpOp, Field, InsertObject, MutationField, OnConflict, Operation, OrderBy,
+    OrderDir, QueryArgs, RootBody, RootField,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -375,10 +375,17 @@ impl Mutation {
         objects: Vec<BTreeMap<String, Value>>,
     ) -> InsertBuilder {
         let t: String = table.into();
+        let insert_objects = objects
+            .into_iter()
+            .map(|columns| InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            })
+            .collect();
         InsertBuilder {
             alias: format!("insert_{t}"),
             table: t,
-            objects,
+            objects: insert_objects,
             on_conflict: None,
             returning: Vec::new(),
             one: false,
@@ -391,11 +398,15 @@ impl Mutation {
         K: Into<String>,
     {
         let t: String = table.into();
-        let map: BTreeMap<String, Value> = obj.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        let columns: BTreeMap<String, Value> =
+            obj.into_iter().map(|(k, v)| (k.into(), v)).collect();
         InsertBuilder {
             alias: format!("insert_{t}_one"),
             table: t,
-            objects: vec![map],
+            objects: vec![InsertObject {
+                columns,
+                nested: BTreeMap::new(),
+            }],
             on_conflict: None,
             returning: Vec::new(),
             one: true,
@@ -460,7 +471,7 @@ impl Mutation {
 pub struct InsertBuilder {
     alias: String,
     table: String,
-    objects: Vec<BTreeMap<String, Value>>,
+    objects: Vec<InsertObject>,
     on_conflict: Option<OnConflict>,
     returning: Vec<Field>,
     one: bool,
