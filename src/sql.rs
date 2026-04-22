@@ -27,6 +27,11 @@ struct RenderCtx {
     /// from the CTE (when source was just inserted here) or from the real
     /// table (Phase 1 behavior).
     inserted_ctes: std::collections::HashMap<String, String>,
+    /// Umbrella CTE alias (e.g., "m0") for the mutation field currently
+    /// being rendered in render_mutation_output_for. Used to filter which
+    /// entries of inserted_ctes are visible to returning-subquery lookup,
+    /// preventing cross-field bleed in multi-field mutation blocks.
+    current_mutation_cte: Option<String>,
 }
 
 impl RenderCtx {
@@ -407,7 +412,19 @@ fn render_relation_subquery(
             }
         }
     }
-    if let Some(cte_alias) = ctx.inserted_ctes.get(&rel.target_table).cloned() {
+    let visible_cte = match (
+        ctx.inserted_ctes.get(&rel.target_table),
+        ctx.current_mutation_cte.as_deref(),
+    ) {
+        (Some(cte_alias), Some(prefix))
+            if cte_alias == prefix || cte_alias.starts_with(&format!("{prefix}_")) =>
+        {
+            Some(cte_alias.clone())
+        }
+        _ => None,
+    };
+
+    if let Some(cte_alias) = visible_cte {
         write!(ctx.sql, " FROM {cte_alias} {remote_alias}").unwrap();
     } else {
         write!(
@@ -1232,6 +1249,18 @@ fn render_delete_by_pk_cte(
 }
 
 fn render_mutation_output_for(
+    mf: &crate::ast::MutationField,
+    cte: &str,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let prev = ctx.current_mutation_cte.replace(cte.to_string());
+    let result = render_mutation_output_for_inner(mf, cte, schema, ctx);
+    ctx.current_mutation_cte = prev;
+    result
+}
+
+fn render_mutation_output_for_inner(
     mf: &crate::ast::MutationField,
     cte: &str,
     schema: &Schema,
