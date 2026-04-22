@@ -316,6 +316,10 @@ async fn nested_array_on_conflict_do_nothing_preserves_existing() {
         .await
         .expect("seed existing post");
 
+    // Insert user "bob" with nested posts, one conflict, one fresh; DO NOTHING.
+    // The conflicting "already-there" row stays owned by alice (DO NOTHING preserved the existing ownership);
+    // "bob-fresh" is bob's. Bob's returning.posts correctly shows only "bob-fresh" because
+    // the FK-filtered relation view excludes posts not owned by bob.
     let v: Value = engine
         .query(
             r#"mutation {
@@ -345,24 +349,31 @@ async fn nested_array_on_conflict_do_nothing_preserves_existing() {
     assert_eq!(row["name"], json!("bob"));
     let bob_id = row["id"].as_i64().unwrap();
 
+    // Bob's posts-relation view shows only the freshly-inserted post — the
+    // conflicting "already-there" was DO NOTHING'd and remains owned by alice,
+    // so it's correctly filtered out of bob's FK-correlated returning subquery.
     let posts = row["posts"].as_array().unwrap();
-    assert_eq!(posts.len(), 2);
-
-    let already = posts
-        .iter()
-        .find(|p| p["title"] == json!("already-there"))
-        .expect("already-there present");
     assert_eq!(
-        already["user_id"].as_i64().unwrap(),
-        alice_id,
-        "DO NOTHING preserves original owner"
+        posts.len(),
+        1,
+        "bob only owns the non-conflicting fresh post; existing row stayed with alice"
     );
+    assert_eq!(posts[0]["title"], json!("bob-fresh"));
+    assert_eq!(posts[0]["user_id"].as_i64().unwrap(), bob_id);
 
-    let fresh = posts
-        .iter()
-        .find(|p| p["title"] == json!("bob-fresh"))
-        .expect("bob-fresh present");
-    assert_eq!(fresh["user_id"].as_i64().unwrap(), bob_id);
+    // Independently verify: "already-there" still belongs to alice, not bob.
+    let independent: Value = engine
+        .query(
+            r#"query { posts(where: { title: {_eq: "already-there"} }) { user_id } }"#,
+            None,
+        )
+        .await
+        .expect("lookup ok");
+    assert_eq!(
+        independent["posts"][0]["user_id"].as_i64().unwrap(),
+        alice_id,
+        "DO NOTHING preserves original owner alice"
+    );
 }
 
 #[tokio::test]
