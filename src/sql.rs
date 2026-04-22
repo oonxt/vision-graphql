@@ -22,6 +22,11 @@ struct RenderCtx {
     sql: String,
     binds: Vec<Bind>,
     alias_counter: usize,
+    /// Maps target-table-name → CTE alias for INSERT CTEs emitted in this
+    /// statement. Used by nested-returning render to decide whether to read
+    /// from the CTE (when source was just inserted here) or from the real
+    /// table (Phase 1 behavior).
+    inserted_ctes: std::collections::HashMap<String, String>,
 }
 
 impl RenderCtx {
@@ -571,6 +576,26 @@ fn render_limit_offset(args: &QueryArgs, ctx: &mut RenderCtx) {
     }
 }
 
+/// Return the PostgreSQL type keyword used in a cast expression (`$1::type`)
+/// for a given schema PgType.
+fn pg_type_cast(pg: &crate::schema::PgType) -> &'static str {
+    use crate::schema::PgType;
+    match pg {
+        PgType::Bool => "bool",
+        PgType::Int4 => "int4",
+        PgType::Int8 => "int8",
+        PgType::Float4 => "float4",
+        PgType::Float8 => "float8",
+        PgType::Text => "text",
+        PgType::Varchar => "varchar",
+        PgType::Uuid => "uuid",
+        PgType::Numeric => "numeric",
+        PgType::Timestamp => "timestamp",
+        PgType::TimestampTz => "timestamptz",
+        PgType::Jsonb => "jsonb",
+    }
+}
+
 fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -732,12 +757,58 @@ fn render_insert_cte(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    // Top-level: parent ordinals are just 1..=N.
+    let parent_ords: Vec<i64> = (1..=objects.len() as i64).collect();
+    render_insert_cte_recursive(
+        cte,
+        table_name,
+        objects,
+        &parent_ords,
+        on_conflict,
+        None,
+        schema,
+        ctx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_insert_cte_recursive(
+    cte: &str,
+    table_name: &str,
+    objects: &[crate::ast::InsertObject],
+    parent_ords: &[i64],
+    on_conflict: Option<&crate::ast::OnConflict>,
+    // Some((parent_ord_cte_alias, relation, parent_table))
+    // when this call is a child insert.
+    parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    debug_assert_eq!(objects.len(), parent_ords.len());
+
     let table = schema.table(table_name).ok_or_else(|| Error::Validate {
         path: cte.into(),
         message: format!("unknown table '{table_name}'"),
     })?;
 
-    use std::collections::BTreeSet;
+    if objects.is_empty() {
+        // Nothing to insert at this level — emit a no-op CTE so later CTEs
+        // can still reference {cte} without type errors. Use a SELECT of an
+        // empty, correctly-typed row set.
+        write!(
+            ctx.sql,
+            "{cte} AS (SELECT * FROM {}.{} WHERE FALSE)",
+            quote_ident(&table.physical_schema),
+            quote_ident(&table.physical_name),
+        )
+        .unwrap();
+        ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
+        return Ok(());
+    }
+
+    // 1. Collect all columns appearing in any row.
     let mut col_set: BTreeSet<String> = BTreeSet::new();
     for obj in objects {
         for k in obj.columns.keys() {
@@ -746,40 +817,27 @@ fn render_insert_cte(
     }
     let cols: Vec<String> = col_set.into_iter().collect();
 
-    write!(
-        ctx.sql,
-        "{cte} AS (INSERT INTO {}.{} (",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
-    )
-    .unwrap();
-    for (i, exposed) in cols.iter().enumerate() {
-        if i > 0 {
-            ctx.sql.push_str(", ");
-        }
-        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-            path: format!("{cte}.{exposed}"),
-            message: format!("unknown column '{exposed}'"),
-        })?;
-        ctx.sql.push_str(&quote_ident(&col.physical_name));
-    }
-    ctx.sql.push_str(") VALUES ");
+    // 2. Emit the `{cte}_input` VALUES CTE with the ord column and each column value.
+    let input_cte = format!("{cte}_input");
+    let ord_col_name = if parent_link.is_some() { "parent_ord" } else { "ord" };
 
+    write!(ctx.sql, "{input_cte} AS (SELECT * FROM (VALUES ").unwrap();
     for (r, obj) in objects.iter().enumerate() {
         if r > 0 {
             ctx.sql.push_str(", ");
         }
         ctx.sql.push('(');
-        for (i, exposed) in cols.iter().enumerate() {
-            if i > 0 {
-                ctx.sql.push_str(", ");
-            }
-            let value = obj.columns.get(exposed);
-            let col = table.find_column(exposed).unwrap();
-            match value {
-                None => {
-                    ctx.sql.push_str("DEFAULT");
-                }
+        // First column: the ordinal.
+        write!(ctx.sql, "{}", parent_ords[r]).unwrap();
+        // Remaining columns: each value (or NULL cast to the correct type).
+        for exposed in &cols {
+            ctx.sql.push_str(", ");
+            let col = table
+                .find_column(exposed)
+                .expect("column should exist — validated at parse");
+            let cast = pg_type_cast(&col.pg_type);
+            match obj.columns.get(exposed) {
+                None => write!(ctx.sql, "NULL::{cast}").unwrap(),
                 Some(v) => {
                     let bind = crate::types::json_to_bind(v, &col.pg_type).map_err(|e| {
                         Error::Validate {
@@ -788,18 +846,162 @@ fn render_insert_cte(
                         }
                     })?;
                     ctx.binds.push(bind);
-                    write!(ctx.sql, "${}", ctx.binds.len()).unwrap();
+                    write!(ctx.sql, "${}::{cast}", ctx.binds.len()).unwrap();
                 }
             }
         }
         ctx.sql.push(')');
     }
+    write!(ctx.sql, ") AS t({ord_col_name}").unwrap();
+    for exposed in &cols {
+        write!(ctx.sql, ", {}", quote_ident(exposed)).unwrap();
+    }
+    ctx.sql.push_str(")), ");
+
+    // 3. Emit the actual INSERT CTE.
+    //    If this is a child, we INSERT (<columns>, <fk_cols_from_parent>)
+    //    SELECT <cols>, p.<parent_pk_cols> FROM {input_cte} c JOIN {parent_ord_cte} p ON p.ord = c.parent_ord.
+    //    If this is top-level, we INSERT (<columns>)
+    //    SELECT <cols> FROM {input_cte} ORDER BY ord.
+    write!(
+        ctx.sql,
+        "{cte} AS (INSERT INTO {}.{} (",
+        quote_ident(&table.physical_schema),
+        quote_ident(&table.physical_name),
+    )
+    .unwrap();
+
+    // Physical column list for INSERT target.
+    let mut first = true;
+    for exposed in &cols {
+        if !first {
+            ctx.sql.push_str(", ");
+        }
+        first = false;
+        let col = table.find_column(exposed).unwrap();
+        ctx.sql.push_str(&quote_ident(&col.physical_name));
+    }
+    // Add FK columns when this is a child insert.
+    if let Some((_, rel, _)) = parent_link {
+        for (_, child_col) in &rel.mapping {
+            if !first {
+                ctx.sql.push_str(", ");
+            }
+            first = false;
+            let col = table.find_column(child_col).ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!("mapped FK column '{child_col}' missing on '{}'", table.exposed_name),
+            })?;
+            ctx.sql.push_str(&quote_ident(&col.physical_name));
+        }
+    }
+    ctx.sql.push(')');
+
+    // SELECT source.
+    match parent_link {
+        None => {
+            ctx.sql.push_str(" SELECT ");
+            let mut first_sel = true;
+            for exposed in &cols {
+                if !first_sel {
+                    ctx.sql.push_str(", ");
+                }
+                first_sel = false;
+                ctx.sql.push_str(&quote_ident(exposed));
+            }
+            write!(ctx.sql, " FROM {input_cte} ORDER BY ord").unwrap();
+        }
+        Some((parent_ord_cte_alias, rel, parent_table)) => {
+            ctx.sql.push_str(" SELECT ");
+            let mut first_sel = true;
+            for exposed in &cols {
+                if !first_sel {
+                    ctx.sql.push_str(", ");
+                }
+                first_sel = false;
+                write!(ctx.sql, "c.{}", quote_ident(exposed)).unwrap();
+            }
+            // FK columns come from the parent ord CTE.
+            for (parent_col, _) in &rel.mapping {
+                if !first_sel {
+                    ctx.sql.push_str(", ");
+                }
+                first_sel = false;
+                let pcol = parent_table.find_column(parent_col).ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!(
+                        "mapped parent column '{parent_col}' missing on '{}'",
+                        parent_table.exposed_name
+                    ),
+                })?;
+                write!(ctx.sql, "p.{}", quote_ident(&pcol.physical_name)).unwrap();
+            }
+            write!(
+                ctx.sql,
+                " FROM {input_cte} c JOIN {parent_ord_cte_alias} p ON p.ord = c.parent_ord"
+            )
+            .unwrap();
+        }
+    }
 
     if let Some(oc) = on_conflict {
         render_on_conflict(oc, table, schema, ctx)?;
     }
-
     ctx.sql.push_str(" RETURNING *)");
+
+    // Track this CTE for returning-visibility lookup.
+    ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
+
+    // 4. For each nested array relation, emit the parent-ord CTE first
+    //    (because children need to JOIN against it), then the child chain.
+    let any_nested = objects.iter().any(|o| !o.nested.is_empty());
+    if any_nested {
+        write!(
+            ctx.sql,
+            ", {cte}_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM {cte})"
+        )
+        .unwrap();
+
+        // Group children by relation name across all parent objects, tracking
+        // which parent_ord each child row belongs to.
+        use std::collections::BTreeMap;
+        let mut per_relation: BTreeMap<&str, (Vec<i64>, Vec<crate::ast::InsertObject>)> =
+            BTreeMap::new();
+
+        for (parent_ord_val, obj) in parent_ords.iter().zip(objects.iter()) {
+            for (rel_name, nested) in &obj.nested {
+                let entry = per_relation
+                    .entry(rel_name.as_str())
+                    .or_insert_with(|| (Vec::new(), Vec::new()));
+                for child in &nested.rows {
+                    entry.0.push(*parent_ord_val);
+                    entry.1.push(child.clone());
+                }
+            }
+        }
+
+        for (rel_name, (child_ords, child_rows)) in per_relation {
+            let rel = table.find_relation(rel_name).ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
+            })?;
+            // Child CTE alias: `{cte}_{rel_name}`.
+            let child_cte = format!("{cte}_{rel_name}");
+            let parent_ord_cte_name = format!("{cte}_ord");
+            ctx.sql.push_str(", ");
+            render_insert_cte_recursive(
+                &child_cte,
+                &rel.target_table,
+                &child_rows,
+                &child_ords,
+                None, // nested children don't carry their own on_conflict in Phase 2
+                Some((&parent_ord_cte_name, rel, table)),
+                schema,
+                ctx,
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1055,7 +1257,34 @@ fn render_mutation_output_for(
                 write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
             } else {
                 ctx.sql.push_str("json_build_object(");
-                write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
+                // affected_rows sums the parent CTE with every child CTE that
+                // was emitted under it.
+                ctx.sql.push_str("'affected_rows', (");
+                // Gather all CTEs whose aliases start with the umbrella
+                // `{cte}` (the parent) or `{cte}_` (the children at any level).
+                // Use ctx.inserted_ctes for this — its values are all the
+                // CTE aliases.
+                let mut matching: Vec<&String> = ctx
+                    .inserted_ctes
+                    .values()
+                    .filter(|v| {
+                        v.as_str() == cte || v.starts_with(&format!("{cte}_"))
+                    })
+                    .collect();
+                matching.sort();
+                for (i, c) in matching.iter().enumerate() {
+                    if i > 0 {
+                        ctx.sql.push_str(" + ");
+                    }
+                    write!(ctx.sql, "(SELECT count(*) FROM {c})").unwrap();
+                }
+                if matching.is_empty() {
+                    // Defensive — should never happen; means render_insert_cte
+                    // didn't record the parent CTE. Fall back to bare count.
+                    write!(ctx.sql, "SELECT count(*) FROM {cte}").unwrap();
+                }
+                ctx.sql.push(')');
+
                 if !returning.is_empty() {
                     ctx.sql
                         .push_str(", 'returning', (SELECT coalesce(json_agg(");

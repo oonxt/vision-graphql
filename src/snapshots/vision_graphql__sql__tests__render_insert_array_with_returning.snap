@@ -2,4 +2,4 @@
 source: src/sql.rs
 expression: sql
 ---
-WITH m0 AS (INSERT INTO "public"."users" ("name") VALUES ($1) RETURNING *) SELECT json_build_object('insert_users', json_build_object('affected_rows', (SELECT count(*) FROM m0), 'returning', (SELECT coalesce(json_agg(json_build_object('id', m0."id")), '[]'::json) FROM m0))) AS result
+WITH m0_input AS (SELECT * FROM (VALUES (1, $1::text)) AS t(ord, "name")), m0 AS (INSERT INTO "public"."users" ("name") SELECT "name" FROM m0_input ORDER BY ord RETURNING *) SELECT json_build_object('insert_users', json_build_object('affected_rows', ((SELECT count(*) FROM m0)), 'returning', (SELECT coalesce(json_agg(json_build_object('id', m0."id")), '[]'::json) FROM m0))) AS result
