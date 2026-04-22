@@ -307,3 +307,46 @@ async fn insert_post_with_two_level_object_nesting() {
     assert_eq!(row["user"]["name"], json!("alice"));
     assert_eq!(row["user"]["organization"]["name"], json!("acme"));
 }
+
+#[tokio::test]
+async fn nested_object_correlation_stress() {
+    let (engine, _c) = setup().await;
+    let mutation = r#"mutation {
+        insert_posts(objects: [
+          { title: "post-a", user: { data: { name: "user-a" } } },
+          { title: "post-b", user: { data: { name: "user-b" } } },
+          { title: "post-c", user: { data: { name: "user-c" } } },
+          { title: "post-d", user: { data: { name: "user-d" } } },
+          { title: "post-e", user: { data: { name: "user-e" } } }
+        ]) {
+          affected_rows
+          returning { title user_id }
+        }
+      }"#;
+    let v: Value = engine.query(mutation, None).await.expect("mutation ok");
+    assert_eq!(v["insert_posts"]["affected_rows"], json!(10));
+
+    let rows = v["insert_posts"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+
+    for r in rows {
+        let title = r["title"].as_str().unwrap().to_string();
+        let user_id = r["user_id"].as_i64().unwrap();
+        let expected_user_name = title.replace("post-", "user-");
+
+        let v2: Value = engine
+            .query(
+                &format!(
+                    r#"query {{ users(where: {{ id: {{_eq: {user_id} }} }}) {{ name }} }}"#
+                ),
+                None,
+            )
+            .await
+            .expect("lookup ok");
+        assert_eq!(
+            v2["users"][0]["name"].as_str().unwrap(),
+            expected_user_name,
+            "post {title} should correlate with user {expected_user_name}"
+        );
+    }
+}
