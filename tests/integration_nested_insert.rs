@@ -188,3 +188,47 @@ async fn nested_insert_object_relation_rejected() {
         "error was: {msg}"
     );
 }
+
+#[tokio::test]
+async fn nested_insert_multi_parent_correlation() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [
+                   { name: "u1", posts: { data: [{ title: "u1-p1" }, { title: "u1-p2" }] } },
+                   { name: "u2", posts: { data: [{ title: "u2-p1" }] } }
+                 ]) {
+                   affected_rows
+                   returning {
+                     name
+                     posts(order_by: [{ id: asc }]) { title }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(5));
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let u1 = rows.iter().find(|r| r["name"] == json!("u1")).expect("u1");
+    let u1_titles: Vec<_> = u1["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(u1_titles, vec![json!("u1-p1"), json!("u1-p2")]);
+
+    let u2 = rows.iter().find(|r| r["name"] == json!("u2")).expect("u2");
+    let u2_titles: Vec<_> = u2["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].clone())
+        .collect();
+    assert_eq!(u2_titles, vec![json!("u2-p1")]);
+}
