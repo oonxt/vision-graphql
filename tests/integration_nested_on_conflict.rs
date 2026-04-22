@@ -395,3 +395,47 @@ async fn top_level_on_conflict_do_nothing_unchanged() {
     assert_eq!(v["insert_users"]["affected_rows"], json!(0));
     assert_eq!(v["insert_users"]["returning"], json!([]));
 }
+
+#[tokio::test]
+async fn two_level_nested_on_conflict_on_innermost() {
+    let (engine, _c) = setup().await;
+
+    let seeded: Value = engine
+        .query(
+            r#"mutation { insert_organizations_one(object: { name: "acme" }) { id } }"#,
+            None,
+        )
+        .await
+        .expect("seed org");
+    let acme_id = seeded["insert_organizations_one"]["id"].as_i64().unwrap();
+
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "p1",
+                   user: { data: {
+                     name: "alice",
+                     organization: {
+                       data: { name: "acme" },
+                       on_conflict: { constraint: "organizations_name_key", update_columns: [] }
+                     }
+                   } }
+                 }]) {
+                   returning {
+                     title
+                     user { name organization { id name } }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+
+    let row = &v["insert_posts"]["returning"][0];
+    assert_eq!(row["title"], json!("p1"));
+    assert_eq!(row["user"]["name"], json!("alice"));
+    assert_eq!(row["user"]["organization"]["id"].as_i64().unwrap(), acme_id);
+    assert_eq!(row["user"]["organization"]["name"], json!("acme"));
+}
