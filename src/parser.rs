@@ -510,7 +510,8 @@ fn parse_insert_object(
     })?;
 
     let mut columns: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    let mut nested: BTreeMap<String, crate::ast::NestedArrayInsert> = BTreeMap::new();
+    let mut nested_arrays: BTreeMap<String, crate::ast::NestedArrayInsert> = BTreeMap::new();
+    let nested_objects: BTreeMap<String, crate::ast::NestedObjectInsert> = BTreeMap::new();
 
     for (k, v) in obj {
         // Try column first.
@@ -585,7 +586,7 @@ fn parse_insert_object(
                         rows.push(child);
                     }
 
-                    nested.insert(
+                    nested_arrays.insert(
                         k.clone(),
                         crate::ast::NestedArrayInsert {
                             table: rel.target_table.clone(),
@@ -611,14 +612,18 @@ fn parse_insert_object(
         });
     }
 
-    if columns.is_empty() && nested.is_empty() {
+    if columns.is_empty() && nested_arrays.is_empty() && nested_objects.is_empty() {
         return Err(Error::Validate {
             path: path.into(),
             message: "insert row must set at least one column or nested relation".into(),
         });
     }
 
-    Ok(crate::ast::InsertObject { columns, nested })
+    Ok(crate::ast::InsertObject {
+        columns,
+        nested_arrays,
+        nested_objects,
+    })
 }
 
 /// Validate that every key in `json` is a known column on `table` and return

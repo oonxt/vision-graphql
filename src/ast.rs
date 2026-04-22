@@ -163,15 +163,21 @@ pub struct OnConflict {
     pub where_: Option<BoolExpr>,
 }
 
-/// One row being inserted. Carries regular column values plus any
-/// nested array-relation inserts that should happen as children.
+/// One row being inserted. Carries regular column values, any nested
+/// array-relation inserts (children), and any nested object-relation inserts
+/// (a single related entity per parent row).
 #[derive(Debug, Clone, Default)]
 pub struct InsertObject {
     /// `{ exposed_column -> value }` for this parent row.
     pub columns: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Nested array-relation inserts, keyed by the parent-side relation name.
-    /// Each value carries the rows to insert as children of *this* parent row.
-    pub nested: std::collections::BTreeMap<String, NestedArrayInsert>,
+    /// Array-relation (one-to-many) nested inserts, keyed by the parent-side
+    /// relation name. Each value carries the rows to insert as children of
+    /// *this* parent row.
+    pub nested_arrays: std::collections::BTreeMap<String, NestedArrayInsert>,
+    /// Object-relation (many-to-one) nested inserts, keyed by the parent-side
+    /// relation name. Each value carries the single row whose PK becomes the
+    /// parent row's FK. The engine inserts this row FIRST, before the parent.
+    pub nested_objects: std::collections::BTreeMap<String, NestedObjectInsert>,
 }
 
 /// A nested `posts: { data: [...] }` block attached to one parent row.
@@ -182,6 +188,17 @@ pub struct NestedArrayInsert {
     /// Rows to insert as children. Each element is itself an `InsertObject`,
     /// so this recurses arbitrarily deep.
     pub rows: Vec<InsertObject>,
+}
+
+/// A nested `user: { data: {...} }` block attached to one parent row.
+/// Exactly one row — object relations reference exactly one entity.
+#[derive(Debug, Clone)]
+pub struct NestedObjectInsert {
+    /// Target table name (resolved from the parent relation's `target_table`).
+    pub table: String,
+    /// The row to insert. The engine inserts this BEFORE the parent row
+    /// and uses its PK as the parent's FK.
+    pub row: InsertObject,
 }
 
 #[cfg(test)]
@@ -283,7 +300,8 @@ mod tests {
             table: "users".into(),
             objects: vec![InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: vec![Field::Column {

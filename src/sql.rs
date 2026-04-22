@@ -975,8 +975,8 @@ fn render_insert_cte_recursive(
 
     // 4. For each nested array relation, emit the parent-ord CTE first
     //    (because children need to JOIN against it), then the child chain.
-    let any_nested = objects.iter().any(|o| !o.nested.is_empty());
-    if any_nested {
+    let any_nested_arrays = objects.iter().any(|o| !o.nested_arrays.is_empty());
+    if any_nested_arrays {
         write!(
             ctx.sql,
             ", {cte}_ord AS (SELECT *, ROW_NUMBER() OVER () AS ord FROM {cte})"
@@ -990,7 +990,7 @@ fn render_insert_cte_recursive(
             BTreeMap::new();
 
         for (parent_ord_val, obj) in parent_ords.iter().zip(objects.iter()) {
-            for (rel_name, nested) in &obj.nested {
+            for (rel_name, nested) in &obj.nested_arrays {
                 let entry = per_relation
                     .entry(rel_name.as_str())
                     .or_insert_with(|| (Vec::new(), Vec::new()));
@@ -1911,7 +1911,8 @@ mod tests {
             table: "users".into(),
             objects: vec![InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: vec![Field::Column {
@@ -1937,7 +1938,8 @@ mod tests {
             table: "users".into(),
             objects: vec![InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: vec![Field::Column {
@@ -2154,7 +2156,8 @@ mod tests {
             table: "users".into(),
             objects: vec![InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: vec![
@@ -2208,14 +2211,15 @@ mod tests {
         let mut child_cols = BTreeMap::new();
         child_cols.insert("title".into(), serde_json::json!("p1"));
 
-        let mut nested = BTreeMap::new();
-        nested.insert(
+        let mut nested_arrays = BTreeMap::new();
+        nested_arrays.insert(
             "posts".into(),
             NestedArrayInsert {
                 table: "posts".into(),
                 rows: vec![InsertObject {
                     columns: child_cols,
-                    nested: BTreeMap::new(),
+                    nested_arrays: BTreeMap::new(),
+                    nested_objects: BTreeMap::new(),
                 }],
             },
         );
@@ -2225,7 +2229,8 @@ mod tests {
             table: "users".into(),
             objects: vec![InsertObject {
                 columns: parent_cols,
-                nested,
+                nested_arrays,
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: vec![

@@ -379,7 +379,8 @@ impl Mutation {
             .into_iter()
             .map(|columns| InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             })
             .collect();
         InsertBuilder {
@@ -405,7 +406,8 @@ impl Mutation {
             table: t,
             objects: vec![InsertObject {
                 columns,
-                nested: BTreeMap::new(),
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
             }],
             on_conflict: None,
             returning: Vec::new(),
