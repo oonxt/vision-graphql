@@ -151,9 +151,35 @@ mutation {
 }
 ```
 
-Nesting is arbitrary-depth (e.g. users → posts → comments). Object-relation
-nested insert (e.g. `insert_posts(objects: [{ title, user: { data: {...} } }])`)
-is not yet supported — use a separate mutation for now.
+Nesting is arbitrary-depth (e.g. users → posts → comments).
+
+### Nested many-to-one insert
+
+Object relations can be inserted alongside their parent in the same mutation.
+The new entity is inserted first, and its PK is used as the parent's FK:
+
+```graphql
+mutation {
+  insert_posts(objects: [
+    { title: "p1", user: { data: { name: "alice" } } },
+    { title: "p2", user: { data: { name: "bob"   } } }
+  ]) {
+    affected_rows            # 4: 2 users + 2 posts
+    returning {
+      title
+      user { name }          # reads from the freshly-inserted users CTE
+    }
+  }
+}
+```
+
+Combines freely with one-to-many nesting — a parent can carry both object and
+array children in one row. Object-relation recursion also works arbitrarily
+deep (e.g. post → user → organization).
+
+**Batch-uniform constraint:** within a single `objects: [...]`, either every
+row uses `<rel>: { data: {...} }` for a given object relation, or no row does.
+Mixed usage is rejected; split into two mutation fields instead.
 
 ## License
 
