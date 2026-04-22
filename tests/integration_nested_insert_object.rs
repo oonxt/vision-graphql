@@ -276,3 +276,34 @@ async fn insert_post_with_nested_user_and_comments() {
         .collect();
     assert_eq!(bodies, vec![json!("c1"), json!("c2")]);
 }
+
+#[tokio::test]
+async fn insert_post_with_two_level_object_nesting() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_posts(objects: [{
+                   title: "p1",
+                   user: { data: {
+                     name: "alice",
+                     organization: { data: { name: "acme" } }
+                   } }
+                 }]) {
+                   affected_rows
+                   returning {
+                     title
+                     user { name organization { name } }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_posts"]["affected_rows"], json!(3));
+    let row = &v["insert_posts"]["returning"][0];
+    assert_eq!(row["title"], json!("p1"));
+    assert_eq!(row["user"]["name"], json!("alice"));
+    assert_eq!(row["user"]["organization"]["name"], json!("acme"));
+}
