@@ -303,3 +303,34 @@ async fn update_returning_with_nested_relation() {
         .collect();
     assert_eq!(titles, vec![json!("a1"), json!("a2")]);
 }
+
+#[tokio::test]
+async fn update_by_pk_selection_with_nested_relation() {
+    let (engine, _c) = setup().await;
+
+    let v0: Value = engine
+        .query(
+            r#"query { users(where: {name: {_eq: "seed_a"}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("lookup ok");
+    let seed_a_id = v0["users"][0]["id"].as_i64().unwrap();
+
+    let mutation = format!(
+        r#"mutation {{
+             update_users_by_pk(
+               pk_columns: {{id: {seed_a_id}}},
+               _set: {{name: "seed_a3"}}
+             ) {{
+               id
+               name
+               posts(order_by: [{{id: asc}}]) {{ title }}
+             }}
+           }}"#
+    );
+    let v: Value = engine.query(&mutation, None).await.expect("mutation ok");
+    let one = &v["update_users_by_pk"];
+    assert_eq!(one["name"], json!("seed_a3"));
+    assert!(one["posts"].as_array().unwrap().len() >= 1);
+}
