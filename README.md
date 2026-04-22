@@ -181,6 +181,38 @@ deep (e.g. post → user → organization).
 row uses `<rel>: { data: {...} }` for a given object relation, or no row does.
 Mixed usage is rejected; split into two mutation fields instead.
 
+### Nested `on_conflict` (upsert-at-any-level)
+
+Both array and object nested wrappers accept an `on_conflict` sibling of `data`.
+The shape matches top-level `on_conflict`:
+
+```graphql
+mutation {
+  insert_posts(objects: [{
+    title: "p1",
+    user: {
+      data: { name: "alice", email: "new@e.com" },
+      on_conflict: {
+        constraint: "users_name_key",
+        update_columns: ["email"]              # or [] for "use existing"
+      }
+    }
+  }]) {
+    returning { title user { email } }
+  }
+}
+```
+
+**Transparent `DO NOTHING` rewrite:** inside a nested wrapper, `update_columns: []`
+is silently rewritten to `DO UPDATE SET <pk> = <table>.<pk>` — a no-op update
+that forces PostgreSQL's `RETURNING` to include conflict rows so the
+just-inserted parent's foreign key can point at the existing entity. Top-level
+`on_conflict` semantics are unchanged — `update_columns: []` still means
+`DO NOTHING` at top level.
+
+This requires a primary key on the nested table; tables without a PK cannot use
+nested `DO NOTHING` (supply non-empty `update_columns` instead).
+
 ## License
 
 MIT OR Apache-2.0
