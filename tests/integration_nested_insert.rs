@@ -276,3 +276,43 @@ async fn nested_insert_correlation_stress() {
         assert_eq!(titles, vec![format!("{name}-child")]);
     }
 }
+
+#[tokio::test]
+async fn nested_insert_three_levels() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"mutation {
+                 insert_users(objects: [{
+                   name: "a",
+                   posts: {
+                     data: [{
+                       title: "p1",
+                       comments: { data: [{ body: "c1" }, { body: "c2" }] }
+                     }]
+                   }
+                 }]) {
+                   affected_rows
+                   returning {
+                     name
+                     posts {
+                       title
+                       comments(order_by: [{ id: asc }]) { body }
+                     }
+                   }
+                 }
+               }"#,
+            None,
+        )
+        .await
+        .expect("mutation ok");
+    assert_eq!(v["insert_users"]["affected_rows"], json!(4));
+    let rows = v["insert_users"]["returning"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let posts = rows[0]["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 1);
+    let comments = posts[0]["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[0]["body"], json!("c1"));
+    assert_eq!(comments[1]["body"], json!("c2"));
+}
