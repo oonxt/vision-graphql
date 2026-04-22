@@ -181,28 +181,6 @@ async fn nested_insert_child_fk_column_rejected() {
 }
 
 #[tokio::test]
-async fn nested_insert_object_relation_rejected() {
-    let (engine, _c) = setup().await;
-    let err = engine
-        .query(
-            r#"mutation {
-                 insert_posts(objects: [
-                   { title: "t", user: { data: { name: "x" } } }
-                 ]) { affected_rows }
-               }"#,
-            None,
-        )
-        .await
-        .err()
-        .expect("expected error");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("object-relation nested insert for 'user'"),
-        "error was: {msg}"
-    );
-}
-
-#[tokio::test]
 async fn nested_insert_multi_parent_correlation() {
     let (engine, _c) = setup().await;
     let v: Value = engine

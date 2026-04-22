@@ -511,7 +511,7 @@ fn parse_insert_object(
 
     let mut columns: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut nested_arrays: BTreeMap<String, crate::ast::NestedArrayInsert> = BTreeMap::new();
-    let nested_objects: BTreeMap<String, crate::ast::NestedObjectInsert> = BTreeMap::new();
+    let mut nested_objects: BTreeMap<String, crate::ast::NestedObjectInsert> = BTreeMap::new();
 
     for (k, v) in obj {
         // Try column first.
@@ -596,12 +596,82 @@ fn parse_insert_object(
                     continue;
                 }
                 crate::schema::RelKind::Object => {
-                    return Err(Error::Validate {
+                    let target = schema
+                        .table(&rel.target_table)
+                        .ok_or_else(|| Error::Validate {
+                            path: format!("{path}.{k}"),
+                            message: format!(
+                                "relation target table '{}' missing",
+                                rel.target_table
+                            ),
+                        })?;
+
+                    // Validate shape: `{ data: <object> }`
+                    let wrapper = v.as_object().ok_or_else(|| Error::Validate {
                         path: format!("{path}.{k}"),
-                        message: format!(
-                            "object-relation nested insert for '{k}' is not yet supported; use a separate mutation"
-                        ),
-                    });
+                        message: "nested object insert expects object with 'data' key".into(),
+                    })?;
+                    let data = wrapper.get("data").ok_or_else(|| Error::Validate {
+                        path: format!("{path}.{k}"),
+                        message: "missing required key 'data' in nested object insert".into(),
+                    })?;
+
+                    // `data` must be a single object, not an array.
+                    if data.is_array() {
+                        return Err(Error::Validate {
+                            path: format!("{path}.{k}.data"),
+                            message: "object-relation 'data' must be a single object, not an array".into(),
+                        });
+                    }
+                    if !data.is_object() {
+                        return Err(Error::Validate {
+                            path: format!("{path}.{k}.data"),
+                            message: "object-relation 'data' must be an object".into(),
+                        });
+                    }
+
+                    // Reject extra keys in the wrapper (leaves room for Phase 3B on_conflict).
+                    for other_k in wrapper.keys() {
+                        if other_k != "data" {
+                            return Err(Error::Validate {
+                                path: format!("{path}.{k}.{other_k}"),
+                                message: format!(
+                                    "unknown key '{other_k}' in nested object insert; only 'data' is supported"
+                                ),
+                            });
+                        }
+                    }
+
+                    // Reject FK-column-also-set conflict: the parent row must not
+                    // specify the mapped FK column when it's also providing nested
+                    // object data.
+                    for (parent_fk_col, _) in &rel.mapping {
+                        if columns.contains_key(parent_fk_col) {
+                            return Err(Error::Validate {
+                                path: format!("{path}.{k}"),
+                                message: format!(
+                                    "column '{parent_fk_col}' is populated from the nested object; must not also appear in the parent row"
+                                ),
+                            });
+                        }
+                    }
+
+                    // Recurse into the inner object.
+                    let child = parse_insert_object(
+                        data,
+                        target,
+                        schema,
+                        &format!("{path}.{k}.data"),
+                    )?;
+
+                    nested_objects.insert(
+                        k.clone(),
+                        crate::ast::NestedObjectInsert {
+                            table: rel.target_table.clone(),
+                            row: child,
+                        },
+                    );
+                    continue;
                 }
             }
         }
