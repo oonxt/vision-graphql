@@ -440,10 +440,8 @@ fn parse_insert_args(
     parent_path: &str,
     single: bool,
 ) -> Result<(Vec<crate::ast::InsertObject>, Option<crate::ast::OnConflict>)> {
-    use std::collections::BTreeMap;
     let mut objects: Vec<crate::ast::InsertObject> = Vec::new();
     let mut on_conflict: Option<crate::ast::OnConflict> = None;
-    let _ = schema;
 
     for (name_p, value_p) in args {
         let aname = name_p.node.as_str();
@@ -451,11 +449,8 @@ fn parse_insert_args(
         match aname {
             "object" if single => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.object"))?;
-                let obj = json_object_to_map(&json, table, &format!("{parent_path}.object"))?;
-                objects.push(crate::ast::InsertObject {
-                    columns: obj,
-                    nested: BTreeMap::new(),
-                });
+                let obj = parse_insert_object(&json, table, schema, &format!("{parent_path}.object"))?;
+                objects.push(obj);
             }
             "objects" if !single => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.objects"))?;
@@ -464,15 +459,13 @@ fn parse_insert_args(
                     message: "expected array".into(),
                 })?;
                 for (i, item) in arr.iter().enumerate() {
-                    let obj = json_object_to_map(
+                    let obj = parse_insert_object(
                         item,
                         table,
+                        schema,
                         &format!("{parent_path}.objects[{i}]"),
                     )?;
-                    objects.push(crate::ast::InsertObject {
-                        columns: obj,
-                        nested: BTreeMap::new(),
-                    });
+                    objects.push(obj);
                 }
             }
             "on_conflict" => {
@@ -504,6 +497,133 @@ fn parse_insert_args(
     Ok((objects, on_conflict))
 }
 
+fn parse_insert_object(
+    json: &Value,
+    table: &Table,
+    schema: &Schema,
+    path: &str,
+) -> Result<crate::ast::InsertObject> {
+    use std::collections::BTreeMap;
+    let obj = json.as_object().ok_or_else(|| Error::Validate {
+        path: path.into(),
+        message: "expected object".into(),
+    })?;
+
+    let mut columns: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut nested: BTreeMap<String, crate::ast::NestedArrayInsert> = BTreeMap::new();
+
+    for (k, v) in obj {
+        // Try column first.
+        if table.find_column(k).is_some() {
+            columns.insert(k.clone(), v.clone());
+            continue;
+        }
+
+        // Try relation.
+        if let Some(rel) = table.find_relation(k) {
+            match rel.kind {
+                crate::schema::RelKind::Array => {
+                    let target = schema
+                        .table(&rel.target_table)
+                        .ok_or_else(|| Error::Validate {
+                            path: format!("{path}.{k}"),
+                            message: format!(
+                                "relation target table '{}' missing",
+                                rel.target_table
+                            ),
+                        })?;
+
+                    // Validate shape: `{ data: [...] }`
+                    let wrapper = v.as_object().ok_or_else(|| Error::Validate {
+                        path: format!("{path}.{k}"),
+                        message: "nested array insert expects object with 'data' key".into(),
+                    })?;
+                    let data = wrapper.get("data").ok_or_else(|| Error::Validate {
+                        path: format!("{path}.{k}"),
+                        message: "missing required key 'data' in nested array insert".into(),
+                    })?;
+                    let data_arr = data.as_array().ok_or_else(|| Error::Validate {
+                        path: format!("{path}.{k}.data"),
+                        message: "expected array".into(),
+                    })?;
+
+                    // Reject any extra keys in the wrapper (e.g. stray on_conflict, which is Phase 3).
+                    for other_k in wrapper.keys() {
+                        if other_k != "data" {
+                            return Err(Error::Validate {
+                                path: format!("{path}.{k}.{other_k}"),
+                                message: format!(
+                                    "unknown key '{other_k}' in nested array insert; only 'data' is supported"
+                                ),
+                            });
+                        }
+                    }
+
+                    // Recurse into each child row.
+                    let mut rows = Vec::with_capacity(data_arr.len());
+                    for (i, item) in data_arr.iter().enumerate() {
+                        let child = parse_insert_object(
+                            item,
+                            target,
+                            schema,
+                            &format!("{path}.{k}.data[{i}]"),
+                        )?;
+
+                        // Reject child input that sets the FK column(s) that the engine
+                        // will supply from the parent.
+                        for (_parent_col, child_fk_col) in &rel.mapping {
+                            if child.columns.contains_key(child_fk_col) {
+                                return Err(Error::Validate {
+                                    path: format!("{path}.{k}.data[{i}].{child_fk_col}"),
+                                    message: format!(
+                                        "column '{child_fk_col}' is populated from the parent; must not appear in nested child input"
+                                    ),
+                                });
+                            }
+                        }
+
+                        rows.push(child);
+                    }
+
+                    nested.insert(
+                        k.clone(),
+                        crate::ast::NestedArrayInsert {
+                            table: rel.target_table.clone(),
+                            rows,
+                        },
+                    );
+                    continue;
+                }
+                crate::schema::RelKind::Object => {
+                    return Err(Error::Validate {
+                        path: format!("{path}.{k}"),
+                        message: format!(
+                            "object-relation nested insert for '{k}' is not yet supported; use a separate mutation"
+                        ),
+                    });
+                }
+            }
+        }
+
+        return Err(Error::Validate {
+            path: format!("{path}.{k}"),
+            message: format!("unknown column '{k}' on '{}'", table.exposed_name),
+        });
+    }
+
+    if columns.is_empty() && nested.is_empty() {
+        return Err(Error::Validate {
+            path: path.into(),
+            message: "insert row must set at least one column or nested relation".into(),
+        });
+    }
+
+    Ok(crate::ast::InsertObject { columns, nested })
+}
+
+/// Validate that every key in `json` is a known column on `table` and return
+/// a plain column map.  Used by the update helpers which do not support
+/// nested relations.
 fn json_object_to_map(
     json: &Value,
     table: &Table,
