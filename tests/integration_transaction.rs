@@ -107,3 +107,120 @@ async fn commit_path_persists_writes() {
     assert_eq!(rows[0]["id"], out["uid"]);
     assert_eq!(rows[0]["posts"][0]["title"], json!("hello"));
 }
+
+#[tokio::test]
+async fn rollback_on_closure_err_reverts_all() {
+    let (engine, _c) = setup().await;
+    let result = engine
+        .transaction(async |tx| {
+            tx.query(
+                r#"mutation { insert_users_one(object: {name: "bob"}) { id } }"#,
+                None,
+            )
+            .await?;
+            Err::<Value, _>(Error::Validate {
+                path: "test".into(),
+                message: "abort".into(),
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(Error::Validate { .. })));
+
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_eq: "bob"}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("select ok");
+    assert_eq!(v["users"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn id_chaining_works() {
+    let (engine, _c) = setup().await;
+    let got: Value = engine
+        .transaction(async |tx| {
+            let u = tx
+                .query(
+                    r#"mutation { insert_users_one(object: {name: "carol"}) { id } }"#,
+                    None,
+                )
+                .await?;
+            let uid = u["insert_users_one"]["id"].as_i64().unwrap();
+            let p = tx
+                .query(
+                    r#"mutation($uid: Int!) {
+                         insert_posts_one(object: {title: "first", user_id: $uid}) {
+                           id user_id
+                         }
+                       }"#,
+                    Some(json!({ "uid": uid })),
+                )
+                .await?;
+            Ok::<_, Error>(json!({ "uid": uid, "post": p["insert_posts_one"].clone() }))
+        })
+        .await
+        .expect("tx ok");
+
+    assert_eq!(got["post"]["user_id"], got["uid"]);
+}
+
+#[tokio::test]
+async fn rollback_on_fk_violation_reverts_first_insert() {
+    let (engine, _c) = setup().await;
+    let result = engine
+        .transaction(async |tx| {
+            tx.query(
+                r#"mutation { insert_users_one(object: {name: "dora"}) { id } }"#,
+                None,
+            )
+            .await?;
+            tx.query(
+                r#"mutation {
+                     insert_posts(objects: [{ title: "orphan", user_id: 9999 }]) {
+                       affected_rows
+                     }
+                   }"#,
+                None,
+            )
+            .await?;
+            Ok::<Value, _>(json!({}))
+        })
+        .await;
+    assert!(matches!(result, Err(Error::Database(_))));
+
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_eq: "dora"}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("select ok");
+    assert_eq!(v["users"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn commit_visibility_from_outside_connection() {
+    let (engine, _c) = setup().await;
+    engine
+        .transaction(async |tx| {
+            tx.query(
+                r#"mutation { insert_users_one(object: {name: "erin"}) { id } }"#,
+                None,
+            )
+            .await?;
+            Ok::<_, Error>(json!({}))
+        })
+        .await
+        .expect("tx ok");
+
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_eq: "erin"}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect("select ok");
+    assert_eq!(v["users"].as_array().unwrap().len(), 1);
+}
