@@ -62,6 +62,6 @@ pub use builder::{
     AggregateBuilder, ByPkBuilder, DeleteBuilder, DeleteByPkBuilder, InsertBuilder, IntoOperation,
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,
 };
-pub use engine::Engine;
+pub use engine::{Engine, TxClient};
 pub use error::Error;
 pub use schema::Schema;
