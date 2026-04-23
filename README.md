@@ -53,7 +53,8 @@ let data = engine
 | `EXISTS` relation filters in `where` | ✓ |
 | Mutations: `insert` / `insert_one` / `update` / `update_by_pk` / `delete` / `delete_by_pk` | ✓ |
 | `on_conflict` upsert | ✓ |
-| `returning` clause on mutations | ✓ |
+| `returning` clause on mutations (with nested relations) | ✓ |
+| Multi-request transactions (`Engine::transaction`) | ✓ |
 | Operators: `_eq`/`_neq`/`_gt`/`_gte`/`_lt`/`_lte`/`_like`/`_ilike`/`_nlike`/`_nilike`/`_in`/`_nin`/`_is_null` | ✓ |
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | GraphQL variables, named + inline fragments | ✓ |
@@ -212,6 +213,40 @@ just-inserted parent's foreign key can point at the existing entity. Top-level
 
 This requires a primary key on the nested table; tables without a PK cannot use
 nested `DO NOTHING` (supply non-empty `update_columns` instead).
+
+## Transactions
+
+`Engine::transaction` runs a closure on a single connection inside one
+PostgreSQL transaction. The closure returning `Ok(v)` commits; returning `Err`
+rolls back. Use it when a second mutation needs an id returned by a first:
+
+```rust
+# async fn example(engine: vision_graphql::Engine) -> Result<(), vision_graphql::Error> {
+use serde_json::{json, Value};
+use vision_graphql::Error;
+
+let post: Value = engine.transaction(async |tx| {
+    let u = tx.query(
+        r#"mutation { insert_users_one(object: {name: "alice"}) { id } }"#,
+        None,
+    ).await?;
+    let uid = u["insert_users_one"]["id"].as_i64().unwrap();
+
+    let p = tx.query(
+        r#"mutation($uid: Int!) {
+             insert_posts_one(object: {title: "hello", user_id: $uid}) { id }
+           }"#,
+        Some(json!({ "uid": uid })),
+    ).await?;
+    Ok::<_, Error>(p)
+}).await?;
+# let _ = post;
+# Ok(()) }
+```
+
+A single GraphQL mutation request is already atomic (one SQL statement per
+request). `transaction` exists for workflows that need atomicity *across*
+multiple requests — most commonly id-chaining between mutations.
 
 ## License
 
