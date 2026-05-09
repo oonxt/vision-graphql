@@ -1,0 +1,255 @@
+# CLI Schema Generator — Design
+
+**Date:** 2026-05-09
+**Scope:** Add a CLI tool that bootstraps a starter `schema.toml` overlay from a live PostgreSQL database, and that validates an existing overlay against the current database.
+
+## Background
+
+`vision-graphql` builds its `Schema` from three layers (later wins):
+
+1. **Introspection** — `Schema::introspect(&pool)` reads `information_schema` and auto-derives tables, columns, primary keys, foreign keys.
+2. **TOML overlay** — `SchemaBuilder::load_config(path)` applies `expose_as`, `hide_columns`, manual relations.
+3. **Builder** — final programmatic touches before `.build()`.
+
+Today, layer 2 has no CLI affordance. To bootstrap a starter `schema.toml`, a user must write Rust glue against `introspect.rs`. To detect drift between an overlay and a migrated database, there is no tool at all — broken overlays surface only at runtime.
+
+## Goals
+
+- Let users generate a complete starter `schema.toml` from a live database in one command.
+- Let users / CI detect when an existing overlay references DB objects that no longer exist.
+- Keep the published `vision-graphql` library tarball unchanged in size and dependencies.
+
+## Non-goals
+
+- Schema migrations. The CLI does not produce SQL DDL.
+- Full schema diff (DB vs. introspected schema). `diff` is scoped narrowly: "is the overlay still valid against the current DB?"
+- Multi-schema introspection. `introspect.rs` currently hardcodes the `public` schema; the CLI inherits that.
+- TLS connections (`sslmode=require`, etc.). NoTls only in v1, matching the README's existing examples.
+- Interactive REPL or `generate --merge` (preserving prior edits in an existing file). v1 always overwrites.
+
+## Architecture
+
+### Workspace layout
+
+The repository becomes a hybrid root-package workspace. The library crate stays at the root; the CLI lives at `crates/vision-graphql-cli/` as a workspace member.
+
+```
+vision-graphql/
+├── Cargo.toml          # [workspace] + [package] (lib unchanged)
+├── src/                # lib source (unchanged)
+└── crates/
+    └── vision-graphql-cli/
+        ├── Cargo.toml
+        └── src/
+            ├── main.rs
+            ├── cmd_generate.rs
+            ├── cmd_diff.rs
+            ├── render.rs
+            ├── analyze.rs
+            └── report.rs
+```
+
+Root `Cargo.toml` gets:
+
+```toml
+[workspace]
+members = [".", "crates/vision-graphql-cli"]
+```
+
+The lib `[package]` block stays untouched, so `cargo publish` from the root continues to publish only `vision-graphql`.
+
+### CLI crate dependencies
+
+```toml
+[package]
+name = "vision-graphql-cli"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "vision-gql"
+path = "src/main.rs"
+
+[dependencies]
+vision-graphql      = { path = "../..", version = "0.2" }
+clap                = { version = "4", features = ["derive"] }
+deadpool-postgres   = "0.14"
+tokio-postgres      = "0.7"
+tokio               = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml                = "0.8"
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+anyhow              = "1"
+```
+
+`vision-graphql`'s public surface needs to expose enough for the CLI: `schema::introspect::introspect` / `IntrospectedDb` and `schema::config::parse` / `ConfigOverlay`. These are currently `pub` modules; verify their items are reachable and promote any `pub(crate)` items if needed.
+
+### Command surface
+
+```
+vision-gql generate [--url <URL>] [--output <PATH>]
+vision-gql diff     [--url <URL>] [--config <PATH>] [--format text|json]
+```
+
+- `--url` defaults to `$DATABASE_URL`. Missing both → exit 2 with a clear message.
+- `generate --output` defaults to `-` (stdout). Any other value writes to that path, creating the file.
+- `diff --config` defaults to `./schema.toml`.
+- `diff --format` is `text` (default) or `json`.
+
+Exit codes:
+- `0` — success / no drift.
+- `1` — drift detected (only for `diff`).
+- `2` — failure (DB connect, parse error, I/O error, missing URL).
+
+## Component design
+
+### `render::toml_template(&IntrospectedDb) -> String`
+
+Pure function. Hand-rolled writer (not `toml::to_string` — we need comments). For each table in the introspected DB, emit a section like:
+
+```toml
+# ── public.users ─────────────────────────────
+# columns: id (int4, PK), name (text?), email (text)
+# foreign keys: posts.user_id -> users.id (inferred relation)
+#
+# [tables.users]
+# expose_as = "profiles"
+# hide_columns = ["password_hash"]
+#
+# # array relation derived from FK posts.user_id -> users.id
+# [[tables.users.relations]]
+# name = "posts"
+# kind = "array"
+# target = "posts"
+# mapping = [["id", "user_id"]]
+```
+
+Every emitted line outside the file header is `#`-prefixed. By default the file is a no-op overlay; the user un-comments specific stanzas to activate them. This preserves the overlay-is-an-overlay semantics — uncommenting only what you change avoids the "overlay drifts in lockstep with DB" problem.
+
+The header (top of file, not commented) is a brief explainer:
+
+```toml
+# Generated by `vision-gql generate` against <host>/<dbname>.
+# Uncomment any stanza below to override defaults from introspection.
+```
+
+The host/dbname are derived from the connection URL (with password redacted). If parsing the URL fails, fall back to a generic line.
+
+### `analyze::find_drift(&ConfigOverlay, &IntrospectedDb) -> DiffReport`
+
+Pure function. Walks every `tables.<key>` and emits findings:
+
+- **`missing_tables`** — overlay references table `<key>` but `(public, key)` is not in the introspected map.
+- **`missing_columns`** — `hide_columns` entry, or relation mapping endpoint, references a column that doesn't exist on the relevant table.
+- **`missing_relation_targets`** — manual relation `target` doesn't resolve to either an introspected physical table or another overlay table's `expose_as`.
+- **`expose_as_collisions`** — two distinct overlay tables map to the same exposed name, or an overlay's `expose_as` collides with another physical table name.
+
+```rust
+pub struct DiffReport {
+    pub missing_tables: Vec<String>,                       // overlay key
+    pub missing_columns: Vec<MissingColumn>,
+    pub missing_relation_targets: Vec<MissingRelTarget>,
+    pub expose_as_collisions: Vec<Collision>,
+}
+
+pub struct MissingColumn {
+    pub table: String,         // overlay key
+    pub column: String,        // physical column name expected
+    pub origin: ColumnOrigin,  // HideColumns | RelationLocal | RelationRemote
+}
+
+pub struct MissingRelTarget {
+    pub table: String,         // overlay key
+    pub relation: String,      // relation name from overlay
+    pub target: String,        // unresolved target
+}
+
+pub struct Collision {
+    pub exposed_name: String,
+    pub sources: Vec<String>,  // physical names contributing
+}
+```
+
+`DiffReport::is_clean()` returns true iff all four vectors are empty.
+
+### `report::write(&DiffReport, Format, impl Write)`
+
+- `Format::Text` — human-readable, grouped by category. Empty groups omitted. Suffix line: `<N> issues found`.
+- `Format::Json` — `serde_json::to_writer_pretty(&report)`.
+
+### `cmd_generate` / `cmd_diff`
+
+Each is a thin orchestrator:
+
+- `cmd_generate(url, output)`:
+  1. Build deadpool pool from `url` (NoTls).
+  2. `introspect(&pool).await?`.
+  3. `let s = render::toml_template(&db);`.
+  4. Write to stdout if `output == "-"`, else to the path.
+
+- `cmd_diff(url, config, format)`:
+  1. `let text = std::fs::read_to_string(config)?;`
+  2. `let cfg = schema::config::parse(&text)?;`
+  3. Build pool, `introspect`.
+  4. `let report = analyze::find_drift(&cfg, &db);`.
+  5. `report::write(&report, format, &mut stdout())`.
+  6. Return `Ok(())` if clean, else `Err(DriftDetected)` mapped to exit `1`.
+
+`main.rs` uses `clap` derive macros, dispatches subcommands, prints errors via `anyhow`, and maps the dedicated `DriftDetected` error to exit `1` while everything else exits `2`.
+
+## Data flow
+
+```
+generate:
+  $DATABASE_URL ─→ Pool ─→ introspect ─→ IntrospectedDb ─→ render ─→ TOML text ─→ stdout / file
+
+diff:
+  schema.toml ─→ parse ─→ ConfigOverlay ─┐
+  $DATABASE_URL ─→ Pool ─→ introspect ───┴─→ analyze ─→ DiffReport ─→ report::write ─→ stdout
+                                                              │
+                                                              └─→ exit code
+```
+
+## Testing
+
+Following the project's existing conventions (`insta` snapshots, `testcontainers` for live PG):
+
+**Unit:**
+- `render::toml_template` — synthetic `IntrospectedDb` fixtures (empty DB, single table no FKs, two tables with one-to-many FK, multi-column PK + composite FK) → `insta::assert_snapshot!`.
+- `analyze::find_drift` — synthetic `(ConfigOverlay, IntrospectedDb)` pairs covering each finding category, plus a clean case → assert on `DiffReport` shape.
+- `report` — fixed `DiffReport` → assert text and JSON output shape via `insta`.
+
+**E2E (in `crates/vision-graphql-cli/tests/`):**
+- testcontainers PG, run a fixed DDL, then invoke the binary via `Command::new(env!("CARGO_BIN_EXE_vision-gql"))`.
+  - `generate` produces non-empty stdout; piping it back through `schema::config::parse` parses successfully (since it's all comments → empty overlay).
+  - `diff` against a known-good toml exits 0.
+  - `diff` against a toml with a stale `hide_columns` entry exits 1 and prints the missing column.
+
+## Error handling
+
+The CLI uses `anyhow` at the top level for ergonomic error chaining. A dedicated `DriftDetected` marker error (or a typed sentinel returned from `cmd_diff`) is matched in `main` to set exit code `1`; all other errors map to `2`. The library's `vision_graphql::Error` wraps fine into `anyhow::Error` via `?`.
+
+Connection error messages should include the redacted URL host/dbname so the user can tell which database failed. Parse errors should include the file path and line/column when possible (the `toml` crate already does this).
+
+## Documentation
+
+- New "CLI" section in the root `README.md` after "Building the schema":
+  - Install: `cargo install vision-graphql-cli`.
+  - One-liner for `generate`, one-liner for `diff`, with sample output.
+  - Note: NoTls only, `public` schema only.
+- Add a one-line forward reference in the existing "Building the schema → 2. TOML overlay" paragraph: "or run `vision-gql generate` to bootstrap a starter file from a live DB."
+
+## Risks and mitigations
+
+- **Library API surface drift.** The CLI imports `schema::introspect::introspect` and `schema::config::parse`. Today these are reachable; the spec's plan must verify and lock them in via a smoke test in the library crate that asserts the items are `pub`.
+- **Workspace conversion side effects.** Adding `[workspace]` to the root might shift `target/` resolution and IDE indexing. Mitigation: add `members = [".", "crates/vision-graphql-cli"]` explicitly so the root remains a member; do not introduce `[workspace.dependencies]` in v1.
+- **`cargo publish` regression.** The published tarball must remain `vision-graphql` only. The crate already has `exclude = ["docs/**", "tests/**", ...]`; we should also add `"crates/**"` to that list to prevent any chance of the CLI source leaking into the published lib tarball. Verify with `cargo package --list` before/after.
+- **Comment-only template confusion.** A user might run `generate` and assume it does something. Mitigation: the file header explains that the default file is a no-op and instructs un-commenting.
+
+## Out of scope (deferred)
+
+- TLS support (would add a feature flag for `tokio-postgres` `with-rustls` or similar).
+- Multi-schema introspection — needs a change in `introspect.rs` itself, tracked separately.
+- `generate --merge` to preserve a user's existing edits.
+- `diff` for full schema (DB-level) drift, not just overlay validity.
+- Interactive REPL (`generate --interactive`).
