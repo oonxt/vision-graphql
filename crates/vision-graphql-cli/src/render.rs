@@ -96,7 +96,7 @@ fn pg_type_short(t: &PgType) -> &'static str {
     }
 }
 
-fn write_table_stanza(out: &mut String, t: &IntrospectedTable, _db: &IntrospectedDb) {
+fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &IntrospectedDb) {
     out.push_str(&format!(
         "# ── {}.{} ─────────────────────────────\n",
         t.schema, t.name
@@ -124,29 +124,54 @@ fn write_table_stanza(out: &mut String, t: &IntrospectedTable, _db: &Introspecte
     if t.foreign_keys.is_empty() {
         out.push_str("# foreign keys: (none)\n");
     } else {
-        out.push_str("# foreign keys:");
         for fk in &t.foreign_keys {
             out.push_str(&format!(
-                " {}({}) -> {}.{}({})",
+                "# foreign keys: {}({}) -> {}({})\n",
                 t.name,
                 fk.from_columns.join(", "),
                 fk.to_table,
-                "",
                 fk.to_columns.join(", "),
             ));
         }
-        out.push('\n');
     }
     out.push_str("#\n");
     out.push_str(&format!("# [tables.{}]\n", t.name));
     out.push_str(&format!("# expose_as = \"{}\"\n", t.name));
     out.push_str("# hide_columns = []\n");
+
+    let derived = vision_graphql::schema::merge::derive_relations_from_fks(db);
+    let mine: Vec<_> = derived.iter().filter(|(src, _, _)| src == &t.name).collect();
+    for (_, rel_name, rel) in mine {
+        let kind = match rel.kind {
+            vision_graphql::schema::RelKind::Object => "object",
+            vision_graphql::schema::RelKind::Array => "array",
+        };
+        out.push_str("#\n");
+        out.push_str(&format!(
+            "# # {} relation derived from FK\n",
+            kind
+        ));
+        out.push_str(&format!("# [[tables.{}.relations]]\n", t.name));
+        out.push_str(&format!("# name = \"{}\"\n", rel_name));
+        out.push_str(&format!("# kind = \"{}\"\n", kind));
+        out.push_str(&format!("# target = \"{}\"\n", rel.target_table));
+        out.push_str("# mapping = [");
+        let mut first = true;
+        for (a, b) in &rel.mapping {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&format!("[\"{}\", \"{}\"]", a, b));
+        }
+        out.push_str("]\n");
+    }
 }
 
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use vision_graphql::schema::introspect::IntrospectedColumn;
+    use vision_graphql::schema::introspect::{IntrospectedColumn, IntrospectedForeignKey};
 
     fn meta() -> HeaderMeta {
         HeaderMeta {
@@ -189,6 +214,58 @@ mod render_tests {
         assert!(out.contains("email (text?)"));
         assert!(out.contains("# foreign keys: (none)"));
         assert!(out.contains("# [tables.users]"));
+    }
+
+    #[test]
+    fn fk_emits_relation_stanzas_on_both_sides() {
+        let mut db = IntrospectedDb::default();
+        db.tables.insert(
+            ("public".into(), "users".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "users".into(),
+                columns: vec![IntrospectedColumn {
+                    name: "id".into(),
+                    pg_type: PgType::Int4,
+                    nullable: false,
+                }],
+                primary_key: vec!["id".into()],
+                unique_constraints: Default::default(),
+                foreign_keys: vec![],
+            },
+        );
+        db.tables.insert(
+            ("public".into(), "posts".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "posts".into(),
+                columns: vec![
+                    IntrospectedColumn { name: "id".into(),      pg_type: PgType::Int4, nullable: false },
+                    IntrospectedColumn { name: "user_id".into(), pg_type: PgType::Int4, nullable: false },
+                ],
+                primary_key: vec!["id".into()],
+                unique_constraints: Default::default(),
+                foreign_keys: vec![IntrospectedForeignKey {
+                    constraint_name: "posts_user_id_fkey".into(),
+                    from_columns: vec!["user_id".into()],
+                    to_schema: "public".into(),
+                    to_table: "users".into(),
+                    to_columns: vec!["id".into()],
+                }],
+            },
+        );
+        let f = TableFilter::new(None, None).unwrap();
+        let out = toml_template(&db, &f, &meta());
+        // Object relation on `posts` side
+        assert!(out.contains("# [[tables.posts.relations]]"));
+        assert!(out.contains("# kind = \"object\""));
+        assert!(out.contains("# target = \"users\""));
+        // Array relation on `users` side
+        assert!(out.contains("# [[tables.users.relations]]"));
+        assert!(out.contains("# kind = \"array\""));
+        assert!(out.contains("# target = \"posts\""));
+        // FK summary line on posts
+        assert!(out.contains("posts(user_id) -> users(id)"));
     }
 
     #[test]
