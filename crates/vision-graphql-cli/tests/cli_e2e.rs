@@ -206,3 +206,55 @@ async fn generate_force_required_to_overwrite() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn validate_clean_exits_zero() {
+    let p = write_temp_toml(
+        "clean_for_validate.toml",
+        r#"
+        [tables.users]
+        expose_as = "profiles"
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["validate", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn validate_dup_expose_as_exits_two() {
+    let p = write_temp_toml(
+        "dup_expose.toml",
+        r#"
+        [tables.users]
+        expose_as = "people"
+
+        [tables.profiles]
+        expose_as = "people"
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["validate", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn missing_url_and_env_exits_two() {
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["generate"])
+        .env_remove("DATABASE_URL")
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("DATABASE_URL"));
+}
