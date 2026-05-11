@@ -1,6 +1,7 @@
 mod analyze;
 mod filter;
 mod render;
+mod report;
 
 use clap::{Parser, Subcommand};
 
