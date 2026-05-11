@@ -1,4 +1,5 @@
 mod filter;
+mod render;
 
 use clap::{Parser, Subcommand};
 
