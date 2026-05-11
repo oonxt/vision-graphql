@@ -35,7 +35,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let pool = build_pool(&args.url)?;
+    let pool = build_pool_pub(&args.url)?;
     let db = introspect(&pool)
         .await
         .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
@@ -68,7 +68,7 @@ enum OutputTarget {
     File(PathBuf),
 }
 
-fn build_pool(url: &str) -> Result<deadpool_postgres::Pool> {
+pub fn build_pool_pub(url: &str) -> Result<deadpool_postgres::Pool> {
     let cfg: tokio_postgres::Config = url
         .parse()
         .with_context(|| format!("parsing connection URL {}", redact_url(url)))?;

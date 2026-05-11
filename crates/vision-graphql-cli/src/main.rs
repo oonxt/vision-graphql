@@ -1,4 +1,5 @@
 mod analyze;
+mod cmd_diff;
 mod cmd_generate;
 mod cmd_validate;
 mod filter;
@@ -126,8 +127,20 @@ fn dispatch(cli: Cli) -> Result<()> {
                 })
                 .await
             }
-            Cmd::Diff(_a) => {
-                anyhow::bail!("diff not yet implemented")
+            Cmd::Diff(a) => {
+                let url = resolve_url(a.db.url)?;
+                let format = match a.format.as_str() {
+                    "json" => report::Format::Json,
+                    _ => report::Format::Text,
+                };
+                cmd_diff::run(cmd_diff::Args {
+                    url,
+                    config: a.config,
+                    format,
+                    include: a.db.include_tables,
+                    ignore: a.db.ignore_tables,
+                })
+                .await
             }
             Cmd::Validate(a) => cmd_validate::run(&a.path),
         }
