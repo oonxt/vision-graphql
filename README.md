@@ -80,7 +80,7 @@ One SQL per request. All user values go through parameterized binds — there is
 Three layers that merge (later wins):
 
 1. **Introspection** — `Schema::introspect(&pool).await?` queries `information_schema` and auto-derives relations from foreign keys.
-2. **TOML overlay** — `.load_config("schema.toml")?` applies renames, hidden columns, and manual relations.
+2. **TOML overlay** — `.load_config("schema.toml")?` applies renames, hidden columns, and manual relations. Run `vision-gql generate` to bootstrap a starter file from a live DB.
 3. **Builder** — `.table(...)` / `.relation(...)` / `.expose_as(...)` for final touches before `.build()`.
 
 Example TOML:
@@ -96,6 +96,32 @@ kind = "array"
 target = "profiles"
 mapping = [["id", "followed_id"]]
 ```
+
+## CLI
+
+`vision-graphql-cli` ships a `vision-gql` binary that bootstraps and validates
+overlay files against a live database.
+
+```bash
+cargo install vision-graphql-cli
+vision-gql generate --url postgres://localhost/myapp > schema.toml
+vision-gql diff     --url postgres://localhost/myapp --config schema.toml
+vision-gql validate schema.toml
+```
+
+`generate` produces a fully-commented starter file; uncomment any stanza to
+override defaults from introspection. `diff` checks the overlay's references
+against the current database (exit 0 = clean, 1 = drift, 2 = error). `validate`
+performs offline structural checks without a connection.
+
+Filter what gets processed with comma-separated globs:
+
+```bash
+vision-gql generate --url $DATABASE_URL --ignore-tables 'audit_*,_temp_*'
+```
+
+Both subcommands accept `$DATABASE_URL` as the default for `--url`. NoTls only
+in this release; only the `public` schema is introspected.
 
 ## Mutations
 
