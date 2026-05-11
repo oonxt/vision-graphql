@@ -1,5 +1,6 @@
 mod analyze;
 mod filter;
+mod log_init;
 mod render;
 mod report;
 
