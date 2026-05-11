@@ -1,4 +1,5 @@
 mod analyze;
+mod cmd_validate;
 mod filter;
 mod log_init;
 mod render;
