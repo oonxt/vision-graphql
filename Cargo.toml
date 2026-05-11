@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/vision-graphql-cli"]
+
 [package]
 name = "vision-graphql"
 version = "0.2.0"
@@ -19,6 +22,7 @@ exclude = [
     "benches/**",
     ".github/**",
     "*.png",
+    "crates/**",
 ]
 
 [dependencies]
