@@ -156,6 +156,19 @@ pub enum MutationField {
     },
 }
 
+impl MutationField {
+    /// The response key this mutation's result is nested under.
+    pub fn alias(&self) -> &str {
+        match self {
+            MutationField::Insert { alias, .. }
+            | MutationField::Update { alias, .. }
+            | MutationField::UpdateByPk { alias, .. }
+            | MutationField::Delete { alias, .. }
+            | MutationField::DeleteByPk { alias, .. } => alias,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OnConflict {
     pub constraint: String,
