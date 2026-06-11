@@ -26,9 +26,7 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
     sb
 }
 
-pub async fn introspect_into_builder(
-    pool: &deadpool_postgres::Pool,
-) -> crate::error::Result<SchemaBuilder> {
+pub async fn introspect_into_builder(pool: &sqlx::PgPool) -> crate::error::Result<SchemaBuilder> {
     let db = crate::schema::introspect::introspect(pool).await?;
     Ok(build_from_introspection(db))
 }

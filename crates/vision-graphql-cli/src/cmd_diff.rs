@@ -22,8 +22,7 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("reading {}", args.config.display()))?;
-    let cfg = parse(&text)
-        .with_context(|| format!("parsing {}", args.config.display()))?;
+    let cfg = parse(&text).with_context(|| format!("parsing {}", args.config.display()))?;
 
     let pool = cmd_generate::build_pool_pub(&args.url)?;
     let db = introspect(&pool)

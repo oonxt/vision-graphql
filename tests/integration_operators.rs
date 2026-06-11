@@ -1,8 +1,6 @@
-use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use serde_json::{json, Value};
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
-use tokio_postgres::NoTls;
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::Engine;
 
@@ -27,31 +25,24 @@ async fn setup() -> (
         .await
         .expect("start pg");
     let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let mut cfg = Config::new();
-    cfg.host = Some("127.0.0.1".into());
-    cfg.port = Some(host_port);
-    cfg.user = Some("postgres".into());
-    cfg.password = Some("postgres".into());
-    cfg.dbname = Some("postgres".into());
-    cfg.manager = Some(ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    });
-    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).expect("pool");
-    {
-        let client = pool.get().await.expect("client");
-        client
-            .batch_execute(
-                r#"
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("pool");
+    sqlx::raw_sql(
+        r#"
                 CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
                     name TEXT
                 );
                 INSERT INTO users (name) VALUES ('alice'), ('bob'), ('carol'), (NULL);
                 "#,
-            )
-            .await
-            .expect("seed");
-    }
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
     (Engine::new(pool, schema()), container)
 }
 

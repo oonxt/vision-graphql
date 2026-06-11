@@ -140,17 +140,17 @@ fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &Introspected
     out.push_str("# hide_columns = []\n");
 
     let derived = vision_graphql::schema::merge::derive_relations_from_fks(db);
-    let mine: Vec<_> = derived.iter().filter(|(src, _, _)| src == &t.name).collect();
+    let mine: Vec<_> = derived
+        .iter()
+        .filter(|(src, _, _)| src == &t.name)
+        .collect();
     for (_, rel_name, rel) in mine {
         let kind = match rel.kind {
             vision_graphql::schema::RelKind::Object => "object",
             vision_graphql::schema::RelKind::Array => "array",
         };
         out.push_str("#\n");
-        out.push_str(&format!(
-            "# # {} relation derived from FK\n",
-            kind
-        ));
+        out.push_str(&format!("# # {} relation derived from FK\n", kind));
         out.push_str(&format!("# [[tables.{}.relations]]\n", t.name));
         out.push_str(&format!("# name = \"{}\"\n", rel_name));
         out.push_str(&format!("# kind = \"{}\"\n", kind));
@@ -199,8 +199,16 @@ mod render_tests {
                 schema: "public".into(),
                 name: "users".into(),
                 columns: vec![
-                    IntrospectedColumn { name: "id".into(),    pg_type: PgType::Int4, nullable: false },
-                    IntrospectedColumn { name: "email".into(), pg_type: PgType::Text, nullable: true  },
+                    IntrospectedColumn {
+                        name: "id".into(),
+                        pg_type: PgType::Int4,
+                        nullable: false,
+                    },
+                    IntrospectedColumn {
+                        name: "email".into(),
+                        pg_type: PgType::Text,
+                        nullable: true,
+                    },
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
@@ -240,8 +248,16 @@ mod render_tests {
                 schema: "public".into(),
                 name: "posts".into(),
                 columns: vec![
-                    IntrospectedColumn { name: "id".into(),      pg_type: PgType::Int4, nullable: false },
-                    IntrospectedColumn { name: "user_id".into(), pg_type: PgType::Int4, nullable: false },
+                    IntrospectedColumn {
+                        name: "id".into(),
+                        pg_type: PgType::Int4,
+                        nullable: false,
+                    },
+                    IntrospectedColumn {
+                        name: "user_id".into(),
+                        pg_type: PgType::Int4,
+                        nullable: false,
+                    },
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),

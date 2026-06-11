@@ -22,7 +22,10 @@ fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()>
         return Ok(());
     }
     if !report.missing_tables.is_empty() {
-        writeln!(out, "missing tables (overlay references nonexistent table):")?;
+        writeln!(
+            out,
+            "missing tables (overlay references nonexistent table):"
+        )?;
         for t in &report.missing_tables {
             writeln!(out, "  - {t}")?;
         }
@@ -47,12 +50,7 @@ fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()>
     if !report.expose_as_collisions.is_empty() {
         writeln!(out, "expose_as collisions:")?;
         for c in &report.expose_as_collisions {
-            writeln!(
-                out,
-                "  - {} <- {}",
-                c.exposed_name,
-                c.sources.join(", ")
-            )?;
+            writeln!(out, "  - {} <- {}", c.exposed_name, c.sources.join(", "))?;
         }
     }
     writeln!(out, "{} issues found", report.issue_count())?;

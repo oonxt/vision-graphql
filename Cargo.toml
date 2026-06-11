@@ -3,7 +3,7 @@ members = [".", "crates/vision-graphql-cli"]
 
 [package]
 name = "vision-graphql"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Hasura-style GraphQL ORM for PostgreSQL — one SQL per request via json_agg."
 license = "MIT OR Apache-2.0"
@@ -27,15 +27,18 @@ exclude = [
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-deadpool-postgres = "0.14"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "json",
+    "tls-rustls-ring-native-roots",
+] }
 async-graphql-parser = "7"
 async-graphql-value = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 tracing = "0.1"
-bytes = "1"
 toml = "0.8"
 
 [dev-dependencies]

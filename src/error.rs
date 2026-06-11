@@ -20,10 +20,7 @@ pub enum Error {
     TypeMap(String),
 
     #[error("database error: {0}")]
-    Database(#[from] tokio_postgres::Error),
-
-    #[error("pool error: {0}")]
-    Pool(#[from] deadpool_postgres::PoolError),
+    Database(#[from] sqlx::Error),
 
     #[error("result decoding: {0}")]
     Decode(String),

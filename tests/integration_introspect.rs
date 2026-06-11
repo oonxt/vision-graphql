@@ -1,13 +1,11 @@
-use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use serde_json::Value;
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
-use tokio_postgres::NoTls;
 use vision_graphql::schema::Schema;
 use vision_graphql::Engine;
 
 async fn setup_pool() -> (
-    deadpool_postgres::Pool,
+    sqlx::PgPool,
     testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
 ) {
     let container = Postgres::default()
@@ -16,22 +14,15 @@ async fn setup_pool() -> (
         .await
         .expect("start pg");
     let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let mut cfg = Config::new();
-    cfg.host = Some("127.0.0.1".into());
-    cfg.port = Some(host_port);
-    cfg.user = Some("postgres".into());
-    cfg.password = Some("postgres".into());
-    cfg.dbname = Some("postgres".into());
-    cfg.manager = Some(ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    });
-    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).expect("pool");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("pool");
 
-    {
-        let client = pool.get().await.expect("client");
-        client
-            .batch_execute(
-                r#"
+    sqlx::raw_sql(
+        r#"
                 CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -45,10 +36,10 @@ async fn setup_pool() -> (
                 INSERT INTO users (name, secret) VALUES ('alice', 's1'), ('bob', 's2');
                 INSERT INTO posts (title, user_id) VALUES ('p1', 1), ('p2', 2);
                 "#,
-            )
-            .await
-            .expect("seed");
-    }
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
     (pool, container)
 }
 

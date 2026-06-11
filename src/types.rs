@@ -3,10 +3,12 @@
 use crate::error::{Error, Result};
 use crate::schema::PgType;
 use serde_json::Value;
-use std::error::Error as StdError;
-use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 
-/// A single bound parameter ready to pass to `tokio-postgres`.
+/// A single bound parameter ready to pass to sqlx.
+///
+/// "Stringly" PostgreSQL types (uuid, numeric, timestamps, jsonb) are carried
+/// as [`Bind::Text`]: the client declares the parameter as `text` and the
+/// rendered SQL casts it (`$1::uuid`) so the server performs the conversion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bind {
     Null,
@@ -15,29 +17,6 @@ pub enum Bind {
     Int8(i64),
     Float8(f64),
     Text(String),
-}
-
-impl ToSql for Bind {
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut bytes::BytesMut,
-    ) -> std::result::Result<IsNull, Box<dyn StdError + Sync + Send>> {
-        match self {
-            Bind::Null => Ok(IsNull::Yes),
-            Bind::Bool(v) => v.to_sql(ty, out),
-            Bind::Int4(v) => v.to_sql(ty, out),
-            Bind::Int8(v) => v.to_sql(ty, out),
-            Bind::Float8(v) => v.to_sql(ty, out),
-            Bind::Text(v) => v.as_str().to_sql(ty, out),
-        }
-    }
-
-    fn accepts(_ty: &Type) -> bool {
-        true
-    }
-
-    to_sql_checked!();
 }
 
 pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {

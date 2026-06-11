@@ -6,10 +6,9 @@ use std::path::Path;
 use vision_graphql::schema::config::parse;
 
 pub fn run(path: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg = parse(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg = parse(&text).with_context(|| format!("parsing {}", path.display()))?;
 
     let mut issues: Vec<String> = Vec::new();
 
@@ -146,7 +145,10 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            p.push(format!("vision-gql-test-{nanos}-{}.toml", std::process::id()));
+            p.push(format!(
+                "vision-gql-test-{nanos}-{}.toml",
+                std::process::id()
+            ));
             let mut f = std::fs::File::create(&p).expect("temp file");
             f.write_all(contents.as_bytes()).expect("write");
             PathHolder { path: p }

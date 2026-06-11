@@ -285,7 +285,14 @@ fn lower_mutation_field(
         if let Some(table) = schema.table(base_name) {
             let (objects, on_conflict) =
                 parse_insert_args(&field.arguments, table, schema, vars, alias, false)?;
-            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
+            let returning = parse_returning(
+                &field.selection_set.node,
+                table,
+                schema,
+                vars,
+                fragments,
+                alias,
+            )?;
             return Ok(MutationField::Insert {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -334,7 +341,14 @@ fn lower_mutation_field(
     if let Some(base_name) = name.strip_prefix("update_") {
         if let Some(table) = schema.table(base_name) {
             let (where_, set) = parse_update_args(&field.arguments, table, schema, vars, alias)?;
-            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
+            let returning = parse_returning(
+                &field.selection_set.node,
+                table,
+                schema,
+                vars,
+                fragments,
+                alias,
+            )?;
             return Ok(MutationField::Update {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -415,7 +429,14 @@ fn lower_mutation_field(
                 path: alias.into(),
                 message: "delete requires 'where'".into(),
             })?;
-            let returning = parse_returning(&field.selection_set.node, table, schema, vars, fragments, alias)?;
+            let returning = parse_returning(
+                &field.selection_set.node,
+                table,
+                schema,
+                vars,
+                fragments,
+                alias,
+            )?;
             return Ok(MutationField::Delete {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
@@ -439,7 +460,10 @@ fn parse_insert_args(
     vars: &Value,
     parent_path: &str,
     single: bool,
-) -> Result<(Vec<crate::ast::InsertObject>, Option<crate::ast::OnConflict>)> {
+) -> Result<(
+    Vec<crate::ast::InsertObject>,
+    Option<crate::ast::OnConflict>,
+)> {
     let mut objects: Vec<crate::ast::InsertObject> = Vec::new();
     let mut on_conflict: Option<crate::ast::OnConflict> = None;
 
@@ -449,7 +473,8 @@ fn parse_insert_args(
         match aname {
             "object" if single => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.object"))?;
-                let obj = parse_insert_object(&json, table, schema, &format!("{parent_path}.object"))?;
+                let obj =
+                    parse_insert_object(&json, table, schema, &format!("{parent_path}.object"))?;
                 objects.push(obj);
             }
             "objects" if !single => {
@@ -505,11 +530,8 @@ fn parse_insert_args(
             .map(|s| s.as_str())
             .collect();
         for (i, obj) in objects.iter().enumerate().skip(1) {
-            let these: std::collections::BTreeSet<&str> = obj
-                .nested_objects
-                .keys()
-                .map(|s| s.as_str())
-                .collect();
+            let these: std::collections::BTreeSet<&str> =
+                obj.nested_objects.keys().map(|s| s.as_str()).collect();
             if these != first_keys {
                 // Find a specific offender for the error message.
                 let missing: Vec<&&str> = first_keys.difference(&these).collect();
@@ -598,15 +620,16 @@ fn parse_insert_object(
         if let Some(rel) = table.find_relation(k) {
             match rel.kind {
                 crate::schema::RelKind::Array => {
-                    let target = schema
-                        .table(&rel.target_table)
-                        .ok_or_else(|| Error::Validate {
-                            path: format!("{path}.{k}"),
-                            message: format!(
-                                "relation target table '{}' missing",
-                                rel.target_table
-                            ),
-                        })?;
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{k}"),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
 
                     // Validate shape: `{ data: [...] }`
                     let wrapper = v.as_object().ok_or_else(|| Error::Validate {
@@ -682,15 +705,16 @@ fn parse_insert_object(
                     continue;
                 }
                 crate::schema::RelKind::Object => {
-                    let target = schema
-                        .table(&rel.target_table)
-                        .ok_or_else(|| Error::Validate {
-                            path: format!("{path}.{k}"),
-                            message: format!(
-                                "relation target table '{}' missing",
-                                rel.target_table
-                            ),
-                        })?;
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: format!("{path}.{k}"),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
 
                     // Validate shape: `{ data: <object> }`
                     let wrapper = v.as_object().ok_or_else(|| Error::Validate {
@@ -706,7 +730,8 @@ fn parse_insert_object(
                     if data.is_array() {
                         return Err(Error::Validate {
                             path: format!("{path}.{k}.data"),
-                            message: "object-relation 'data' must be a single object, not an array".into(),
+                            message: "object-relation 'data' must be a single object, not an array"
+                                .into(),
                         });
                     }
                     if !data.is_object() {
@@ -754,12 +779,8 @@ fn parse_insert_object(
                     }
 
                     // Recurse into the inner object.
-                    let child = parse_insert_object(
-                        data,
-                        target,
-                        schema,
-                        &format!("{path}.{k}.data"),
-                    )?;
+                    let child =
+                        parse_insert_object(data, target, schema, &format!("{path}.{k}.data"))?;
 
                     nested_objects.insert(
                         k.clone(),

@@ -148,8 +148,11 @@ pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter
                     });
                 }
                 if let Some(target_table) = by_name.get(target_phys.as_str()) {
-                    let remote_set: std::collections::BTreeSet<&str> =
-                        target_table.columns.iter().map(|c| c.name.as_str()).collect();
+                    let remote_set: std::collections::BTreeSet<&str> = target_table
+                        .columns
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect();
                     if !remote_set.contains(remote.as_str()) {
                         report.missing_columns.push(MissingColumn {
                             table: key.clone(),
@@ -168,9 +171,7 @@ pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vision_graphql::schema::config::{
-        RelationKindOverlay, RelationOverlay, TableOverlay,
-    };
+    use vision_graphql::schema::config::{RelationKindOverlay, RelationOverlay, TableOverlay};
     use vision_graphql::schema::introspect::{IntrospectedColumn, IntrospectedTable};
     use vision_graphql::schema::PgType;
 
@@ -182,8 +183,16 @@ mod tests {
                 schema: "public".into(),
                 name: "users".into(),
                 columns: vec![
-                    IntrospectedColumn { name: "id".into(),    pg_type: PgType::Int4, nullable: false },
-                    IntrospectedColumn { name: "email".into(), pg_type: PgType::Text, nullable: true  },
+                    IntrospectedColumn {
+                        name: "id".into(),
+                        pg_type: PgType::Int4,
+                        nullable: false,
+                    },
+                    IntrospectedColumn {
+                        name: "email".into(),
+                        pg_type: PgType::Text,
+                        nullable: true,
+                    },
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
@@ -217,10 +226,7 @@ mod tests {
     fn missing_table_reported() {
         let db = db_users_only();
         let mut cfg = ConfigOverlay::default();
-        cfg.tables.insert(
-            "ghosts".into(),
-            TableOverlay::default(),
-        );
+        cfg.tables.insert("ghosts".into(), TableOverlay::default());
         let r = find_drift(&cfg, &db, &no_filter());
         assert_eq!(r.missing_tables, vec!["ghosts".to_string()]);
     }
@@ -240,7 +246,10 @@ mod tests {
         let r = find_drift(&cfg, &db, &no_filter());
         assert_eq!(r.missing_columns.len(), 1);
         assert_eq!(r.missing_columns[0].column, "password_hash");
-        assert!(matches!(r.missing_columns[0].origin, ColumnOrigin::HideColumns));
+        assert!(matches!(
+            r.missing_columns[0].origin,
+            ColumnOrigin::HideColumns
+        ));
     }
 
     #[test]

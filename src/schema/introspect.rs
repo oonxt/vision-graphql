@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::schema::PgType;
-use deadpool_postgres::Pool;
+use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default)]
@@ -55,21 +55,22 @@ pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
     }
 }
 
-pub async fn introspect(pool: &Pool) -> Result<IntrospectedDb> {
-    let client = pool.get().await?;
+pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
     let mut db = IntrospectedDb::default();
 
-    let rows = client
-        .query(
-            r#"
-            SELECT table_schema, table_name, column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-            ORDER BY table_schema, table_name, ordinal_position
-            "#,
-            &[],
-        )
-        .await?;
+    // information_schema columns are domain types (sql_identifier etc.);
+    // cast to text so decoding stays driver-agnostic.
+    let rows = sqlx::query(
+        r#"
+        SELECT table_schema::text, table_name::text, column_name::text,
+               data_type::text, is_nullable::text
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        ORDER BY table_schema, table_name, ordinal_position
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
     for row in rows {
         let schema: String = row.get(0);
         let tname: String = row.get(1);
@@ -104,21 +105,20 @@ pub async fn introspect(pool: &Pool) -> Result<IntrospectedDb> {
         });
     }
 
-    let rows = client
-        .query(
-            r#"
-            SELECT tc.table_schema, tc.table_name, kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-             AND tc.table_name = kcu.table_name
-            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
-            ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position
-            "#,
-            &[],
-        )
-        .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT tc.table_schema::text, tc.table_name::text, kcu.column_name::text
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+        ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
     for row in rows {
         let schema: String = row.get(0);
         let tname: String = row.get(1);
@@ -128,21 +128,21 @@ pub async fn introspect(pool: &Pool) -> Result<IntrospectedDb> {
         }
     }
 
-    let rows = client
-        .query(
-            r#"
-            SELECT tc.table_schema, tc.table_name, tc.constraint_name, kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-             AND tc.table_name = kcu.table_name
-            WHERE tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY') AND tc.table_schema = 'public'
-            ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
-            "#,
-            &[],
-        )
-        .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT tc.table_schema::text, tc.table_name::text, tc.constraint_name::text,
+               kcu.column_name::text
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY') AND tc.table_schema = 'public'
+        ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
     for row in rows {
         let schema: String = row.get(0);
         let tname: String = row.get(1);
@@ -156,35 +156,34 @@ pub async fn introspect(pool: &Pool) -> Result<IntrospectedDb> {
         }
     }
 
-    let rows = client
-        .query(
-            r#"
-            SELECT
-                tc.table_schema,
-                tc.table_name,
-                tc.constraint_name,
-                kcu.column_name,
-                ccu.table_schema AS foreign_schema,
-                ccu.table_name AS foreign_table,
-                ccu.column_name AS foreign_column,
-                kcu.ordinal_position
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-             AND tc.table_name = kcu.table_name
-            JOIN information_schema.referential_constraints rc
-              ON tc.constraint_name = rc.constraint_name
-             AND tc.table_schema = rc.constraint_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON rc.unique_constraint_name = ccu.constraint_name
-             AND rc.unique_constraint_schema = ccu.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-            ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
-            "#,
-            &[],
-        )
-        .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            tc.table_schema::text,
+            tc.table_name::text,
+            tc.constraint_name::text,
+            kcu.column_name::text,
+            ccu.table_schema::text AS foreign_schema,
+            ccu.table_name::text AS foreign_table,
+            ccu.column_name::text AS foreign_column,
+            kcu.ordinal_position
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        JOIN information_schema.referential_constraints rc
+          ON tc.constraint_name = rc.constraint_name
+         AND tc.table_schema = rc.constraint_schema
+        JOIN information_schema.constraint_column_usage ccu
+          ON rc.unique_constraint_name = ccu.constraint_name
+         AND rc.unique_constraint_schema = ccu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+        ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
     let mut fk_acc: BTreeMap<(String, String, String), IntrospectedForeignKey> = BTreeMap::new();
     for row in rows {
         let schema: String = row.get(0);

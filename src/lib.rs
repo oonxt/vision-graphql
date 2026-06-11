@@ -8,14 +8,12 @@
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! use deadpool_postgres::{Config, Runtime};
-//! use tokio_postgres::NoTls;
+//! use sqlx::postgres::PgPoolOptions;
 //! use vision_graphql::{Engine, Query, Schema};
 //!
-//! let mut cfg = Config::new();
-//! cfg.host = Some("localhost".into());
-//! cfg.dbname = Some("mydb".into());
-//! let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+//! let pool = PgPoolOptions::new()
+//!     .connect("postgres://localhost/mydb")
+//!     .await?;
 //!
 //! // Introspect the database to build the schema.
 //! let schema = Schema::introspect(&pool).await?.build();

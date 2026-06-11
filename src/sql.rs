@@ -209,7 +209,7 @@ fn render_bool_expr(
                     message: format!("{e}"),
                 })?;
             ctx.binds.push(bind);
-            let placeholder = format!("${}", ctx.binds.len());
+            let placeholder = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -706,7 +706,7 @@ fn render_by_pk(
                 message: format!("{e}"),
             })?;
         ctx.binds.push(bind);
-        let ph = format!("${}", ctx.binds.len());
+        let ph = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
         write!(
             ctx.sql,
             "{inner_alias}.{} = {ph}",
@@ -824,7 +824,8 @@ fn render_insert_cte_recursive(
             quote_ident(&table.physical_name),
         )
         .unwrap();
-        ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
+        ctx.inserted_ctes
+            .insert(table_name.to_string(), cte.to_string());
         // Also emit a no-op _ord so callers that JOIN against it don't break.
         write!(
             ctx.sql,
@@ -854,13 +855,12 @@ fn render_insert_cte_recursive(
     }
 
     for rel_name in &object_rel_names {
-        let rel = table.find_relation(rel_name).ok_or_else(|| Error::Validate {
-            path: cte.into(),
-            message: format!(
-                "unknown relation '{rel_name}' on '{}'",
-                table.exposed_name
-            ),
-        })?;
+        let rel = table
+            .find_relation(rel_name)
+            .ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
+            })?;
         // Gather the N object-rows (one per parent row), in parent ord order.
         let child_rows: Vec<crate::ast::InsertObject> = objects
             .iter()
@@ -898,7 +898,11 @@ fn render_insert_cte_recursive(
 
     // 3. Emit the parent's `{cte}_input` VALUES CTE with ord + column values.
     let input_cte = format!("{cte}_input");
-    let ord_col_name = if parent_link.is_some() { "parent_ord" } else { "ord" };
+    let ord_col_name = if parent_link.is_some() {
+        "parent_ord"
+    } else {
+        "ord"
+    };
 
     write!(ctx.sql, "{input_cte} AS (SELECT * FROM (VALUES ").unwrap();
     for (r, obj) in objects.iter().enumerate() {
@@ -962,10 +966,15 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = table.find_column(child_col).ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!("mapped FK column '{child_col}' missing on '{}'", table.exposed_name),
-            })?;
+            let col = table
+                .find_column(child_col)
+                .ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!(
+                        "mapped FK column '{child_col}' missing on '{}'",
+                        table.exposed_name
+                    ),
+                })?;
             ctx.sql.push_str(&quote_ident(&col.physical_name));
         }
     }
@@ -977,10 +986,15 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = table.find_column(parent_fk_col).ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!("mapped FK column '{parent_fk_col}' missing on '{}'", table.exposed_name),
-            })?;
+            let col = table
+                .find_column(parent_fk_col)
+                .ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!(
+                        "mapped FK column '{parent_fk_col}' missing on '{}'",
+                        table.exposed_name
+                    ),
+                })?;
             ctx.sql.push_str(&quote_ident(&col.physical_name));
         }
     }
@@ -1003,13 +1017,15 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let pcol = parent_table.find_column(parent_col).ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!(
-                    "mapped parent column '{parent_col}' missing on '{}'",
-                    parent_table.exposed_name
-                ),
-            })?;
+            let pcol = parent_table
+                .find_column(parent_col)
+                .ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!(
+                        "mapped parent column '{parent_col}' missing on '{}'",
+                        parent_table.exposed_name
+                    ),
+                })?;
             write!(ctx.sql, "p.{}", quote_ident(&pcol.physical_name)).unwrap();
         }
     }
@@ -1017,28 +1033,27 @@ fn render_insert_cte_recursive(
     // is `o_{rel_name}` — unique per object relation.
     for rel_name in &object_rel_names {
         let rel = table.find_relation(rel_name).unwrap();
-        let obj_target = schema.table(&rel.target_table).ok_or_else(|| Error::Validate {
-            path: cte.into(),
-            message: format!("object-relation target '{}' missing", rel.target_table),
-        })?;
+        let obj_target = schema
+            .table(&rel.target_table)
+            .ok_or_else(|| Error::Validate {
+                path: cte.into(),
+                message: format!("object-relation target '{}' missing", rel.target_table),
+            })?;
         for (_, target_col) in &rel.mapping {
             if !first_sel {
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let tcol = obj_target.find_column(target_col).ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!(
-                    "mapped target column '{target_col}' missing on '{}'",
-                    obj_target.exposed_name
-                ),
-            })?;
-            write!(
-                ctx.sql,
-                "o_{rel_name}.{}",
-                quote_ident(&tcol.physical_name)
-            )
-            .unwrap();
+            let tcol = obj_target
+                .find_column(target_col)
+                .ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!(
+                        "mapped target column '{target_col}' missing on '{}'",
+                        obj_target.exposed_name
+                    ),
+                })?;
+            write!(ctx.sql, "o_{rel_name}.{}", quote_ident(&tcol.physical_name)).unwrap();
         }
     }
 
@@ -1077,7 +1092,8 @@ fn render_insert_cte_recursive(
     ctx.sql.push_str(" RETURNING *)");
 
     // 5. Track this CTE for returning-visibility lookup.
-    ctx.inserted_ctes.insert(table_name.to_string(), cte.to_string());
+    ctx.inserted_ctes
+        .insert(table_name.to_string(), cte.to_string());
 
     // 6. Always emit `{cte}_ord` so any consumer (array-children or object-relation
     //    parents) can JOIN against it.
@@ -1107,10 +1123,12 @@ fn render_insert_cte_recursive(
         }
 
         for (rel_name, (child_ords, child_rows)) in per_relation {
-            let rel = table.find_relation(rel_name).ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
-            })?;
+            let rel = table
+                .find_relation(rel_name)
+                .ok_or_else(|| Error::Validate {
+                    path: cte.into(),
+                    message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
+                })?;
             // Find the first parent row that has this array relation; read its on_conflict.
             // Array relations can be present in some parent rows and absent in others
             // (unlike object relations which are batch-uniform), so we scan all parents.
@@ -1246,9 +1264,10 @@ fn render_update_cte(
         ctx.binds.push(bind);
         write!(
             ctx.sql,
-            "{} = ${}",
+            "{} = ${}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len()
+            ctx.binds.len(),
+            pg_type_cast(&col.pg_type)
         )
         .unwrap();
     }
@@ -1293,9 +1312,10 @@ fn render_update_by_pk_cte(
         ctx.binds.push(bind);
         write!(
             ctx.sql,
-            "{} = ${}",
+            "{} = ${}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len()
+            ctx.binds.len(),
+            pg_type_cast(&col.pg_type)
         )
         .unwrap();
     }
@@ -1316,9 +1336,10 @@ fn render_update_by_pk_cte(
         ctx.binds.push(bind);
         write!(
             ctx.sql,
-            "{} = ${}",
+            "{} = ${}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len()
+            ctx.binds.len(),
+            pg_type_cast(&col.pg_type)
         )
         .unwrap();
     }
@@ -1383,9 +1404,10 @@ fn render_delete_by_pk_cte(
         ctx.binds.push(bind);
         write!(
             ctx.sql,
-            "{} = ${}",
+            "{} = ${}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len()
+            ctx.binds.len(),
+            pg_type_cast(&col.pg_type)
         )
         .unwrap();
     }
@@ -1445,9 +1467,7 @@ fn render_mutation_output_for_inner(
                 let mut matching: Vec<&String> = ctx
                     .inserted_ctes
                     .values()
-                    .filter(|v| {
-                        v.as_str() == cte || v.starts_with(&format!("{cte}_"))
-                    })
+                    .filter(|v| v.as_str() == cte || v.starts_with(&format!("{cte}_")))
                     .collect();
                 matching.sort();
                 for (i, c) in matching.iter().enumerate() {
@@ -1590,7 +1610,14 @@ fn render_aggregate(
 
     if let Some(node_fields) = nodes {
         ctx.sql.push_str(", 'nodes', coalesce(json_agg(");
-        render_json_build_object_for_nodes(node_fields, &inner_alias, table, &root.alias, schema, ctx)?;
+        render_json_build_object_for_nodes(
+            node_fields,
+            &inner_alias,
+            table,
+            &root.alias,
+            schema,
+            ctx,
+        )?;
         ctx.sql.push_str("), '[]'::json)");
     }
 
@@ -1851,7 +1878,7 @@ fn render_bool_expr_no_alias(
                     message: format!("{e}"),
                 })?;
             ctx.binds.push(bind);
-            let placeholder = format!("${}", ctx.binds.len());
+            let placeholder = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",

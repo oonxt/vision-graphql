@@ -1,11 +1,10 @@
 //! Generate a starter schema.toml from a live database.
 
 use anyhow::{bail, Context, Result};
-use deadpool_postgres::{Config, Runtime};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::path::PathBuf;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio_postgres::NoTls;
 use vision_graphql::schema::introspect::introspect;
 
 use crate::filter::TableFilter;
@@ -28,10 +27,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if let OutputTarget::File(p) = &output_target {
         if p.exists() && !args.force {
-            bail!(
-                "refusing to overwrite {} without --force",
-                p.display()
-            );
+            bail!("refusing to overwrite {} without --force", p.display());
         }
     }
 
@@ -68,25 +64,11 @@ enum OutputTarget {
     File(PathBuf),
 }
 
-pub fn build_pool_pub(url: &str) -> Result<deadpool_postgres::Pool> {
-    let cfg: tokio_postgres::Config = url
+pub fn build_pool_pub(url: &str) -> Result<sqlx::PgPool> {
+    let opts: PgConnectOptions = url
         .parse()
         .with_context(|| format!("parsing connection URL {}", redact_url(url)))?;
-    let mut dp = Config::new();
-    dp.host = cfg
-        .get_hosts()
-        .iter()
-        .find_map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
-            _ => None,
-        });
-    dp.port = cfg.get_ports().first().copied();
-    dp.user = cfg.get_user().map(str::to_string);
-    dp.password = cfg
-        .get_password()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(str::to_string);
-    dp.dbname = cfg.get_dbname().map(str::to_string);
-    dp.create_pool(Some(Runtime::Tokio1), NoTls)
-        .context("creating connection pool")
+    Ok(PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy_with(opts))
 }

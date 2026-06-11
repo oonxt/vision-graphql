@@ -5,9 +5,10 @@ use crate::error::{Error, Result};
 use crate::parser::parse_and_lower;
 use crate::schema::Schema;
 use crate::sql::render;
-use deadpool_postgres::{Pool, Transaction as DeadpoolTx};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sqlx::postgres::Postgres;
+use sqlx::PgPool;
 use std::sync::Arc;
 
 /// Typed shape of an `insert` / `update` / `delete` mutation result:
@@ -42,12 +43,12 @@ fn unwrap_and_deserialize<T: DeserializeOwned>(mut data: Value, alias: Option<&s
 }
 
 pub struct Engine {
-    pool: Pool,
+    pool: PgPool,
     schema: Arc<Schema>,
 }
 
 impl Engine {
-    pub fn new(pool: Pool, schema: Schema) -> Self {
+    pub fn new(pool: PgPool, schema: Schema) -> Self {
         Self {
             pool,
             schema: Arc::new(schema),
@@ -108,29 +109,25 @@ impl Engine {
     /// Run a closure inside a single PostgreSQL transaction. Every call to
     /// [`TxClient::query`] / [`TxClient::run`] inside the closure uses the
     /// same connection and the same tx. `Ok` commits; `Err` rolls back and
-    /// the error is returned verbatim. Panics unwind; tokio-postgres's
-    /// `Drop` impl on the tx will roll back.
+    /// the error is returned verbatim. Panics unwind; sqlx's `Drop` impl on
+    /// the tx will roll back.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn transaction<F, T>(&self, f: F) -> Result<T>
     where
-        F: for<'tx> AsyncFnOnce(TxClient<'tx>) -> Result<T>,
+        F: AsyncFnOnce(&mut TxClient) -> Result<T>,
     {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let result = {
-            let tc = TxClient {
-                tx: &tx,
-                schema: self.schema.clone(),
-            };
-            f(tc).await
+        let tx = self.pool.begin().await?;
+        let mut tc = TxClient {
+            tx,
+            schema: self.schema.clone(),
         };
-        match result {
+        match f(&mut tc).await {
             Ok(v) => {
-                tx.commit().await?;
+                tc.tx.commit().await?;
                 Ok(v)
             }
             Err(e) => {
-                let _ = tx.rollback().await;
+                let _ = tc.tx.rollback().await;
                 Err(e)
             }
         }
@@ -139,35 +136,36 @@ impl Engine {
 
 /// A handle to an open PostgreSQL transaction that exposes the same query
 /// surface as [`Engine`]. Obtained via [`Engine::transaction`]; cannot be
-/// constructed directly.
-pub struct TxClient<'tx> {
-    tx: &'tx DeadpoolTx<'tx>,
+/// constructed directly. Methods take `&mut self` because the underlying
+/// connection is exclusively borrowed per statement.
+pub struct TxClient {
+    tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
 }
 
-impl<'tx> TxClient<'tx> {
+impl TxClient {
     /// Same as [`Engine::query`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
+    pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let op = parse_and_lower(source, &vars, None, &self.schema)?;
         let (sql, binds) = render(&op, &self.schema)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        crate::executor::execute_on(self.tx, &sql, &binds).await
+        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
 
     /// Same as [`Engine::run`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
+    pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         let operation = op.into_operation();
         let (sql, binds) = render(&operation, &self.schema)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        crate::executor::execute_on(self.tx, &sql, &binds).await
+        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
 
     /// Same as [`Engine::query_as`], but runs on the transaction's connection.
     pub async fn query_as<T: DeserializeOwned>(
-        &self,
+        &mut self,
         source: &str,
         variables: Option<Value>,
     ) -> Result<T> {
@@ -177,14 +175,14 @@ impl<'tx> TxClient<'tx> {
 
     /// Same as [`Engine::run_as`], but runs on the transaction's connection.
     pub async fn run_as<T: DeserializeOwned>(
-        &self,
+        &mut self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
         let (sql, binds) = render(&operation, &self.schema)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        let data = crate::executor::execute_on(self.tx, &sql, &binds).await?;
+        let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 }

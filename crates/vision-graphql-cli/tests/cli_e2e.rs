@@ -15,30 +15,29 @@ async fn boot_pg() -> (
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
     // Seed a tiny schema.
-    let cfg: tokio_postgres::Config = url.parse().unwrap();
-    let (client, conn) = cfg.connect(tokio_postgres::NoTls).await.expect("connect");
-    tokio::spawn(async move { let _ = conn.await; });
-    client
-        .batch_execute(
-            r#"
-            CREATE TABLE users (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                secret TEXT
-            );
-            CREATE TABLE posts (
-                id SERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                user_id INT NOT NULL REFERENCES users(id)
-            );
-            CREATE TABLE audit_log (
-                id SERIAL PRIMARY KEY,
-                msg TEXT NOT NULL
-            );
-            "#,
-        )
-        .await
-        .expect("seed");
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE users (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            secret TEXT
+        );
+        CREATE TABLE posts (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            user_id INT NOT NULL REFERENCES users(id)
+        );
+        CREATE TABLE audit_log (
+            id SERIAL PRIMARY KEY,
+            msg TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    pool.close().await;
 
     (url, container)
 }
@@ -51,7 +50,11 @@ async fn generate_to_stdout_includes_all_tables() {
         .args(["generate", "--url", &url])
         .output()
         .expect("run cli");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8(out.stdout).unwrap();
     assert!(s.contains("# ── public.users ─"));
     assert!(s.contains("# ── public.posts ─"));
@@ -96,7 +99,11 @@ async fn diff_clean_overlay_exits_zero() {
         .args(["diff", "--url", &url, "--config", p.to_str().unwrap()])
         .output()
         .expect("run cli");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8(out.stdout).unwrap().contains("OK"));
     let _ = std::fs::remove_file(&p);
 }
@@ -196,10 +203,21 @@ async fn generate_force_required_to_overwrite() {
         .args(["generate", "--url", &url, "-o", path.to_str().unwrap()])
         .output()
         .expect("run cli");
-    assert_eq!(out.status.code(), Some(2), "second write without --force must exit 2");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "second write without --force must exit 2"
+    );
 
     let out = Command::new(bin)
-        .args(["generate", "--url", &url, "-o", path.to_str().unwrap(), "--force"])
+        .args([
+            "generate",
+            "--url",
+            &url,
+            "-o",
+            path.to_str().unwrap(),
+            "--force",
+        ])
         .output()
         .expect("run cli");
     assert!(out.status.success(), "with --force must succeed");

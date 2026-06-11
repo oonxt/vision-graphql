@@ -1,8 +1,6 @@
-use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use serde_json::{json, Value};
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
-use tokio_postgres::NoTls;
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
 
@@ -33,7 +31,10 @@ fn schema() -> Schema {
                 .column("user_id", "user_id", PgType::Int4, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")]))
-                .relation("comments", Relation::array("comments").on([("id", "post_id")])),
+                .relation(
+                    "comments",
+                    Relation::array("comments").on([("id", "post_id")]),
+                ),
         )
         .table(
             Table::new("comments", "public", "comments")
@@ -55,21 +56,14 @@ async fn setup() -> (
         .await
         .expect("start pg");
     let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let mut cfg = Config::new();
-    cfg.host = Some("127.0.0.1".into());
-    cfg.port = Some(host_port);
-    cfg.user = Some("postgres".into());
-    cfg.password = Some("postgres".into());
-    cfg.dbname = Some("postgres".into());
-    cfg.manager = Some(ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    });
-    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).expect("pool");
-    {
-        let client = pool.get().await.expect("client");
-        client
-            .batch_execute(
-                r#"
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("pool");
+    sqlx::raw_sql(
+        r#"
                 CREATE TABLE organizations (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL
@@ -90,10 +84,10 @@ async fn setup() -> (
                     post_id INT NOT NULL REFERENCES posts(id)
                 );
                 "#,
-            )
-            .await
-            .expect("seed");
-    }
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
     let engine = Engine::new(pool, schema());
     (engine, container)
 }
@@ -206,10 +200,7 @@ async fn nested_object_mixed_batch_is_error() {
         .err()
         .expect("expected error");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("must be uniform"),
-        "error was: {msg}"
-    );
+    assert!(msg.contains("must be uniform"), "error was: {msg}");
 }
 
 #[tokio::test]
@@ -336,9 +327,7 @@ async fn nested_object_correlation_stress() {
 
         let v2: Value = engine
             .query(
-                &format!(
-                    r#"query {{ users(where: {{ id: {{_eq: {user_id} }} }}) {{ name }} }}"#
-                ),
+                &format!(r#"query {{ users(where: {{ id: {{_eq: {user_id} }} }}) {{ name }} }}"#),
                 None,
             )
             .await

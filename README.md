@@ -5,15 +5,14 @@ A Hasura-style ORM for PostgreSQL in Rust. Accepts GraphQL query strings (or a t
 ## Quick start
 
 ```rust
-use deadpool_postgres::{Config, Runtime};
-use tokio_postgres::NoTls;
+use sqlx::postgres::PgPoolOptions;
 use vision_graphql::{Engine, Query, Schema};
 
 # async fn example() -> anyhow::Result<()> {
-let mut cfg = Config::new();
-cfg.host = Some("localhost".into());
-cfg.dbname = Some("mydb".into());
-let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+// Any sqlx PgPool works — share the one your app already has.
+let pool = PgPoolOptions::new()
+    .connect("postgres://localhost/mydb")
+    .await?;
 
 // Option 1: introspect the database
 let schema = Schema::introspect(&pool).await?.build();
@@ -41,8 +40,22 @@ let data = engine
             .limit(10),
     )
     .await?;
+
+// Typed path — unwraps the single root field and deserializes
+#[derive(serde::Deserialize)]
+struct User { id: i64, name: Option<String> }
+
+let users: Vec<User> = engine
+    .run_as(Query::from("users").select(&["id", "name"]))
+    .await?;
 # Ok(()) }
 ```
+
+`run_as` unwraps the root key for you: `Query::from` → `Vec<T>`, `Query::by_pk`
+→ `Option<T>`, and `insert`/`update`/`delete` → `MutationResult<T>`
+(`{ affected_rows, returning }`). `query_as` deserializes the whole `data`
+envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
+`serde_json::Value` remain for passthrough use.
 
 ## Features
 
@@ -61,6 +74,7 @@ let data = engine
 | Schema introspection | ✓ |
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
+| Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
 | Row-level permissions | Not implemented |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
@@ -120,8 +134,9 @@ Filter what gets processed with comma-separated globs:
 vision-gql generate --url $DATABASE_URL --ignore-tables 'audit_*,_temp_*'
 ```
 
-Both subcommands accept `$DATABASE_URL` as the default for `--url`. NoTls only
-in this release; only the `public` schema is introspected.
+Both subcommands accept `$DATABASE_URL` as the default for `--url`. TLS is
+supported via rustls (`sslmode=require` in the URL); only the `public` schema
+is introspected.
 
 ## Mutations
 
