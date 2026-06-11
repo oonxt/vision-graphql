@@ -60,6 +60,33 @@ async fn in_operator_matches_multiple_values() {
 }
 
 #[tokio::test]
+async fn nin_operator_excludes_values_and_nulls() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_nin: ["alice"]}}) { name } }"#,
+            None,
+        )
+        .await
+        .expect("query ok");
+    // bob + carol; the NULL-name row never matches, same as SQL NOT IN.
+    assert_eq!(v["users"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn empty_in_list_matches_nothing() {
+    let (engine, _c) = setup().await;
+    let v: Value = engine
+        .query(
+            r#"query { users(where: {name: {_in: []}}) { name } }"#,
+            None,
+        )
+        .await
+        .expect("query ok");
+    assert_eq!(v["users"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn like_matches_pattern() {
     let (engine, _c) = setup().await;
     let v: Value = engine

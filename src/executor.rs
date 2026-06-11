@@ -24,6 +24,11 @@ where
             Bind::Int8(v) => q.bind(*v),
             Bind::Float8(v) => q.bind(*v),
             Bind::Text(v) => q.bind(v.clone()),
+            Bind::BoolArray(v) => q.bind(v.clone()),
+            Bind::Int4Array(v) => q.bind(v.clone()),
+            Bind::Int8Array(v) => q.bind(v.clone()),
+            Bind::Float8Array(v) => q.bind(v.clone()),
+            Bind::TextArray(v) => q.bind(v.clone()),
         };
     }
     let json = q.fetch_one(executor).await?;

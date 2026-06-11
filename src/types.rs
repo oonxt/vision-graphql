@@ -17,6 +17,11 @@ pub enum Bind {
     Int8(i64),
     Float8(f64),
     Text(String),
+    BoolArray(Vec<Option<bool>>),
+    Int4Array(Vec<Option<i32>>),
+    Int8Array(Vec<Option<i64>>),
+    Float8Array(Vec<Option<f64>>),
+    TextArray(Vec<Option<String>>),
 }
 
 pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
@@ -51,6 +56,62 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .map(|s| Bind::Text(s.to_string()))
             .ok_or_else(|| Error::TypeMap(format!("expected string for {pg:?}"))),
         PgType::Jsonb => Ok(Bind::Text(v.to_string())),
+    }
+}
+
+/// Convert a JSON array (from `_in` / `_nin`) into a single array bind for
+/// `= ANY($n)` / `<> ALL($n)`. NULL elements are allowed and keep SQL `IN`
+/// semantics (they never match).
+pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
+    fn collect<T>(
+        values: &[Value],
+        f: impl Fn(&Value) -> Option<T>,
+        expected: &str,
+    ) -> Result<Vec<Option<T>>> {
+        values
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    Ok(None)
+                } else {
+                    f(v).map(Some)
+                        .ok_or_else(|| Error::TypeMap(format!("expected {expected}")))
+                }
+            })
+            .collect()
+    }
+    match pg {
+        PgType::Bool => collect(values, Value::as_bool, "Bool").map(Bind::BoolArray),
+        PgType::Int4 => collect(
+            values,
+            |v| v.as_i64().and_then(|n| i32::try_from(n).ok()),
+            "Int4",
+        )
+        .map(Bind::Int4Array),
+        PgType::Int8 => collect(values, Value::as_i64, "Int8").map(Bind::Int8Array),
+        PgType::Float4 | PgType::Float8 => {
+            collect(values, Value::as_f64, "floating point").map(Bind::Float8Array)
+        }
+        PgType::Text
+        | PgType::Varchar
+        | PgType::Uuid
+        | PgType::Numeric
+        | PgType::Timestamp
+        | PgType::TimestampTz => {
+            collect(values, |v| v.as_str().map(str::to_string), "string").map(Bind::TextArray)
+        }
+        PgType::Jsonb => Ok(Bind::TextArray(
+            values
+                .iter()
+                .map(|v| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                })
+                .collect(),
+        )),
     }
 }
 

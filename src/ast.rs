@@ -92,6 +92,13 @@ pub enum BoolExpr {
         column: String,
         negated: bool,
     },
+    /// `column = ANY($n)` over a single bound array (`<> ALL($n)` when
+    /// negated). NULL elements keep SQL `IN` semantics: they never match.
+    InList {
+        column: String,
+        values: Vec<Value>,
+        negated: bool,
+    },
     /// Match rows where the named relation has at least one matching row.
     Relation {
         name: String,

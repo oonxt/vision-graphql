@@ -157,16 +157,12 @@ impl QueryBuilder {
     }
 
     pub fn where_in(mut self, col: impl Into<String>, values: &[Value]) -> Self {
-        let column = col.into();
-        let parts: Vec<BoolExpr> = values
-            .iter()
-            .map(|v| BoolExpr::Compare {
-                column: column.clone(),
-                op: CmpOp::Eq,
-                value: v.clone(),
-            })
-            .collect();
-        self.args.where_ = Some(merge_and(self.args.where_.take(), BoolExpr::Or(parts)));
+        let cmp = BoolExpr::InList {
+            column: col.into(),
+            values: values.to_vec(),
+            negated: false,
+        };
+        self.args.where_ = Some(merge_and(self.args.where_.take(), cmp));
         self
     }
 
@@ -796,8 +792,13 @@ mod tests {
             .where_in("id", &[json!(1), json!(2)])
             .build();
         match rf.args.where_.as_ref().unwrap() {
-            BoolExpr::Or(parts) => assert_eq!(parts.len(), 2),
-            _ => panic!("expected Or"),
+            BoolExpr::InList {
+                values, negated, ..
+            } => {
+                assert_eq!(values.len(), 2);
+                assert!(!negated);
+            }
+            _ => panic!("expected InList"),
         }
     }
 

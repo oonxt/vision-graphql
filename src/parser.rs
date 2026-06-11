@@ -1343,30 +1343,22 @@ fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Resu
                                 path: format!("{path}.{col_name}._in"),
                                 message: "expected array".into(),
                             })?;
-                            let inner: Vec<BoolExpr> = arr
-                                .iter()
-                                .map(|v| BoolExpr::Compare {
-                                    column: col.exposed_name.clone(),
-                                    op: CmpOp::Eq,
-                                    value: v.clone(),
-                                })
-                                .collect();
-                            parts.push(BoolExpr::Or(inner));
+                            parts.push(BoolExpr::InList {
+                                column: col.exposed_name.clone(),
+                                values: arr.clone(),
+                                negated: false,
+                            });
                         }
                         "_nin" => {
                             let arr = op_val.as_array().ok_or_else(|| Error::Validate {
                                 path: format!("{path}.{col_name}._nin"),
                                 message: "expected array".into(),
                             })?;
-                            let inner: Vec<BoolExpr> = arr
-                                .iter()
-                                .map(|v| BoolExpr::Compare {
-                                    column: col.exposed_name.clone(),
-                                    op: CmpOp::Neq,
-                                    value: v.clone(),
-                                })
-                                .collect();
-                            parts.push(BoolExpr::And(inner));
+                            parts.push(BoolExpr::InList {
+                                column: col.exposed_name.clone(),
+                                values: arr.clone(),
+                                negated: true,
+                            });
                         }
                         other => {
                             return Err(Error::Validate {
@@ -1964,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_where_in_expands_to_or() {
+    fn parse_where_in_lowers_to_in_list() {
         let op = parse_and_lower(
             r#"query { users(where: {id: {_in: [1, 2, 3]}}) { id } }"#,
             &json!({}),
@@ -1976,8 +1968,16 @@ mod tests {
             panic!("expected Query")
         };
         match roots[0].args.where_.as_ref().unwrap() {
-            crate::ast::BoolExpr::Or(parts) => assert_eq!(parts.len(), 3),
-            _ => panic!("expected Or chain"),
+            crate::ast::BoolExpr::InList {
+                column,
+                values,
+                negated,
+            } => {
+                assert_eq!(column, "id");
+                assert_eq!(values.len(), 3);
+                assert!(!negated);
+            }
+            _ => panic!("expected InList"),
         }
     }
 

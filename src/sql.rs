@@ -244,6 +244,37 @@ fn render_bool_expr(
             .unwrap();
             Ok(())
         }
+        BoolExpr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            if values.is_empty() {
+                ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
+                return Ok(());
+            }
+            let bind = crate::types::json_to_bind_array(values, &col.pg_type).map_err(|e| {
+                Error::Validate {
+                    path: format!("where.{column}"),
+                    message: format!("{e}"),
+                }
+            })?;
+            ctx.binds.push(bind);
+            let pred = if *negated { "<> ALL" } else { "= ANY" };
+            write!(
+                ctx.sql,
+                "{table_alias}.{} {pred} (${}::{}[])",
+                quote_ident(&col.physical_name),
+                ctx.binds.len(),
+                pg_type_cast(&col.pg_type)
+            )
+            .unwrap();
+            Ok(())
+        }
         BoolExpr::Relation { name, inner } => {
             let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
                 path: format!("where.{name}"),
@@ -1906,6 +1937,37 @@ fn render_bool_expr_no_alias(
             })?;
             let pred = if *negated { "IS NOT NULL" } else { "IS NULL" };
             write!(ctx.sql, "{} {pred}", quote_ident(&col.physical_name)).unwrap();
+            Ok(())
+        }
+        BoolExpr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            if values.is_empty() {
+                ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
+                return Ok(());
+            }
+            let bind = crate::types::json_to_bind_array(values, &col.pg_type).map_err(|e| {
+                Error::Validate {
+                    path: format!("where.{column}"),
+                    message: format!("{e}"),
+                }
+            })?;
+            ctx.binds.push(bind);
+            let pred = if *negated { "<> ALL" } else { "= ANY" };
+            write!(
+                ctx.sql,
+                "{} {pred} (${}::{}[])",
+                quote_ident(&col.physical_name),
+                ctx.binds.len(),
+                pg_type_cast(&col.pg_type)
+            )
+            .unwrap();
             Ok(())
         }
         BoolExpr::Relation { .. } => Err(Error::Validate {
