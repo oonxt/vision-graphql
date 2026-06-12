@@ -51,7 +51,10 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
         | PgType::Uuid
         | PgType::Numeric
         | PgType::Timestamp
-        | PgType::TimestampTz => v
+        | PgType::TimestampTz
+        | PgType::Date
+        | PgType::Time
+        | PgType::Enum(_) => v
             .as_str()
             .map(|s| Bind::Text(s.to_string()))
             .ok_or_else(|| Error::TypeMap(format!("expected string for {pg:?}"))),
@@ -97,7 +100,10 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
         | PgType::Uuid
         | PgType::Numeric
         | PgType::Timestamp
-        | PgType::TimestampTz => {
+        | PgType::TimestampTz
+        | PgType::Date
+        | PgType::Time
+        | PgType::Enum(_) => {
             collect(values, |v| v.as_str().map(str::to_string), "string").map(Bind::TextArray)
         }
         PgType::Jsonb => Ok(Bind::TextArray(

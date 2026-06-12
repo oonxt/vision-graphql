@@ -630,9 +630,9 @@ fn render_limit_offset(args: &QueryArgs, ctx: &mut RenderCtx) {
 
 /// Return the PostgreSQL type keyword used in a cast expression (`$1::type`)
 /// for a given schema PgType.
-fn pg_type_cast(pg: &crate::schema::PgType) -> &'static str {
+fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
     use crate::schema::PgType;
-    match pg {
+    std::borrow::Cow::Borrowed(match pg {
         PgType::Bool => "bool",
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
@@ -645,7 +645,10 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> &'static str {
         PgType::Timestamp => "timestamp",
         PgType::TimestampTz => "timestamptz",
         PgType::Jsonb => "jsonb",
-    }
+        PgType::Date => "date",
+        PgType::Time => "time",
+        PgType::Enum(udt_name) => return std::borrow::Cow::Owned(quote_ident(udt_name)),
+    })
 }
 
 fn quote_ident(s: &str) -> String {
@@ -2044,6 +2047,104 @@ mod tests {
         insta::assert_snapshot!(sql);
         assert_eq!(binds.len(), 1);
         assert!(matches!(binds[0], crate::types::Bind::Int4(42)));
+    }
+
+    fn roles_schema() -> Schema {
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("role", "role", PgType::Enum("role_type".into()), false)
+                    .column("birthday", "birthday", PgType::Date, true),
+            )
+            .build()
+    }
+
+    #[test]
+    fn render_where_eq_enum() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs {
+                where_: Some(BoolExpr::Compare {
+                    column: "role".into(),
+                    op: CmpOp::Eq,
+                    value: json!("admin"),
+                }),
+                ..Default::default()
+            },
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
+        }]);
+        let (sql, binds) = render(&op, &roles_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], crate::types::Bind::Text(s) if s == "admin"));
+    }
+
+    #[test]
+    fn render_where_in_enum_list() {
+        use crate::ast::BoolExpr;
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs {
+                where_: Some(BoolExpr::InList {
+                    column: "role".into(),
+                    values: vec![json!("admin"), json!("staff")],
+                    negated: false,
+                }),
+                ..Default::default()
+            },
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
+        }]);
+        let (sql, binds) = render(&op, &roles_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], crate::types::Bind::TextArray(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn render_where_gte_date() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs {
+                where_: Some(BoolExpr::Compare {
+                    column: "birthday".into(),
+                    op: CmpOp::Gte,
+                    value: json!("2000-01-01"),
+                }),
+                ..Default::default()
+            },
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
+        }]);
+        let (sql, binds) = render(&op, &roles_schema()).unwrap();
+        insta::assert_snapshot!(sql);
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], crate::types::Bind::Text(s) if s == "2000-01-01"));
     }
 
     #[test]

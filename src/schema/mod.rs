@@ -25,6 +25,10 @@ pub enum PgType {
     Timestamp,
     TimestampTz,
     Jsonb,
+    Date,
+    Time,
+    /// User-defined enum type; carries the `udt_name` used in cast expressions.
+    Enum(String),
 }
 
 #[derive(Debug)]

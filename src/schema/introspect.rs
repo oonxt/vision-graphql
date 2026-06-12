@@ -51,6 +51,8 @@ pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
         "timestamp without time zone" => Some(PgType::Timestamp),
         "timestamp with time zone" => Some(PgType::TimestampTz),
         "jsonb" => Some(PgType::Jsonb),
+        "date" => Some(PgType::Date),
+        "time without time zone" => Some(PgType::Time),
         _ => None,
     }
 }
@@ -62,11 +64,15 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
     // cast to text so decoding stays driver-agnostic.
     let rows = sqlx::query(
         r#"
-        SELECT table_schema::text, table_name::text, column_name::text,
-               data_type::text, is_nullable::text
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-        ORDER BY table_schema, table_name, ordinal_position
+        SELECT c.table_schema::text, c.table_name::text, c.column_name::text,
+               c.data_type::text, c.is_nullable::text, c.udt_name::text,
+               (SELECT t.typtype = 'e'
+                  FROM pg_type t
+                  JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE t.typname = c.udt_name AND n.nspname = c.udt_schema) AS is_enum
+        FROM information_schema.columns c
+        WHERE c.table_schema = 'public'
+        ORDER BY c.table_schema, c.table_name, c.ordinal_position
         "#,
     )
     .fetch_all(pool)
@@ -77,7 +83,14 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         let cname: String = row.get(2);
         let dtype: String = row.get(3);
         let is_nullable: String = row.get(4);
-        let Some(pg_type) = data_type_to_pg_type(&dtype) else {
+        let udt_name: String = row.get(5);
+        let is_enum: Option<bool> = row.get(6);
+        let pg_type = if dtype == "USER-DEFINED" && is_enum == Some(true) {
+            Some(PgType::Enum(udt_name))
+        } else {
+            data_type_to_pg_type(&dtype)
+        };
+        let Some(pg_type) = pg_type else {
             tracing::warn!(
                 target: "vision_graphql::introspect",
                 table = %tname,
