@@ -25,6 +25,11 @@ pub enum PgType {
     Timestamp,
     TimestampTz,
     Jsonb,
+    Date,
+    Time,
+    /// User-defined enum type; carries the schema-qualified type name used in
+    /// cast expressions (`$1::"schema"."name"`).
+    Enum { schema: String, name: String },
 }
 
 #[derive(Debug)]
