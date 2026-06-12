@@ -2,4 +2,4 @@
 source: src/sql.rs
 expression: sql
 ---
-SELECT json_build_object('users', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."id" AS "id" FROM "public"."users" t0 WHERE t0."role" = ANY ($1::"role_type"[])) r1)) AS result
+SELECT json_build_object('users', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."id" AS "id" FROM "public"."users" t0 WHERE t0."role" = ANY ($1::"public"."role_type"[])) r1)) AS result

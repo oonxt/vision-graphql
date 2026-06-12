@@ -65,12 +65,12 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
     let rows = sqlx::query(
         r#"
         SELECT c.table_schema::text, c.table_name::text, c.column_name::text,
-               c.data_type::text, c.is_nullable::text, c.udt_name::text,
-               (SELECT t.typtype = 'e'
-                  FROM pg_type t
-                  JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE t.typname = c.udt_name AND n.nspname = c.udt_schema) AS is_enum
+               c.data_type::text, c.is_nullable::text,
+               c.udt_schema::text, c.udt_name::text,
+               t.typtype = 'e' AS is_enum
         FROM information_schema.columns c
+        LEFT JOIN pg_namespace n ON n.nspname = c.udt_schema
+        LEFT JOIN pg_type t ON t.typnamespace = n.oid AND t.typname = c.udt_name
         WHERE c.table_schema = 'public'
         ORDER BY c.table_schema, c.table_name, c.ordinal_position
         "#,
@@ -83,12 +83,14 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         let cname: String = row.get(2);
         let dtype: String = row.get(3);
         let is_nullable: String = row.get(4);
-        let udt_name: String = row.get(5);
-        let is_enum: Option<bool> = row.get(6);
-        let pg_type = if dtype == "USER-DEFINED" && is_enum == Some(true) {
-            Some(PgType::Enum(udt_name))
-        } else {
-            data_type_to_pg_type(&dtype)
+        let udt_schema: Option<String> = row.get(5);
+        let udt_name: Option<String> = row.get(6);
+        let is_enum: Option<bool> = row.get(7);
+        let pg_type = match (&*dtype, udt_schema, udt_name, is_enum) {
+            ("USER-DEFINED", Some(schema), Some(name), Some(true)) => {
+                Some(PgType::Enum { schema, name })
+            }
+            _ => data_type_to_pg_type(&dtype),
         };
         let Some(pg_type) = pg_type else {
             tracing::warn!(

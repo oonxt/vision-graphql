@@ -79,8 +79,8 @@ fn write_header(out: &mut String, meta: &HeaderMeta) {
     out.push_str("# Uncomment any stanza below to override defaults from introspection.\n");
 }
 
-fn pg_type_short(t: &PgType) -> &'static str {
-    match t {
+fn pg_type_short(t: &PgType) -> std::borrow::Cow<'static, str> {
+    std::borrow::Cow::Borrowed(match t {
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
         PgType::Text => "text",
@@ -93,7 +93,12 @@ fn pg_type_short(t: &PgType) -> &'static str {
         PgType::Timestamp => "timestamp",
         PgType::TimestampTz => "timestamptz",
         PgType::Jsonb => "jsonb",
-    }
+        PgType::Date => "date",
+        PgType::Time => "time",
+        PgType::Enum { schema, name } => {
+            return std::borrow::Cow::Owned(format!("{schema}.{name}"));
+        }
+    })
 }
 
 fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &IntrospectedDb) {

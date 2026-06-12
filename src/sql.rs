@@ -647,7 +647,9 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
         PgType::Jsonb => "jsonb",
         PgType::Date => "date",
         PgType::Time => "time",
-        PgType::Enum(udt_name) => return std::borrow::Cow::Owned(quote_ident(udt_name)),
+        PgType::Enum { schema, name } => {
+            return std::borrow::Cow::Owned(format!("{}.{}", quote_ident(schema), quote_ident(name)));
+        }
     })
 }
 
@@ -2054,7 +2056,15 @@ mod tests {
             .table(
                 Table::new("users", "public", "users")
                     .column("id", "id", PgType::Int4, false)
-                    .column("role", "role", PgType::Enum("role_type".into()), false)
+                    .column(
+                        "role",
+                        "role",
+                        PgType::Enum {
+                            schema: "public".into(),
+                            name: "role_type".into(),
+                        },
+                        false,
+                    )
                     .column("birthday", "birthday", PgType::Date, true),
             )
             .build()

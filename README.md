@@ -72,6 +72,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | GraphQL variables, named + inline fragments | ✓ |
 | Schema introspection | ✓ |
+| PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |
+| Enum array columns (`role_type[]`) | Not implemented (skipped at introspection) |
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
