@@ -77,7 +77,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
-| Row-level permissions | Not implemented |
+| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries (mutations rejected for now) |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
 
@@ -256,6 +256,50 @@ just-inserted parent's foreign key can point at the existing entity. Top-level
 
 This requires a primary key on the nested table; tables without a PK cannot use
 nested `DO NOTHING` (supply non-empty `update_columns` instead).
+
+## Scoped execution
+
+`Engine::scoped(ScopeSet)` returns a handle that rewrites every query before
+rendering: each table access point — root selects, `_by_pk`, aggregates,
+relation subqueries at any depth, and `EXISTS` relation filters inside
+`where` — gets the table's predicate AND-ed in. Tables without an entry are
+denied (fail-closed), so the set must spell out everything the caller may
+touch. The mechanism is policy-agnostic: how predicates are derived (RBAC,
+ownership chains, …) is up to the application.
+
+```rust
+# use vision_graphql::{Engine, ScopeSet, Query};
+# use vision_graphql::ast::{BoolExpr, CmpOp};
+# async fn example(engine: Engine, user_id: i64) -> Result<(), vision_graphql::Error> {
+let scope = ScopeSet::new()
+    .allow("orders", BoolExpr::Compare {
+        column: "user_id".into(),
+        op: CmpOp::Eq,
+        value: user_id.into(),
+    })
+    .allow("samples", BoolExpr::Relation {            // one-hop ownership chain
+        name: "order".into(),
+        inner: Box::new(BoolExpr::Compare {
+            column: "user_id".into(),
+            op: CmpOp::Eq,
+            value: user_id.into(),
+        }),
+    })
+    .unrestricted("adverts");                          // public lookup table
+
+let scoped = engine.scoped(scope);
+let mine = scoped.query("query { orders { id title } }", None).await?;
+// `samples_aggregate`, `orders_by_pk(id: …)`, nested relations — all filtered.
+// `scoped.query("query { staffs { id } }", …)` → Error::ScopeDenied.
+# Ok(()) }
+```
+
+Scope predicates are trusted policy: they are injected as-is and never
+re-scoped themselves. `scoped.transaction(…)` hands the closure a
+`ScopedTxClient`, so the scope cannot be escaped mid-transaction. Mutations
+through a scoped handle are currently rejected fail-closed; scoped mutation
+support (owner-column validation on insert, scoped update/delete) is the next
+milestone.
 
 ## Transactions
 

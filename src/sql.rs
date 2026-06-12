@@ -750,6 +750,12 @@ fn render_by_pk(
         )
         .unwrap();
     }
+    // by_pk has no `where` argument in the source language, but the scope
+    // rewrite injects predicates here; honor them on top of the PK match.
+    if let Some(expr) = root.args.where_.as_ref() {
+        ctx.sql.push_str(" AND ");
+        render_bool_expr(expr, table, &inner_alias, schema, ctx)?;
+    }
     ctx.sql.push_str(" LIMIT 1) ");
     ctx.sql.push_str(&row_alias);
     ctx.sql.push(')');
@@ -1818,9 +1824,13 @@ fn render_aggregate_source(
             ctx.sql.push_str(&quote_ident(c));
         }
     }
+    // Alias the source so the where clause goes through the standard
+    // renderer, which supports EXISTS relation filters (needed both for
+    // user-written relation filters and for scope-injected predicates).
+    let src_alias = ctx.next_alias("s");
     write!(
         ctx.sql,
-        " FROM {}.{}",
+        " FROM {}.{} {src_alias}",
         quote_ident(&table.physical_schema),
         quote_ident(&table.physical_name),
     )
@@ -1828,7 +1838,7 @@ fn render_aggregate_source(
 
     if let Some(expr) = root.args.where_.as_ref() {
         ctx.sql.push_str(" WHERE ");
-        render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        render_bool_expr(expr, table, &src_alias, schema, ctx)?;
     }
     if !root.args.order_by.is_empty() {
         ctx.sql.push_str(" ORDER BY ");

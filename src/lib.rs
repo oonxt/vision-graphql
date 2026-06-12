@@ -53,6 +53,7 @@ pub mod error;
 pub mod executor;
 pub mod parser;
 pub mod schema;
+pub mod scope;
 pub mod sql;
 pub mod types;
 
@@ -60,6 +61,7 @@ pub use builder::{
     AggregateBuilder, ByPkBuilder, DeleteBuilder, DeleteByPkBuilder, InsertBuilder, IntoOperation,
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,
 };
-pub use engine::{Engine, MutationResult, TxClient};
+pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::Error;
 pub use schema::Schema;
+pub use scope::{ScopeSet, TableScope};

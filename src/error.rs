@@ -24,6 +24,12 @@ pub enum Error {
 
     #[error("result decoding: {0}")]
     Decode(String),
+
+    #[error("scope: table '{table}' is not accessible in scoped execution")]
+    ScopeDenied { table: String },
+
+    #[error("scope: {0}")]
+    Scope(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
