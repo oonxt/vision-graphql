@@ -148,6 +148,10 @@ pub enum MutationField {
         pk: Vec<(String, serde_json::Value)>,
         set: std::collections::BTreeMap<String, serde_json::Value>,
         selection: Vec<Field>,
+        /// Scope predicate AND-ed onto the PK match under deny-by-default
+        /// scoped execution. `None` for unscoped runs and unrestricted tables.
+        /// A row failing it simply does not match, so the mutation returns null.
+        scope: Option<BoolExpr>,
     },
     Delete {
         alias: String,
@@ -160,6 +164,10 @@ pub enum MutationField {
         table: String,
         pk: Vec<(String, serde_json::Value)>,
         selection: Vec<Field>,
+        /// Scope predicate AND-ed onto the PK match under deny-by-default
+        /// scoped execution. `None` for unscoped runs and unrestricted tables.
+        /// A row failing it simply does not match, so the mutation returns null.
+        scope: Option<BoolExpr>,
     },
 }
 

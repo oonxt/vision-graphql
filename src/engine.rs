@@ -200,7 +200,8 @@ impl TxClient {
 
 /// Scoped counterpart of [`Engine`], obtained via [`Engine::scoped`]. Mirrors
 /// the same query surface; every operation passes through the scope rewrite
-/// before rendering. Mutations are rejected (fail-closed) for now.
+/// before rendering. Scoped `update`/`delete` (and their `_by_pk` forms) inject
+/// the predicate as a filter; scoped `insert` is rejected (fail-closed) for now.
 pub struct ScopedEngine<'e> {
     engine: &'e Engine,
     scope: ScopeSet,

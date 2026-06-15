@@ -12,12 +12,15 @@
 //! injected as-is and are NOT themselves re-scoped (a predicate may reference
 //! a relation to a table the caller cannot query directly).
 //!
-//! Mutations are currently rejected in scoped execution (fail-closed); scoped
-//! mutation support is tracked separately.
+//! Scoped `update` and `delete` (including their `_by_pk` forms) inject the
+//! predicate as a *filter*: it is AND-ed into the statement's `WHERE`, so a
+//! scoped caller can only modify rows the predicate already lets them see. A
+//! `_by_pk` row failing the predicate simply does not match and the mutation
+//! returns null. Scoped `insert` is not yet supported and stays fail-closed.
 
 use std::collections::HashMap;
 
-use crate::ast::{BoolExpr, Field, Operation, RootBody};
+use crate::ast::{BoolExpr, Field, MutationField, Operation, RootBody};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 
@@ -102,42 +105,144 @@ fn merge_and_into(slot: &mut Option<BoolExpr>, new_term: BoolExpr) {
     });
 }
 
+/// AND `new_term` into a required where slot (update/delete carry a
+/// non-optional `where_`). Flattens into an existing top-level `And`.
+fn and_in(slot: &mut BoolExpr, new_term: BoolExpr) {
+    let cur = std::mem::replace(slot, BoolExpr::And(Vec::new()));
+    *slot = match cur {
+        BoolExpr::And(mut parts) => {
+            parts.push(new_term);
+            BoolExpr::And(parts)
+        }
+        other => BoolExpr::And(vec![other, new_term]),
+    };
+}
+
+/// Look up `table` in the schema, mapping absence to a validation error keyed
+/// on `path` (the mutation's response alias).
+fn lookup_table<'s>(schema: &'s Schema, table: &str, path: &str) -> Result<&'s Table> {
+    schema
+        .table(table)
+        .map(|t| &**t)
+        .ok_or_else(|| Error::Validate {
+            path: path.to_string(),
+            message: format!("unknown table '{table}'"),
+        })
+}
+
 /// Rewrite `op` in place so every table access point carries its scope
 /// predicate. Errors fail the whole operation before any SQL is built.
 pub(crate) fn apply_scope(op: &mut Operation, scope: &ScopeSet, schema: &Schema) -> Result<()> {
-    let roots = match op {
-        Operation::Mutation(_) => {
-            return Err(Error::Scope(
-                "mutations are not supported in scoped execution".into(),
-            ));
-        }
-        Operation::Query(roots) => roots,
-    };
-    for root in roots {
-        let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
-            path: root.alias.clone(),
-            message: format!("unknown table '{}'", root.table),
-        })?;
-        // Scope EXISTS targets inside the user-written where FIRST, so the
-        // predicate we inject afterwards is never itself re-scoped.
-        if let Some(w) = root.args.where_.as_mut() {
-            scope_bool_expr(w, table, scope, schema)?;
-        }
-        if let Some(expr) = resolve(scope, &root.table)? {
-            merge_and_into(&mut root.args.where_, expr);
-        }
-        match &mut root.body {
-            RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
-                scope_fields(selection, table, scope, schema)?;
+    match op {
+        Operation::Query(roots) => {
+            for root in roots {
+                scope_root(root, scope, schema)?;
             }
-            RootBody::Aggregate { nodes, .. } => {
-                if let Some(fields) = nodes.as_mut() {
-                    scope_fields(fields, table, scope, schema)?;
-                }
+        }
+        Operation::Mutation(fields) => {
+            for mf in fields {
+                scope_mutation(mf, scope, schema)?;
             }
         }
     }
     Ok(())
+}
+
+/// Rewrite one query root field so its table — and every nested relation it
+/// reaches — carries the scope predicate.
+fn scope_root(
+    root: &mut crate::ast::RootField,
+    scope: &ScopeSet,
+    schema: &Schema,
+) -> Result<()> {
+    let table = lookup_table(schema, &root.table, &root.alias)?;
+    // Scope EXISTS targets inside the user-written where FIRST, so the
+    // predicate we inject afterwards is never itself re-scoped.
+    if let Some(w) = root.args.where_.as_mut() {
+        scope_bool_expr(w, table, scope, schema)?;
+    }
+    if let Some(expr) = resolve(scope, &root.table)? {
+        merge_and_into(&mut root.args.where_, expr);
+    }
+    match &mut root.body {
+        RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
+            scope_fields(selection, table, scope, schema)?;
+        }
+        RootBody::Aggregate { nodes, .. } => {
+            if let Some(fields) = nodes.as_mut() {
+                scope_fields(fields, table, scope, schema)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one mutation field so it can only touch in-scope rows.
+///
+/// `update`/`delete` AND the predicate into their `WHERE`; the `_by_pk` forms
+/// stash it in their `scope` slot for the renderer to append onto the PK
+/// match. Relation fields in `returning`/selection are scoped like any query
+/// selection. `insert` stays fail-closed.
+fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
+    match mf {
+        MutationField::Insert { table, .. } => Err(Error::Scope(format!(
+            "scoped insert is not yet supported (table '{table}')"
+        ))),
+        MutationField::Update {
+            alias,
+            table,
+            where_,
+            returning,
+            ..
+        } => {
+            let t = lookup_table(schema, table, alias)?;
+            // Scope EXISTS targets in the user-written where before injecting.
+            scope_bool_expr(where_, t, scope, schema)?;
+            scope_fields(returning, t, scope, schema)?;
+            if let Some(expr) = resolve(scope, table)? {
+                and_in(where_, expr);
+            }
+            Ok(())
+        }
+        MutationField::Delete {
+            alias,
+            table,
+            where_,
+            returning,
+        } => {
+            let t = lookup_table(schema, table, alias)?;
+            scope_bool_expr(where_, t, scope, schema)?;
+            scope_fields(returning, t, scope, schema)?;
+            if let Some(expr) = resolve(scope, table)? {
+                and_in(where_, expr);
+            }
+            Ok(())
+        }
+        MutationField::UpdateByPk {
+            alias,
+            table,
+            selection,
+            scope: slot,
+            ..
+        } => {
+            let t = lookup_table(schema, table, alias)?;
+            scope_fields(selection, t, scope, schema)?;
+            *slot = resolve(scope, table)?;
+            Ok(())
+        }
+        MutationField::DeleteByPk {
+            alias,
+            table,
+            selection,
+            scope: slot,
+            ..
+        } => {
+            let t = lookup_table(schema, table, alias)?;
+            scope_fields(selection, t, scope, schema)?;
+            *slot = resolve(scope, table)?;
+            Ok(())
+        }
+    }
 }
 
 /// Scope every relation field in a selection, recursively.
@@ -356,11 +461,98 @@ mod tests {
     }
 
     #[test]
-    fn mutations_are_rejected() {
-        let mut op = Operation::Mutation(Vec::new());
-        let scope = ScopeSet::new();
+    fn scoped_insert_is_rejected() {
+        let mut op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_posts".into(),
+            table: "posts".into(),
+            objects: Vec::new(),
+            on_conflict: None,
+            returning: Vec::new(),
+            one: false,
+        }]);
+        let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
         let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
         assert!(matches!(err, Error::Scope(_)));
+    }
+
+    #[test]
+    fn update_where_gets_scope_anded_in() {
+        let mut op = Operation::Mutation(vec![MutationField::Update {
+            alias: "update_posts".into(),
+            table: "posts".into(),
+            where_: owner("id", 1),
+            set: std::collections::BTreeMap::new(),
+            returning: Vec::new(),
+        }]);
+        let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::Update { where_, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(where_, BoolExpr::And(parts) if parts.len() == 2),
+            "update where must be (user AND scope), got {where_:?}"
+        );
+    }
+
+    #[test]
+    fn delete_on_denied_table_errors() {
+        let mut op = Operation::Mutation(vec![MutationField::Delete {
+            alias: "delete_posts".into(),
+            table: "posts".into(),
+            where_: owner("id", 1),
+            returning: Vec::new(),
+        }]);
+        let scope = ScopeSet::new(); // posts absent: denied
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(matches!(err, Error::ScopeDenied { table } if table == "posts"));
+    }
+
+    #[test]
+    fn update_by_pk_fills_scope_slot() {
+        let mut op = Operation::Mutation(vec![MutationField::UpdateByPk {
+            alias: "update_posts_by_pk".into(),
+            table: "posts".into(),
+            pk: vec![("id".into(), json!(1))],
+            set: std::collections::BTreeMap::new(),
+            selection: Vec::new(),
+            scope: None,
+        }]);
+        let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::UpdateByPk { scope, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(scope, Some(BoolExpr::Compare { column, .. }) if column == "user_id"),
+            "by_pk scope slot must carry the predicate, got {scope:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_by_pk_leaves_scope_empty() {
+        let mut op = Operation::Mutation(vec![MutationField::DeleteByPk {
+            alias: "delete_posts_by_pk".into(),
+            table: "posts".into(),
+            pk: vec![("id".into(), json!(1))],
+            selection: Vec::new(),
+            scope: None,
+        }]);
+        let scope = ScopeSet::new().unrestricted("posts");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::DeleteByPk { scope, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(scope.is_none(), "unrestricted table needs no predicate");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::ast::{BoolExpr, CmpOp};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
-use vision_graphql::{Engine, Error, Query, ScopeSet};
+use vision_graphql::{Engine, Error, Mutation, Query, ScopeSet};
 
 fn schema() -> Schema {
     Schema::builder()
@@ -307,4 +307,132 @@ async fn transaction_cannot_escape_scope() {
         .await
         .expect_err("empty scope denies inside tx too");
     assert!(matches!(err, Error::ScopeDenied { .. }));
+}
+
+// ===== Scoped mutations: update/delete inject the predicate as a filter, so a
+// scoped caller can only touch rows already in their scope. Insert stays
+// fail-closed. =====
+
+#[tokio::test]
+async fn scoped_update_only_touches_owned_rows() {
+    let (engine, _c) = setup().await;
+    // alice (user 1) tries to retitle order 3 (bob's). The scope predicate
+    // (user_id = 1) AND-s onto her where, so zero rows match.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update("orders")
+                .where_eq("id", 3)
+                .set("title", json!("hijacked"))
+                .returning(&["id"]),
+        )
+        .await
+        .expect("update ok");
+    assert_eq!(v["update_orders"]["affected_rows"], json!(0));
+
+    // bob's order is untouched.
+    let title: Value = engine
+        .run(Query::by_pk("orders", &[("id", json!(3))]).select(&["title"]))
+        .await
+        .expect("read ok");
+    assert_eq!(title["orders_by_pk"]["title"], json!("b-order-1"));
+
+    // alice CAN update her own order.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update("orders")
+                .where_eq("id", 1)
+                .set("title", json!("a-order-1-edited"))
+                .returning(&["id", "title"]),
+        )
+        .await
+        .expect("update ok");
+    assert_eq!(v["update_orders"]["affected_rows"], json!(1));
+    assert_eq!(
+        v["update_orders"]["returning"][0]["title"],
+        json!("a-order-1-edited")
+    );
+}
+
+#[tokio::test]
+async fn scoped_update_by_pk_returns_null_for_foreign_row() {
+    let (engine, _c) = setup().await;
+    // by_pk on bob's order: PK matches but scope predicate does not → null.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update_by_pk("orders", &[("id", json!(3))])
+                .set("title", json!("nope"))
+                .select(&["id"]),
+        )
+        .await
+        .expect("update_by_pk ok");
+    assert_eq!(v["update_orders_by_pk"], Value::Null);
+
+    // own row by_pk succeeds.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update_by_pk("orders", &[("id", json!(2))])
+                .set("title", json!("a-order-2-edited"))
+                .select(&["id", "title"]),
+        )
+        .await
+        .expect("update_by_pk ok");
+    assert_eq!(v["update_orders_by_pk"]["title"], json!("a-order-2-edited"));
+}
+
+#[tokio::test]
+async fn scoped_delete_cannot_remove_foreign_rows() {
+    let (engine, _c) = setup().await;
+    // alice deletes "all" orders she can reach via a broad predicate; only her
+    // own rows are eligible because the scope filter is AND-ed in.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::delete("orders")
+                .where_expr(BoolExpr::Compare {
+                    column: "id".into(),
+                    op: CmpOp::Gt,
+                    value: json!(0),
+                })
+                .returning(&["id"]),
+        )
+        .await
+        .expect("delete ok");
+    assert_eq!(v["delete_orders"]["affected_rows"], json!(2), "only alice's 2");
+
+    // bob's order 3 survives.
+    let remaining: Value = engine
+        .run(Query::from("orders").select(&["id"]))
+        .await
+        .expect("read ok");
+    let rows = remaining["orders"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], json!(3));
+}
+
+#[tokio::test]
+async fn scoped_delete_by_pk_on_denied_table_fails_closed() {
+    let (engine, _c) = setup().await;
+    // samples is reachable, but a table absent from the set is denied outright.
+    let scope = ScopeSet::new().allow("orders", eq("user_id", 1)); // samples absent
+    let err = engine
+        .scoped(scope)
+        .run(Mutation::delete_by_pk("samples", &[("id", json!(1))]).select(&["id"]))
+        .await
+        .expect_err("denied");
+    assert!(matches!(err, Error::ScopeDenied { table } if table == "samples"));
+}
+
+#[tokio::test]
+async fn scoped_insert_is_rejected() {
+    let (engine, _c) = setup().await;
+    let err = engine
+        .scoped(user_scope(1))
+        .run(Mutation::insert_one("orders", [("user_id", json!(1)), ("title", json!("x"))]))
+        .await
+        .expect_err("insert rejected under scope");
+    assert!(matches!(err, Error::Scope(_)));
 }

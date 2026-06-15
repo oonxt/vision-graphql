@@ -609,6 +609,7 @@ impl UpdateByPkBuilder {
             pk: self.pk,
             set: self.set,
             selection: self.selection,
+            scope: None,
         }
     }
 }
@@ -694,6 +695,7 @@ impl DeleteByPkBuilder {
             table: self.table,
             pk: self.pk,
             selection: self.selection,
+            scope: None,
         }
     }
 }

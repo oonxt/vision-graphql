@@ -788,14 +788,22 @@ fn render_mutation(
             } => {
                 render_update_cte(&cte, table, where_, set, schema, ctx)?;
             }
-            MutationField::UpdateByPk { table, pk, set, .. } => {
-                render_update_by_pk_cte(&cte, table, pk, set, schema, ctx)?;
+            MutationField::UpdateByPk {
+                table,
+                pk,
+                set,
+                scope,
+                ..
+            } => {
+                render_update_by_pk_cte(&cte, table, pk, set, scope.as_ref(), schema, ctx)?;
             }
             MutationField::Delete { table, where_, .. } => {
                 render_delete_cte(&cte, table, where_, schema, ctx)?;
             }
-            MutationField::DeleteByPk { table, pk, .. } => {
-                render_delete_by_pk_cte(&cte, table, pk, schema, ctx)?;
+            MutationField::DeleteByPk {
+                table, pk, scope, ..
+            } => {
+                render_delete_by_pk_cte(&cte, table, pk, scope.as_ref(), schema, ctx)?;
             }
         }
     }
@@ -1324,6 +1332,7 @@ fn render_update_by_pk_cte(
     table_name: &str,
     pk: &[(String, serde_json::Value)],
     set: &std::collections::BTreeMap<String, serde_json::Value>,
+    scope: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -1385,6 +1394,11 @@ fn render_update_by_pk_cte(
         )
         .unwrap();
     }
+    if let Some(expr) = scope {
+        ctx.sql.push_str(" AND (");
+        render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        ctx.sql.push(')');
+    }
     ctx.sql.push_str(" RETURNING *)");
     Ok(())
 }
@@ -1416,6 +1430,7 @@ fn render_delete_by_pk_cte(
     cte: &str,
     table_name: &str,
     pk: &[(String, serde_json::Value)],
+    scope: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -1452,6 +1467,11 @@ fn render_delete_by_pk_cte(
             pg_type_cast(&col.pg_type)
         )
         .unwrap();
+    }
+    if let Some(expr) = scope {
+        ctx.sql.push_str(" AND (");
+        render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        ctx.sql.push(')');
     }
     ctx.sql.push_str(" RETURNING *)");
     Ok(())
@@ -2305,6 +2325,63 @@ mod tests {
         }]);
         let (sql, _) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn render_update_by_pk_appends_scope_predicate() {
+        use crate::ast::{BoolExpr, CmpOp, MutationField};
+        use std::collections::BTreeMap;
+
+        let mut set = BTreeMap::new();
+        set.insert("name".to_string(), serde_json::json!("bob"));
+        let op = Operation::Mutation(vec![MutationField::UpdateByPk {
+            alias: "update_users_by_pk".into(),
+            table: "users".into(),
+            pk: vec![("id".into(), serde_json::json!(1))],
+            set,
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            scope: Some(BoolExpr::Compare {
+                column: "name".into(),
+                op: CmpOp::Eq,
+                value: serde_json::json!("alice"),
+            }),
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        // PK match AND scope, all before RETURNING.
+        let where_pos = sql.find("WHERE").expect("has where");
+        let ret_pos = sql.find("RETURNING").expect("has returning");
+        let clause = &sql[where_pos..ret_pos];
+        assert!(clause.contains("\"id\" = $"), "PK match present: {clause}");
+        assert!(
+            clause.contains(" AND (\"name\" = $"),
+            "scope ANDed onto PK match: {clause}"
+        );
+        // set value + pk value + scope value
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn render_delete_by_pk_without_scope_has_no_extra_and() {
+        use crate::ast::MutationField;
+
+        let op = Operation::Mutation(vec![MutationField::DeleteByPk {
+            alias: "delete_users_by_pk".into(),
+            table: "users".into(),
+            pk: vec![("id".into(), serde_json::json!(1))],
+            selection: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            scope: None,
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        let where_pos = sql.find("WHERE").expect("has where");
+        let ret_pos = sql.find("RETURNING").expect("has returning");
+        assert!(!sql[where_pos..ret_pos].contains(" AND "), "unscoped: bare PK match");
+        assert_eq!(binds.len(), 1);
     }
 
     #[test]

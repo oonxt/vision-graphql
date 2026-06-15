@@ -332,6 +332,7 @@ fn lower_mutation_field(
                     pk,
                     set,
                     selection,
+                    scope: None,
                 });
             }
         }
@@ -398,6 +399,7 @@ fn lower_mutation_field(
                     table: base_name.to_string(),
                     pk,
                     selection,
+                    scope: None,
                 });
             }
         }
