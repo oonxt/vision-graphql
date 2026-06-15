@@ -227,6 +227,11 @@ pub struct NestedArrayInsert {
     /// which would change it to the proposed sequence id) to keep
     /// RETURNING correlated 1:1 with input ords.
     pub on_conflict: Option<OnConflict>,
+    /// Post-insert scope check for this nested target table under deny-by-
+    /// default scoped execution: every child row inserted here must satisfy
+    /// it or the whole statement aborts. `None` for unscoped runs and
+    /// unrestricted tables.
+    pub scope_check: Option<BoolExpr>,
 }
 
 /// A nested `user: { data: {...} }` block attached to one parent row.
@@ -241,6 +246,9 @@ pub struct NestedObjectInsert {
     /// Optional Hasura-style on_conflict. Same rewrite semantics as
     /// NestedArrayInsert.
     pub on_conflict: Option<OnConflict>,
+    /// Post-insert scope check for this nested target table. See
+    /// [`NestedArrayInsert::scope_check`].
+    pub scope_check: Option<BoolExpr>,
 }
 
 #[cfg(test)]

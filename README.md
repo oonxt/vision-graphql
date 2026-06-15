@@ -77,7 +77,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
-| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `update`/`delete` (incl. `_by_pk`) + flat `insert` (post-insert check); nested `insert` rejected for now |
+| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `update`/`delete` (incl. `_by_pk`) + `insert` (post-insert check, enforced at every nested level) |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
 
@@ -304,12 +304,14 @@ only modify rows already in scope. A `_by_pk` row failing the predicate simply
 does not match, so the mutation returns null (the same IDOR-safe behavior as a
 scoped `by_pk` query). Tables absent from the `ScopeSet` are denied.
 
-Scoped flat `insert` injects the predicate as a post-insert *check*: the
-renderer wraps the insert in a guard CTE so every inserted row must satisfy the
+Scoped `insert` injects the predicate as a post-insert *check*: the renderer
+wraps the insert in a guard CTE so every inserted row must satisfy the
 predicate, and any violation aborts the whole statement (nothing is committed).
-Nested inserts (`{ data: … }` children) would write into other tables whose
-checks are not yet enforced, so they are rejected fail-closed (`Error::Scope`)
-— enforcing the check at every nested level is the next milestone.
+Nested inserts (`{ data: … }` children) are enforced at every level — each
+nested target table must be in the `ScopeSet` (else `Error::ScopeDenied`), and
+its rows are checked against its own predicate. Because the insert and all its
+nested children render to a single atomic statement, a violation anywhere rolls
+back every level.
 
 ## Transactions
 

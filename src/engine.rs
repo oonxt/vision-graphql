@@ -201,8 +201,8 @@ impl TxClient {
 /// Scoped counterpart of [`Engine`], obtained via [`Engine::scoped`]. Mirrors
 /// the same query surface; every operation passes through the scope rewrite
 /// before rendering. Scoped `update`/`delete` (and their `_by_pk` forms) inject
-/// the predicate as a filter; flat `insert` injects it as a post-insert check.
-/// Nested inserts are rejected (fail-closed) for now.
+/// the predicate as a filter; `insert` injects it as a post-insert check,
+/// enforced at every nested level.
 pub struct ScopedEngine<'e> {
     engine: &'e Engine,
     scope: ScopeSet,

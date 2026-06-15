@@ -704,6 +704,7 @@ fn parse_insert_object(
                             table: rel.target_table.clone(),
                             rows,
                             on_conflict,
+                            scope_check: None,
                         },
                     );
                     continue;
@@ -792,6 +793,7 @@ fn parse_insert_object(
                             table: rel.target_table.clone(),
                             row: child,
                             on_conflict,
+                            scope_check: None,
                         },
                     );
                     continue;

@@ -491,19 +491,92 @@ async fn scoped_insert_on_denied_table_fails_closed() {
     assert!(matches!(err, Error::ScopeDenied { table } if table == "samples"));
 }
 
+/// Parent `users` is unrestricted (a fresh user can be created); nested
+/// `orders` must be tagged `ok-*`. Models "may create any user, but only
+/// orders within my tenant prefix". Deterministic because the check is on a
+/// column the child sets directly, not the derived FK.
+fn nested_insert_scope() -> ScopeSet {
+    ScopeSet::new().unrestricted("users").allow(
+        "orders",
+        BoolExpr::Compare {
+            column: "title".into(),
+            op: CmpOp::Like,
+            value: json!("ok-%"),
+        },
+    )
+}
+
 #[tokio::test]
-async fn scoped_nested_insert_is_rejected() {
+async fn scoped_nested_insert_in_scope_succeeds() {
     let (engine, _c) = setup().await;
-    // A nested insert would write children whose scope we don't yet enforce —
-    // rejected fail-closed at rewrite time (no SQL emitted). Nested inserts are
-    // only expressible through the GraphQL parser, so drive it via a string.
-    let err = engine
-        .scoped(user_scope(1))
+    let v: Value = engine
+        .scoped(nested_insert_scope())
         .query(
-            r#"mutation { insert_users_one(object: {name: "carol", orders: {data: [{title: "smuggled"}]}}) { id } }"#,
+            r#"mutation { insert_users_one(object: {name: "carol", orders: {data: [{title: "ok-1"}]}}) { id name } }"#,
             None,
         )
         .await
-        .expect_err("nested insert rejected under scope");
-    assert!(matches!(err, Error::Scope(msg) if msg.contains("nested")));
+        .expect("in-scope nested insert ok");
+    assert_eq!(v["insert_users_one"]["name"], json!("carol"));
+
+    // Both the parent and the child were committed.
+    let orders: Value = engine
+        .run(
+            Query::from("orders")
+                .where_eq("title", "ok-1")
+                .select(&["title"]),
+        )
+        .await
+        .expect("read ok");
+    assert_eq!(orders["orders"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_nested_insert_child_violation_aborts_everything() {
+    let (engine, _c) = setup().await;
+    // The child order is tagged outside the allowed prefix → the nested guard
+    // aborts the whole statement; neither the user nor the order is committed.
+    let err = engine
+        .scoped(nested_insert_scope())
+        .query(
+            r#"mutation { insert_users_one(object: {name: "mallory", orders: {data: [{title: "smuggled"}]}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect_err("child out of scope must abort");
+    assert!(
+        matches!(&err, Error::Database(_)),
+        "expected DB abort, got {err:?}"
+    );
+
+    // Atomic: the parent user was rolled back too.
+    let users: Value = engine
+        .run(
+            Query::from("users")
+                .where_eq("name", "mallory")
+                .select(&["id"]),
+        )
+        .await
+        .expect("read ok");
+    assert!(
+        users["users"].as_array().unwrap().is_empty(),
+        "parent insert must roll back with the failed child"
+    );
+}
+
+#[tokio::test]
+async fn scoped_nested_insert_denied_target_fails_closed() {
+    let (engine, _c) = setup().await;
+    // Parent allowed, but the nested target table `orders` is absent from the
+    // set → denied at rewrite time, before any SQL runs.
+    let scope = ScopeSet::new().unrestricted("users");
+    let err = engine
+        .scoped(scope)
+        .query(
+            r#"mutation { insert_users_one(object: {name: "nina", orders: {data: [{title: "x"}]}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect_err("denied nested target");
+    assert!(matches!(err, Error::ScopeDenied { table } if table == "orders"));
 }

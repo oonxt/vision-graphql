@@ -18,11 +18,12 @@
 //! `_by_pk` row failing the predicate simply does not match and the mutation
 //! returns null.
 //!
-//! Scoped flat `insert` injects the predicate as a post-insert *check*: every
+//! Scoped `insert` injects the predicate as a post-insert *check*: every
 //! inserted row must satisfy it or the whole statement aborts (the renderer
-//! emits a guard CTE that errors on violation). Nested inserts would write into
-//! other tables whose checks are not yet enforced, so they are rejected
-//! fail-closed for now.
+//! emits a guard CTE that errors on violation). Nested inserts are enforced at
+//! every level — each nested target table must be in the scope set, and its
+//! rows are checked against its own predicate; a violation anywhere aborts the
+//! whole (atomic) statement.
 
 use std::collections::HashMap;
 
@@ -183,9 +184,10 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
 ///
 /// `update`/`delete` AND the predicate into their `WHERE`; the `_by_pk` forms
 /// stash it in their `scope` slot for the renderer to append onto the PK
-/// match. A flat `insert` stashes the predicate in its `scope_check` slot for
-/// the renderer's post-insert guard; nested `insert` stays fail-closed.
-/// Relation fields in `returning`/selection are scoped like any query selection.
+/// match. An `insert` stashes the predicate in its `scope_check` slot for the
+/// renderer's post-insert guard, recursing into nested inserts so every level's
+/// target table is resolved and checked. Relation fields in `returning`/
+/// selection are scoped like any query selection.
 fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
     match mf {
         MutationField::Insert {
@@ -197,23 +199,14 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             ..
         } => {
             let t = lookup_table(schema, table, alias)?;
-            // Resolve first so a denied/absent table fails closed regardless
-            // of shape (deny-by-default takes precedence over the nested-insert
-            // limitation below).
-            let check = resolve(scope, table)?;
-            // Nested inserts would write into other tables whose own scope
-            // checks we don't yet enforce — reject them rather than let a
-            // child row escape scope.
-            if objects
-                .iter()
-                .any(|o| !o.nested_arrays.is_empty() || !o.nested_objects.is_empty())
-            {
-                return Err(Error::Scope(format!(
-                    "scoped nested insert is not yet supported (table '{table}')"
-                )));
-            }
+            *scope_check = resolve(scope, table)?;
             scope_fields(returning, t, scope, schema)?;
-            *scope_check = check;
+            // Recurse through nested inserts, resolving each nested target
+            // table's check. An absent/denied nested table fails closed here,
+            // before any SQL is built.
+            for obj in objects.iter_mut() {
+                scope_insert_object(obj, scope)?;
+            }
             Ok(())
         }
         MutationField::Update {
@@ -271,6 +264,24 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             Ok(())
         }
     }
+}
+
+/// Resolve and stash the scope check for every nested insert reachable from
+/// `obj`, recursively. Each nested target table must be in the scope set; an
+/// absent/denied one fails closed (`Error::ScopeDenied`). The predicate itself
+/// is policy and is not re-scoped.
+fn scope_insert_object(obj: &mut crate::ast::InsertObject, scope: &ScopeSet) -> Result<()> {
+    for nai in obj.nested_arrays.values_mut() {
+        nai.scope_check = resolve(scope, &nai.table)?;
+        for row in nai.rows.iter_mut() {
+            scope_insert_object(row, scope)?;
+        }
+    }
+    for noi in obj.nested_objects.values_mut() {
+        noi.scope_check = resolve(scope, &noi.table)?;
+        scope_insert_object(&mut noi.row, scope)?;
+    }
+    Ok(())
 }
 
 /// Scope every relation field in a selection, recursively.
@@ -548,21 +559,48 @@ mod tests {
         assert!(matches!(err, Error::ScopeDenied { table } if table == "posts"));
     }
 
-    #[test]
-    fn nested_insert_is_rejected() {
+    fn nested_posts_parent() -> crate::ast::InsertObject {
         let mut parent = crate::ast::InsertObject::default();
         parent.nested_arrays.insert(
-            "comments".into(),
+            "posts".into(),
             crate::ast::NestedArrayInsert {
-                table: "comments".into(),
+                table: "posts".into(),
                 rows: vec![crate::ast::InsertObject::default()],
                 on_conflict: None,
+                scope_check: None,
             },
         );
-        let mut op = Operation::Mutation(vec![insert("posts", vec![parent])]);
-        let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
+        parent
+    }
+
+    #[test]
+    fn nested_insert_gets_per_level_check() {
+        let mut op = Operation::Mutation(vec![insert("users", vec![nested_posts_parent()])]);
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .allow("posts", owner("user_id", 7));
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::Insert { objects, .. } = &fields[0] else {
+            unreachable!()
+        };
+        let nai = objects[0].nested_arrays.get("posts").unwrap();
+        assert!(
+            matches!(&nai.scope_check, Some(BoolExpr::Compare { column, .. }) if column == "user_id"),
+            "nested level must carry its table's check, got {:?}",
+            nai.scope_check
+        );
+    }
+
+    #[test]
+    fn nested_insert_denied_target_fails_closed() {
+        let mut op = Operation::Mutation(vec![insert("users", vec![nested_posts_parent()])]);
+        // users allowed, but the nested target `posts` is absent → denied.
+        let scope = ScopeSet::new().unrestricted("users");
         let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
-        assert!(matches!(err, Error::Scope(msg) if msg.contains("nested")));
+        assert!(matches!(err, Error::ScopeDenied { table } if table == "posts"));
     }
 
     #[test]

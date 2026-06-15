@@ -32,6 +32,10 @@ struct RenderCtx {
     /// entries of inserted_ctes are visible to returning-subquery lookup,
     /// preventing cross-field bleed in multi-field mutation blocks.
     current_mutation_cte: Option<String>,
+    /// Names of scope-check guard CTEs emitted by scoped inserts (at every
+    /// nesting level). The final SELECT cross-joins them so PostgreSQL is
+    /// forced to evaluate each guard's abort-on-violation CASE.
+    scope_check_ctes: Vec<String>,
 }
 
 impl RenderCtx {
@@ -773,9 +777,6 @@ fn render_mutation(
 ) -> Result<()> {
     use crate::ast::MutationField;
     ctx.sql.push_str("WITH ");
-    // Names of scope-check CTEs the final SELECT must reference so their
-    // abort-on-violation CASE is forced to evaluate.
-    let mut check_ctes: Vec<String> = Vec::new();
     for (i, mf) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -789,10 +790,15 @@ fn render_mutation(
                 scope_check,
                 ..
             } => {
-                render_insert_cte(&cte, table, objects, on_conflict.as_ref(), schema, ctx)?;
-                if let Some(check) = scope_check {
-                    check_ctes.push(render_insert_scope_check(&cte, table, check, schema, ctx)?);
-                }
+                render_insert_cte(
+                    &cte,
+                    table,
+                    objects,
+                    on_conflict.as_ref(),
+                    scope_check.as_ref(),
+                    schema,
+                    ctx,
+                )?;
             }
             MutationField::Update {
                 table, where_, set, ..
@@ -828,32 +834,31 @@ fn render_mutation(
         render_mutation_output_for(mf, &cte, schema, ctx)?;
     }
     ctx.sql.push_str(") AS result");
-    // Cross-join the 1-row check CTEs so PostgreSQL is forced to evaluate each
-    // scope-check CASE; a violation aborts the whole statement.
-    if !check_ctes.is_empty() {
+    // Cross-join the 1-row guard CTEs (from scoped inserts at every nesting
+    // level) so PostgreSQL is forced to evaluate each scope-check CASE; a
+    // violation aborts the whole statement.
+    if !ctx.scope_check_ctes.is_empty() {
         ctx.sql.push_str(" FROM ");
-        ctx.sql.push_str(&check_ctes.join(", "));
+        ctx.sql.push_str(&ctx.scope_check_ctes.join(", "));
     }
     Ok(())
 }
 
-/// Emit `, {cte}_chk AS (...)` — a single-row CTE that aggregates the scope
-/// predicate over the just-inserted rows in `{cte}`. If every row satisfies it
-/// the CASE yields 0; otherwise it casts a diagnostic string to `integer`,
-/// raising an error that aborts the statement. The `count(*)` inside the cast
-/// argument keeps PostgreSQL from constant-folding (and prematurely raising)
-/// the ELSE branch at plan time — it is only evaluated when a row violates.
-fn render_insert_scope_check(
+/// Emit `, {cte}_chk AS (...)` — a single-row guard CTE that aggregates `check`
+/// over the just-inserted rows in `{cte}`. If every row satisfies it the CASE
+/// yields 0; otherwise it casts a diagnostic string to `integer`, raising an
+/// error that aborts the statement. The `count(*)` inside the cast argument
+/// keeps PostgreSQL from constant-folding (and prematurely raising) the ELSE
+/// branch at plan time — it is only evaluated when a row actually violates.
+/// The guard CTE name is recorded in `ctx.scope_check_ctes` so the final SELECT
+/// references it.
+fn emit_scope_guard(
     cte: &str,
-    table_name: &str,
+    table: &Table,
     check: &crate::ast::BoolExpr,
     schema: &Schema,
     ctx: &mut RenderCtx,
-) -> Result<String> {
-    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
-        path: cte.into(),
-        message: format!("unknown table '{table_name}'"),
-    })?;
+) -> Result<()> {
     let chk = format!("{cte}_chk");
     write!(ctx.sql, ", {chk} AS (SELECT CASE WHEN coalesce(bool_and(").unwrap();
     render_bool_expr(check, table, cte, schema, ctx)?;
@@ -863,7 +868,8 @@ fn render_insert_scope_check(
         table.exposed_name
     )
     .unwrap();
-    Ok(chk)
+    ctx.scope_check_ctes.push(chk);
+    Ok(())
 }
 
 fn render_insert_cte(
@@ -871,6 +877,7 @@ fn render_insert_cte(
     table_name: &str,
     objects: &[crate::ast::InsertObject],
     on_conflict: Option<&crate::ast::OnConflict>,
+    scope_check: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -882,6 +889,7 @@ fn render_insert_cte(
         objects,
         &parent_ords,
         on_conflict,
+        scope_check,
         None,
         false, // top-level: NOT nested
         schema,
@@ -896,6 +904,7 @@ fn render_insert_cte_recursive(
     objects: &[crate::ast::InsertObject],
     parent_ords: &[i64],
     on_conflict: Option<&crate::ast::OnConflict>,
+    scope_check: Option<&crate::ast::BoolExpr>,
     parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
     is_nested_cte: bool,
     schema: &Schema,
@@ -977,6 +986,10 @@ fn render_insert_cte_recursive(
             .first()
             .and_then(|o| o.nested_objects.get(rel_name))
             .and_then(|noi| noi.on_conflict.clone());
+        let child_scope_check = objects
+            .first()
+            .and_then(|o| o.nested_objects.get(rel_name))
+            .and_then(|noi| noi.scope_check.clone());
         let child_cte = format!("{cte}_{rel_name}");
         render_insert_cte_recursive(
             &child_cte,
@@ -984,6 +997,7 @@ fn render_insert_cte_recursive(
             &child_rows,
             &child_ords,
             child_on_conflict.as_ref(),
+            child_scope_check.as_ref(),
             None, // NOT a child-of-parent; this is a prerequisite insert
             true, // this is a nested CTE
             schema,
@@ -1199,6 +1213,12 @@ fn render_insert_cte_recursive(
     )
     .unwrap();
 
+    // 6b. Scoped insert: emit this level's abort-on-violation guard so every
+    //     row just inserted into {cte} must satisfy the table's scope check.
+    if let Some(check) = scope_check {
+        emit_scope_guard(cte, table, check, schema, ctx)?;
+    }
+
     // 7. For each nested array relation, emit the child chain.
     let any_nested_arrays = objects.iter().any(|o| !o.nested_arrays.is_empty());
     if any_nested_arrays {
@@ -1232,6 +1252,12 @@ fn render_insert_cte_recursive(
                 .iter()
                 .find_map(|o| o.nested_arrays.get(rel_name))
                 .and_then(|nai| nai.on_conflict.clone());
+            // Scope check for this nested target table (same for every parent's
+            // wrapper since it keys on the target table).
+            let child_scope_check = objects
+                .iter()
+                .find_map(|o| o.nested_arrays.get(rel_name))
+                .and_then(|nai| nai.scope_check.clone());
             let child_cte = format!("{cte}_{rel_name}");
             let parent_ord_cte_name = format!("{cte}_ord");
             ctx.sql.push_str(", ");
@@ -1241,6 +1267,7 @@ fn render_insert_cte_recursive(
                 &child_rows,
                 &child_ords,
                 child_on_conflict.as_ref(),
+                child_scope_check.as_ref(),
                 Some((&parent_ord_cte_name, rel, table)),
                 true, // this is a nested CTE
                 schema,
@@ -2772,6 +2799,7 @@ mod tests {
                     nested_objects: BTreeMap::new(),
                 }],
                 on_conflict: None,
+                scope_check: None,
             },
         );
 
@@ -2847,6 +2875,7 @@ mod tests {
                     nested_objects: BTreeMap::new(),
                 },
                 on_conflict: None,
+                scope_check: None,
             },
         );
 
@@ -2926,6 +2955,7 @@ mod tests {
                     update_columns: vec![],
                     where_: None,
                 }),
+                scope_check: None,
             },
         );
 
