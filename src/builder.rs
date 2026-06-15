@@ -505,6 +505,7 @@ impl InsertBuilder {
             on_conflict: self.on_conflict,
             returning: self.returning,
             one: self.one,
+            scope_check: None,
         }
     }
 }
@@ -609,6 +610,7 @@ impl UpdateByPkBuilder {
             pk: self.pk,
             set: self.set,
             selection: self.selection,
+            scope: None,
         }
     }
 }
@@ -694,6 +696,7 @@ impl DeleteByPkBuilder {
             table: self.table,
             pk: self.pk,
             selection: self.selection,
+            scope: None,
         }
     }
 }

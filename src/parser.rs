@@ -275,6 +275,7 @@ fn lower_mutation_field(
                     on_conflict,
                     returning,
                     one: true,
+                    scope_check: None,
                 });
             }
         }
@@ -300,6 +301,7 @@ fn lower_mutation_field(
                 on_conflict,
                 returning,
                 one: false,
+                scope_check: None,
             });
         }
     }
@@ -332,6 +334,7 @@ fn lower_mutation_field(
                     pk,
                     set,
                     selection,
+                    scope: None,
                 });
             }
         }
@@ -398,6 +401,7 @@ fn lower_mutation_field(
                     table: base_name.to_string(),
                     pk,
                     selection,
+                    scope: None,
                 });
             }
         }
@@ -700,6 +704,7 @@ fn parse_insert_object(
                             table: rel.target_table.clone(),
                             rows,
                             on_conflict,
+                            scope_check: None,
                         },
                     );
                     continue;
@@ -788,6 +793,7 @@ fn parse_insert_object(
                             table: rel.target_table.clone(),
                             row: child,
                             on_conflict,
+                            scope_check: None,
                         },
                     );
                     continue;

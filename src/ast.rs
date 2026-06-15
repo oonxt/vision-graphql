@@ -133,6 +133,10 @@ pub enum MutationField {
         /// true for `insert_users_one` (single object result); false for `insert_users`
         /// (array result wrapped in `{affected_rows, returning}`).
         one: bool,
+        /// Post-insert scope check under deny-by-default scoped execution:
+        /// every inserted row must satisfy this predicate or the whole
+        /// statement aborts. `None` for unscoped runs and unrestricted tables.
+        scope_check: Option<BoolExpr>,
     },
     Update {
         alias: String,
@@ -148,6 +152,10 @@ pub enum MutationField {
         pk: Vec<(String, serde_json::Value)>,
         set: std::collections::BTreeMap<String, serde_json::Value>,
         selection: Vec<Field>,
+        /// Scope predicate AND-ed onto the PK match under deny-by-default
+        /// scoped execution. `None` for unscoped runs and unrestricted tables.
+        /// A row failing it simply does not match, so the mutation returns null.
+        scope: Option<BoolExpr>,
     },
     Delete {
         alias: String,
@@ -160,6 +168,10 @@ pub enum MutationField {
         table: String,
         pk: Vec<(String, serde_json::Value)>,
         selection: Vec<Field>,
+        /// Scope predicate AND-ed onto the PK match under deny-by-default
+        /// scoped execution. `None` for unscoped runs and unrestricted tables.
+        /// A row failing it simply does not match, so the mutation returns null.
+        scope: Option<BoolExpr>,
     },
 }
 
@@ -215,6 +227,11 @@ pub struct NestedArrayInsert {
     /// which would change it to the proposed sequence id) to keep
     /// RETURNING correlated 1:1 with input ords.
     pub on_conflict: Option<OnConflict>,
+    /// Post-insert scope check for this nested target table under deny-by-
+    /// default scoped execution: every child row inserted here must satisfy
+    /// it or the whole statement aborts. `None` for unscoped runs and
+    /// unrestricted tables.
+    pub scope_check: Option<BoolExpr>,
 }
 
 /// A nested `user: { data: {...} }` block attached to one parent row.
@@ -229,6 +246,9 @@ pub struct NestedObjectInsert {
     /// Optional Hasura-style on_conflict. Same rewrite semantics as
     /// NestedArrayInsert.
     pub on_conflict: Option<OnConflict>,
+    /// Post-insert scope check for this nested target table. See
+    /// [`NestedArrayInsert::scope_check`].
+    pub scope_check: Option<BoolExpr>,
 }
 
 #[cfg(test)]
@@ -339,6 +359,7 @@ mod tests {
                 alias: "id".into(),
             }],
             one: false,
+            scope_check: None,
         };
         match m {
             MutationField::Insert { objects, .. } => assert_eq!(objects.len(), 1),
