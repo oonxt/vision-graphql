@@ -505,6 +505,7 @@ impl InsertBuilder {
             on_conflict: self.on_conflict,
             returning: self.returning,
             one: self.one,
+            scope_check: None,
         }
     }
 }

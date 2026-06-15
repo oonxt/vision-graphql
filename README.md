@@ -77,7 +77,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
-| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `update`/`delete` (incl. `_by_pk`); `insert` rejected for now |
+| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `update`/`delete` (incl. `_by_pk`) + flat `insert` (post-insert check); nested `insert` rejected for now |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
 
@@ -302,9 +302,14 @@ Scoped `update` and `delete` (and their `_by_pk` forms) inject the predicate as
 a filter — it is AND-ed into the statement's `WHERE`, so a scoped caller can
 only modify rows already in scope. A `_by_pk` row failing the predicate simply
 does not match, so the mutation returns null (the same IDOR-safe behavior as a
-scoped `by_pk` query). Tables absent from the `ScopeSet` are denied. Scoped
-`insert` is still rejected fail-closed (`Error::Scope`); it needs post-insert
-check semantics rather than predicate injection and is the next milestone.
+scoped `by_pk` query). Tables absent from the `ScopeSet` are denied.
+
+Scoped flat `insert` injects the predicate as a post-insert *check*: the
+renderer wraps the insert in a guard CTE so every inserted row must satisfy the
+predicate, and any violation aborts the whole statement (nothing is committed).
+Nested inserts (`{ data: … }` children) would write into other tables whose
+checks are not yet enforced, so they are rejected fail-closed (`Error::Scope`)
+— enforcing the check at every nested level is the next milestone.
 
 ## Transactions
 

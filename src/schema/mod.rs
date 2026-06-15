@@ -29,7 +29,10 @@ pub enum PgType {
     Time,
     /// User-defined enum type; carries the schema-qualified type name used in
     /// cast expressions (`$1::"schema"."name"`).
-    Enum { schema: String, name: String },
+    Enum {
+        schema: String,
+        name: String,
+    },
 }
 
 #[derive(Debug)]

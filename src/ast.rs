@@ -133,6 +133,10 @@ pub enum MutationField {
         /// true for `insert_users_one` (single object result); false for `insert_users`
         /// (array result wrapped in `{affected_rows, returning}`).
         one: bool,
+        /// Post-insert scope check under deny-by-default scoped execution:
+        /// every inserted row must satisfy this predicate or the whole
+        /// statement aborts. `None` for unscoped runs and unrestricted tables.
+        scope_check: Option<BoolExpr>,
     },
     Update {
         alias: String,
@@ -347,6 +351,7 @@ mod tests {
                 alias: "id".into(),
             }],
             one: false,
+            scope_check: None,
         };
         match m {
             MutationField::Insert { objects, .. } => assert_eq!(objects.len(), 1),

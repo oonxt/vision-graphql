@@ -27,7 +27,10 @@ fn schema() -> Schema {
                 .column("title", "title", PgType::Text, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")]))
-                .relation("samples", Relation::array("samples").on([("id", "order_id")])),
+                .relation(
+                    "samples",
+                    Relation::array("samples").on([("id", "order_id")]),
+                ),
         )
         .table(
             Table::new("samples", "public", "samples")
@@ -129,7 +132,9 @@ async fn root_select_is_filtered_to_owner() {
         .expect("query ok");
     let orders = v["orders"].as_array().expect("array");
     assert_eq!(orders.len(), 2, "alice sees exactly her 2 orders");
-    assert!(orders.iter().all(|o| o["title"].as_str().unwrap().starts_with("a-")));
+    assert!(orders
+        .iter()
+        .all(|o| o["title"].as_str().unwrap().starts_with("a-")));
 }
 
 #[tokio::test]
@@ -193,10 +198,7 @@ async fn aggregate_count_respects_scope() {
     let (engine, _c) = setup().await;
     let v: Value = engine
         .scoped(user_scope(1))
-        .query(
-            "query { samples_aggregate { aggregate { count } } }",
-            None,
-        )
+        .query("query { samples_aggregate { aggregate { count } } }", None)
         .await
         .expect("query ok");
     assert_eq!(
@@ -285,16 +287,16 @@ async fn transaction_cannot_escape_scope() {
         .transaction(async |tx| {
             let v = tx.query("query { orders { id } }", None).await?;
             let count = v["orders"].as_array().unwrap().len();
-            let denied = tx
-                .query("query { samples { id } }", None)
-                .await
-                .is_ok();
+            let denied = tx.query("query { samples { id } }", None).await.is_ok();
             Ok::<_, Error>((count, denied))
         })
         .await
         .expect("tx ok");
     assert_eq!(own_count, 2);
-    assert!(denied, "samples IS in user scope — sanity check the tx path");
+    assert!(
+        denied,
+        "samples IS in user scope — sanity check the tx path"
+    );
 
     // and a genuinely denied table inside a tx:
     let err = scoped
@@ -401,7 +403,11 @@ async fn scoped_delete_cannot_remove_foreign_rows() {
         )
         .await
         .expect("delete ok");
-    assert_eq!(v["delete_orders"]["affected_rows"], json!(2), "only alice's 2");
+    assert_eq!(
+        v["delete_orders"]["affected_rows"],
+        json!(2),
+        "only alice's 2"
+    );
 
     // bob's order 3 survives.
     let remaining: Value = engine
@@ -427,12 +433,77 @@ async fn scoped_delete_by_pk_on_denied_table_fails_closed() {
 }
 
 #[tokio::test]
-async fn scoped_insert_is_rejected() {
+async fn scoped_insert_in_scope_succeeds() {
     let (engine, _c) = setup().await;
+    // alice inserts an order owned by herself — satisfies the scope check.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::insert_one("orders", [("user_id", json!(1)), ("title", json!("a-new"))])
+                .returning(&["user_id", "title"]),
+        )
+        .await
+        .expect("in-scope insert ok");
+    assert_eq!(v["insert_orders_one"]["title"], json!("a-new"));
+    assert_eq!(v["insert_orders_one"]["user_id"], json!(1));
+}
+
+#[tokio::test]
+async fn scoped_insert_outside_scope_aborts() {
+    let (engine, _c) = setup().await;
+    // alice tries to insert an order owned by bob (user_id 2). The post-insert
+    // check fails → the whole statement aborts and nothing is committed.
     let err = engine
         .scoped(user_scope(1))
-        .run(Mutation::insert_one("orders", [("user_id", json!(1)), ("title", json!("x"))]))
+        .run(Mutation::insert_one(
+            "orders",
+            [("user_id", json!(2)), ("title", json!("forged"))],
+        ))
         .await
-        .expect_err("insert rejected under scope");
-    assert!(matches!(err, Error::Scope(_)));
+        .expect_err("out-of-scope insert must abort");
+    // Surfaces as a DB error from the deliberate failed cast.
+    assert!(
+        matches!(&err, Error::Database(_)),
+        "expected DB-level abort, got {err:?}"
+    );
+
+    // Nothing was written: bob still has exactly his one seeded order.
+    let bob: Value = engine
+        .run(Query::from("orders").where_eq("user_id", 2).select(&["id"]))
+        .await
+        .expect("read ok");
+    assert_eq!(bob["orders"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scoped_insert_on_denied_table_fails_closed() {
+    let (engine, _c) = setup().await;
+    // samples is absent from this set → denied before any SQL runs.
+    let scope = ScopeSet::new().allow("orders", eq("user_id", 1));
+    let err = engine
+        .scoped(scope)
+        .run(Mutation::insert_one(
+            "samples",
+            [("order_id", json!(1)), ("serial", json!("X"))],
+        ))
+        .await
+        .expect_err("denied table");
+    assert!(matches!(err, Error::ScopeDenied { table } if table == "samples"));
+}
+
+#[tokio::test]
+async fn scoped_nested_insert_is_rejected() {
+    let (engine, _c) = setup().await;
+    // A nested insert would write children whose scope we don't yet enforce —
+    // rejected fail-closed at rewrite time (no SQL emitted). Nested inserts are
+    // only expressible through the GraphQL parser, so drive it via a string.
+    let err = engine
+        .scoped(user_scope(1))
+        .query(
+            r#"mutation { insert_users_one(object: {name: "carol", orders: {data: [{title: "smuggled"}]}}) { id } }"#,
+            None,
+        )
+        .await
+        .expect_err("nested insert rejected under scope");
+    assert!(matches!(err, Error::Scope(msg) if msg.contains("nested")));
 }

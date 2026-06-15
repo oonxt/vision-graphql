@@ -16,7 +16,13 @@
 //! predicate as a *filter*: it is AND-ed into the statement's `WHERE`, so a
 //! scoped caller can only modify rows the predicate already lets them see. A
 //! `_by_pk` row failing the predicate simply does not match and the mutation
-//! returns null. Scoped `insert` is not yet supported and stays fail-closed.
+//! returns null.
+//!
+//! Scoped flat `insert` injects the predicate as a post-insert *check*: every
+//! inserted row must satisfy it or the whole statement aborts (the renderer
+//! emits a guard CTE that errors on violation). Nested inserts would write into
+//! other tables whose checks are not yet enforced, so they are rejected
+//! fail-closed for now.
 
 use std::collections::HashMap;
 
@@ -150,11 +156,7 @@ pub(crate) fn apply_scope(op: &mut Operation, scope: &ScopeSet, schema: &Schema)
 
 /// Rewrite one query root field so its table — and every nested relation it
 /// reaches — carries the scope predicate.
-fn scope_root(
-    root: &mut crate::ast::RootField,
-    scope: &ScopeSet,
-    schema: &Schema,
-) -> Result<()> {
+fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
     let table = lookup_table(schema, &root.table, &root.alias)?;
     // Scope EXISTS targets inside the user-written where FIRST, so the
     // predicate we inject afterwards is never itself re-scoped.
@@ -185,9 +187,34 @@ fn scope_root(
 /// selection. `insert` stays fail-closed.
 fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
     match mf {
-        MutationField::Insert { table, .. } => Err(Error::Scope(format!(
-            "scoped insert is not yet supported (table '{table}')"
-        ))),
+        MutationField::Insert {
+            alias,
+            table,
+            objects,
+            returning,
+            scope_check,
+            ..
+        } => {
+            let t = lookup_table(schema, table, alias)?;
+            // Resolve first so a denied/absent table fails closed regardless
+            // of shape (deny-by-default takes precedence over the nested-insert
+            // limitation below).
+            let check = resolve(scope, table)?;
+            // Nested inserts would write into other tables whose own scope
+            // checks we don't yet enforce — reject them rather than let a
+            // child row escape scope.
+            if objects
+                .iter()
+                .any(|o| !o.nested_arrays.is_empty() || !o.nested_objects.is_empty())
+            {
+                return Err(Error::Scope(format!(
+                    "scoped nested insert is not yet supported (table '{table}')"
+                )));
+            }
+            scope_fields(returning, t, scope, schema)?;
+            *scope_check = check;
+            Ok(())
+        }
         MutationField::Update {
             alias,
             table,
@@ -460,19 +487,81 @@ mod tests {
         assert!(matches!(err, Error::ScopeDenied { table } if table == "posts"));
     }
 
-    #[test]
-    fn scoped_insert_is_rejected() {
-        let mut op = Operation::Mutation(vec![MutationField::Insert {
-            alias: "insert_posts".into(),
-            table: "posts".into(),
-            objects: Vec::new(),
+    fn insert(table: &str, objects: Vec<crate::ast::InsertObject>) -> MutationField {
+        MutationField::Insert {
+            alias: format!("insert_{table}"),
+            table: table.into(),
+            objects,
             on_conflict: None,
             returning: Vec::new(),
             one: false,
-        }]);
+            scope_check: None,
+        }
+    }
+
+    #[test]
+    fn flat_insert_gets_scope_check() {
+        let mut op = Operation::Mutation(vec![insert(
+            "posts",
+            vec![crate::ast::InsertObject::default()],
+        )]);
+        let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::Insert { scope_check, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(scope_check, Some(BoolExpr::Compare { column, .. }) if column == "user_id"),
+            "flat insert must carry the table's check, got {scope_check:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_insert_has_no_check() {
+        let mut op = Operation::Mutation(vec![insert(
+            "posts",
+            vec![crate::ast::InsertObject::default()],
+        )]);
+        let scope = ScopeSet::new().unrestricted("posts");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::Insert { scope_check, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(scope_check.is_none(), "unrestricted table needs no check");
+    }
+
+    #[test]
+    fn insert_on_denied_table_errors() {
+        let mut op = Operation::Mutation(vec![insert(
+            "posts",
+            vec![crate::ast::InsertObject::default()],
+        )]);
+        let scope = ScopeSet::new(); // posts absent → denied
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(matches!(err, Error::ScopeDenied { table } if table == "posts"));
+    }
+
+    #[test]
+    fn nested_insert_is_rejected() {
+        let mut parent = crate::ast::InsertObject::default();
+        parent.nested_arrays.insert(
+            "comments".into(),
+            crate::ast::NestedArrayInsert {
+                table: "comments".into(),
+                rows: vec![crate::ast::InsertObject::default()],
+                on_conflict: None,
+            },
+        );
+        let mut op = Operation::Mutation(vec![insert("posts", vec![parent])]);
         let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
         let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
-        assert!(matches!(err, Error::Scope(_)));
+        assert!(matches!(err, Error::Scope(msg) if msg.contains("nested")));
     }
 
     #[test]

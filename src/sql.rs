@@ -648,7 +648,11 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
         PgType::Date => "date",
         PgType::Time => "time",
         PgType::Enum { schema, name } => {
-            return std::borrow::Cow::Owned(format!("{}.{}", quote_ident(schema), quote_ident(name)));
+            return std::borrow::Cow::Owned(format!(
+                "{}.{}",
+                quote_ident(schema),
+                quote_ident(name)
+            ));
         }
     })
 }
@@ -769,6 +773,9 @@ fn render_mutation(
 ) -> Result<()> {
     use crate::ast::MutationField;
     ctx.sql.push_str("WITH ");
+    // Names of scope-check CTEs the final SELECT must reference so their
+    // abort-on-violation CASE is forced to evaluate.
+    let mut check_ctes: Vec<String> = Vec::new();
     for (i, mf) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -779,9 +786,13 @@ fn render_mutation(
                 table,
                 objects,
                 on_conflict,
+                scope_check,
                 ..
             } => {
                 render_insert_cte(&cte, table, objects, on_conflict.as_ref(), schema, ctx)?;
+                if let Some(check) = scope_check {
+                    check_ctes.push(render_insert_scope_check(&cte, table, check, schema, ctx)?);
+                }
             }
             MutationField::Update {
                 table, where_, set, ..
@@ -817,7 +828,42 @@ fn render_mutation(
         render_mutation_output_for(mf, &cte, schema, ctx)?;
     }
     ctx.sql.push_str(") AS result");
+    // Cross-join the 1-row check CTEs so PostgreSQL is forced to evaluate each
+    // scope-check CASE; a violation aborts the whole statement.
+    if !check_ctes.is_empty() {
+        ctx.sql.push_str(" FROM ");
+        ctx.sql.push_str(&check_ctes.join(", "));
+    }
     Ok(())
+}
+
+/// Emit `, {cte}_chk AS (...)` — a single-row CTE that aggregates the scope
+/// predicate over the just-inserted rows in `{cte}`. If every row satisfies it
+/// the CASE yields 0; otherwise it casts a diagnostic string to `integer`,
+/// raising an error that aborts the statement. The `count(*)` inside the cast
+/// argument keeps PostgreSQL from constant-folding (and prematurely raising)
+/// the ELSE branch at plan time — it is only evaluated when a row violates.
+fn render_insert_scope_check(
+    cte: &str,
+    table_name: &str,
+    check: &crate::ast::BoolExpr,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<String> {
+    let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+        path: cte.into(),
+        message: format!("unknown table '{table_name}'"),
+    })?;
+    let chk = format!("{cte}_chk");
+    write!(ctx.sql, ", {chk} AS (SELECT CASE WHEN coalesce(bool_and(").unwrap();
+    render_bool_expr(check, table, cte, schema, ctx)?;
+    write!(
+        ctx.sql,
+        "), true) THEN 0 ELSE CAST('vision_graphql: scope check violation on \"{}\" (' || count(*)::text || ' rows) inserted outside scope' AS integer) END AS ok FROM {cte})",
+        table.exposed_name
+    )
+    .unwrap();
+    Ok(chk)
 }
 
 fn render_insert_cte(
@@ -2295,6 +2341,7 @@ mod tests {
                 alias: "id".into(),
             }],
             one: false,
+            scope_check: None,
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
@@ -2322,9 +2369,76 @@ mod tests {
                 alias: "id".into(),
             }],
             one: true,
+            scope_check: None,
         }]);
         let (sql, _) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
+    }
+
+    #[test]
+    fn render_insert_scope_check_emits_guard_cte() {
+        use crate::ast::{BoolExpr, CmpOp, InsertObject, MutationField};
+        use std::collections::BTreeMap;
+
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![InsertObject {
+                columns,
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
+            }],
+            on_conflict: None,
+            returning: vec![Field::Column {
+                physical: "id".into(),
+                alias: "id".into(),
+            }],
+            one: false,
+            scope_check: Some(BoolExpr::Compare {
+                column: "name".into(),
+                op: CmpOp::Eq,
+                value: serde_json::json!("alice"),
+            }),
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(
+            sql.contains("m0_chk AS (SELECT CASE WHEN coalesce(bool_and("),
+            "guard CTE: {sql}"
+        );
+        assert!(
+            sql.contains("count(*)::text"),
+            "non-constant cast defers folding: {sql}"
+        );
+        assert!(
+            sql.trim_end().ends_with("FROM m0_chk"),
+            "final SELECT must reference the guard: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_insert_without_scope_check_has_no_guard() {
+        use crate::ast::{InsertObject, MutationField};
+        use std::collections::BTreeMap;
+
+        let mut columns = BTreeMap::new();
+        columns.insert("name".to_string(), serde_json::json!("alice"));
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![InsertObject {
+                columns,
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
+            }],
+            on_conflict: None,
+            returning: Vec::new(),
+            one: false,
+            scope_check: None,
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(!sql.contains("_chk"), "no guard when unscoped: {sql}");
     }
 
     #[test]
@@ -2380,7 +2494,10 @@ mod tests {
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         let where_pos = sql.find("WHERE").expect("has where");
         let ret_pos = sql.find("RETURNING").expect("has returning");
-        assert!(!sql[where_pos..ret_pos].contains(" AND "), "unscoped: bare PK match");
+        assert!(
+            !sql[where_pos..ret_pos].contains(" AND "),
+            "unscoped: bare PK match"
+        );
         assert_eq!(binds.len(), 1);
     }
 
@@ -2608,6 +2725,7 @@ mod tests {
                 },
             ],
             one: false,
+            scope_check: None,
         }]);
 
         let (sql, _binds) = render(&op, &schema).unwrap();
@@ -2682,6 +2800,7 @@ mod tests {
                 },
             ],
             one: false,
+            scope_check: None,
         }]);
 
         let (sql, _binds) = render(&op, &schema).unwrap();
@@ -2756,6 +2875,7 @@ mod tests {
                 },
             ],
             one: false,
+            scope_check: None,
         }]);
 
         let (sql, _binds) = render(&op, &schema).unwrap();
@@ -2823,6 +2943,7 @@ mod tests {
                 alias: "title".into(),
             }],
             one: false,
+            scope_check: None,
         }]);
 
         let (sql, _binds) = render(&op, &schema).unwrap();

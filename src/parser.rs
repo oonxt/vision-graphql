@@ -275,6 +275,7 @@ fn lower_mutation_field(
                     on_conflict,
                     returning,
                     one: true,
+                    scope_check: None,
                 });
             }
         }
@@ -300,6 +301,7 @@ fn lower_mutation_field(
                 on_conflict,
                 returning,
                 one: false,
+                scope_check: None,
             });
         }
     }
