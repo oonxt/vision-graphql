@@ -183,8 +183,9 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
 ///
 /// `update`/`delete` AND the predicate into their `WHERE`; the `_by_pk` forms
 /// stash it in their `scope` slot for the renderer to append onto the PK
-/// match. Relation fields in `returning`/selection are scoped like any query
-/// selection. `insert` stays fail-closed.
+/// match. A flat `insert` stashes the predicate in its `scope_check` slot for
+/// the renderer's post-insert guard; nested `insert` stays fail-closed.
+/// Relation fields in `returning`/selection are scoped like any query selection.
 fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
     match mf {
         MutationField::Insert {
