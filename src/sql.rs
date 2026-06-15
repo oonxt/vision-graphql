@@ -835,11 +835,23 @@ fn render_mutation(
     }
     ctx.sql.push_str(") AS result");
     // Cross-join the 1-row guard CTEs (from scoped inserts at every nesting
-    // level) so PostgreSQL is forced to evaluate each scope-check CASE; a
-    // violation aborts the whole statement.
+    // level) and reference each guard's `ok` in WHERE. The WHERE reference is
+    // essential: without it PostgreSQL prunes the unused `ok` column and never
+    // evaluates the error-raising CASE, so the guard would silently do nothing.
+    // On a passing insert every `ok` is 0 and the row is kept; on a violation
+    // the CASE's ELSE cast fails while WHERE is evaluated, aborting the
+    // statement.
     if !ctx.scope_check_ctes.is_empty() {
         ctx.sql.push_str(" FROM ");
         ctx.sql.push_str(&ctx.scope_check_ctes.join(", "));
+        ctx.sql.push_str(" WHERE ");
+        let guards = std::mem::take(&mut ctx.scope_check_ctes);
+        for (i, chk) in guards.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(" AND ");
+            }
+            write!(ctx.sql, "{chk}.ok = 0").unwrap();
+        }
     }
     Ok(())
 }
@@ -2078,10 +2090,58 @@ fn render_bool_expr_no_alias(
             .unwrap();
             Ok(())
         }
-        BoolExpr::Relation { .. } => Err(Error::Validate {
-            path: "where".into(),
-            message: "relation filters not supported inside aggregate source".into(),
-        }),
+        BoolExpr::Relation { name, inner } => {
+            // No table alias here (UPDATE/DELETE/ON CONFLICT target the table by
+            // name), so correlate the EXISTS back to it via the table's physical
+            // name rather than an alias.
+            let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
+                path: format!("where.{name}"),
+                message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
+            })?;
+            let target = schema
+                .table(&rel.target_table)
+                .ok_or_else(|| Error::Validate {
+                    path: format!("where.{name}"),
+                    message: format!("relation target table '{}' missing", rel.target_table),
+                })?;
+            let remote_alias = ctx.next_alias("e");
+            write!(
+                ctx.sql,
+                "EXISTS (SELECT 1 FROM {}.{} {remote_alias} WHERE ",
+                quote_ident(&target.physical_schema),
+                quote_ident(&target.physical_name),
+            )
+            .unwrap();
+            for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
+                if i > 0 {
+                    ctx.sql.push_str(" AND ");
+                }
+                let l = table
+                    .find_column(local_col)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("where.{name}"),
+                        message: format!("relation mapping: unknown local column '{local_col}'"),
+                    })?;
+                let r = target
+                    .find_column(remote_col)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("where.{name}"),
+                        message: format!("relation mapping: unknown remote column '{remote_col}'"),
+                    })?;
+                write!(
+                    ctx.sql,
+                    "{remote_alias}.{} = {}.{}",
+                    quote_ident(&r.physical_name),
+                    quote_ident(&table.physical_name),
+                    quote_ident(&l.physical_name),
+                )
+                .unwrap();
+            }
+            ctx.sql.push_str(" AND ");
+            render_bool_expr(inner, target, &remote_alias, schema, ctx)?;
+            ctx.sql.push(')');
+            Ok(())
+        }
     }
 }
 
@@ -2439,8 +2499,8 @@ mod tests {
             "non-constant cast defers folding: {sql}"
         );
         assert!(
-            sql.trim_end().ends_with("FROM m0_chk"),
-            "final SELECT must reference the guard: {sql}"
+            sql.trim_end().ends_with("FROM m0_chk WHERE m0_chk.ok = 0"),
+            "final SELECT must reference the guard's ok in WHERE so PG evaluates it: {sql}"
         );
     }
 

@@ -250,17 +250,19 @@ async fn unrestricted_table_passes_through() {
 }
 
 #[tokio::test]
-async fn mutation_is_rejected_fail_closed() {
+async fn scoped_insert_array_in_scope_succeeds() {
     let (engine, _c) = setup().await;
-    let err = engine
+    // The array insert form (insert_orders) is scoped just like insert_one:
+    // an in-scope row passes the post-insert guard.
+    let v: Value = engine
         .scoped(user_scope(1))
         .query(
             r#"mutation { insert_orders(objects: [{user_id: 1, title: "x"}]) { affected_rows } }"#,
             None,
         )
         .await
-        .expect_err("mutations unsupported in scoped mode");
-    assert!(matches!(err, Error::Scope(_)));
+        .expect("in-scope array insert ok");
+    assert_eq!(v["insert_orders"]["affected_rows"], json!(1));
 }
 
 #[tokio::test]
@@ -388,12 +390,14 @@ async fn scoped_update_by_pk_returns_null_for_foreign_row() {
 #[tokio::test]
 async fn scoped_delete_cannot_remove_foreign_rows() {
     let (engine, _c) = setup().await;
-    // alice deletes "all" orders she can reach via a broad predicate; only her
-    // own rows are eligible because the scope filter is AND-ed in.
+    // alice deletes "all" samples she can reach via a broad predicate. samples'
+    // scope is a Relation (reachable via her orders), so this also exercises a
+    // Relation predicate inside a DELETE WHERE; only her 2 samples are eligible.
+    // samples is a leaf table (nothing FK-references it).
     let v: Value = engine
         .scoped(user_scope(1))
         .run(
-            Mutation::delete("orders")
+            Mutation::delete("samples")
                 .where_expr(BoolExpr::Compare {
                     column: "id".into(),
                     op: CmpOp::Gt,
@@ -404,19 +408,19 @@ async fn scoped_delete_cannot_remove_foreign_rows() {
         .await
         .expect("delete ok");
     assert_eq!(
-        v["delete_orders"]["affected_rows"],
+        v["delete_samples"]["affected_rows"],
         json!(2),
-        "only alice's 2"
+        "only alice's 2 samples"
     );
 
-    // bob's order 3 survives.
+    // bob's sample survives.
     let remaining: Value = engine
-        .run(Query::from("orders").select(&["id"]))
+        .run(Query::from("samples").select(&["serial"]))
         .await
         .expect("read ok");
-    let rows = remaining["orders"].as_array().unwrap();
+    let rows = remaining["samples"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], json!(3));
+    assert_eq!(rows[0]["serial"], json!("S-B1"));
 }
 
 #[tokio::test]
