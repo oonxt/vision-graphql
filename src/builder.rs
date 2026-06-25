@@ -568,6 +568,7 @@ impl UpdateBuilder {
             where_: self.where_.expect("update builder: where clause required"),
             set: self.set,
             returning: self.returning,
+            scope_check: None,
         }
     }
 }

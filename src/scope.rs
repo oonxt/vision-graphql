@@ -12,18 +12,26 @@
 //! injected as-is and are NOT themselves re-scoped (a predicate may reference
 //! a relation to a table the caller cannot query directly).
 //!
-//! Scoped `update` and `delete` (including their `_by_pk` forms) inject the
-//! predicate as a *filter*: it is AND-ed into the statement's `WHERE`, so a
-//! scoped caller can only modify rows the predicate already lets them see. A
-//! `_by_pk` row failing the predicate simply does not match and the mutation
-//! returns null.
+//! Scoped `delete` (and its `_by_pk` form) injects the predicate as a *filter*:
+//! it is AND-ed into the statement's `WHERE`, so a scoped caller can only remove
+//! rows the predicate already lets them see. A `_by_pk` row failing the
+//! predicate simply does not match and the mutation returns null.
+//!
+//! Scoped `update` (and its `_by_pk` form) injects the predicate as *both* a
+//! pre-image filter and a post-update check. The filter is AND-ed into the
+//! `WHERE` (so only in-scope rows are touched); the check is a guard CTE the
+//! renderer emits over the updated rows, so a caller cannot move a row *out* of
+//! scope (e.g. reassign an owning column). A violation aborts the statement.
 //!
 //! Scoped `insert` injects the predicate as a post-insert *check*: every
 //! inserted row must satisfy it or the whole statement aborts (the renderer
 //! emits a guard CTE that errors on violation). Nested inserts are enforced at
 //! every level — each nested target table must be in the scope set, and its
 //! rows are checked against its own predicate; a violation anywhere aborts the
-//! whole (atomic) statement.
+//! whole (atomic) statement. An `insert` with `on_conflict … update_columns`
+//! (upsert) additionally injects the predicate into the `DO UPDATE … WHERE` as
+//! a pre-image filter, so a conflicting row outside scope is skipped rather than
+//! overwritten; the post-insert check still applies to the resulting row.
 
 use std::collections::HashMap;
 
@@ -182,11 +190,14 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
 
 /// Rewrite one mutation field so it can only touch in-scope rows.
 ///
-/// `update`/`delete` AND the predicate into their `WHERE`; the `_by_pk` forms
-/// stash it in their `scope` slot for the renderer to append onto the PK
-/// match. An `insert` stashes the predicate in its `scope_check` slot for the
-/// renderer's post-insert guard, recursing into nested inserts so every level's
-/// target table is resolved and checked. Relation fields in `returning`/
+/// `update`/`delete` AND the predicate into their `WHERE`; `update` also stashes
+/// it in `scope_check` so the renderer emits a post-update guard (no row may be
+/// moved out of scope). The `_by_pk` forms stash the predicate in their `scope`
+/// slot, which the renderer appends onto the PK match and — for `update_by_pk` —
+/// re-checks as a post-update guard. An `insert` stashes the predicate in its
+/// `scope_check` slot for the renderer's post-insert guard (and its upsert
+/// `DO UPDATE … WHERE` pre-image filter), recursing into nested inserts so every
+/// level's target table is resolved and checked. Relation fields in `returning`/
 /// selection are scoped like any query selection.
 fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
     match mf {
@@ -214,13 +225,20 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             table,
             where_,
             returning,
+            scope_check,
             ..
         } => {
             let t = lookup_table(schema, table, alias)?;
             // Scope EXISTS targets in the user-written where before injecting.
             scope_bool_expr(where_, t, scope, schema)?;
             scope_fields(returning, t, scope, schema)?;
-            if let Some(expr) = resolve(scope, table)? {
+            let pred = resolve(scope, table)?;
+            // Same predicate twice: pre-image filter (AND-ed into the WHERE) and
+            // post-update check (the renderer's guard CTE). The filter restricts
+            // which rows may be touched; the check forbids moving a row out of
+            // scope.
+            *scope_check = pred.clone();
+            if let Some(expr) = pred {
                 and_in(where_, expr);
             }
             Ok(())
@@ -611,18 +629,52 @@ mod tests {
             where_: owner("id", 1),
             set: std::collections::BTreeMap::new(),
             returning: Vec::new(),
+            scope_check: None,
         }]);
         let scope = ScopeSet::new().allow("posts", owner("user_id", 7));
         apply_scope(&mut op, &scope, &schema()).unwrap();
         let Operation::Mutation(fields) = op else {
             unreachable!()
         };
-        let MutationField::Update { where_, .. } = &fields[0] else {
+        let MutationField::Update {
+            where_,
+            scope_check,
+            ..
+        } = &fields[0]
+        else {
             unreachable!()
         };
         assert!(
             matches!(where_, BoolExpr::And(parts) if parts.len() == 2),
             "update where must be (user AND scope), got {where_:?}"
+        );
+        assert!(
+            matches!(scope_check, Some(BoolExpr::Compare { column, .. }) if column == "user_id"),
+            "update must also stash the predicate as a post-update check, got {scope_check:?}"
+        );
+    }
+
+    #[test]
+    fn unrestricted_update_has_no_check() {
+        let mut op = Operation::Mutation(vec![MutationField::Update {
+            alias: "update_posts".into(),
+            table: "posts".into(),
+            where_: owner("id", 1),
+            set: std::collections::BTreeMap::new(),
+            returning: Vec::new(),
+            scope_check: None,
+        }]);
+        let scope = ScopeSet::new().unrestricted("posts");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Mutation(fields) = op else {
+            unreachable!()
+        };
+        let MutationField::Update { scope_check, .. } = &fields[0] else {
+            unreachable!()
+        };
+        assert!(
+            scope_check.is_none(),
+            "unrestricted update needs no post-update check"
         );
     }
 

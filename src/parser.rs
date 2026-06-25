@@ -358,6 +358,7 @@ fn lower_mutation_field(
                 where_,
                 set,
                 returning,
+                scope_check: None,
             });
         }
     }
@@ -1214,7 +1215,12 @@ fn lower_args(
     Ok(out)
 }
 
-fn lower_where(json: &Value, table: &Table, schema: &Schema, path: &str) -> Result<BoolExpr> {
+pub(crate) fn lower_where(
+    json: &Value,
+    table: &Table,
+    schema: &Schema,
+    path: &str,
+) -> Result<BoolExpr> {
     let obj = json.as_object().ok_or_else(|| Error::Validate {
         path: path.into(),
         message: "expected object".into(),
