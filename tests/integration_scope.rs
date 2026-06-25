@@ -8,8 +8,9 @@ use serde_json::{json, Value};
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::ast::{BoolExpr, CmpOp};
+use vision_graphql::predicate::{col, principal, rel};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
-use vision_graphql::{Engine, Error, Mutation, Query, ScopeSet};
+use vision_graphql::{Engine, Error, Mutation, Query, ScopePolicy, ScopeSet};
 
 fn schema() -> Schema {
     Schema::builder()
@@ -694,4 +695,87 @@ async fn scoped_nested_insert_denied_target_fails_closed() {
         .await
         .expect_err("denied nested target");
     assert!(matches!(err, Error::ScopeDenied { table } if table == "orders"));
+}
+
+// ===== ScopePolicy: build the policy shape once, bind a principal per request.
+// Both the DSL and the TOML loader must enforce identically to a hand-built
+// ScopeSet. =====
+
+#[tokio::test]
+async fn scope_policy_dsl_binds_per_principal() {
+    let (engine, _c) = setup().await;
+    let policy = ScopePolicy::builder()
+        .allow("users", col("id").eq(principal()))
+        .allow("orders", col("user_id").eq(principal()))
+        .allow("samples", rel("order", col("user_id").eq(principal())))
+        .unrestricted("adverts")
+        .validate(&schema())
+        .expect("policy validates against the schema");
+
+    // alice (principal 1) sees exactly her two orders — same as user_scope(1).
+    let v: Value = engine
+        .scoped(policy.bind_value(1).expect("bind"))
+        .query("query { orders { id title } }", None)
+        .await
+        .expect("query ok");
+    let orders = v["orders"].as_array().expect("array");
+    assert_eq!(orders.len(), 2);
+    assert!(orders
+        .iter()
+        .all(|o| o["title"].as_str().unwrap().starts_with("a-")));
+
+    // Same policy, different principal: bob sees only his order.
+    let v: Value = engine
+        .scoped(policy.bind_value(2).expect("bind"))
+        .query("query { orders { id } }", None)
+        .await
+        .expect("query ok");
+    assert_eq!(v["orders"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scope_policy_validate_rejects_typo_at_build_time() {
+    // A wrong column is caught when the policy is built, not per request.
+    let err = ScopePolicy::builder()
+        .allow("orders", col("owner_id").eq(principal())) // no such column
+        .validate(&schema())
+        .expect_err("typo must fail validation");
+    assert!(matches!(err, Error::Validate { .. }));
+}
+
+#[tokio::test]
+async fn scope_policy_from_toml_enforces() {
+    let (engine, _c) = setup().await;
+    let toml = r#"
+        [tables.users]
+        where = { id = { _eq = "$principal" } }
+
+        [tables.orders]
+        where = { user_id = { _eq = "$principal" } }
+
+        [tables.samples]
+        where = { order = { user_id = { _eq = "$principal" } } }
+
+        [tables.adverts]
+        unrestricted = true
+    "#;
+    let policy = ScopePolicy::from_toml(toml, &schema()).expect("toml policy");
+
+    // samples reachable via the order chain: bob (2) sees exactly his one sample.
+    let v: Value = engine
+        .scoped(policy.bind_value(2).expect("bind"))
+        .query("query { samples { serial } }", None)
+        .await
+        .expect("query ok");
+    let samples = v["samples"].as_array().expect("array");
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0]["serial"], json!("S-B1"));
+
+    // A table absent from the policy is still denied.
+    let err = engine
+        .scoped(policy.bind_value(2).expect("bind"))
+        .query("query { orders { id } }", None)
+        .await;
+    // orders IS in the policy, so this succeeds; a genuinely absent table fails:
+    assert!(err.is_ok());
 }

@@ -52,8 +52,11 @@ pub mod engine;
 pub mod error;
 pub mod executor;
 pub mod parser;
+pub mod policy;
+pub mod predicate;
 pub mod schema;
 pub mod scope;
+pub mod scope_config;
 pub mod sql;
 pub mod types;
 
@@ -63,5 +66,9 @@ pub use builder::{
 };
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::Error;
+pub use policy::{ScopePolicy, ScopePolicyBuilder, ScopeRule};
+pub use predicate::{
+    and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr,
+};
 pub use schema::Schema;
 pub use scope::{ScopeSet, TableScope};

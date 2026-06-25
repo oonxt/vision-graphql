@@ -298,6 +298,59 @@ Scope predicates are trusted policy: they are injected as-is and never
 re-scoped themselves. `scoped.transaction(…)` hands the closure a
 `ScopedTxClient`, so the scope cannot be escaped mid-transaction.
 
+### Building scope: `ScopePolicy`
+
+Hand-building a `ScopeSet` from raw `BoolExpr` every request is verbose and the
+shape (tables, columns, relation chains) is usually static — only the principal
+varies. `ScopePolicy` captures that shape once, validates it against the schema,
+and binds a principal per request:
+
+```rust
+# use vision_graphql::{Engine, ScopePolicy, Schema};
+# use vision_graphql::predicate::{col, rel, principal};
+# async fn example(engine: Engine, schema: &Schema, user_id: i64) -> Result<(), vision_graphql::Error> {
+// once, at startup — `validate` catches typos in table/column/relation names:
+let policy = ScopePolicy::builder()
+    .allow("orders", col("user_id").eq(principal()))
+    .allow("samples", rel("order", col("user_id").eq(principal())))  // ownership chain
+    .unrestricted("adverts")
+    .validate(schema)?;
+
+// per request — a cheap tree-walk, no parsing or schema lookups:
+let scoped = engine.scoped(policy.bind_value(user_id)?);
+let _ = scoped.query("query { orders { id title } }", None).await?;
+# Ok(()) }
+```
+
+The predicate DSL (`col`, `rel`, `and`, `or`, `not`, `param`, `principal`) builds
+templates whose value slots are filled at bind time. `principal()` is the default
+parameter; multi-key scopes use named params:
+
+```rust
+# use vision_graphql::{ScopePolicy, Principal};
+# use vision_graphql::predicate::{col, param};
+# fn example(policy: &ScopePolicy, tenant: i64, user: i64) -> Result<(), vision_graphql::Error> {
+// policy: .allow("audit_log", and([col("tenant_id").eq(param("tenant_id")),
+//                                   col("actor_id").eq(param("user_id"))]))
+let scope = policy.bind(&Principal::new().set("tenant_id", tenant).set("user_id", user))?;
+# let _ = scope; Ok(()) }
+```
+
+The same policy can be loaded from TOML (`ScopePolicy::from_toml`), where `where`
+uses the query `where` object syntax and `"$name"` marks a parameter (`$$`
+escapes a literal `$`):
+
+```toml
+[tables.orders]
+where = { user_id = { _eq = "$principal" } }
+
+[tables.samples]
+where = { order = { user_id = { _eq = "$principal" } } }   # relation chain
+
+[tables.adverts]
+unrestricted = true
+```
+
 Scoped `delete` (and its `_by_pk` form) injects the predicate as a filter — it
 is AND-ed into the statement's `WHERE`, so a scoped caller can only remove rows
 already in scope. A `_by_pk` row failing the predicate simply does not match, so
