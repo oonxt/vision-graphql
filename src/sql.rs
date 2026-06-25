@@ -801,9 +801,13 @@ fn render_mutation(
                 )?;
             }
             MutationField::Update {
-                table, where_, set, ..
+                table,
+                where_,
+                set,
+                scope_check,
+                ..
             } => {
-                render_update_cte(&cte, table, where_, set, schema, ctx)?;
+                render_update_cte(&cte, table, where_, set, scope_check.as_ref(), schema, ctx)?;
             }
             MutationField::UpdateByPk {
                 table,
@@ -857,17 +861,19 @@ fn render_mutation(
 }
 
 /// Emit `, {cte}_chk AS (...)` — a single-row guard CTE that aggregates `check`
-/// over the just-inserted rows in `{cte}`. If every row satisfies it the CASE
-/// yields 0; otherwise it casts a diagnostic string to `integer`, raising an
-/// error that aborts the statement. The `count(*)` inside the cast argument
-/// keeps PostgreSQL from constant-folding (and prematurely raising) the ELSE
-/// branch at plan time — it is only evaluated when a row actually violates.
-/// The guard CTE name is recorded in `ctx.scope_check_ctes` so the final SELECT
-/// references it.
+/// over the rows written into `{cte}` (inserted or updated). If every row
+/// satisfies it the CASE yields 0; otherwise it casts a diagnostic string to
+/// `integer`, raising an error that aborts the statement. The `count(*)` inside
+/// the cast argument keeps PostgreSQL from constant-folding (and prematurely
+/// raising) the ELSE branch at plan time — it is only evaluated when a row
+/// actually violates. `action` names the operation in the diagnostic (e.g.
+/// "inserted", "modified"). The guard CTE name is recorded in
+/// `ctx.scope_check_ctes` so the final SELECT references it.
 fn emit_scope_guard(
     cte: &str,
     table: &Table,
     check: &crate::ast::BoolExpr,
+    action: &str,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -876,7 +882,7 @@ fn emit_scope_guard(
     render_bool_expr(check, table, cte, schema, ctx)?;
     write!(
         ctx.sql,
-        "), true) THEN 0 ELSE CAST('vision_graphql: scope check violation on \"{}\" (' || count(*)::text || ' rows) inserted outside scope' AS integer) END AS ok FROM {cte})",
+        "), true) THEN 0 ELSE CAST('vision_graphql: scope check violation on \"{}\" (' || count(*)::text || ' rows) {action} outside scope' AS integer) END AS ok FROM {cte})",
         table.exposed_name
     )
     .unwrap();
@@ -1209,7 +1215,7 @@ fn render_insert_cte_recursive(
     }
 
     if let Some(oc) = on_conflict {
-        render_on_conflict(oc, table, schema, is_nested_cte, ctx)?;
+        render_on_conflict(oc, table, scope_check, is_nested_cte, schema, ctx)?;
     }
     ctx.sql.push_str(" RETURNING *)");
 
@@ -1228,7 +1234,7 @@ fn render_insert_cte_recursive(
     // 6b. Scoped insert: emit this level's abort-on-violation guard so every
     //     row just inserted into {cte} must satisfy the table's scope check.
     if let Some(check) = scope_check {
-        emit_scope_guard(cte, table, check, schema, ctx)?;
+        emit_scope_guard(cte, table, check, "inserted", schema, ctx)?;
     }
 
     // 7. For each nested array relation, emit the child chain.
@@ -1294,8 +1300,9 @@ fn render_insert_cte_recursive(
 fn render_on_conflict(
     oc: &crate::ast::OnConflict,
     table: &Table,
-    schema: &Schema,
+    scope_check: Option<&crate::ast::BoolExpr>,
     nested_context: bool,
+    schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     write!(
@@ -1356,9 +1363,29 @@ fn render_on_conflict(
             )
             .unwrap();
         }
-        if let Some(expr) = oc.where_.as_ref() {
-            ctx.sql.push_str(" WHERE ");
-            render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        // Combine the user's optional DO UPDATE WHERE with the scope predicate.
+        // In a DO UPDATE, unqualified columns reference the *existing* (target)
+        // row, so the scope predicate here acts as a pre-image filter: a
+        // conflicting row outside scope fails the WHERE and is skipped rather
+        // than overwritten. (The post-insert guard still checks the resulting
+        // row, covering the post-image.)
+        match (oc.where_.as_ref(), scope_check) {
+            (Some(user), Some(scope)) => {
+                ctx.sql.push_str(" WHERE (");
+                render_bool_expr_no_alias(user, table, schema, ctx)?;
+                ctx.sql.push_str(") AND (");
+                render_bool_expr_no_alias(scope, table, schema, ctx)?;
+                ctx.sql.push(')');
+            }
+            (Some(user), None) => {
+                ctx.sql.push_str(" WHERE ");
+                render_bool_expr_no_alias(user, table, schema, ctx)?;
+            }
+            (None, Some(scope)) => {
+                ctx.sql.push_str(" WHERE ");
+                render_bool_expr_no_alias(scope, table, schema, ctx)?;
+            }
+            (None, None) => {}
         }
     }
     Ok(())
@@ -1369,6 +1396,7 @@ fn render_update_cte(
     table_name: &str,
     where_: &crate::ast::BoolExpr,
     set: &std::collections::BTreeMap<String, serde_json::Value>,
+    scope_check: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -1409,6 +1437,12 @@ fn render_update_cte(
     ctx.sql.push_str(" WHERE ");
     render_bool_expr_no_alias(where_, table, schema, ctx)?;
     ctx.sql.push_str(" RETURNING *)");
+    // Post-update check: every row left by the UPDATE must still satisfy the
+    // scope predicate, or the guard aborts the statement (so a scoped caller
+    // cannot move a row out of scope).
+    if let Some(check) = scope_check {
+        emit_scope_guard(cte, table, check, "modified", schema, ctx)?;
+    }
     Ok(())
 }
 
@@ -1485,6 +1519,13 @@ fn render_update_by_pk_cte(
         ctx.sql.push(')');
     }
     ctx.sql.push_str(" RETURNING *)");
+    // Post-update check: the same predicate that gates the PK match is
+    // re-checked over the updated row, so a by_pk update cannot move an
+    // in-scope row out of scope. A row the filter excluded leaves the CTE
+    // empty, so the guard passes (the mutation just returns null).
+    if let Some(check) = scope {
+        emit_scope_guard(cte, table, check, "modified", schema, ctx)?;
+    }
     Ok(())
 }
 
@@ -2529,6 +2570,115 @@ mod tests {
     }
 
     #[test]
+    fn render_update_with_scope_check_emits_guard_cte() {
+        use crate::ast::{BoolExpr, CmpOp, MutationField};
+        use std::collections::BTreeMap;
+
+        let mut set = BTreeMap::new();
+        set.insert("name".to_string(), serde_json::json!("bob"));
+        let scope = BoolExpr::Compare {
+            column: "name".into(),
+            op: CmpOp::Eq,
+            value: serde_json::json!("alice"),
+        };
+        let op = Operation::Mutation(vec![MutationField::Update {
+            alias: "update_users".into(),
+            table: "users".into(),
+            // where already carries the AND-ed scope (as apply_scope leaves it).
+            where_: BoolExpr::And(vec![
+                BoolExpr::Compare {
+                    column: "id".into(),
+                    op: CmpOp::Gt,
+                    value: serde_json::json!(0),
+                },
+                scope.clone(),
+            ]),
+            set,
+            returning: Vec::new(),
+            scope_check: Some(scope),
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(
+            sql.contains("m0_chk AS (SELECT CASE WHEN coalesce(bool_and("),
+            "post-update guard CTE: {sql}"
+        );
+        assert!(
+            sql.contains("modified outside scope"),
+            "guard diagnostic names the update: {sql}"
+        );
+        assert!(
+            sql.trim_end().ends_with("FROM m0_chk WHERE m0_chk.ok = 0"),
+            "final SELECT references the guard's ok: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_update_without_scope_check_has_no_guard() {
+        use crate::ast::{BoolExpr, CmpOp, MutationField};
+        use std::collections::BTreeMap;
+
+        let mut set = BTreeMap::new();
+        set.insert("name".to_string(), serde_json::json!("bob"));
+        let op = Operation::Mutation(vec![MutationField::Update {
+            alias: "update_users".into(),
+            table: "users".into(),
+            where_: BoolExpr::Compare {
+                column: "id".into(),
+                op: CmpOp::Gt,
+                value: serde_json::json!(0),
+            },
+            set,
+            returning: Vec::new(),
+            scope_check: None,
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(!sql.contains("_chk"), "no guard when unscoped: {sql}");
+    }
+
+    #[test]
+    fn render_upsert_injects_scope_into_do_update_where() {
+        use crate::ast::{BoolExpr, CmpOp, InsertObject, MutationField, OnConflict};
+        use std::collections::BTreeMap;
+
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), serde_json::json!(1));
+        columns.insert("name".to_string(), serde_json::json!("alice"));
+        let op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_users".into(),
+            table: "users".into(),
+            objects: vec![InsertObject {
+                columns,
+                nested_arrays: BTreeMap::new(),
+                nested_objects: BTreeMap::new(),
+            }],
+            on_conflict: Some(OnConflict {
+                constraint: "users_pkey".into(),
+                update_columns: vec!["name".into()],
+                where_: None,
+            }),
+            returning: Vec::new(),
+            one: false,
+            scope_check: Some(BoolExpr::Compare {
+                column: "name".into(),
+                op: CmpOp::Eq,
+                value: serde_json::json!("alice"),
+            }),
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        // The DO UPDATE WHERE applies the scope predicate to the EXISTING row,
+        // so a conflicting foreign row is skipped, not overwritten.
+        assert!(
+            sql.contains("DO UPDATE SET") && sql.contains("WHERE \"name\" = $"),
+            "scope predicate gates DO UPDATE on the pre-image row: {sql}"
+        );
+        // And the post-insert guard still checks the resulting row.
+        assert!(
+            sql.contains("m0_chk AS (SELECT CASE WHEN coalesce(bool_and("),
+            "post-insert guard still present: {sql}"
+        );
+    }
+
+    #[test]
     fn render_update_by_pk_appends_scope_predicate() {
         use crate::ast::{BoolExpr, CmpOp, MutationField};
         use std::collections::BTreeMap;
@@ -2560,8 +2710,18 @@ mod tests {
             clause.contains(" AND (\"name\" = $"),
             "scope ANDed onto PK match: {clause}"
         );
-        // set value + pk value + scope value
-        assert_eq!(binds.len(), 3);
+        // by_pk also re-checks the scope predicate as a post-update guard so an
+        // in-scope row cannot be moved out of scope.
+        assert!(
+            sql.contains("m0_chk AS (SELECT CASE WHEN coalesce(bool_and("),
+            "post-update guard CTE: {sql}"
+        );
+        assert!(
+            sql.trim_end().ends_with("FROM m0_chk WHERE m0_chk.ok = 0"),
+            "final SELECT references the guard's ok: {sql}"
+        );
+        // set value + pk value + scope filter value + scope guard value
+        assert_eq!(binds.len(), 4);
     }
 
     #[test]

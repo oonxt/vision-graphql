@@ -77,7 +77,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
-| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `update`/`delete` (incl. `_by_pk`) + `insert` (post-insert check, enforced at every nested level) |
+| Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
 
@@ -298,11 +298,18 @@ Scope predicates are trusted policy: they are injected as-is and never
 re-scoped themselves. `scoped.transaction(…)` hands the closure a
 `ScopedTxClient`, so the scope cannot be escaped mid-transaction.
 
-Scoped `update` and `delete` (and their `_by_pk` forms) inject the predicate as
-a filter — it is AND-ed into the statement's `WHERE`, so a scoped caller can
-only modify rows already in scope. A `_by_pk` row failing the predicate simply
-does not match, so the mutation returns null (the same IDOR-safe behavior as a
-scoped `by_pk` query). Tables absent from the `ScopeSet` are denied.
+Scoped `delete` (and its `_by_pk` form) injects the predicate as a filter — it
+is AND-ed into the statement's `WHERE`, so a scoped caller can only remove rows
+already in scope. A `_by_pk` row failing the predicate simply does not match, so
+the mutation returns null (the same IDOR-safe behavior as a scoped `by_pk`
+query). Tables absent from the `ScopeSet` are denied.
+
+Scoped `update` (and its `_by_pk` form) enforces the predicate *twice*: as a
+pre-image filter AND-ed into the `WHERE` (only in-scope rows are touched) and as
+a post-update *check* — a guard CTE over the updated rows — so a caller cannot
+move a row **out** of scope (e.g. reassign an owning column). A violation aborts
+the whole statement; a `_by_pk` row the filter excluded leaves nothing to check
+and returns null.
 
 Scoped `insert` injects the predicate as a post-insert *check*: the renderer
 wraps the insert in a guard CTE so every inserted row must satisfy the
@@ -311,7 +318,9 @@ Nested inserts (`{ data: … }` children) are enforced at every level — each
 nested target table must be in the `ScopeSet` (else `Error::ScopeDenied`), and
 its rows are checked against its own predicate. Because the insert and all its
 nested children render to a single atomic statement, a violation anywhere rolls
-back every level.
+back every level. An upsert (`on_conflict` with `update_columns`) additionally
+applies the predicate to the `DO UPDATE … WHERE`, so a conflicting row outside
+scope is skipped rather than overwritten.
 
 ## Transactions
 

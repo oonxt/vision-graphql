@@ -568,6 +568,117 @@ async fn scoped_nested_insert_child_violation_aborts_everything() {
     );
 }
 
+// ===== Post-update check: a scoped caller may not move a row *out* of their
+// scope (e.g. reassign the owning column). The scope predicate is enforced both
+// as a pre-image filter (which rows can be touched) and a post-update guard
+// (the result must stay in scope). =====
+
+#[tokio::test]
+async fn scoped_update_cannot_move_row_out_of_scope() {
+    let (engine, _c) = setup().await;
+    // alice owns order 1. She tries to reassign it to bob (user_id 2). The
+    // pre-image filter (user_id = 1) matches her own row, but the post-update
+    // guard sees the new row with user_id = 2 → violation → whole stmt aborts.
+    let err = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update("orders")
+                .where_eq("id", 1)
+                .set("user_id", json!(2))
+                .returning(&["id"]),
+        )
+        .await
+        .expect_err("moving a row out of scope must abort");
+    assert!(
+        matches!(&err, Error::Database(_)),
+        "expected DB-level abort, got {err:?}"
+    );
+
+    // Nothing changed: order 1 still belongs to alice.
+    let owner: Value = engine
+        .run(Query::by_pk("orders", &[("id", json!(1))]).select(&["user_id"]))
+        .await
+        .expect("read ok");
+    assert_eq!(owner["orders_by_pk"]["user_id"], json!(1), "row untouched");
+
+    // An in-scope update (changing a non-owning column) still works.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update("orders")
+                .where_eq("id", 1)
+                .set("title", json!("a-order-1-edited"))
+                .returning(&["id"]),
+        )
+        .await
+        .expect("in-scope update ok");
+    assert_eq!(v["update_orders"]["affected_rows"], json!(1));
+}
+
+#[tokio::test]
+async fn scoped_update_by_pk_cannot_move_row_out_of_scope() {
+    let (engine, _c) = setup().await;
+    // alice's own order 2, reassigned to bob via _by_pk: PK + pre-image filter
+    // match, but the post-update guard rejects the out-of-scope result.
+    let err = engine
+        .scoped(user_scope(1))
+        .run(
+            Mutation::update_by_pk("orders", &[("id", json!(2))])
+                .set("user_id", json!(2))
+                .select(&["id"]),
+        )
+        .await
+        .expect_err("by_pk move out of scope must abort");
+    assert!(
+        matches!(&err, Error::Database(_)),
+        "expected DB-level abort, got {err:?}"
+    );
+
+    let owner: Value = engine
+        .run(Query::by_pk("orders", &[("id", json!(2))]).select(&["user_id"]))
+        .await
+        .expect("read ok");
+    assert_eq!(owner["orders_by_pk"]["user_id"], json!(1), "row untouched");
+}
+
+// ===== Upsert pre-image: a scoped insert with on_conflict do_update injects the
+// scope predicate into the DO UPDATE WHERE, so a conflicting row outside scope
+// is skipped (not overwritten) rather than stolen. =====
+
+#[tokio::test]
+async fn scoped_upsert_cannot_overwrite_foreign_row() {
+    let (engine, _c) = setup().await;
+    // bob's order 3 exists. alice upserts on the orders pkey, trying to take it
+    // over by setting user_id = 1 and a new title. The DO UPDATE WHERE applies
+    // her scope (user_id = 1) to the EXISTING row (still user_id = 2) → the
+    // conflict row is skipped, nothing is updated, and bob keeps his order.
+    let v: Value = engine
+        .scoped(user_scope(1))
+        .query(
+            r#"mutation {
+                 insert_orders(
+                   objects: [{id: 3, user_id: 1, title: "stolen"}],
+                   on_conflict: {constraint: "orders_pkey", update_columns: ["user_id", "title"]}
+                 ) { affected_rows }
+               }"#,
+            None,
+        )
+        .await
+        .expect("upsert runs without error");
+    assert_eq!(
+        v["insert_orders"]["affected_rows"], json!(0),
+        "foreign conflict row is skipped, not overwritten"
+    );
+
+    // bob's order 3 is intact.
+    let order: Value = engine
+        .run(Query::by_pk("orders", &[("id", json!(3))]).select(&["user_id", "title"]))
+        .await
+        .expect("read ok");
+    assert_eq!(order["orders_by_pk"]["user_id"], json!(2), "still bob's");
+    assert_eq!(order["orders_by_pk"]["title"], json!("b-order-1"));
+}
+
 #[tokio::test]
 async fn scoped_nested_insert_denied_target_fails_closed() {
     let (engine, _c) = setup().await;

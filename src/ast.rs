@@ -145,6 +145,13 @@ pub enum MutationField {
         /// `{ exposed_column -> new_value }`
         set: std::collections::BTreeMap<String, serde_json::Value>,
         returning: Vec<Field>,
+        /// Post-update scope check under deny-by-default scoped execution: every
+        /// row left by the UPDATE must still satisfy this predicate or the whole
+        /// statement aborts. The same predicate is also AND-ed into `where_` as a
+        /// pre-image filter, so together a scoped caller may only modify rows
+        /// already in scope and may not move a row out of scope. `None` for
+        /// unscoped runs and unrestricted tables.
+        scope_check: Option<BoolExpr>,
     },
     UpdateByPk {
         alias: String,
@@ -152,9 +159,12 @@ pub enum MutationField {
         pk: Vec<(String, serde_json::Value)>,
         set: std::collections::BTreeMap<String, serde_json::Value>,
         selection: Vec<Field>,
-        /// Scope predicate AND-ed onto the PK match under deny-by-default
-        /// scoped execution. `None` for unscoped runs and unrestricted tables.
-        /// A row failing it simply does not match, so the mutation returns null.
+        /// Scope predicate under deny-by-default scoped execution, used twice:
+        /// AND-ed onto the PK match as a pre-image filter (a row failing it does
+        /// not match, so the mutation returns null), and re-checked as a
+        /// post-update guard so an in-scope row cannot be moved out of scope by
+        /// the update (a violation aborts the statement). `None` for unscoped
+        /// runs and unrestricted tables.
         scope: Option<BoolExpr>,
     },
     Delete {

@@ -358,6 +358,7 @@ fn lower_mutation_field(
                 where_,
                 set,
                 returning,
+                scope_check: None,
             });
         }
     }
