@@ -1364,26 +1364,29 @@ fn render_on_conflict(
             .unwrap();
         }
         // Combine the user's optional DO UPDATE WHERE with the scope predicate.
-        // In a DO UPDATE, unqualified columns reference the *existing* (target)
-        // row, so the scope predicate here acts as a pre-image filter: a
-        // conflicting row outside scope fails the WHERE and is skipped rather
-        // than overwritten. (The post-insert guard still checks the resulting
-        // row, covering the post-image.)
+        // In a DO UPDATE these reference the *existing* (target) row, so the
+        // scope predicate acts as a pre-image filter: a conflicting row outside
+        // scope fails the WHERE and is skipped rather than overwritten. (The
+        // post-insert guard still checks the resulting row, covering the
+        // post-image.) Columns are qualified with the target table's name: the
+        // insert's `INSERT … SELECT … FROM c` keeps the source relation `c` (and
+        // `excluded`) in scope here, so a bare column would be ambiguous.
+        let tref = quote_ident(&table.physical_name);
         match (oc.where_.as_ref(), scope_check) {
             (Some(user), Some(scope)) => {
                 ctx.sql.push_str(" WHERE (");
-                render_bool_expr_no_alias(user, table, schema, ctx)?;
+                render_bool_expr(user, table, &tref, schema, ctx)?;
                 ctx.sql.push_str(") AND (");
-                render_bool_expr_no_alias(scope, table, schema, ctx)?;
+                render_bool_expr(scope, table, &tref, schema, ctx)?;
                 ctx.sql.push(')');
             }
             (Some(user), None) => {
                 ctx.sql.push_str(" WHERE ");
-                render_bool_expr_no_alias(user, table, schema, ctx)?;
+                render_bool_expr(user, table, &tref, schema, ctx)?;
             }
             (None, Some(scope)) => {
                 ctx.sql.push_str(" WHERE ");
-                render_bool_expr_no_alias(scope, table, schema, ctx)?;
+                render_bool_expr(scope, table, &tref, schema, ctx)?;
             }
             (None, None) => {}
         }
@@ -2668,8 +2671,8 @@ mod tests {
         // The DO UPDATE WHERE applies the scope predicate to the EXISTING row,
         // so a conflicting foreign row is skipped, not overwritten.
         assert!(
-            sql.contains("DO UPDATE SET") && sql.contains("WHERE \"name\" = $"),
-            "scope predicate gates DO UPDATE on the pre-image row: {sql}"
+            sql.contains("DO UPDATE SET") && sql.contains("WHERE \"users\".\"name\" = $"),
+            "scope predicate gates DO UPDATE on the qualified pre-image row: {sql}"
         );
         // And the post-insert guard still checks the resulting row.
         assert!(
