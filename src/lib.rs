@@ -67,8 +67,6 @@ pub use builder::{
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::Error;
 pub use policy::{ScopePolicy, ScopePolicyBuilder, ScopeRule};
-pub use predicate::{
-    and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr,
-};
+pub use predicate::{and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr};
 pub use schema::Schema;
 pub use scope::{ScopeSet, TableScope};

@@ -129,8 +129,7 @@ async fn nested_object_missing_data_key_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(msg.contains("'data'"), "error was: {msg}");
 }
@@ -149,8 +148,7 @@ async fn nested_object_array_data_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("must be a single object, not an array"),
@@ -172,8 +170,7 @@ async fn nested_object_fk_and_nested_both_set_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("populated from the nested object"),
@@ -197,8 +194,7 @@ async fn nested_object_mixed_batch_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(msg.contains("must be uniform"), "error was: {msg}");
 }
@@ -380,8 +376,7 @@ async fn nested_object_rolls_back_on_parent_failure() {
             None,
         )
         .await
-        .err()
-        .expect("expected DB error");
+        .expect_err("expected DB error");
     let _ = err;
 
     // Verify no orphan post with title="rb".

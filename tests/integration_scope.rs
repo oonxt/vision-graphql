@@ -667,7 +667,8 @@ async fn scoped_upsert_cannot_overwrite_foreign_row() {
         .await
         .expect("upsert runs without error");
     assert_eq!(
-        v["insert_orders"]["affected_rows"], json!(0),
+        v["insert_orders"]["affected_rows"],
+        json!(0),
         "foreign conflict row is skipped, not overwritten"
     );
 

@@ -108,9 +108,11 @@ fn toml_to_json(v: &toml::Value) -> Value {
         toml::Value::Boolean(b) => Value::from(*b),
         toml::Value::Datetime(d) => Value::String(d.to_string()),
         toml::Value::Array(a) => Value::Array(a.iter().map(toml_to_json).collect()),
-        toml::Value::Table(t) => {
-            Value::Object(t.iter().map(|(k, v)| (k.clone(), toml_to_json(v))).collect())
-        }
+        toml::Value::Table(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -235,9 +237,7 @@ mod tests {
             where = { user = { id = { _eq = "$account" } } }
         "#;
         let policy = parse(toml, &schema()).unwrap();
-        let set = policy
-            .bind(&Principal::new().set("account", 99))
-            .unwrap();
+        let set = policy.bind(&Principal::new().set("account", 99)).unwrap();
         let crate::TableScope::Allow(BoolExpr::Relation { inner, .. }) = set.get("orders").unwrap()
         else {
             panic!("expected relation");
