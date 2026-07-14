@@ -515,10 +515,7 @@ fn render_relation_subquery(
                 ctx.sql.push_str(", ");
             }
             render_order_by_expr(ob, target, &remote_alias, schema, &ob_path, ctx)?;
-            ctx.sql.push_str(match ob.direction {
-                crate::ast::OrderDir::Asc => " ASC",
-                crate::ast::OrderDir::Desc => " DESC",
-            });
+            render_order_dir(ob, ctx);
         }
     }
 
@@ -585,6 +582,23 @@ fn render_relation_field(
 /// could have read. A row filtered out by scope contributes no row to the
 /// subquery, so the term evaluates to NULL — the same as no related row at all,
 /// which is exactly what the caller is entitled to know.
+/// `ASC` / `DESC`, plus an explicit `NULLS FIRST|LAST` when the caller asked for
+/// one. Omitting it leaves PostgreSQL's default, which is asymmetric:
+/// `ASC` sorts NULLs last, `DESC` sorts them first — so `DESC NULLS LAST` has to
+/// be requested, it is not what plain `desc` gives you.
+fn render_order_dir(ob: &crate::ast::OrderBy, ctx: &mut RenderCtx) {
+    ctx.sql.push_str(match ob.direction {
+        crate::ast::OrderDir::Asc => " ASC",
+        crate::ast::OrderDir::Desc => " DESC",
+    });
+    if let Some(n) = ob.nulls {
+        ctx.sql.push_str(match n {
+            crate::ast::NullsOrder::First => " NULLS FIRST",
+            crate::ast::NullsOrder::Last => " NULLS LAST",
+        });
+    }
+}
+
 fn render_order_by_expr(
     ob: &crate::ast::OrderBy,
     table: &Table,
@@ -747,10 +761,7 @@ fn render_order_by(
         }
         first = false;
         render_order_by_expr(ob, table, table_alias, schema, "order_by", ctx)?;
-        ctx.sql.push_str(match ob.direction {
-            crate::ast::OrderDir::Asc => " ASC",
-            crate::ast::OrderDir::Desc => " DESC",
-        });
+        render_order_dir(ob, ctx);
     }
     Ok(())
 }
@@ -2752,6 +2763,101 @@ mod tests {
         assert!(
             sql.contains("ORDER BY (SELECT"),
             "nested relation field must support relation-qualified order_by, got: {sql}"
+        );
+    }
+
+    // ── NULL placement in ORDER BY ─────────────────────────────────────────
+
+    /// PostgreSQL's default is asymmetric: ASC sorts NULLs last, DESC sorts them
+    /// first. `desc_nulls_last` is therefore a distinct thing you must ask for —
+    /// this is the case the old raw SQL (`ORDER BY abundance DESC NULLS LAST`)
+    /// needed and plain `desc` silently would not have given.
+    #[test]
+    fn desc_nulls_last_is_not_the_same_as_desc() {
+        let schema = users_schema();
+        let plain = crate::parser::parse_and_lower(
+            "query { users(order_by: {name: desc}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
+        let (plain_sql, _) = render(&plain, &schema).unwrap();
+
+        let pinned = crate::parser::parse_and_lower(
+            "query { users(order_by: {name: desc_nulls_last}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
+        let (pinned_sql, _) = render(&pinned, &schema).unwrap();
+
+        assert!(plain_sql.contains(" DESC"), "got: {plain_sql}");
+        assert!(
+            !plain_sql.contains("NULLS"),
+            "plain desc must not pin NULLs, got: {plain_sql}"
+        );
+        assert!(pinned_sql.contains(" DESC NULLS LAST"), "got: {pinned_sql}");
+    }
+
+    #[test]
+    fn all_four_nulls_variants_render() {
+        let schema = users_schema();
+        for (token, expect) in [
+            ("asc_nulls_first", " ASC NULLS FIRST"),
+            ("asc_nulls_last", " ASC NULLS LAST"),
+            ("desc_nulls_first", " DESC NULLS FIRST"),
+            ("desc_nulls_last", " DESC NULLS LAST"),
+        ] {
+            let op = crate::parser::parse_and_lower(
+                &format!("query {{ users(order_by: {{name: {token}}}) {{ id }} }}"),
+                &serde_json::json!({}),
+                None,
+                &schema,
+            )
+            .unwrap();
+            let (sql, _) = render(&op, &schema).unwrap();
+            assert!(
+                sql.contains(expect),
+                "{token} -> 期望 `{expect}`，得到: {sql}"
+            );
+        }
+    }
+
+    /// NULL placement must survive the relation-qualified (correlated subquery) path.
+    #[test]
+    fn nulls_order_survives_relation_qualified_order_by() {
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "query { posts(order_by: {user: {name: desc_nulls_last}}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
+        let (sql, _) = render(&op, &schema).unwrap();
+        assert!(sql.contains("ORDER BY (SELECT"), "got: {sql}");
+        assert!(
+            sql.contains(") DESC NULLS LAST"),
+            "关联排序也必须带上 NULLS LAST，got: {sql}"
+        );
+    }
+
+    #[test]
+    fn unknown_direction_names_the_valid_tokens() {
+        let schema = users_schema();
+        let err = crate::parser::parse_and_lower(
+            "query { users(order_by: {name: sideways}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("desc_nulls_last"),
+            "报错应列出合法取值，got: {msg}"
         );
     }
 

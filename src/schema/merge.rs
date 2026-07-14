@@ -8,7 +8,7 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
     let rels = derive_relations_from_fks(&db);
     let mut sb = crate::schema::Schema::builder();
     for ((_, tname), it) in &db.tables {
-        let mut t = Table::new(tname, &it.schema, tname).read_only(it.is_view);
+        let mut t = Table::new(tname, &it.schema, tname).read_only(it.read_only);
         let column_names: std::collections::BTreeSet<&str> =
             it.columns.iter().map(|c| c.name.as_str()).collect();
         for col in &it.columns {
@@ -100,8 +100,24 @@ pub fn apply_config(
             );
         }
 
-        if !old_pk.is_empty() {
-            let refs: Vec<&str> = old_pk.iter().map(String::as_str).collect();
+        // A view has no constraints, so introspection finds no PK for it. The
+        // overlay is how a view declares the columns that logically identify a
+        // row, which is what makes `_by_pk` available on it.
+        let pk = overlay
+            .and_then(|o| o.primary_key.clone())
+            .unwrap_or(old_pk);
+        for col in &pk {
+            if t.find_column(col).is_none() {
+                tracing::warn!(
+                    target: "vision_graphql::merge",
+                    table = %new_exposed,
+                    column = %col,
+                    "primary_key names a column the table does not expose; _by_pk on it will fail"
+                );
+            }
+        }
+        if !pk.is_empty() {
+            let refs: Vec<&str> = pk.iter().map(String::as_str).collect();
             t = t.primary_key(&refs);
         }
 
@@ -248,7 +264,7 @@ mod tests {
                 primary_key: vec!["title".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
-                is_view: false,
+                read_only: false,
             },
         );
         db.tables.insert(
@@ -277,7 +293,7 @@ mod tests {
                     from_columns: vec!["value_type".into()],
                     to_columns: vec!["title".into()],
                 }],
-                is_view: false,
+                read_only: false,
             },
         );
         db
@@ -320,7 +336,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
-                is_view: false,
+                read_only: false,
             },
         );
         db.tables.insert(
@@ -349,7 +365,7 @@ mod tests {
                     to_table: "users".into(),
                     to_columns: vec!["id".into()],
                 }],
-                is_view: false,
+                read_only: false,
             },
         );
         db
@@ -417,6 +433,7 @@ mod tests {
                 mapping: vec![("id".into(), "followed_id".into())],
             }],
             read_only: None,
+            primary_key: None,
         };
         cfg.tables.insert("users".into(), users_overlay);
 

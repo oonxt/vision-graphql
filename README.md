@@ -70,6 +70,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Multi-request transactions (`Engine::transaction`) | ✓ |
 | Operators: `_eq`/`_neq`/`_gt`/`_gte`/`_lt`/`_lte`/`_like`/`_ilike`/`_nlike`/`_nilike`/`_in`/`_nin`/`_is_null` | ✓ |
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
+| `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
 | GraphQL variables, named + inline fragments | ✓ |
 | Schema introspection | ✓ |
 | PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |

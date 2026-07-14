@@ -3,7 +3,7 @@ members = [".", "crates/vision-graphql-cli"]
 
 [package]
 name = "vision-graphql"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Hasura-style GraphQL ORM for PostgreSQL — one SQL per request via json_agg."
 license = "MIT OR Apache-2.0"
