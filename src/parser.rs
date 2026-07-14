@@ -244,6 +244,29 @@ fn lower_mutation(
     Ok(Operation::Mutation(fields))
 }
 
+/// Reject a mutation aimed at a read-only table.
+///
+/// Mutation roots are derived from the exposed table name by prefix, so every
+/// table in the schema is writable unless something says otherwise — and
+/// introspection puts views in the schema, because they have columns in
+/// `information_schema` like any other relation. Postgres auto-updates a *simple*
+/// view straight through to its base table, so an unguarded `insert_my_view`
+/// does not fail: it writes rows into the table behind the view. This is the
+/// check that stops that, and it has to cover nested-insert targets too, which
+/// reach a table without ever naming a root field.
+fn ensure_mutable(table: &Table, path: &str) -> Result<()> {
+    if table.read_only {
+        return Err(Error::Validate {
+            path: path.to_string(),
+            message: format!(
+                "table '{}' is read-only; mutations are not available",
+                table.exposed_name
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn lower_mutation_field(
     name: &str,
     alias: &str,
@@ -258,6 +281,7 @@ fn lower_mutation_field(
     if let Some(base) = name.strip_suffix("_one") {
         if let Some(base_name) = base.strip_prefix("insert_") {
             if let Some(table) = schema.table(base_name) {
+                ensure_mutable(table, alias)?;
                 let (objects, on_conflict) =
                     parse_insert_args(&field.arguments, table, schema, vars, alias, true)?;
                 let returning = lower_selection_set(
@@ -284,6 +308,7 @@ fn lower_mutation_field(
     // insert_<table>
     if let Some(base_name) = name.strip_prefix("insert_") {
         if let Some(table) = schema.table(base_name) {
+            ensure_mutable(table, alias)?;
             let (objects, on_conflict) =
                 parse_insert_args(&field.arguments, table, schema, vars, alias, false)?;
             let returning = parse_returning(
@@ -310,6 +335,7 @@ fn lower_mutation_field(
     if let Some(base) = name.strip_suffix("_by_pk") {
         if let Some(base_name) = base.strip_prefix("update_") {
             if let Some(table) = schema.table(base_name) {
+                ensure_mutable(table, alias)?;
                 if table.primary_key.is_empty() {
                     return Err(Error::Validate {
                         path: alias.into(),
@@ -343,6 +369,7 @@ fn lower_mutation_field(
     // update_<table>
     if let Some(base_name) = name.strip_prefix("update_") {
         if let Some(table) = schema.table(base_name) {
+            ensure_mutable(table, alias)?;
             let (where_, set) = parse_update_args(&field.arguments, table, schema, vars, alias)?;
             let returning = parse_returning(
                 &field.selection_set.node,
@@ -367,6 +394,7 @@ fn lower_mutation_field(
     if let Some(base) = name.strip_suffix("_by_pk") {
         if let Some(base_name) = base.strip_prefix("delete_") {
             if let Some(table) = schema.table(base_name) {
+                ensure_mutable(table, alias)?;
                 if table.primary_key.is_empty() {
                     return Err(Error::Validate {
                         path: alias.into(),
@@ -411,6 +439,7 @@ fn lower_mutation_field(
     // delete_<table>
     if let Some(base_name) = name.strip_prefix("delete_") {
         if let Some(table) = schema.table(base_name) {
+            ensure_mutable(table, alias)?;
             let mut where_: Option<crate::ast::BoolExpr> = None;
             for (name_p, value_p) in &field.arguments {
                 let aname = name_p.node.as_str();
@@ -635,6 +664,7 @@ fn parse_insert_object(
                                     rel.target_table
                                 ),
                             })?;
+                    ensure_mutable(target, &format!("{path}.{k}"))?;
 
                     // Validate shape: `{ data: [...] }`
                     let wrapper = v.as_object().ok_or_else(|| Error::Validate {
@@ -721,6 +751,7 @@ fn parse_insert_object(
                                     rel.target_table
                                 ),
                             })?;
+                    ensure_mutable(target, &format!("{path}.{k}"))?;
 
                     // Validate shape: `{ data: <object> }`
                     let wrapper = v.as_object().ok_or_else(|| Error::Validate {

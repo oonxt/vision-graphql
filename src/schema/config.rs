@@ -20,6 +20,12 @@ pub struct TableOverlay {
     pub hide_columns: Vec<String>,
     #[serde(default)]
     pub relations: Vec<RelationOverlay>,
+    /// Override what introspection decided about mutability. Introspection marks
+    /// views read-only; set `read_only = false` for a view fronted by INSTEAD OF
+    /// triggers, or `true` to freeze a base table. Absent means "keep whatever
+    /// introspection found".
+    #[serde(default)]
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
