@@ -580,7 +580,7 @@ fn parse_insert_args(
         for obj in objects.iter() {
             for (rel_name, nai) in &obj.nested_arrays {
                 if let Some(existing) = first_array_oc.get(rel_name.as_str()) {
-                    if format!("{:?}", *existing) != format!("{:?}", &nai.on_conflict) {
+                    if format!("{:?}", *existing) != format!("{:?}", nai.on_conflict) {
                         return Err(Error::Validate {
                             path: format!("{parent_path}.objects.{rel_name}.on_conflict"),
                             message: format!(

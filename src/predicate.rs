@@ -82,10 +82,24 @@ pub enum ScopeExpr {
     And(Vec<ScopeExpr>),
     Or(Vec<ScopeExpr>),
     Not(Box<ScopeExpr>),
-    Relation { name: String, inner: Box<ScopeExpr> },
-    Compare { column: String, op: CmpOp, value: Operand },
-    IsNull { column: String, negated: bool },
-    InList { column: String, values: Vec<Operand>, negated: bool },
+    Relation {
+        name: String,
+        inner: Box<ScopeExpr>,
+    },
+    Compare {
+        column: String,
+        op: CmpOp,
+        value: Operand,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+    InList {
+        column: String,
+        values: Vec<Operand>,
+        negated: bool,
+    },
 }
 
 /// Start a column predicate: `col("user_id").eq(principal())`.
@@ -233,9 +247,9 @@ impl ScopeExpr {
     /// Errors only when a referenced parameter is missing from `p`.
     pub fn resolve(&self, p: &Principal) -> Result<BoolExpr> {
         Ok(match self {
-            ScopeExpr::And(parts) => BoolExpr::And(
-                parts.iter().map(|e| e.resolve(p)).collect::<Result<_>>()?,
-            ),
+            ScopeExpr::And(parts) => {
+                BoolExpr::And(parts.iter().map(|e| e.resolve(p)).collect::<Result<_>>()?)
+            }
             ScopeExpr::Or(parts) => {
                 BoolExpr::Or(parts.iter().map(|e| e.resolve(p)).collect::<Result<_>>()?)
             }

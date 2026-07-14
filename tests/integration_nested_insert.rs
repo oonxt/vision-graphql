@@ -133,8 +133,7 @@ async fn nested_insert_missing_data_key_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(msg.contains("'data'"), "error was: {msg}");
 }
@@ -152,8 +151,7 @@ async fn nested_insert_non_array_data_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(msg.contains("expected array"), "error was: {msg}");
 }
@@ -171,8 +169,7 @@ async fn nested_insert_child_fk_column_rejected() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("populated from the parent"),
@@ -438,8 +435,7 @@ async fn nested_insert_rolls_back_on_child_failure() {
             None,
         )
         .await
-        .err()
-        .expect("expected DB error");
+        .expect_err("expected DB error");
     let _ = err;
 
     let v: Value = engine

@@ -149,8 +149,7 @@ async fn nested_wrapper_unknown_key_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("'data' and 'on_conflict'"),
@@ -175,8 +174,7 @@ async fn nested_on_conflict_missing_constraint_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("'constraint'"),
@@ -508,8 +506,7 @@ async fn nested_on_conflict_divergent_across_batch_is_error() {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .expect_err("expected error");
     let msg = format!("{err}");
     assert!(
         msg.contains("identical across all rows"),

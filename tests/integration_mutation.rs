@@ -323,7 +323,7 @@ async fn update_by_pk_selection_with_nested_relation() {
     let v: Value = engine.query(&mutation, None).await.expect("mutation ok");
     let one = &v["update_users_by_pk"];
     assert_eq!(one["name"], json!("seed_a3"));
-    assert!(one["posts"].as_array().unwrap().len() >= 1);
+    assert!(!one["posts"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -168,10 +168,13 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
         ScopeExpr::Compare { column, .. }
         | ScopeExpr::IsNull { column, .. }
         | ScopeExpr::InList { column, .. } => {
-            table.find_column(column).map(|_| ()).ok_or_else(|| Error::Validate {
-                path: format!("{path}.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })
+            table
+                .find_column(column)
+                .map(|_| ())
+                .ok_or_else(|| Error::Validate {
+                    path: format!("{path}.{column}"),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+                })
         }
     }
 }
@@ -243,7 +246,10 @@ mod tests {
     #[test]
     fn bind_missing_param_errors() {
         let policy = ScopePolicy::builder()
-            .allow("orders", col("user_id").eq(crate::predicate::param("tenant")))
+            .allow(
+                "orders",
+                col("user_id").eq(crate::predicate::param("tenant")),
+            )
             .validate(&schema())
             .unwrap();
         let err = policy.bind_value(7).unwrap_err();
