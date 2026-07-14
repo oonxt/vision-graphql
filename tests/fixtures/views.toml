@@ -1,0 +1,8 @@
+# Views and materialized views have no constraints, so introspection finds no
+# primary key for them. This is how you declare the columns that logically
+# identify a row, which is what makes `_by_pk` available.
+[tables.active_users]
+primary_key = ["id"]
+
+[tables.mv_user_stats]
+primary_key = ["id"]

@@ -19,11 +19,17 @@ pub struct IntrospectedTable {
     pub primary_key: Vec<String>,
     pub unique_constraints: BTreeMap<String, Vec<String>>,
     pub foreign_keys: Vec<IntrospectedForeignKey>,
-    /// True when Postgres reports this relation as a VIEW rather than a BASE
-    /// TABLE. Views arrive here because `information_schema.columns` lists their
-    /// columns like any other relation's; the distinction only shows up in
-    /// `information_schema.tables.table_type`.
-    pub is_view: bool,
+    /// The relation is not a base table, so it must not be handed mutation
+    /// roots: a view (Postgres auto-updates a simple one straight through to the
+    /// table behind it) or a materialized view (Postgres refuses to write one at
+    /// all — it can only be REFRESHed).
+    ///
+    /// Plain views reach us through `information_schema.columns`, which lists
+    /// their columns like any other relation's, so they are indistinguishable
+    /// from base tables until `information_schema.tables.table_type` says
+    /// otherwise. Materialized views are absent from `information_schema`
+    /// entirely and come from a separate `pg_catalog` pass.
+    pub read_only: bool,
 }
 
 #[derive(Debug)]
@@ -60,6 +66,26 @@ pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
         "time without time zone" => Some(PgType::Time),
         _ => None,
     }
+}
+
+/// Drop a type modifier from a `format_type` result so it matches the spelling
+/// `information_schema.data_type` uses, which is what `data_type_to_pg_type`
+/// expects.
+///
+/// The modifier is not always a suffix — Postgres renders it mid-name for the
+/// datetime types (`timestamp(3) with time zone`), so trimming from the end is
+/// not enough.
+fn strip_type_modifier(t: &str) -> String {
+    let (Some(open), Some(close)) = (t.find('('), t.find(')')) else {
+        return t.to_string();
+    };
+    if close < open {
+        return t.to_string();
+    }
+    let mut out = String::with_capacity(t.len());
+    out.push_str(&t[..open]);
+    out.push_str(&t[close + 1..]);
+    out.trim().to_string()
 }
 
 pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
@@ -117,7 +143,7 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
                 primary_key: Vec::new(),
                 unique_constraints: BTreeMap::new(),
                 foreign_keys: Vec::new(),
-                is_view: false,
+                read_only: false,
             });
         entry.columns.push(IntrospectedColumn {
             name: cname,
@@ -143,8 +169,85 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         let schema: String = row.get(0);
         let tname: String = row.get(1);
         if let Some(t) = db.tables.get_mut(&(schema, tname)) {
-            t.is_view = true;
+            t.read_only = true;
         }
+    }
+
+    // Materialized views. They are a Postgres extension, so `information_schema`
+    // does not know about them at all — no amount of relaxing the queries above
+    // will surface one. Their columns have to come from `pg_catalog` directly.
+    //
+    // `format_type` is used rather than a `data_type` column so the spelling
+    // matches what `data_type_to_pg_type` already understands; enums are detected
+    // from `typtype` instead, exactly as the information_schema pass does.
+    let rows = sqlx::query(
+        r#"
+        SELECT n.nspname::text, c.relname::text, a.attname::text,
+               format_type(a.atttypid, a.atttypmod)::text,
+               (NOT a.attnotnull) AS nullable,
+               (t.typtype = 'e') AS is_enum,
+               tn.nspname::text, t.typname::text
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+        JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
+        WHERE c.relkind = 'm'
+          AND n.nspname = 'public'
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY n.nspname, c.relname, a.attnum
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let schema: String = row.get(0);
+        let tname: String = row.get(1);
+        let cname: String = row.get(2);
+        let dtype: String = row.get(3);
+        let nullable: bool = row.get(4);
+        let is_enum: bool = row.get(5);
+        let udt_schema: String = row.get(6);
+        let udt_name: String = row.get(7);
+
+        let pg_type = if is_enum {
+            Some(PgType::Enum {
+                schema: udt_schema,
+                name: udt_name,
+            })
+        } else {
+            data_type_to_pg_type(&strip_type_modifier(&dtype))
+        };
+        let Some(pg_type) = pg_type else {
+            tracing::warn!(
+                target: "vision_graphql::introspect",
+                table = %tname,
+                column = %cname,
+                data_type = %dtype,
+                "skipping materialized-view column with unsupported type"
+            );
+            continue;
+        };
+        let entry = db
+            .tables
+            .entry((schema.clone(), tname.clone()))
+            .or_insert_with(|| IntrospectedTable {
+                schema: schema.clone(),
+                name: tname.clone(),
+                columns: Vec::new(),
+                primary_key: Vec::new(),
+                unique_constraints: BTreeMap::new(),
+                foreign_keys: Vec::new(),
+                // Postgres cannot write a materialized view at all; it can only
+                // be REFRESHed.
+                read_only: true,
+            });
+        entry.columns.push(IntrospectedColumn {
+            name: cname,
+            pg_type,
+            nullable,
+        });
     }
 
     let rows = sqlx::query(
@@ -258,6 +361,45 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `format_type` (used for the materialized-view pass) renders the modifier
+    /// mid-name for the datetime types, so a suffix trim would leave
+    /// `timestamp with time zone` mangled and the column would map to nothing
+    /// and be silently dropped.
+    #[test]
+    fn strips_type_modifiers_wherever_they_appear() {
+        // Suffix modifier.
+        assert_eq!(
+            strip_type_modifier("character varying(50)"),
+            "character varying"
+        );
+        assert_eq!(strip_type_modifier("numeric(10,2)"), "numeric");
+        // Infix modifier — the case a suffix trim gets wrong.
+        assert_eq!(
+            strip_type_modifier("timestamp(3) with time zone"),
+            "timestamp with time zone"
+        );
+        assert_eq!(
+            strip_type_modifier("time(6) without time zone"),
+            "time without time zone"
+        );
+        // No modifier at all: unchanged.
+        assert_eq!(strip_type_modifier("integer"), "integer");
+        assert_eq!(
+            strip_type_modifier("timestamp with time zone"),
+            "timestamp with time zone"
+        );
+
+        // And the stripped spellings are exactly what the mapper understands.
+        assert_eq!(
+            data_type_to_pg_type(&strip_type_modifier("timestamp(3) with time zone")),
+            Some(PgType::TimestampTz)
+        );
+        assert_eq!(
+            data_type_to_pg_type(&strip_type_modifier("character varying(50)")),
+            Some(PgType::Varchar)
+        );
+    }
 
     #[test]
     fn maps_known_types() {

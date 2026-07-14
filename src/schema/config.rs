@@ -21,11 +21,20 @@ pub struct TableOverlay {
     #[serde(default)]
     pub relations: Vec<RelationOverlay>,
     /// Override what introspection decided about mutability. Introspection marks
-    /// views read-only; set `read_only = false` for a view fronted by INSTEAD OF
-    /// triggers, or `true` to freeze a base table. Absent means "keep whatever
-    /// introspection found".
+    /// views and materialized views read-only; set `read_only = false` for a view
+    /// fronted by INSTEAD OF triggers, or `true` to freeze a base table. Absent
+    /// means "keep whatever introspection found".
     #[serde(default)]
     pub read_only: Option<bool>,
+    /// Declare a logical primary key. Views and materialized views have no
+    /// constraints, so introspection finds no PK for them and `_by_pk` is
+    /// unavailable — this is how you say "`id` identifies a row in this view".
+    ///
+    /// Nothing enforces uniqueness; the columns are used to build the `WHERE`
+    /// of a `_by_pk` lookup, so a non-unique choice just means the lookup
+    /// returns whichever row Postgres reaches first.
+    #[serde(default)]
+    pub primary_key: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

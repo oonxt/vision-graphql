@@ -2766,7 +2766,6 @@ mod tests {
         );
     }
 
-
     // ── NULL placement in ORDER BY ─────────────────────────────────────────
 
     /// PostgreSQL's default is asymmetric: ASC sorts NULLs last, DESC sorts them
@@ -2778,17 +2777,27 @@ mod tests {
         let schema = users_schema();
         let plain = crate::parser::parse_and_lower(
             "query { users(order_by: {name: desc}) { id } }",
-            &serde_json::json!({}), None, &schema).unwrap();
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
         let (plain_sql, _) = render(&plain, &schema).unwrap();
 
         let pinned = crate::parser::parse_and_lower(
             "query { users(order_by: {name: desc_nulls_last}) { id } }",
-            &serde_json::json!({}), None, &schema).unwrap();
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
         let (pinned_sql, _) = render(&pinned, &schema).unwrap();
 
         assert!(plain_sql.contains(" DESC"), "got: {plain_sql}");
-        assert!(!plain_sql.contains("NULLS"),
-            "plain desc must not pin NULLs, got: {plain_sql}");
+        assert!(
+            !plain_sql.contains("NULLS"),
+            "plain desc must not pin NULLs, got: {plain_sql}"
+        );
         assert!(pinned_sql.contains(" DESC NULLS LAST"), "got: {pinned_sql}");
     }
 
@@ -2803,9 +2812,16 @@ mod tests {
         ] {
             let op = crate::parser::parse_and_lower(
                 &format!("query {{ users(order_by: {{name: {token}}}) {{ id }} }}"),
-                &serde_json::json!({}), None, &schema).unwrap();
+                &serde_json::json!({}),
+                None,
+                &schema,
+            )
+            .unwrap();
             let (sql, _) = render(&op, &schema).unwrap();
-            assert!(sql.contains(expect), "{token} -> 期望 `{expect}`，得到: {sql}");
+            assert!(
+                sql.contains(expect),
+                "{token} -> 期望 `{expect}`，得到: {sql}"
+            );
         }
     }
 
@@ -2815,11 +2831,17 @@ mod tests {
         let schema = users_posts_schema();
         let op = crate::parser::parse_and_lower(
             "query { posts(order_by: {user: {name: desc_nulls_last}}) { id } }",
-            &serde_json::json!({}), None, &schema).unwrap();
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
         let (sql, _) = render(&op, &schema).unwrap();
         assert!(sql.contains("ORDER BY (SELECT"), "got: {sql}");
-        assert!(sql.contains(") DESC NULLS LAST"),
-            "关联排序也必须带上 NULLS LAST，got: {sql}");
+        assert!(
+            sql.contains(") DESC NULLS LAST"),
+            "关联排序也必须带上 NULLS LAST，got: {sql}"
+        );
     }
 
     #[test]
@@ -2827,10 +2849,16 @@ mod tests {
         let schema = users_schema();
         let err = crate::parser::parse_and_lower(
             "query { users(order_by: {name: sideways}) { id } }",
-            &serde_json::json!({}), None, &schema).unwrap_err();
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("desc_nulls_last"),
-            "报错应列出合法取值，got: {msg}");
+        assert!(
+            msg.contains("desc_nulls_last"),
+            "报错应列出合法取值，got: {msg}"
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! GraphQL string → IR.
 
-use crate::ast::{NullsOrder, BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField};
+use crate::ast::{
+    BoolExpr, CmpOp, Field, NullsOrder, Operation, OrderBy, OrderDir, QueryArgs, RootField,
+};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
