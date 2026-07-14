@@ -8,7 +8,7 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
     let rels = derive_relations_from_fks(&db);
     let mut sb = crate::schema::Schema::builder();
     for ((_, tname), it) in &db.tables {
-        let mut t = Table::new(tname, &it.schema, tname);
+        let mut t = Table::new(tname, &it.schema, tname).read_only(it.is_view);
         let column_names: std::collections::BTreeSet<&str> =
             it.columns.iter().map(|c| c.name.as_str()).collect();
         for col in &it.columns {
@@ -70,13 +70,20 @@ pub fn apply_config(
         let old_physical_schema = old.physical_schema.clone();
         let old_physical_name = old.physical_name.clone();
         let old_pk = old.primary_key.clone();
+        let old_read_only = old.read_only;
 
         let overlay = cfg.tables.get(&exposed);
         let new_exposed = overlay
             .and_then(|o| o.expose_as.clone())
             .unwrap_or_else(|| exposed.clone());
 
-        let mut t = Table::new(&new_exposed, &old_physical_schema, &old_physical_name);
+        // The overlay overrides introspection in both directions: a view fronted
+        // by INSTEAD OF triggers is genuinely writable, and a base table may be
+        // deliberately frozen.
+        let read_only = overlay.and_then(|o| o.read_only).unwrap_or(old_read_only);
+
+        let mut t =
+            Table::new(&new_exposed, &old_physical_schema, &old_physical_name).read_only(read_only);
 
         let hidden: std::collections::BTreeSet<&str> = overlay
             .map(|o| o.hide_columns.iter().map(String::as_str).collect())
@@ -241,6 +248,7 @@ mod tests {
                 primary_key: vec!["title".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                is_view: false,
             },
         );
         db.tables.insert(
@@ -269,6 +277,7 @@ mod tests {
                     from_columns: vec!["value_type".into()],
                     to_columns: vec!["title".into()],
                 }],
+                is_view: false,
             },
         );
         db
@@ -311,6 +320,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                is_view: false,
             },
         );
         db.tables.insert(
@@ -339,6 +349,7 @@ mod tests {
                     to_table: "users".into(),
                     to_columns: vec!["id".into()],
                 }],
+                is_view: false,
             },
         );
         db
@@ -405,6 +416,7 @@ mod tests {
                 target: "profiles".into(),
                 mapping: vec![("id".into(), "followed_id".into())],
             }],
+            read_only: None,
         };
         cfg.tables.insert("users".into(), users_overlay);
 

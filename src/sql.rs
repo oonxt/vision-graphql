@@ -902,12 +902,78 @@ fn render_by_pk(
     Ok(())
 }
 
+/// Reject any mutation that would write to a read-only table.
+///
+/// The parser refuses to *derive* mutation roots for a read-only table, but the
+/// builder API (`Mutation::insert(..)` → `Engine::run`) constructs the AST
+/// directly and never passes through the parser. The renderer is the one choke
+/// point both paths share, so the guard has to live here as well — a read-only
+/// table is a property of the schema, and no way of reaching the renderer may
+/// write to one.
+fn check_mutable(fields: &[crate::ast::MutationField], schema: &Schema) -> Result<()> {
+    use crate::ast::{InsertObject, MutationField};
+
+    fn deny(table: &Table, alias: &str) -> Error {
+        Error::Validate {
+            path: alias.to_string(),
+            message: format!(
+                "table '{}' is read-only; mutations are not available",
+                table.exposed_name
+            ),
+        }
+    }
+
+    fn check_table(name: &str, alias: &str, schema: &Schema) -> Result<()> {
+        let t = schema.table(name).ok_or_else(|| Error::Validate {
+            path: alias.to_string(),
+            message: format!("unknown table '{name}'"),
+        })?;
+        if t.read_only {
+            return Err(deny(t, alias));
+        }
+        Ok(())
+    }
+
+    // A nested insert reaches a table without naming a root field, so recurse.
+    fn check_nested(obj: &InsertObject, alias: &str, schema: &Schema) -> Result<()> {
+        for na in obj.nested_arrays.values() {
+            check_table(&na.table, alias, schema)?;
+            for row in &na.rows {
+                check_nested(row, alias, schema)?;
+            }
+        }
+        for no in obj.nested_objects.values() {
+            check_table(&no.table, alias, schema)?;
+            check_nested(&no.row, alias, schema)?;
+        }
+        Ok(())
+    }
+
+    for mf in fields {
+        let table = match mf {
+            MutationField::Insert { table, .. }
+            | MutationField::Update { table, .. }
+            | MutationField::UpdateByPk { table, .. }
+            | MutationField::Delete { table, .. }
+            | MutationField::DeleteByPk { table, .. } => table,
+        };
+        check_table(table, mf.alias(), schema)?;
+        if let MutationField::Insert { objects, .. } = mf {
+            for obj in objects {
+                check_nested(obj, mf.alias(), schema)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn render_mutation(
     fields: &[crate::ast::MutationField],
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::MutationField;
+    check_mutable(fields, schema)?;
     ctx.sql.push_str("WITH ");
     for (i, mf) in fields.iter().enumerate() {
         if i > 0 {

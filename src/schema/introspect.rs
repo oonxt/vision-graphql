@@ -19,6 +19,11 @@ pub struct IntrospectedTable {
     pub primary_key: Vec<String>,
     pub unique_constraints: BTreeMap<String, Vec<String>>,
     pub foreign_keys: Vec<IntrospectedForeignKey>,
+    /// True when Postgres reports this relation as a VIEW rather than a BASE
+    /// TABLE. Views arrive here because `information_schema.columns` lists their
+    /// columns like any other relation's; the distinction only shows up in
+    /// `information_schema.tables.table_type`.
+    pub is_view: bool,
 }
 
 #[derive(Debug)]
@@ -112,12 +117,34 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
                 primary_key: Vec::new(),
                 unique_constraints: BTreeMap::new(),
                 foreign_keys: Vec::new(),
+                is_view: false,
             });
         entry.columns.push(IntrospectedColumn {
             name: cname,
             pg_type,
             nullable: is_nullable == "YES",
         });
+    }
+
+    // Which of those relations are views. `information_schema.columns` does not
+    // distinguish them, so without this a view is indistinguishable from a base
+    // table and would be handed mutation roots that write through to whatever
+    // sits behind it.
+    let rows = sqlx::query(
+        r#"
+        SELECT t.table_schema::text, t.table_name::text
+        FROM information_schema.tables t
+        WHERE t.table_schema = 'public' AND t.table_type = 'VIEW'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let schema: String = row.get(0);
+        let tname: String = row.get(1);
+        if let Some(t) = db.tables.get_mut(&(schema, tname)) {
+            t.is_view = true;
+        }
     }
 
     let rows = sqlx::query(

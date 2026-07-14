@@ -1,0 +1,7 @@
+# A view fronted by INSTEAD OF triggers is genuinely writable, and a base table
+# can be deliberately frozen. Both directions override what introspection found.
+[tables.writable_users]
+read_only = false
+
+[tables.orders]
+read_only = true

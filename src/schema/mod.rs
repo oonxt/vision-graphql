@@ -109,6 +109,18 @@ pub struct Table {
     columns_by_exposed: HashMap<String, Column>,
     pub primary_key: Vec<String>,
     relations_by_name: HashMap<String, Relation>,
+    /// No `insert_` / `update_` / `delete_` root is derived for this table, and
+    /// it cannot be the target of a nested insert.
+    ///
+    /// Mutation roots are derived from the exposed name by prefix, so anything
+    /// reachable in the schema is writable unless it says otherwise. Views are
+    /// the motivating case: introspection picks them up (they have columns in
+    /// `information_schema`), and Postgres auto-updates a *simple* view straight
+    /// through to its base table — so an unguarded `insert_my_view` really does
+    /// write rows into the table behind it. Introspection marks views read-only;
+    /// config can override in either direction (a view with INSTEAD OF triggers
+    /// is genuinely writable; a base table may be deliberately frozen).
+    pub read_only: bool,
 }
 
 impl Table {
@@ -120,7 +132,14 @@ impl Table {
             columns_by_exposed: HashMap::new(),
             primary_key: Vec::new(),
             relations_by_name: HashMap::new(),
+            read_only: false,
         }
+    }
+
+    /// Mark this table read-only: no mutation roots, no nested-insert target.
+    pub fn read_only(mut self, yes: bool) -> Self {
+        self.read_only = yes;
+        self
     }
 
     pub fn column(
