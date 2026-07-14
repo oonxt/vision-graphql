@@ -175,6 +175,7 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
     if let Some(expr) = resolve(scope, &root.table)? {
         merge_and_into(&mut root.args.where_, expr);
     }
+    scope_order_by(&mut root.args, table, scope, schema)?;
     match &mut root.body {
         RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
             scope_fields(selection, table, scope, schema)?;
@@ -335,7 +336,52 @@ fn scope_fields(
         if let Some(expr) = resolve(scope, &rel.target_table)? {
             merge_and_into(&mut args.where_, expr);
         }
+        scope_order_by(args, target, scope, schema)?;
         scope_fields(selection, target, scope, schema)?;
+    }
+    Ok(())
+}
+
+/// Resolve the scope of every table an `order_by` walks through.
+///
+/// Ordering through an object relation reads the target table exactly as
+/// selecting it does — the renderer emits a correlated subquery over it — so it
+/// resolves the same way, and fail-closed for the same reason: a caller that may
+/// not read a table must not be able to sort by it either. Sorting is not a
+/// weaker form of access than reading; the resulting row order is a function of
+/// the hidden column, and for a low-cardinality column it discloses that column
+/// outright.
+///
+/// A restricted (rather than denied) target keeps working: its predicate is
+/// stashed on the hop and ANDed into the subquery, so rows the caller cannot see
+/// sort as NULL instead of by their real value.
+fn scope_order_by(
+    args: &mut crate::ast::QueryArgs,
+    table: &Table,
+    scope: &ScopeSet,
+    schema: &Schema,
+) -> Result<()> {
+    for ob in &mut args.order_by {
+        let mut cur = table;
+        for hop in &mut ob.path {
+            let rel = cur
+                .find_relation(&hop.relation)
+                .ok_or_else(|| Error::Validate {
+                    path: format!("{}.order_by.{}", cur.exposed_name, hop.relation),
+                    message: format!(
+                        "unknown relation '{}' on '{}'",
+                        hop.relation, cur.exposed_name
+                    ),
+                })?;
+            let target = schema
+                .table(&rel.target_table)
+                .ok_or_else(|| Error::Validate {
+                    path: format!("{}.order_by.{}", cur.exposed_name, hop.relation),
+                    message: format!("unknown table '{}'", rel.target_table),
+                })?;
+            hop.filter = resolve(scope, &rel.target_table)?;
+            cur = target;
+        }
     }
     Ok(())
 }

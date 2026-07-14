@@ -1,6 +1,6 @@
 [package]
 name = "vision-graphql-cli"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.85"
 description = "CLI to generate and validate vision-graphql schema overlays."
@@ -12,7 +12,7 @@ name = "vision-gql"
 path = "src/main.rs"
 
 [dependencies]
-vision-graphql      = { path = "../..", version = "0.6.0" }
+vision-graphql      = { path = "../..", version = "0.7.0" }
 clap                = { version = "4", features = ["derive"] }
 sqlx                = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
