@@ -779,3 +779,98 @@ async fn scope_policy_from_toml_enforces() {
     // orders IS in the policy, so this succeeds; a genuinely absent table fails:
     assert!(err.is_ok());
 }
+
+// ===== order_by through an object relation reads the target table, so it is
+// scoped exactly like selecting that relation would be. Sorting is not a weaker
+// form of access than reading: the row order is a function of the sort column,
+// and for a low-cardinality column it discloses that column outright. =====
+
+/// Reaching a denied table through `order_by` must fail closed, exactly as
+/// selecting it does — otherwise scope's fail-closed contract has a hole that
+/// happens to be spelled `order_by` instead of a selection set.
+#[tokio::test]
+async fn ordering_through_denied_relation_fails_closed() {
+    let (engine, _c) = setup().await;
+    let scope = ScopeSet::new().unrestricted("orders"); // users absent => denied
+
+    // Baseline: selecting the relation is denied.
+    let err = engine
+        .scoped(scope.clone())
+        .query("query { orders { title user { name } } }", None)
+        .await
+        .expect_err("selecting a denied relation must fail closed");
+    assert!(matches!(err, Error::ScopeDenied { ref table } if table == "users"));
+
+    // The same table, reached through order_by instead: must be denied too.
+    let err = engine
+        .scoped(scope)
+        .query(
+            "query { orders(order_by: {user: {name: asc}}) { title } }",
+            None,
+        )
+        .await
+        .expect_err("ordering through a denied relation must fail closed");
+    assert!(matches!(err, Error::ScopeDenied { ref table } if table == "users"));
+}
+
+/// Every hop is resolved, not just the first: `samples → order → user` reaches
+/// `users`, which is denied, even though the intermediate `orders` is allowed.
+#[tokio::test]
+async fn ordering_through_denied_relation_fails_closed_at_any_hop() {
+    let (engine, _c) = setup().await;
+    let scope = ScopeSet::new()
+        .unrestricted("samples")
+        .unrestricted("orders"); // users absent => denied at the second hop
+
+    let err = engine
+        .scoped(scope)
+        .query(
+            "query { samples(order_by: {order: {user: {name: asc}}}) { serial } }",
+            None,
+        )
+        .await
+        .expect_err("a denied table at any hop must fail closed");
+    assert!(matches!(err, Error::ScopeDenied { ref table } if table == "users"));
+}
+
+/// A *restricted* (not denied) relation keeps working, but the sort only sees
+/// rows the caller could have read: out-of-scope rows contribute NULL rather
+/// than their real value.
+///
+/// The caller here may read only user 2 (bob). Ordering all orders by the
+/// author's name ascending must NOT reveal that alice sorts before bob — her
+/// row is invisible, so it sorts as NULL (last), putting bob's order first.
+/// If the scope predicate were dropped from the ORDER BY subquery, alice's
+/// 'alice' would sort before 'bob' and the expected order would flip — which is
+/// exactly the leak this asserts against.
+#[tokio::test]
+async fn ordering_through_restricted_relation_cannot_see_out_of_scope_rows() {
+    let (engine, _c) = setup().await;
+    let scope = ScopeSet::new()
+        .unrestricted("orders")
+        .allow("users", eq("id", 2)); // only bob is readable
+
+    let v: Value = engine
+        .scoped(scope)
+        .query(
+            "query { orders(order_by: [{user: {name: asc}}, {id: asc}]) { title } }",
+            None,
+        )
+        .await
+        .expect("ordering through a restricted relation still runs");
+
+    let titles: Vec<&str> = v["orders"]
+        .as_array()
+        .expect("orders")
+        .iter()
+        .map(|o| o["title"].as_str().expect("title"))
+        .collect();
+
+    // All three orders survive (the sort is a scalar subquery, not a join), but
+    // alice's two sort as NULL — last under ASC — instead of by 'alice'.
+    assert_eq!(
+        titles,
+        vec!["b-order-1", "a-order-1", "a-order-2"],
+        "out-of-scope author names must sort as NULL, not by their real value"
+    );
+}

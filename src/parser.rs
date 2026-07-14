@@ -1505,7 +1505,10 @@ fn lower_order_by_entry(
         });
     }
     out.push(OrderBy {
-        path: rel_path.clone(),
+        path: rel_path
+            .iter()
+            .map(|r| crate::ast::OrderByHop::new(r.as_str()))
+            .collect(),
         column: key.to_string(),
         direction,
     });

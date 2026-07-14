@@ -50,14 +50,41 @@ pub struct QueryArgs {
     pub distinct_on: Vec<String>,
 }
 
+/// One object-relation hop on the way to an `order_by` column.
+#[derive(Debug, Clone)]
+pub struct OrderByHop {
+    /// Exposed name of the object relation to walk.
+    pub relation: String,
+    /// Scope predicate for this hop's target table, injected by `apply_scope`.
+    /// `None` when the caller is unscoped, or the target is unrestricted.
+    ///
+    /// Ordering through a relation reads the target table just as selecting it
+    /// does, so it must be filtered the same way — otherwise a scoped caller
+    /// could sort by a column on rows it is not allowed to read, and recover
+    /// those values from the resulting row order. The predicate lives per hop
+    /// rather than per `OrderBy` so a multi-hop path cannot silently leave a
+    /// middle table unfiltered.
+    pub filter: Option<BoolExpr>,
+}
+
+impl OrderByHop {
+    /// An unfiltered hop. `apply_scope` fills `filter` in for scoped callers.
+    pub fn new(relation: impl Into<String>) -> Self {
+        OrderByHop {
+            relation: relation.into(),
+            filter: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderBy {
     /// Object-relation path to walk before reaching `column`. Empty for a column
     /// on the table being ordered.
     ///
     /// `order_by: {sample: {collected_at: asc}}` on `experiments` lowers to
-    /// `path = ["sample"], column = "collected_at"`.
-    pub path: Vec<String>,
+    /// `path = [hop("sample")], column = "collected_at"`.
+    pub path: Vec<OrderByHop>,
     pub column: String,
     pub direction: OrderDir,
 }

@@ -579,6 +579,12 @@ fn render_relation_field(
 /// A correlated subquery is used rather than a JOIN so the row multiplicity of
 /// the surrounding query is untouched — object relations are 1:1, so LIMIT 1 is
 /// exact, and NULL (no matching row) sorts as PostgreSQL's default.
+///
+/// Each hop's scope predicate (`OrderByHop::filter`, injected by `apply_scope`)
+/// is ANDed into the subquery's WHERE, so a scoped caller sorts only by rows it
+/// could have read. A row filtered out by scope contributes no row to the
+/// subquery, so the term evaluates to NULL — the same as no related row at all,
+/// which is exactly what the caller is entitled to know.
 fn render_order_by_expr(
     ob: &crate::ast::OrderBy,
     table: &Table,
@@ -588,22 +594,36 @@ fn render_order_by_expr(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     if ob.path.is_empty() {
-        let col = table.find_column(&ob.column).ok_or_else(|| Error::Validate {
-            path: format!("{path_ctx}.{}", ob.column),
-            message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
-        })?;
+        let col = table
+            .find_column(&ob.column)
+            .ok_or_else(|| Error::Validate {
+                path: format!("{path_ctx}.{}", ob.column),
+                message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
+            })?;
         write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
         return Ok(());
     }
 
+    struct Hop<'a> {
+        alias: String,
+        target: &'a Table,
+        qualified: String,
+        /// Join conditions tying this hop to the previous one (or, for the
+        /// first hop, to the outer row).
+        conds: Vec<String>,
+        filter: Option<&'a crate::ast::BoolExpr>,
+    }
+
+    // Walk the path first: the FROM/JOIN text needs the leaf alias, which is
+    // only known at the end, and the SQL must be emitted in a single forward
+    // pass so bind placeholders stay in step with the binds render_bool_expr
+    // pushes.
+    let mut hops: Vec<Hop> = Vec::with_capacity(ob.path.len());
     let mut cur = table;
     let mut cur_alias = table_alias.to_string();
-    let mut from_clause = String::new();
-    let mut joins: Vec<String> = Vec::new();
-    let mut correlation: Vec<String> = Vec::new();
-    let mut leaf_alias = String::new();
 
-    for (i, rel_name) in ob.path.iter().enumerate() {
+    for hop in &ob.path {
+        let rel_name = &hop.relation;
         let rel = cur.find_relation(rel_name).ok_or_else(|| Error::Validate {
             path: format!("{path_ctx}.{rel_name}"),
             message: format!("unknown relation '{rel_name}' on '{}'", cur.exposed_name),
@@ -641,22 +661,20 @@ fn render_order_by_expr(
             ));
         }
 
-        let qualified = format!(
-            "{}.{}",
-            quote_ident(&target.physical_schema),
-            quote_ident(&target.physical_name)
-        );
-        if i == 0 {
-            // Only the first hop correlates to the outer query; the rest are joins.
-            from_clause = format!("{qualified} AS {a}");
-            correlation = conds;
-        } else {
-            joins.push(format!("JOIN {qualified} AS {a} ON {}", conds.join(" AND ")));
-        }
+        hops.push(Hop {
+            alias: a.clone(),
+            target,
+            qualified: format!(
+                "{}.{}",
+                quote_ident(&target.physical_schema),
+                quote_ident(&target.physical_name)
+            ),
+            conds,
+            filter: hop.filter.as_ref(),
+        });
 
         cur = target;
-        cur_alias = a.clone();
-        leaf_alias = a;
+        cur_alias = a;
     }
 
     let col = cur.find_column(&ob.column).ok_or_else(|| Error::Validate {
@@ -664,15 +682,36 @@ fn render_order_by_expr(
         message: format!("unknown column '{}' on '{}'", ob.column, cur.exposed_name),
     })?;
 
+    let first = &hops[0];
+    let leaf = hops.last().expect("path is non-empty");
     write!(
         ctx.sql,
-        "(SELECT {leaf_alias}.{} FROM {from_clause}{}{} WHERE {} LIMIT 1)",
+        "(SELECT {}.{} FROM {} AS {}",
+        leaf.alias,
         quote_ident(&col.physical_name),
-        if joins.is_empty() { "" } else { " " },
-        joins.join(" "),
-        correlation.join(" AND ")
+        first.qualified,
+        first.alias
     )
     .unwrap();
+    // Only the first hop correlates to the outer query; the rest are joins.
+    for h in &hops[1..] {
+        write!(
+            ctx.sql,
+            " JOIN {} AS {} ON {}",
+            h.qualified,
+            h.alias,
+            h.conds.join(" AND ")
+        )
+        .unwrap();
+    }
+    write!(ctx.sql, " WHERE {}", first.conds.join(" AND ")).unwrap();
+    for h in &hops {
+        if let Some(f) = h.filter {
+            ctx.sql.push_str(" AND ");
+            render_bool_expr(f, h.target, &h.alias, schema, ctx)?;
+        }
+    }
+    ctx.sql.push_str(" LIMIT 1)");
     Ok(())
 }
 
@@ -2537,7 +2576,6 @@ mod tests {
             )
             .build()
     }
-
 
     // ── ORDER BY through object relations ──────────────────────────────────
 

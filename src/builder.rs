@@ -143,7 +143,10 @@ impl QueryBuilder {
         S: Into<String>,
     {
         self.args.order_by.push(OrderBy {
-            path: relation_path.into_iter().map(Into::into).collect(),
+            path: relation_path
+                .into_iter()
+                .map(crate::ast::OrderByHop::new)
+                .collect(),
             column: col.into(),
             direction,
         });
