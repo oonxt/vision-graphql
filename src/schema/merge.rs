@@ -9,6 +9,8 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
     let mut sb = crate::schema::Schema::builder();
     for ((_, tname), it) in &db.tables {
         let mut t = Table::new(tname, &it.schema, tname);
+        let column_names: std::collections::BTreeSet<&str> =
+            it.columns.iter().map(|c| c.name.as_str()).collect();
         for col in &it.columns {
             t = t.column(&col.name, &col.name, col.pg_type.clone(), col.nullable);
         }
@@ -17,9 +19,25 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
             t = t.primary_key(&refs);
         }
         for (src, name, rel) in &rels {
-            if src == tname {
-                t = t.relation(name, rel.clone());
+            if src != tname {
+                continue;
             }
+            // 自动推导出的关联绝不能遮蔽同名的真实列。
+            // 选择字段时关联优先于列（parser 先查 find_relation），一旦同名，
+            // 查询里写这个名字拿到的是关联对象而不是列值 —— 且没有任何报错，
+            // 只是静默返回 {}。典型触发场景：文本列 + 指向同名查找表的外键
+            // （value_type / container_type / role / experiment_type ...）。
+            // 这种便利关联价值有限，列才是本体，冲突时让列赢。
+            if column_names.contains(name.as_str()) {
+                tracing::warn!(
+                    target: "vision_graphql::merge",
+                    table = %tname,
+                    name = %name,
+                    "skipping FK auto-relation: name collides with a column of the same name"
+                );
+                continue;
+            }
+            t = t.relation(name, rel.clone());
         }
         sb = sb.table(t);
     }
@@ -204,6 +222,75 @@ pub fn derive_relations_from_fks(db: &IntrospectedDb) -> Vec<(String, String, Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 文本列 + 指向同名查找表的外键（value_type 列 -> value_type 表）。
+    /// 自动关联若沿用目标表名，就会和列同名；而选择字段时关联优先于列，
+    /// 查询里写 value_type 会静默拿到一个空对象 {} 而不是列值。
+    /// 列必须赢。
+    fn fixture_column_shadowed_by_lookup_fk() -> IntrospectedDb {
+        let mut db = IntrospectedDb::default();
+        db.tables.insert(
+            ("public".into(), "value_type".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "value_type".into(),
+                columns: vec![IntrospectedColumn {
+                    name: "title".into(),
+                    pg_type: PgType::Text,
+                    nullable: false,
+                }],
+                primary_key: vec!["title".into()],
+                unique_constraints: Default::default(),
+                foreign_keys: vec![],
+            },
+        );
+        db.tables.insert(
+            ("public".into(), "benchmarks".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "benchmarks".into(),
+                columns: vec![
+                    IntrospectedColumn {
+                        name: "id".into(),
+                        pg_type: PgType::Int4,
+                        nullable: false,
+                    },
+                    IntrospectedColumn {
+                        name: "value_type".into(),
+                        pg_type: PgType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: vec!["id".into()],
+                unique_constraints: Default::default(),
+                foreign_keys: vec![IntrospectedForeignKey {
+                    constraint_name: "benchmarks_value_type_fkey".into(),
+                    to_schema: "public".into(),
+                    to_table: "value_type".into(),
+                    from_columns: vec!["value_type".into()],
+                    to_columns: vec!["title".into()],
+                }],
+            },
+        );
+        db
+    }
+
+    #[test]
+    fn auto_relation_never_shadows_a_column() {
+        let schema = build_from_introspection(fixture_column_shadowed_by_lookup_fk()).build();
+        let t = schema.table("benchmarks").expect("benchmarks table");
+
+        // 列还在，且能被选中
+        assert!(
+            t.find_column("value_type").is_some(),
+            "value_type 列必须存在"
+        );
+        // 同名的自动关联被跳过了，否则它会遮蔽这一列
+        assert!(
+            t.find_relation("value_type").is_none(),
+            "与列同名的自动关联必须被跳过，否则查询会静默返回 {{}} 而不是列值"
+        );
+    }
+
     use crate::schema::introspect::{
         IntrospectedColumn, IntrospectedForeignKey, IntrospectedTable,
     };
