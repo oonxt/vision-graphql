@@ -1,6 +1,6 @@
 //! GraphQL string → IR.
 
-use crate::ast::{BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField};
+use crate::ast::{NullsOrder, BoolExpr, CmpOp, Field, Operation, OrderBy, OrderDir, QueryArgs, RootField};
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
@@ -1519,13 +1519,22 @@ fn lower_order_by_entry(
         path: format!("{path}.{key}"),
         message: "expected 'asc' or 'desc'".into(),
     })?;
-    let direction = match dir_s {
-        "asc" => OrderDir::Asc,
-        "desc" => OrderDir::Desc,
+    // Hasura's six: NULL placement is part of the direction token, because
+    // PostgreSQL's default is asymmetric (ASC -> nulls last, DESC -> nulls first).
+    let (direction, nulls) = match dir_s {
+        "asc" => (OrderDir::Asc, None),
+        "desc" => (OrderDir::Desc, None),
+        "asc_nulls_first" => (OrderDir::Asc, Some(NullsOrder::First)),
+        "asc_nulls_last" => (OrderDir::Asc, Some(NullsOrder::Last)),
+        "desc_nulls_first" => (OrderDir::Desc, Some(NullsOrder::First)),
+        "desc_nulls_last" => (OrderDir::Desc, Some(NullsOrder::Last)),
         other => {
             return Err(Error::Validate {
                 path: format!("{path}.{key}"),
-                message: format!("unknown direction '{other}'"),
+                message: format!(
+                    "unknown direction '{other}'; expected asc / desc / \
+                     asc_nulls_first / asc_nulls_last / desc_nulls_first / desc_nulls_last"
+                ),
             })
         }
     };
@@ -1542,6 +1551,7 @@ fn lower_order_by_entry(
             .collect(),
         column: key.to_string(),
         direction,
+        nulls,
     });
     Ok(())
 }

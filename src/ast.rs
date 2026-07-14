@@ -87,6 +87,8 @@ pub struct OrderBy {
     pub path: Vec<OrderByHop>,
     pub column: String,
     pub direction: OrderDir,
+    /// `None` = PostgreSQL's default placement for `direction`.
+    pub nulls: Option<NullsOrder>,
 }
 
 impl OrderBy {
@@ -96,7 +98,14 @@ impl OrderBy {
             path: Vec::new(),
             column: column.into(),
             direction,
+            nulls: None,
         }
+    }
+
+    /// Pin where NULLs land instead of taking PostgreSQL's default.
+    pub fn nulls(mut self, nulls: NullsOrder) -> Self {
+        self.nulls = Some(nulls);
+        self
     }
 }
 
@@ -104,6 +113,16 @@ impl OrderBy {
 pub enum OrderDir {
     Asc,
     Desc,
+}
+
+/// Where NULLs sort. `None` on an [`OrderBy`] leaves PostgreSQL's default, which
+/// is not symmetric: `ASC` puts NULLs last, `DESC` puts them first. So
+/// `desc_nulls_last` is a real thing you have to ask for — plain `desc` will not
+/// give it to you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullsOrder {
+    First,
+    Last,
 }
 
 #[allow(clippy::large_enum_variant)]

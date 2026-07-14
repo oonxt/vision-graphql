@@ -149,6 +149,7 @@ impl QueryBuilder {
                 .collect(),
             column: col.into(),
             direction,
+            nulls: None,
         });
         self
     }
