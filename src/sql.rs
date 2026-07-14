@@ -165,7 +165,7 @@ fn render_inner_select(
     )
     .unwrap();
     render_where(&root.args, table, table_alias, schema, ctx)?;
-    render_order_by(&root.args, table, table_alias, ctx)?;
+    render_order_by(&root.args, table, table_alias, schema, ctx)?;
     render_limit_offset(&root.args, ctx);
     Ok(())
 }
@@ -509,29 +509,16 @@ fn render_relation_subquery(
 
     if !args.order_by.is_empty() {
         ctx.sql.push_str(" ORDER BY ");
+        let ob_path = format!("{parent_path}.{alias}.order_by");
         for (i, ob) in args.order_by.iter().enumerate() {
             if i > 0 {
                 ctx.sql.push_str(", ");
             }
-            let col = target
-                .find_column(&ob.column)
-                .ok_or_else(|| Error::Validate {
-                    path: format!("{parent_path}.{alias}.order_by.{}", ob.column),
-                    message: format!(
-                        "unknown column '{}' on '{}'",
-                        ob.column, target.exposed_name
-                    ),
-                })?;
-            let dir = match ob.direction {
-                crate::ast::OrderDir::Asc => "ASC",
-                crate::ast::OrderDir::Desc => "DESC",
-            };
-            write!(
-                ctx.sql,
-                "{remote_alias}.{} {dir}",
-                quote_ident(&col.physical_name),
-            )
-            .unwrap();
+            render_order_by_expr(ob, target, &remote_alias, schema, &ob_path, ctx)?;
+            ctx.sql.push_str(match ob.direction {
+                crate::ast::OrderDir::Asc => " ASC",
+                crate::ast::OrderDir::Desc => " DESC",
+            });
         }
     }
 
@@ -578,17 +565,136 @@ fn render_relation_field(
     Ok(())
 }
 
+/// The expression an ORDER BY term sorts on.
+///
+/// A plain column renders as `alias."col"`. A term that walks object relations
+/// renders as a correlated scalar subquery, e.g. ordering `experiments` by
+/// `{sample: {collected_at: asc}}`:
+///
+/// ```sql
+/// (SELECT ob0."collected_at" FROM "public"."samples" AS ob0
+///   WHERE ob0."id" = e0."sample_id" LIMIT 1)
+/// ```
+///
+/// A correlated subquery is used rather than a JOIN so the row multiplicity of
+/// the surrounding query is untouched — object relations are 1:1, so LIMIT 1 is
+/// exact, and NULL (no matching row) sorts as PostgreSQL's default.
+fn render_order_by_expr(
+    ob: &crate::ast::OrderBy,
+    table: &Table,
+    table_alias: &str,
+    schema: &Schema,
+    path_ctx: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    if ob.path.is_empty() {
+        let col = table.find_column(&ob.column).ok_or_else(|| Error::Validate {
+            path: format!("{path_ctx}.{}", ob.column),
+            message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
+        })?;
+        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+        return Ok(());
+    }
+
+    let mut cur = table;
+    let mut cur_alias = table_alias.to_string();
+    let mut from_clause = String::new();
+    let mut joins: Vec<String> = Vec::new();
+    let mut correlation: Vec<String> = Vec::new();
+    let mut leaf_alias = String::new();
+
+    for (i, rel_name) in ob.path.iter().enumerate() {
+        let rel = cur.find_relation(rel_name).ok_or_else(|| Error::Validate {
+            path: format!("{path_ctx}.{rel_name}"),
+            message: format!("unknown relation '{rel_name}' on '{}'", cur.exposed_name),
+        })?;
+        if rel.kind != crate::schema::RelKind::Object {
+            return Err(Error::Validate {
+                path: format!("{path_ctx}.{rel_name}"),
+                message: format!(
+                    "cannot order by array relation '{rel_name}'; only object relations are supported"
+                ),
+            });
+        }
+        let target = schema
+            .table(&rel.target_table)
+            .ok_or_else(|| Error::Validate {
+                path: format!("{path_ctx}.{rel_name}"),
+                message: format!("relation target table '{}' missing", rel.target_table),
+            })?;
+
+        let a = ctx.next_alias("ob");
+        let mut conds = Vec::new();
+        for (local, remote) in &rel.mapping {
+            let lcol = cur.find_column(local).ok_or_else(|| Error::Validate {
+                path: format!("{path_ctx}.{rel_name}"),
+                message: format!("unknown column '{local}' on '{}'", cur.exposed_name),
+            })?;
+            let rcol = target.find_column(remote).ok_or_else(|| Error::Validate {
+                path: format!("{path_ctx}.{rel_name}"),
+                message: format!("unknown column '{remote}' on '{}'", target.exposed_name),
+            })?;
+            conds.push(format!(
+                "{a}.{} = {cur_alias}.{}",
+                quote_ident(&rcol.physical_name),
+                quote_ident(&lcol.physical_name)
+            ));
+        }
+
+        let qualified = format!(
+            "{}.{}",
+            quote_ident(&target.physical_schema),
+            quote_ident(&target.physical_name)
+        );
+        if i == 0 {
+            // Only the first hop correlates to the outer query; the rest are joins.
+            from_clause = format!("{qualified} AS {a}");
+            correlation = conds;
+        } else {
+            joins.push(format!("JOIN {qualified} AS {a} ON {}", conds.join(" AND ")));
+        }
+
+        cur = target;
+        cur_alias = a.clone();
+        leaf_alias = a;
+    }
+
+    let col = cur.find_column(&ob.column).ok_or_else(|| Error::Validate {
+        path: format!("{path_ctx}.{}", ob.column),
+        message: format!("unknown column '{}' on '{}'", ob.column, cur.exposed_name),
+    })?;
+
+    write!(
+        ctx.sql,
+        "(SELECT {leaf_alias}.{} FROM {from_clause}{}{} WHERE {} LIMIT 1)",
+        quote_ident(&col.physical_name),
+        if joins.is_empty() { "" } else { " " },
+        joins.join(" "),
+        correlation.join(" AND ")
+    )
+    .unwrap();
+    Ok(())
+}
+
 fn render_order_by(
     args: &QueryArgs,
     table: &Table,
     table_alias: &str,
+    schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    let mut prefix: Vec<(String, crate::ast::OrderDir)> = Vec::new();
+    // distinct_on columns must lead the ORDER BY; they are always own columns.
+    let mut prefix: Vec<crate::ast::OrderBy> = Vec::new();
     for d in &args.distinct_on {
-        let already = args.order_by.iter().any(|ob| ob.column == *d);
+        let already = args
+            .order_by
+            .iter()
+            .any(|ob| ob.path.is_empty() && ob.column == *d);
         if !already {
-            prefix.push((d.clone(), crate::ast::OrderDir::Asc));
+            prefix.push(crate::ast::OrderBy::column(
+                d.clone(),
+                crate::ast::OrderDir::Asc,
+            ));
         }
     }
     if prefix.is_empty() && args.order_by.is_empty() {
@@ -596,29 +702,16 @@ fn render_order_by(
     }
     ctx.sql.push_str(" ORDER BY ");
     let mut first = true;
-    for (col_name, dir) in prefix.iter().map(|(c, d)| (c.as_str(), *d)).chain(
-        args.order_by
-            .iter()
-            .map(|ob| (ob.column.as_str(), ob.direction)),
-    ) {
+    for ob in prefix.iter().chain(args.order_by.iter()) {
         if !first {
             ctx.sql.push_str(", ");
         }
         first = false;
-        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-            path: format!("order_by.{col_name}"),
-            message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
-        })?;
-        let dir_s = match dir {
-            crate::ast::OrderDir::Asc => "ASC",
-            crate::ast::OrderDir::Desc => "DESC",
-        };
-        write!(
-            ctx.sql,
-            "{table_alias}.{} {dir_s}",
-            quote_ident(&col.physical_name)
-        )
-        .unwrap();
+        render_order_by_expr(ob, table, table_alias, schema, "order_by", ctx)?;
+        ctx.sql.push_str(match ob.direction {
+            crate::ast::OrderDir::Asc => " ASC",
+            crate::ast::OrderDir::Desc => " DESC",
+        });
     }
     Ok(())
 }
@@ -2408,14 +2501,8 @@ mod tests {
             alias: "users".into(),
             args: QueryArgs {
                 order_by: vec![
-                    OrderBy {
-                        column: "name".into(),
-                        direction: OrderDir::Asc,
-                    },
-                    OrderBy {
-                        column: "id".into(),
-                        direction: OrderDir::Desc,
-                    },
+                    OrderBy::column("name", OrderDir::Asc),
+                    OrderBy::column("id", OrderDir::Desc),
                 ],
                 limit: Some(10),
                 offset: Some(5),
@@ -2449,6 +2536,119 @@ mod tests {
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
+    }
+
+
+    // ── ORDER BY through object relations ──────────────────────────────────
+
+    /// `posts(order_by: {user: {name: asc}})` — sort posts by their author's name.
+    /// Renders as a correlated scalar subquery so the row multiplicity of the
+    /// outer query is untouched.
+    #[test]
+    fn order_by_object_relation_renders_correlated_subquery() {
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "query { posts(order_by: {user: {name: asc}}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .expect("parse");
+        let (sql, _binds) = render(&op, &schema).expect("render");
+
+        assert!(
+            sql.contains("ORDER BY (SELECT"),
+            "order_by through a relation must render a subquery, got: {sql}"
+        );
+        assert!(
+            sql.contains(r#"FROM "public"."users""#),
+            "subquery must select from the related table, got: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 1)"),
+            "object relation is 1:1, subquery must be bounded, got: {sql}"
+        );
+        assert!(sql.contains(" ASC"), "direction must survive, got: {sql}");
+    }
+
+    /// The correlation must tie the subquery to the outer row, not to a constant.
+    #[test]
+    fn order_by_object_relation_correlates_to_outer_row() {
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "query { posts(order_by: {user: {name: desc}}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .expect("parse");
+        let (sql, _) = render(&op, &schema).expect("render");
+
+        // posts.user maps ("user_id" -> "id"): subquery.users.id = outer.posts.user_id
+        let has_correlation = sql.contains(r#"."id" = "#) && sql.contains(r#"."user_id""#);
+        assert!(
+            has_correlation,
+            "subquery must correlate users.id to the outer posts.user_id, got: {sql}"
+        );
+        assert!(sql.contains(" DESC"), "direction must survive, got: {sql}");
+    }
+
+    /// Own columns must keep rendering as a plain column reference — no subquery.
+    #[test]
+    fn order_by_own_column_stays_plain() {
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "query { posts(order_by: {title: asc}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .expect("parse");
+        let (sql, _) = render(&op, &schema).expect("render");
+
+        assert!(sql.contains(r#""title" ASC"#), "got: {sql}");
+        assert!(
+            !sql.contains("ORDER BY (SELECT"),
+            "a plain column must not become a subquery, got: {sql}"
+        );
+    }
+
+    /// Ordering through an array relation needs an aggregate (Hasura's
+    /// `posts_aggregate: {count: desc}`), which is not implemented. It must be a
+    /// clear error rather than silently sorting by something arbitrary.
+    #[test]
+    fn order_by_array_relation_is_rejected() {
+        let schema = users_posts_schema();
+        let err = crate::parser::parse_and_lower(
+            "query { users(order_by: {posts: {title: asc}}) { id } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .expect_err("ordering by an array relation must not be accepted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("array relation"),
+            "error should name the cause, got: {msg}"
+        );
+    }
+
+    /// A relation-qualified order_by on a nested relation field, not just the root.
+    #[test]
+    fn order_by_object_relation_inside_nested_field() {
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "query { users { id posts(order_by: {user: {name: asc}}) { title } } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .expect("parse");
+        let (sql, _) = render(&op, &schema).expect("render");
+        assert!(
+            sql.contains("ORDER BY (SELECT"),
+            "nested relation field must support relation-qualified order_by, got: {sql}"
+        );
     }
 
     #[test]

@@ -123,7 +123,27 @@ impl QueryBuilder {
     }
 
     pub fn order_by(mut self, col: impl Into<String>, direction: OrderDir) -> Self {
+        self.args.order_by.push(OrderBy::column(col, direction));
+        self
+    }
+
+    /// Order by a column reached through one or more object relations.
+    ///
+    /// ```ignore
+    /// Query::from("experiments").order_by_related(["sample"], "collected_at", OrderDir::Desc)
+    /// ```
+    pub fn order_by_related<I, S>(
+        mut self,
+        relation_path: I,
+        col: impl Into<String>,
+        direction: OrderDir,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         self.args.order_by.push(OrderBy {
+            path: relation_path.into_iter().map(Into::into).collect(),
             column: col.into(),
             direction,
         });

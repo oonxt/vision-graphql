@@ -1174,7 +1174,8 @@ fn lower_args(
                 )?);
             }
             "order_by" => {
-                out.order_by = lower_order_by(v, vars, &format!("{parent_path}.order_by"))?;
+                out.order_by =
+                    lower_order_by(v, vars, &format!("{parent_path}.order_by"), table, schema)?;
             }
             "limit" => {
                 out.limit = Some(gql_u64(v, vars, &format!("{parent_path}.limit"))?);
@@ -1390,7 +1391,13 @@ pub(crate) fn lower_where(
     })
 }
 
-fn lower_order_by(v: &GqlValue, vars: &Value, path: &str) -> Result<Vec<OrderBy>> {
+fn lower_order_by(
+    v: &GqlValue,
+    vars: &Value,
+    path: &str,
+    table: &Table,
+    schema: &Schema,
+) -> Result<Vec<OrderBy>> {
     let json = gql_to_json(v, vars, path)?;
     let arr: Vec<&Value> = match &json {
         Value::Array(xs) => xs.iter().collect(),
@@ -1408,28 +1415,101 @@ fn lower_order_by(v: &GqlValue, vars: &Value, path: &str) -> Result<Vec<OrderBy>
             path: format!("{path}[{i}]"),
             message: "expected object".into(),
         })?;
-        for (col, dir_val) in obj {
-            let dir_s = dir_val.as_str().ok_or_else(|| Error::Validate {
-                path: format!("{path}[{i}].{col}"),
-                message: "expected 'asc' or 'desc'".into(),
-            })?;
-            let direction = match dir_s {
-                "asc" => OrderDir::Asc,
-                "desc" => OrderDir::Desc,
-                other => {
-                    return Err(Error::Validate {
-                        path: format!("{path}[{i}].{col}"),
-                        message: format!("unknown direction '{other}'"),
-                    })
-                }
-            };
-            out.push(OrderBy {
-                column: col.clone(),
-                direction,
-            });
+        for (key, val) in obj {
+            lower_order_by_entry(
+                key,
+                val,
+                &format!("{path}[{i}]"),
+                table,
+                schema,
+                &mut Vec::new(),
+                &mut out,
+            )?;
         }
     }
     Ok(out)
+}
+
+/// One `order_by` entry. A string value (`asc` / `desc`) terminates on a column;
+/// an object value walks an object relation and recurses.
+fn lower_order_by_entry(
+    key: &str,
+    val: &Value,
+    path: &str,
+    table: &Table,
+    schema: &Schema,
+    rel_path: &mut Vec<String>,
+    out: &mut Vec<OrderBy>,
+) -> Result<()> {
+    // Nested: order by a column reached through an object relation.
+    if let Value::Object(inner) = val {
+        let rel = table.find_relation(key).ok_or_else(|| Error::Validate {
+            path: format!("{path}.{key}"),
+            message: format!(
+                "unknown column or relation '{key}' on '{}'",
+                table.exposed_name
+            ),
+        })?;
+        // Ordering through an array relation would need an aggregate
+        // (Hasura's `posts_aggregate: {count: desc}`), which is not implemented.
+        if rel.kind != crate::schema::RelKind::Object {
+            return Err(Error::Validate {
+                path: format!("{path}.{key}"),
+                message: format!(
+                    "cannot order by array relation '{key}'; only object relations are supported"
+                ),
+            });
+        }
+        let target = schema
+            .table(&rel.target_table)
+            .ok_or_else(|| Error::Validate {
+                path: format!("{path}.{key}"),
+                message: format!("relation target table '{}' missing", rel.target_table),
+            })?;
+
+        rel_path.push(key.to_string());
+        for (k, v) in inner {
+            lower_order_by_entry(
+                k,
+                v,
+                &format!("{path}.{key}"),
+                target,
+                schema,
+                rel_path,
+                out,
+            )?;
+        }
+        rel_path.pop();
+        return Ok(());
+    }
+
+    // Leaf: a direction on a column of the current table.
+    let dir_s = val.as_str().ok_or_else(|| Error::Validate {
+        path: format!("{path}.{key}"),
+        message: "expected 'asc' or 'desc'".into(),
+    })?;
+    let direction = match dir_s {
+        "asc" => OrderDir::Asc,
+        "desc" => OrderDir::Desc,
+        other => {
+            return Err(Error::Validate {
+                path: format!("{path}.{key}"),
+                message: format!("unknown direction '{other}'"),
+            })
+        }
+    };
+    if table.find_column(key).is_none() {
+        return Err(Error::Validate {
+            path: format!("{path}.{key}"),
+            message: format!("unknown column '{key}' on '{}'", table.exposed_name),
+        });
+    }
+    out.push(OrderBy {
+        path: rel_path.clone(),
+        column: key.to_string(),
+        direction,
+    });
+    Ok(())
 }
 
 fn gql_u64(v: &GqlValue, vars: &Value, path: &str) -> Result<u64> {

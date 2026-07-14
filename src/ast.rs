@@ -52,8 +52,25 @@ pub struct QueryArgs {
 
 #[derive(Debug, Clone)]
 pub struct OrderBy {
+    /// Object-relation path to walk before reaching `column`. Empty for a column
+    /// on the table being ordered.
+    ///
+    /// `order_by: {sample: {collected_at: asc}}` on `experiments` lowers to
+    /// `path = ["sample"], column = "collected_at"`.
+    pub path: Vec<String>,
     pub column: String,
     pub direction: OrderDir,
+}
+
+impl OrderBy {
+    /// Order by a column on the table itself.
+    pub fn column(column: impl Into<String>, direction: OrderDir) -> Self {
+        OrderBy {
+            path: Vec::new(),
+            column: column.into(),
+            direction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
