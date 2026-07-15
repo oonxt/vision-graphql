@@ -61,6 +61,7 @@ pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
         "uuid" => Some(PgType::Uuid),
         "timestamp without time zone" => Some(PgType::Timestamp),
         "timestamp with time zone" => Some(PgType::TimestampTz),
+        "json" => Some(PgType::Json),
         "jsonb" => Some(PgType::Jsonb),
         "date" => Some(PgType::Date),
         "time without time zone" => Some(PgType::Time),

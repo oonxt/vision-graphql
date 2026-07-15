@@ -137,6 +137,58 @@ async fn insert_with_stringly_types() {
 }
 
 #[tokio::test]
+async fn read_jsonb_subkey_with_path_and_alias() {
+    let (engine, _c) = setup().await;
+    let res = engine
+        .query(
+            r#"query { events(where: {id: {_eq: 1}}) { id abundance: meta(path: "k") } }"#,
+            None,
+        )
+        .await
+        .expect("jsonb path read should work");
+    // meta = {"k": 1}; `meta #> '{k}'` returns the jsonb value 1, renamed to `abundance`.
+    assert_eq!(res, json!({"events": [{"id": 1, "abundance": 1}]}));
+}
+
+#[tokio::test]
+async fn read_jsonb_nested_path_cascades_and_indexes() {
+    let (engine, _c) = setup().await;
+    engine
+        .query(
+            r#"
+            mutation {
+                insert_events(objects: [{
+                    ext_id: "44444444-4444-4444-4444-444444444444",
+                    created_at: "2026-07-01T00:00:00Z",
+                    meta: {a: {b: [10, 20, 30]}}
+                }]) { affected_rows }
+            }
+            "#,
+            None,
+        )
+        .await
+        .expect("insert nested jsonb");
+
+    let res = engine
+        .query(
+            r#"query {
+                events(where: {ext_id: {_eq: "44444444-4444-4444-4444-444444444444"}}) {
+                    inner: meta(path: "a.b")
+                    second: meta(path: "a.b.1")
+                }
+            }"#,
+            None,
+        )
+        .await
+        .expect("nested jsonb path read should work");
+    // `#> '{a,b}'` keeps the jsonb array structure; `#> '{a,b,1}'` indexes it.
+    assert_eq!(
+        res,
+        json!({"events": [{"inner": [10, 20, 30], "second": 20}]})
+    );
+}
+
+#[tokio::test]
 async fn filter_uuid_in_list() {
     let (engine, _c) = setup().await;
     let res = engine

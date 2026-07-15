@@ -1,6 +1,6 @@
 # vision-graphql
 
-A Hasura-style ORM for PostgreSQL in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via PostgreSQL's `json_agg`/`row_to_json` — no N+1.
+A Hasura-style GraphQL-to-SQL query engine for PostgreSQL in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via PostgreSQL's `json_agg`/`row_to_json` — no N+1.
 
 ## Quick start
 
@@ -71,6 +71,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Operators: `_eq`/`_neq`/`_gt`/`_gte`/`_lt`/`_lte`/`_like`/`_ilike`/`_nlike`/`_nilike`/`_in`/`_nin`/`_is_null` | ✓ |
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
+| Field aliases (`abundance: data`) | ✓ |
+| JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables, named + inline fragments | ✓ |
 | Schema introspection | ✓ |
 | PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |
@@ -81,6 +83,28 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
 | Computed fields | Not implemented |
 | Subscriptions | Not implemented |
+
+## JSON/JSONB path reads
+
+Read inside a `json`/`jsonb` column with a `path` argument. The path is a
+dot-separated string of keys; numeric components index into JSON arrays (both
+follow PostgreSQL `#>` semantics). The result keeps its JSON structure, so it
+nests inside the response unchanged. Combine with a field alias to rename the key:
+
+```graphql
+query {
+  samples {
+    id
+    abundance: data(path: "abundance")   # data #> '{abundance}' AS "abundance"
+    first_tag: data(path: "tags.0")       # data #> '{tags,0}'
+  }
+}
+```
+
+Works anywhere a column is selected — top-level, nested relations, `_by_pk`,
+mutation `returning`, and aggregate `nodes`. The typed builder has the parallel
+`.column_path("data", "abundance", &["abundance"])`. Using `path` on a
+non-`json`/`jsonb` column is a validation error.
 
 ## Architecture
 

@@ -137,6 +137,19 @@ fn render_inner_select(
                 )
                 .unwrap();
             }
+            Field::JsonPath {
+                physical,
+                alias,
+                path,
+            } => {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{}.{}", root.alias, alias),
+                    message: format!("unknown column '{physical}' on '{}'", root.table),
+                })?;
+                let err_path = format!("{}.{}", root.alias, alias);
+                let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
+                write!(ctx.sql, r#"{expr} AS "{alias}""#).unwrap();
+            }
             Field::Relation {
                 name,
                 alias,
@@ -426,6 +439,24 @@ fn render_relation_subquery(
                     fa
                 )
                 .unwrap();
+            }
+            Field::JsonPath {
+                physical,
+                alias: fa,
+                path,
+            } => {
+                let col = target
+                    .find_column(physical)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("{parent_path}.{alias}.{fa}"),
+                        message: format!(
+                            "unknown column '{physical}' on '{}'",
+                            target.exposed_name
+                        ),
+                    })?;
+                let err_path = format!("{parent_path}.{alias}.{fa}");
+                let expr = render_json_path_expr(&remote_alias, col, path, &err_path, ctx)?;
+                write!(ctx.sql, r#"{expr} AS "{fa}""#).unwrap();
             }
             Field::Relation {
                 name: cname,
@@ -775,6 +806,40 @@ fn render_limit_offset(args: &QueryArgs, ctx: &mut RenderCtx) {
     }
 }
 
+/// Render a JSON/JSONB path read as `<table_alias>."col" #> $N::text[]`, pushing
+/// the path components as a single `text[]` bind. The result preserves the
+/// column's json/jsonb type, so it nests inside the surrounding `json_agg`/
+/// `row_to_json` unchanged.
+///
+/// The column type is validated here (not only in the parser) because the typed
+/// builder API constructs [`Field::JsonPath`] without going through the parser.
+fn render_json_path_expr(
+    table_alias: &str,
+    col: &crate::schema::Column,
+    path: &[String],
+    err_path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<String> {
+    use crate::schema::PgType;
+    if !matches!(col.pg_type, PgType::Json | PgType::Jsonb) {
+        return Err(Error::Validate {
+            path: err_path.into(),
+            message: format!(
+                "path read requires a json/jsonb column, but '{}' is not",
+                col.exposed_name
+            ),
+        });
+    }
+    ctx.binds.push(Bind::TextArray(
+        path.iter().map(|c| Some(c.clone())).collect(),
+    ));
+    Ok(format!(
+        "{table_alias}.{} #> ${}::text[]",
+        quote_ident(&col.physical_name),
+        ctx.binds.len()
+    ))
+}
+
 /// Return the PostgreSQL type keyword used in a cast expression (`$1::type`)
 /// for a given schema PgType.
 fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
@@ -791,6 +856,7 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
         PgType::Numeric => "numeric",
         PgType::Timestamp => "timestamp",
         PgType::TimestampTz => "timestamptz",
+        PgType::Json => "json",
         PgType::Jsonb => "jsonb",
         PgType::Date => "date",
         PgType::Time => "time",
@@ -851,6 +917,19 @@ fn render_by_pk(
                     alias
                 )
                 .unwrap();
+            }
+            Field::JsonPath {
+                physical,
+                alias,
+                path,
+            } => {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{}.{}", root.alias, alias),
+                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                })?;
+                let err_path = format!("{}.{}", root.alias, alias);
+                let expr = render_json_path_expr(&inner_alias, col, path, &err_path, ctx)?;
+                write!(ctx.sql, r#"{expr} AS "{alias}""#).unwrap();
             }
             Field::Relation {
                 name,
@@ -2104,6 +2183,19 @@ fn render_json_build_object_for_nodes(
                 )
                 .unwrap();
             }
+            Field::JsonPath {
+                physical,
+                alias,
+                path,
+            } => {
+                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.nodes.{alias}"),
+                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                })?;
+                let err_path = format!("{parent_path}.nodes.{alias}");
+                let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
+                write!(ctx.sql, "'{alias}', {expr}").unwrap();
+            }
             Field::Relation {
                 name,
                 alias: rel_alias,
@@ -2159,13 +2251,15 @@ fn render_aggregate_source(
     }
     if let Some(fields) = nodes {
         for f in fields {
-            if let Field::Column { physical, .. } = f {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
-                    path: format!("{}.nodes", root.alias),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
-                })?;
-                cols_needed.insert(col.physical_name.clone());
-            }
+            let physical = match f {
+                Field::Column { physical, .. } | Field::JsonPath { physical, .. } => physical,
+                Field::Relation { .. } => continue,
+            };
+            let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                path: format!("{}.nodes", root.alias),
+                message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+            })?;
+            cols_needed.insert(col.physical_name.clone());
         }
     }
 
@@ -2436,6 +2530,85 @@ mod tests {
         let (sql, binds) = render(&op, &users_schema()).unwrap();
         insta::assert_snapshot!(sql);
         assert!(binds.is_empty());
+    }
+
+    fn docs_schema() -> Schema {
+        Schema::builder()
+            .table(
+                Table::new("docs", "public", "docs")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("data", "data", PgType::Jsonb, true)
+                    .column("meta", "meta", PgType::Json, true)
+                    .column("name", "name", PgType::Text, true),
+            )
+            .build()
+    }
+
+    #[test]
+    fn render_json_path_extract() {
+        let op = Operation::Query(vec![RootField {
+            table: "docs".into(),
+            alias: "docs".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List {
+                selection: vec![Field::JsonPath {
+                    physical: "data".into(),
+                    alias: "abundance".into(),
+                    path: vec!["a".into(), "b".into()],
+                }],
+            },
+        }]);
+        let (sql, binds) = render(&op, &docs_schema()).unwrap();
+        assert!(
+            sql.contains(r#""data" #> $1::text[] AS "abundance""#),
+            "unexpected SQL: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert_eq!(
+            binds[0],
+            Bind::TextArray(vec![Some("a".into()), Some("b".into())])
+        );
+    }
+
+    #[test]
+    fn render_json_path_on_plain_json_column() {
+        let op = Operation::Query(vec![RootField {
+            table: "docs".into(),
+            alias: "docs".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List {
+                selection: vec![Field::JsonPath {
+                    physical: "meta".into(),
+                    alias: "tags".into(),
+                    path: vec!["tags".into()],
+                }],
+            },
+        }]);
+        let (sql, _) = render(&op, &docs_schema()).unwrap();
+        assert!(sql.contains(r#""meta" #> $1::text[] AS "tags""#));
+    }
+
+    #[test]
+    fn render_json_path_rejects_non_json_column() {
+        // The builder API bypasses the parser, so the renderer must reject a
+        // path read on a non-json/jsonb column itself.
+        let op = Operation::Query(vec![RootField {
+            table: "docs".into(),
+            alias: "docs".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List {
+                selection: vec![Field::JsonPath {
+                    physical: "name".into(),
+                    alias: "oops".into(),
+                    path: vec!["x".into()],
+                }],
+            },
+        }]);
+        let err = render(&op, &docs_schema()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message, .. } if message.contains("json/jsonb")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

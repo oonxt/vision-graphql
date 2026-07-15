@@ -103,6 +103,24 @@ impl QueryBuilder {
         self
     }
 
+    /// Select a `#>` path read of a JSON/JSONB column under `alias`, e.g.
+    /// `.column_path("data", "abundance", &["a", "b"])` renders
+    /// `data #> '{a,b}' AS "abundance"`. Numeric components index into JSON
+    /// arrays. The column must be `json`/`jsonb`; that is checked at render.
+    pub fn column_path(
+        mut self,
+        col: impl Into<String>,
+        alias: impl Into<String>,
+        path: &[&str],
+    ) -> Self {
+        self.selection.push(Field::JsonPath {
+            physical: col.into(),
+            alias: alias.into(),
+            path: path.iter().map(|c| (*c).to_string()).collect(),
+        });
+        self
+    }
+
     pub fn where_expr(mut self, expr: BoolExpr) -> Self {
         self.args.where_ = Some(expr);
         self
@@ -800,6 +818,29 @@ mod tests {
         };
         assert_eq!(ops.len(), 2);
         assert!(nodes.is_none());
+    }
+
+    #[test]
+    fn query_builder_column_path() {
+        let rf = Query::from("docs")
+            .column("id")
+            .column_path("data", "abundance", &["a", "b"])
+            .build();
+        let RootBody::List { selection } = &rf.body else {
+            panic!("expected List");
+        };
+        match &selection[1] {
+            Field::JsonPath {
+                physical,
+                alias,
+                path,
+            } => {
+                assert_eq!(physical, "data");
+                assert_eq!(alias, "abundance");
+                assert_eq!(path, &vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected JsonPath, got {other:?}"),
+        }
     }
 
     #[test]

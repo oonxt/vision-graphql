@@ -132,6 +132,16 @@ pub enum Field {
         physical: String,
         alias: String,
     },
+    /// Scalar read of a JSON/JSONB column through a `#>` path extraction, e.g.
+    /// `abundance: data(path: "a.b")` → `data #> '{a,b}' AS "abundance"`.
+    /// The result keeps its JSON/JSONB type (structure preserved), and numeric
+    /// path components index into JSON arrays per PostgreSQL `#>` semantics.
+    JsonPath {
+        physical: String,
+        alias: String,
+        /// Non-empty list of key/index components. Rendered as a `text[]` bind.
+        path: Vec<String>,
+    },
     Relation {
         /// Name of the relation on the parent table (resolved via schema at render).
         name: String,

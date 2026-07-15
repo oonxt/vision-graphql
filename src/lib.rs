@@ -1,6 +1,6 @@
 //! # vision-graphql
 //!
-//! A Hasura-style ORM for PostgreSQL. Accepts GraphQL query strings or
+//! A Hasura-style GraphQL-to-SQL query engine for PostgreSQL. Accepts GraphQL query strings or
 //! typed Rust builders and returns `serde_json::Value` in Hasura's data
 //! shape.
 //!

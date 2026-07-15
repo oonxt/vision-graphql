@@ -24,6 +24,7 @@ pub enum PgType {
     Uuid,
     Timestamp,
     TimestampTz,
+    Json,
     Jsonb,
     Date,
     Time,

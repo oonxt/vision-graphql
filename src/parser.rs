@@ -117,8 +117,12 @@ fn lower_query(
                 if let Some(base_name) = name.strip_suffix("_aggregate") {
                     if let Some(table) = schema.table(base_name) {
                         let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
-                        let (ops, nodes) =
-                            lower_aggregate_selection(&field.selection_set.node, table, &alias)?;
+                        let (ops, nodes) = lower_aggregate_selection(
+                            &field.selection_set.node,
+                            table,
+                            vars,
+                            &alias,
+                        )?;
                         roots.push(RootField {
                             table: base_name.to_string(),
                             alias,
@@ -1175,14 +1179,88 @@ fn lower_selection_set(
                     path: format!("{parent_path}.{alias}"),
                     message: format!("unknown column '{name}' on '{}'", table.exposed_name),
                 })?;
-                out.push(Field::Column {
-                    physical: col.physical_name.clone(),
+                out.push(lower_scalar_field(
+                    &field.arguments,
+                    col,
                     alias,
-                });
+                    vars,
+                    parent_path,
+                )?);
             }
         }
     }
     Ok(out)
+}
+
+/// Lower a scalar column selection into either a plain [`Field::Column`] or a
+/// [`Field::JsonPath`] when a `path` argument is present.
+///
+/// `path` is a dot-separated string of key/index components; it is only valid on
+/// `json`/`jsonb` columns. Any other argument on a scalar field is rejected
+/// rather than silently ignored.
+fn lower_scalar_field(
+    arguments: &[(Positioned<Name>, Positioned<GqlValue>)],
+    col: &crate::schema::Column,
+    alias: String,
+    vars: &Value,
+    parent_path: &str,
+) -> Result<Field> {
+    let mut path_value: Option<&GqlValue> = None;
+    for (name_p, value_p) in arguments {
+        match name_p.node.as_str() {
+            "path" => path_value = Some(&value_p.node),
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{parent_path}.{alias}"),
+                    message: format!(
+                        "unknown argument '{other}' on column '{}'",
+                        col.exposed_name
+                    ),
+                })
+            }
+        }
+    }
+
+    let Some(v) = path_value else {
+        return Ok(Field::Column {
+            physical: col.physical_name.clone(),
+            alias,
+        });
+    };
+
+    use crate::schema::PgType;
+    if !matches!(col.pg_type, PgType::Json | PgType::Jsonb) {
+        return Err(Error::Validate {
+            path: format!("{parent_path}.{alias}"),
+            message: format!(
+                "argument 'path' requires a json/jsonb column, but '{}' is not",
+                col.exposed_name
+            ),
+        });
+    }
+
+    let json = gql_to_json(v, vars, &format!("{parent_path}.{alias}.path"))?;
+    let raw = json.as_str().ok_or_else(|| Error::Validate {
+        path: format!("{parent_path}.{alias}.path"),
+        message: "argument 'path' must be a string (e.g. \"a.b.c\")".into(),
+    })?;
+    let path: Vec<String> = raw
+        .split('.')
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_string())
+        .collect();
+    if path.is_empty() {
+        return Err(Error::Validate {
+            path: format!("{parent_path}.{alias}.path"),
+            message: "argument 'path' must name at least one key".into(),
+        });
+    }
+
+    Ok(Field::JsonPath {
+        physical: col.physical_name.clone(),
+        alias,
+        path,
+    })
 }
 
 fn lower_args(
@@ -1605,6 +1683,7 @@ fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
 fn lower_aggregate_selection(
     set: &SelectionSet,
     table: &Table,
+    vars: &Value,
     parent_path: &str,
 ) -> Result<(Vec<crate::ast::AggOp>, Option<Vec<Field>>)> {
     let mut ops: Vec<crate::ast::AggOp> = Vec::new();
@@ -1673,6 +1752,7 @@ fn lower_aggregate_selection(
                 let fields = lower_selection_columns_only(
                     &field.selection_set.node,
                     table,
+                    vars,
                     &format!("{parent_path}.nodes"),
                 )?;
                 nodes = Some(fields);
@@ -1691,6 +1771,7 @@ fn lower_aggregate_selection(
 fn lower_selection_columns_only(
     set: &SelectionSet,
     table: &Table,
+    vars: &Value,
     parent_path: &str,
 ) -> Result<Vec<Field>> {
     let mut out = Vec::new();
@@ -1711,10 +1792,13 @@ fn lower_selection_columns_only(
             path: format!("{parent_path}.{alias}"),
             message: format!("unknown column '{name}' on '{}'", table.exposed_name),
         })?;
-        out.push(Field::Column {
-            physical: col.physical_name.clone(),
+        out.push(lower_scalar_field(
+            &field.arguments,
+            col,
             alias,
-        });
+            vars,
+            parent_path,
+        )?);
     }
     Ok(out)
 }
@@ -1732,9 +1816,94 @@ mod tests {
                 Table::new("users", "public", "users")
                     .column("id", "id", PgType::Int4, false)
                     .column("name", "name", PgType::Text, true)
+                    .column("data", "data", PgType::Jsonb, true)
                     .primary_key(&["id"]),
             )
             .build()
+    }
+
+    #[test]
+    fn parse_json_path_with_alias() {
+        let op = parse_and_lower(
+            r#"query { users { abundance: data(path: "a.b") } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        match &selection[0] {
+            Field::JsonPath {
+                physical,
+                alias,
+                path,
+            } => {
+                assert_eq!(physical, "data");
+                assert_eq!(alias, "abundance");
+                assert_eq!(path, &vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected JsonPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_path_single_key() {
+        let op = parse_and_lower(
+            r#"query { users { data(path: "abundance") } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        match &selection[0] {
+            Field::JsonPath { alias, path, .. } => {
+                // No GraphQL alias → response key falls back to the field name.
+                assert_eq!(alias, "data");
+                assert_eq!(path, &vec!["abundance".to_string()]);
+            }
+            other => panic!("expected JsonPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_path_rejects_non_json_column() {
+        let err = parse_and_lower(
+            r#"query { users { name(path: "a") } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("json/jsonb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_column_argument() {
+        let err = parse_and_lower(
+            r#"query { users { data(bogus: "x") } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown argument 'bogus'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

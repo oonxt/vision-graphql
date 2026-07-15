@@ -58,7 +58,7 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .as_str()
             .map(|s| Bind::Text(s.to_string()))
             .ok_or_else(|| Error::TypeMap(format!("expected string for {pg:?}"))),
-        PgType::Jsonb => Ok(Bind::Text(v.to_string())),
+        PgType::Json | PgType::Jsonb => Ok(Bind::Text(v.to_string())),
     }
 }
 
@@ -106,7 +106,7 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
         | PgType::Enum { .. } => {
             collect(values, |v| v.as_str().map(str::to_string), "string").map(Bind::TextArray)
         }
-        PgType::Jsonb => Ok(Bind::TextArray(
+        PgType::Json | PgType::Jsonb => Ok(Bind::TextArray(
             values
                 .iter()
                 .map(|v| {
