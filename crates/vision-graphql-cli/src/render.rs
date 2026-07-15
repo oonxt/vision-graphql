@@ -92,6 +92,7 @@ fn pg_type_short(t: &PgType) -> std::borrow::Cow<'static, str> {
         PgType::Uuid => "uuid",
         PgType::Timestamp => "timestamp",
         PgType::TimestampTz => "timestamptz",
+        PgType::Json => "json",
         PgType::Jsonb => "jsonb",
         PgType::Date => "date",
         PgType::Time => "time",
