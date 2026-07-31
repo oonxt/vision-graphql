@@ -5,7 +5,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::path::PathBuf;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use vision_graphql::schema::introspect::introspect;
+use vision_graphql::schema::introspect::introspect_schemas;
 
 use crate::filter::TableFilter;
 use crate::render::{redact_url, toml_template, HeaderMeta};
@@ -14,6 +14,7 @@ pub struct Args {
     pub url: String,
     pub output: String,
     pub force: bool,
+    pub schemas: Vec<String>,
     pub include: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
 }
@@ -32,7 +33,8 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let pool = build_pool_pub(&args.url)?;
-    let db = introspect(&pool)
+    let schemas: Vec<&str> = args.schemas.iter().map(String::as_str).collect();
+    let db = introspect_schemas(&pool, &schemas)
         .await
         .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
 

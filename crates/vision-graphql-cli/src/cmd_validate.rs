@@ -139,14 +139,22 @@ mod tests {
             }
         }
 
+        /// Tests in one binary run on parallel threads, so a timestamp alone is
+        /// not a unique name: two of them landing in the same nanosecond get the
+        /// same path, and the first one's `Drop` deletes the file the second is
+        /// still reading. The counter is what actually makes this unique; the
+        /// timestamp only keeps names distinct across runs.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
         pub fn write_temp(contents: &str) -> PathHolder {
             let mut p = std::env::temp_dir();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             p.push(format!(
-                "vision-gql-test-{nanos}-{}.toml",
+                "vision-gql-test-{nanos}-{}-{seq}.toml",
                 std::process::id()
             ));
             let mut f = std::fs::File::create(&p).expect("temp file");

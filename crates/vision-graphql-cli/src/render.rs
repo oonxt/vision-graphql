@@ -52,17 +52,22 @@ pub fn toml_template(db: &IntrospectedDb, filter: &TableFilter, meta: &HeaderMet
     let mut out = String::new();
     write_header(&mut out, meta);
 
+    // Stanza keys must be the names the schema exposes, not the raw table names:
+    // that is what an overlay key resolves against. They differ once more than
+    // one schema is introspected, since later schemas are prefixed.
+    let exposed = vision_graphql::schema::merge::exposed_name_map(db);
+
     let mut emitted_any = false;
-    for ((schema, name), table) in &db.tables {
-        if schema != "public" {
+    for (key, table) in &db.tables {
+        let Some(name) = exposed.get(key) else {
             continue;
-        }
+        };
         if !filter.keep(name) {
             continue;
         }
         emitted_any = true;
         out.push('\n');
-        write_table_stanza(&mut out, table, db);
+        write_table_stanza(&mut out, name, table, db);
     }
     if !emitted_any {
         out.push_str("\n# (no tables matched the filter)\n");
@@ -102,7 +107,7 @@ fn pg_type_short(t: &PgType) -> std::borrow::Cow<'static, str> {
     })
 }
 
-fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &IntrospectedDb) {
+fn write_table_stanza(out: &mut String, exposed: &str, t: &IntrospectedTable, db: &IntrospectedDb) {
     out.push_str(&format!(
         "# ── {}.{} ─────────────────────────────\n",
         t.schema, t.name
@@ -141,14 +146,14 @@ fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &Introspected
         }
     }
     out.push_str("#\n");
-    out.push_str(&format!("# [tables.{}]\n", t.name));
-    out.push_str(&format!("# expose_as = \"{}\"\n", t.name));
+    out.push_str(&format!("# [tables.{exposed}]\n"));
+    out.push_str(&format!("# expose_as = \"{exposed}\"\n"));
     out.push_str("# hide_columns = []\n");
 
     let derived = vision_graphql::schema::merge::derive_relations_from_fks(db);
     let mine: Vec<_> = derived
         .iter()
-        .filter(|(src, _, _)| src == &t.name)
+        .filter(|(src, _, _)| src == exposed)
         .collect();
     for (_, rel_name, rel) in mine {
         let kind = match rel.kind {
@@ -157,7 +162,7 @@ fn write_table_stanza(out: &mut String, t: &IntrospectedTable, db: &Introspected
         };
         out.push_str("#\n");
         out.push_str(&format!("# # {} relation derived from FK\n", kind));
-        out.push_str(&format!("# [[tables.{}.relations]]\n", t.name));
+        out.push_str(&format!("# [[tables.{exposed}.relations]]\n"));
         out.push_str(&format!("# name = \"{}\"\n", rel_name));
         out.push_str(&format!("# kind = \"{}\"\n", kind));
         out.push_str(&format!("# target = \"{}\"\n", rel.target_table));
@@ -219,6 +224,7 @@ mod render_tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                read_only: false,
             },
         );
         let f = TableFilter::new(None, None).unwrap();
@@ -246,6 +252,7 @@ mod render_tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                read_only: false,
             },
         );
         db.tables.insert(
@@ -274,6 +281,7 @@ mod render_tests {
                     to_table: "users".into(),
                     to_columns: vec!["id".into()],
                 }],
+                read_only: false,
             },
         );
         let f = TableFilter::new(None, None).unwrap();
@@ -307,6 +315,7 @@ mod render_tests {
                     primary_key: vec!["id".into()],
                     unique_constraints: Default::default(),
                     foreign_keys: vec![],
+                    read_only: false,
                 },
             );
         }

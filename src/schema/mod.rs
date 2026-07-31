@@ -205,9 +205,35 @@ impl Schema {
         self.tables_by_exposed.get(exposed)
     }
 
-    /// Introspect the database and return a ready-to-customize builder.
+    /// Introspect the `public` schema and return a ready-to-customize builder.
+    /// Shorthand for [`Schema::introspect_schemas`] with `["public"]`.
     pub async fn introspect(pool: &sqlx::PgPool) -> crate::error::Result<SchemaBuilder> {
         crate::schema::merge::introspect_into_builder(pool).await
+    }
+
+    /// Introspect several schemas at once. Foreign keys that cross between them
+    /// become relations like any other.
+    ///
+    /// **The first schema listed owns the bare table names; every other schema
+    /// is exposed prefixed** — `introspect_schemas(pool, &["app", "audit"])`
+    /// gives `orders` for `app.orders` and `audit_orders` for `audit.orders`.
+    /// The order is fixed by this call rather than inferred, so creating a table
+    /// in a later schema can never rename one that queries already depend on.
+    /// Rename anything you don't like with the overlay's `expose_as`.
+    ///
+    /// ```no_run
+    /// # async fn example(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    /// use vision_graphql::Schema;
+    /// let schema = Schema::introspect_schemas(&pool, &["app", "audit"])
+    ///     .await?
+    ///     .build();
+    /// # Ok(()) }
+    /// ```
+    pub async fn introspect_schemas(
+        pool: &sqlx::PgPool,
+        schemas: &[&str],
+    ) -> crate::error::Result<SchemaBuilder> {
+        crate::schema::merge::introspect_schemas_into_builder(pool, schemas).await
     }
 }
 

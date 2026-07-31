@@ -75,9 +75,10 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables, named + inline fragments | ✓ |
 | Schema introspection | ✓ |
+| Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |
 | Enum array columns (`role_type[]`) | Not implemented (skipped at introspection) |
-| TOML config overlay (`expose_as`, `hide_columns`, manual relations) | ✓ |
+| TOML config overlay (`expose_as`, `schema`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
@@ -120,7 +121,7 @@ One SQL per request. All user values go through parameterized binds — there is
 
 Three layers that merge (later wins):
 
-1. **Introspection** — `Schema::introspect(&pool).await?` queries `information_schema` and auto-derives relations from foreign keys.
+1. **Introspection** — `Schema::introspect(&pool).await?` queries `information_schema` and auto-derives relations from foreign keys. It reads `public`; use `Schema::introspect_schemas(&pool, &["app", "audit"]).await?` for more (see below).
 2. **TOML overlay** — `.load_config("schema.toml")?` applies renames, hidden columns, and manual relations. Run `vision-gql generate` to bootstrap a starter file from a live DB.
 3. **Builder** — `.table(...)` / `.relation(...)` / `.expose_as(...)` for final touches before `.build()`.
 
@@ -137,6 +138,60 @@ kind = "array"
 target = "profiles"
 mapping = [["id", "followed_id"]]
 ```
+
+## Multiple schemas
+
+`Schema::introspect_schemas` reads several Postgres schemas into one GraphQL
+schema. Foreign keys that cross between them become ordinary relations — they
+render as the same correlated subquery a same-schema relation does, so a
+cross-schema read is still one SQL statement.
+
+```rust
+let schema = Schema::introspect_schemas(&pool, &["app", "audit"]).await?.build();
+```
+
+**The first schema listed owns the bare table names; every later schema is
+exposed prefixed.** Given `app.orders` and `audit.orders`, that call exposes
+`orders` and `audit_orders`.
+
+The order is fixed by the call rather than inferred from what collides, so
+creating a table in a later schema can never rename one that queries already
+depend on. Introspecting `["public"]` alone — which is what `Schema::introspect`
+does — is unaffected: nothing is prefixed.
+
+```graphql
+query {
+  orders(where: {audit_actor: {name: {_eq: "bob"}}}) {
+    total
+    audit_actor { name }     # app.orders -> audit.actors
+  }
+}
+```
+
+Rename anything you don't like with `expose_as`. A foreign key pointing into a
+schema you did not list is skipped, since there is no exposed table for the
+relation to target.
+
+To read a table from a different physical schema than the one it was
+introspected from, use `schema` in the overlay. Only the schema qualifier moves —
+columns still come from what introspection read, so the target must have the same
+shape:
+
+```toml
+[tables.orders]
+schema = "archive"     # renders "archive"."orders"
+```
+
+### Cross-*database* reads
+
+A single SQL statement cannot span Postgres databases, so this is as far as the
+engine goes on its own. The way to reach another database today is
+`postgres_fdw`: create foreign tables in a schema (say `remote`), then include it
+in `introspect_schemas`. They introspect like any other relation, but carry no
+constraints, so declare a `primary_key` in the overlay if you want `_by_pk` on
+them. Note that a foreign table on the inner side of a correlated subquery
+pushes down poorly, and that a transaction spanning the FDW boundary is not
+atomic.
 
 ## CLI
 
@@ -161,9 +216,17 @@ Filter what gets processed with comma-separated globs:
 vision-gql generate --url $DATABASE_URL --ignore-tables 'audit_*,_temp_*'
 ```
 
+`--schema` selects which Postgres schemas to read (default `public`), with the
+same "first one owns the bare names" rule as `Schema::introspect_schemas`. Stanza
+keys in the generated file are the exposed names, so they line up with what the
+overlay resolves against:
+
+```bash
+vision-gql generate --url $DATABASE_URL --schema app,audit
+```
+
 Both subcommands accept `$DATABASE_URL` as the default for `--url`. TLS is
-supported via rustls (`sslmode=require` in the URL); only the `public` schema
-is introspected.
+supported via rustls (`sslmode=require` in the URL).
 
 ## Mutations
 

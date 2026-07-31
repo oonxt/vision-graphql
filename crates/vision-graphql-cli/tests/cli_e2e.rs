@@ -75,6 +75,72 @@ async fn generate_ignore_tables_filters() {
     assert!(!s.contains("audit_log"));
 }
 
+/// `--schema` selects what gets read, and the stanza keys must be the *exposed*
+/// names — that is what an overlay key resolves against, so a stanza keyed by
+/// the raw table name would silently match nothing for the prefixed schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn generate_reads_multiple_schemas_and_keys_stanzas_by_exposed_name() {
+    let (url, _c) = boot_pg().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    sqlx::raw_sql(
+        r#"
+        CREATE SCHEMA audit;
+        CREATE TABLE audit.users (id SERIAL PRIMARY KEY, action TEXT NOT NULL);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed audit schema");
+    pool.close().await;
+
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["generate", "--url", &url, "--schema", "public,audit"])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8(out.stdout).unwrap();
+
+    assert!(s.contains("# ── public.users ─"), "public.users missing");
+    assert!(s.contains("# ── audit.users ─"), "audit.users missing");
+
+    // public is listed first, so it keeps the bare name and audit is prefixed.
+    assert!(
+        s.contains("# [tables.users]"),
+        "expected bare `users` stanza"
+    );
+    assert!(
+        s.contains("# [tables.audit_users]"),
+        "expected the prefixed `audit_users` stanza"
+    );
+}
+
+/// Without `--schema`, nothing changes: `public` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn generate_defaults_to_public_only() {
+    let (url, _c) = boot_pg().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    sqlx::raw_sql("CREATE SCHEMA audit; CREATE TABLE audit.ghosts (id SERIAL PRIMARY KEY);")
+        .execute(&pool)
+        .await
+        .expect("seed audit schema");
+    pool.close().await;
+
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["generate", "--url", &url])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("public.users"));
+    assert!(!s.contains("ghosts"), "audit was not asked for");
+}
+
 fn write_temp_toml(name: &str, contents: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vision-gql-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

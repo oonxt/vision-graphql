@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use vision_graphql::schema::config::parse;
-use vision_graphql::schema::introspect::introspect;
+use vision_graphql::schema::introspect::introspect_schemas;
 
 use crate::analyze::find_drift;
 use crate::cmd_generate;
@@ -15,6 +15,7 @@ pub struct Args {
     pub url: String,
     pub config: std::path::PathBuf,
     pub format: Format,
+    pub schemas: Vec<String>,
     pub include: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
 }
@@ -25,7 +26,8 @@ pub async fn run(args: Args) -> Result<()> {
     let cfg = parse(&text).with_context(|| format!("parsing {}", args.config.display()))?;
 
     let pool = cmd_generate::build_pool_pub(&args.url)?;
-    let db = introspect(&pool)
+    let schemas: Vec<&str> = args.schemas.iter().map(String::as_str).collect();
+    let db = introspect_schemas(&pool, &schemas)
         .await
         .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
 

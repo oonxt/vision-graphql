@@ -16,6 +16,16 @@ pub struct ConfigOverlay {
 pub struct TableOverlay {
     #[serde(default)]
     pub expose_as: Option<String>,
+    /// Read this table from a different physical schema than the one it was
+    /// introspected from — `schema = "archive"` keeps every column, type, and
+    /// relation found on `public.orders` but renders `"archive"."orders"`.
+    ///
+    /// Only the schema qualifier moves. Columns still come from whatever
+    /// introspection actually read, so the table this points at must have the
+    /// same shape; nothing checks that it does, and a mismatch surfaces as a
+    /// Postgres error at query time rather than a schema error at load time.
+    #[serde(default)]
+    pub schema: Option<String>,
     #[serde(default)]
     pub hide_columns: Vec<String>,
     #[serde(default)]

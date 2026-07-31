@@ -44,6 +44,11 @@ struct CommonDb {
     #[arg(long)]
     url: Option<String>,
 
+    /// Comma-separated Postgres schemas to introspect. The first one owns the
+    /// bare table names; later ones are exposed prefixed (`audit_orders`).
+    #[arg(long = "schema", value_delimiter = ',', default_value = "public")]
+    schemas: Vec<String>,
+
     /// Comma-separated globs; restrict to matching tables.
     #[arg(long, value_delimiter = ',')]
     include_tables: Option<Vec<String>>,
@@ -122,6 +127,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     url,
                     output: a.output,
                     force: a.force,
+                    schemas: a.db.schemas,
                     include: a.db.include_tables,
                     ignore: a.db.ignore_tables,
                 })
@@ -137,6 +143,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     url,
                     config: a.config,
                     format,
+                    schemas: a.db.schemas,
                     include: a.db.include_tables,
                     ignore: a.db.ignore_tables,
                 })

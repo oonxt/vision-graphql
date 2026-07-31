@@ -9,6 +9,16 @@ use std::collections::BTreeMap;
 pub struct IntrospectedDb {
     /// Keyed by `(schema_name, table_name)`.
     pub tables: BTreeMap<(String, String), IntrospectedTable>,
+    /// The schemas that were asked for, in the order they were asked for.
+    ///
+    /// Order is meaningful, not decorative: the first schema owns the bare
+    /// exposed names and every other schema is prefixed, so that adding a table
+    /// to a later schema can never silently rename an existing one. See
+    /// [`crate::schema::merge::exposed_name_map`].
+    ///
+    /// Empty on a hand-built value; the naming rule then falls back to
+    /// "`public` first, then alphabetical".
+    pub schemas: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -89,11 +99,34 @@ fn strip_type_modifier(t: &str) -> String {
     out.trim().to_string()
 }
 
+/// Introspect the `public` schema. Shorthand for
+/// [`introspect_schemas`]`(pool, &["public"])`.
 pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
-    let mut db = IntrospectedDb::default();
+    introspect_schemas(pool, &["public"]).await
+}
+
+/// Introspect the named schemas.
+///
+/// Order matters for the exposed names the schema builder derives — see
+/// [`IntrospectedDb::schemas`]. Foreign tables (`postgres_fdw` and friends) are
+/// picked up like any other relation, but carry no constraints, so they arrive
+/// with no primary key; declare one with the overlay's `primary_key` if you want
+/// `_by_pk` on them.
+pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<IntrospectedDb> {
+    if schemas.is_empty() {
+        return Err(crate::error::Error::Schema(
+            "introspect_schemas needs at least one schema".into(),
+        ));
+    }
+    let wanted: Vec<String> = schemas.iter().map(|s| (*s).to_string()).collect();
+    let mut db = IntrospectedDb {
+        tables: BTreeMap::new(),
+        schemas: wanted.clone(),
+    };
 
     // information_schema columns are domain types (sql_identifier etc.);
-    // cast to text so decoding stays driver-agnostic.
+    // cast to text so decoding stays driver-agnostic. The same cast is what
+    // makes `= ANY($1)` bind against a plain `text[]`.
     let rows = sqlx::query(
         r#"
         SELECT c.table_schema::text, c.table_name::text, c.column_name::text,
@@ -103,10 +136,11 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         FROM information_schema.columns c
         LEFT JOIN pg_namespace n ON n.nspname = c.udt_schema
         LEFT JOIN pg_type t ON t.typnamespace = n.oid AND t.typname = c.udt_name
-        WHERE c.table_schema = 'public'
+        WHERE c.table_schema::text = ANY($1)
         ORDER BY c.table_schema, c.table_name, c.ordinal_position
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     for row in rows {
@@ -161,9 +195,10 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         r#"
         SELECT t.table_schema::text, t.table_name::text
         FROM information_schema.tables t
-        WHERE t.table_schema = 'public' AND t.table_type = 'VIEW'
+        WHERE t.table_schema::text = ANY($1) AND t.table_type = 'VIEW'
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     for row in rows {
@@ -194,12 +229,13 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
         JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
         WHERE c.relkind = 'm'
-          AND n.nspname = 'public'
+          AND n.nspname::text = ANY($1)
           AND a.attnum > 0
           AND NOT a.attisdropped
         ORDER BY n.nspname, c.relname, a.attnum
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     for row in rows {
@@ -259,10 +295,11 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
           ON tc.constraint_name = kcu.constraint_name
          AND tc.table_schema = kcu.table_schema
          AND tc.table_name = kcu.table_name
-        WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+        WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema::text = ANY($1)
         ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     for row in rows {
@@ -283,10 +320,11 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
           ON tc.constraint_name = kcu.constraint_name
          AND tc.table_schema = kcu.table_schema
          AND tc.table_name = kcu.table_name
-        WHERE tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY') AND tc.table_schema = 'public'
+        WHERE tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY') AND tc.table_schema::text = ANY($1)
         ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     for row in rows {
@@ -324,10 +362,11 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
         JOIN information_schema.constraint_column_usage ccu
           ON rc.unique_constraint_name = ccu.constraint_name
          AND rc.unique_constraint_schema = ccu.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema::text = ANY($1)
         ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
         "#,
     )
+    .bind(&wanted)
     .fetch_all(pool)
     .await?;
     let mut fk_acc: BTreeMap<(String, String, String), IntrospectedForeignKey> = BTreeMap::new();
@@ -353,6 +392,19 @@ pub async fn introspect(pool: &PgPool) -> Result<IntrospectedDb> {
     for ((schema, tname, _), fk) in fk_acc {
         if let Some(t) = db.tables.get_mut(&(schema, tname)) {
             t.foreign_keys.push(fk);
+        }
+    }
+
+    // A schema that turned up nothing is far more often a typo than an
+    // intentionally empty schema, and it fails silently otherwise: the tables
+    // the caller expected just are not in the resulting Schema.
+    for want in &wanted {
+        if !db.tables.keys().any(|(s, _)| s == want) {
+            tracing::warn!(
+                target: "vision_graphql::introspect",
+                schema = %want,
+                "introspected schema contains no tables; check the name exists and is readable"
+            );
         }
     }
 

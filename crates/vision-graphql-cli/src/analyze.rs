@@ -61,21 +61,23 @@ impl DiffReport {
 pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter) -> DiffReport {
     let mut report = DiffReport::default();
 
-    // Index physical tables for quick lookup; only `public` is in scope.
-    let by_name: BTreeMap<&str, &IntrospectedTable> = db
+    // Index tables under the names the schema actually exposes them as — which
+    // is what an overlay key refers to. With one schema that is just the table
+    // name; with several, later schemas are prefixed.
+    let exposed = vision_graphql::schema::merge::exposed_name_map(db);
+    let by_name: BTreeMap<String, &IntrospectedTable> = db
         .tables
         .iter()
-        .filter(|((schema, _), _)| schema == "public")
-        .map(|((_, name), t)| (name.as_str(), t))
+        .filter_map(|(key, t)| exposed.get(key).map(|name| (name.clone(), t)))
         .collect();
 
     // expose_as collisions: track all exposed names.
     let mut exposed_owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for name in by_name.keys() {
         exposed_owners
-            .entry((*name).to_string())
+            .entry(name.clone())
             .or_default()
-            .push((*name).to_string());
+            .push(name.clone());
     }
     for (key, overlay) in &cfg.tables {
         if !filter.keep(key) {
@@ -197,6 +199,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                read_only: false,
             },
         );
         db
@@ -216,6 +219,7 @@ mod tests {
                 expose_as: Some("profiles".into()),
                 hide_columns: vec!["email".into()],
                 relations: vec![],
+                ..Default::default()
             },
         );
         let r = find_drift(&cfg, &db, &no_filter());
@@ -241,6 +245,7 @@ mod tests {
                 expose_as: None,
                 hide_columns: vec!["password_hash".into()],
                 relations: vec![],
+                ..Default::default()
             },
         );
         let r = find_drift(&cfg, &db, &no_filter());
@@ -267,6 +272,7 @@ mod tests {
                     target: "ghost_table".into(),
                     mapping: vec![("id".into(), "user_id".into())],
                 }],
+                ..Default::default()
             },
         );
         let r = find_drift(&cfg, &db, &no_filter());
@@ -290,6 +296,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
                 foreign_keys: vec![],
+                read_only: false,
             },
         );
         let mut cfg = ConfigOverlay::default();
