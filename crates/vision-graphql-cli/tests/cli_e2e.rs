@@ -141,6 +141,82 @@ async fn generate_defaults_to_public_only() {
     assert!(!s.contains("ghosts"), "audit was not asked for");
 }
 
+/// A `schema = "..."` repoint keeps the columns introspection read, so a target
+/// that lacks one is a query-time Postgres error — `diff` has to catch it.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_catches_repoint_to_table_missing_columns() {
+    let (url, _c) = boot_pg().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    sqlx::raw_sql(
+        r#"
+        CREATE SCHEMA archive;
+        -- public.users has id/name/secret; this one is missing `secret`.
+        CREATE TABLE archive.users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed archive");
+    pool.close().await;
+
+    let p = write_temp_toml(
+        "repoint_bad.toml",
+        r#"
+        [tables.users]
+        schema = "archive"
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            &url,
+            "--config",
+            p.to_str().unwrap(),
+            "--schema",
+            "public,archive",
+        ])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(1), "expected drift exit code");
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("broken schema repoints"), "got: {s}");
+    assert!(
+        s.contains("secret"),
+        "should name the missing column; got: {s}"
+    );
+    let _ = std::fs::remove_file(&p);
+}
+
+/// Same overlay, but `archive` was never introspected: `diff` must say it could
+/// not check rather than either passing silently or inventing drift.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_reports_unverifiable_repoint_without_failing() {
+    let (url, _c) = boot_pg().await;
+    let p = write_temp_toml(
+        "repoint_unverified.toml",
+        r#"
+        [tables.users]
+        schema = "archive"
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["diff", "--url", &url, "--config", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "unverifiable must not fail diff; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("not checked"), "got: {s}");
+    assert!(s.contains("--schema archive"), "got: {s}");
+    let _ = std::fs::remove_file(&p);
+}
+
 fn write_temp_toml(name: &str, contents: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vision-gql-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

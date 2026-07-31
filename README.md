@@ -210,6 +210,12 @@ override defaults from introspection. `diff` checks the overlay's references
 against the current database (exit 0 = clean, 1 = drift, 2 = error). `validate`
 performs offline structural checks without a connection.
 
+`diff` also checks `schema` repoints: the target must exist and must carry the
+columns the exposed table declares, since a repoint moves only the schema
+qualifier. If the target schema was not introspected, `diff` reports the repoint
+as *not checked* rather than passing it silently — add it to `--schema` to have
+it verified.
+
 Filter what gets processed with comma-separated globs:
 
 ```bash

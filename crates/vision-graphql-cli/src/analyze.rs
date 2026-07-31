@@ -12,6 +12,42 @@ pub struct DiffReport {
     pub missing_columns: Vec<MissingColumn>,
     pub missing_relation_targets: Vec<MissingRelTarget>,
     pub expose_as_collisions: Vec<Collision>,
+    /// `schema = "..."` repoints that are definitely broken.
+    pub bad_repoints: Vec<BadRepoint>,
+    /// `schema = "..."` repoints aimed at a schema that was not introspected,
+    /// so nothing here could be checked either way. Reported so the hole is
+    /// visible, but not counted as drift — "I could not look" is not a finding.
+    pub unverified_repoints: Vec<UnverifiedRepoint>,
+}
+
+/// An overlay `schema = "..."` that points somewhere it cannot work.
+///
+/// A repoint moves only the schema qualifier; columns keep coming from the table
+/// introspection actually read. So the target must exist and must carry those
+/// columns, or the mismatch surfaces as a Postgres error at query time — which
+/// is exactly the class of thing `diff` exists to catch first.
+#[derive(Debug, Serialize)]
+pub struct BadRepoint {
+    pub table: String,
+    pub schema: String,
+    pub problem: RepointProblem,
+    /// Columns the target lacks. Empty unless `problem` is `ColumnsMissing`.
+    pub missing_columns: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepointProblem {
+    /// The schema was introspected, but has no table of that name.
+    TableMissing,
+    /// The target exists but is missing columns the exposed table declares.
+    ColumnsMissing,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnverifiedRepoint {
+    pub table: String,
+    pub schema: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,17 +80,17 @@ pub struct Collision {
 
 impl DiffReport {
     pub fn is_clean(&self) -> bool {
-        self.missing_tables.is_empty()
-            && self.missing_columns.is_empty()
-            && self.missing_relation_targets.is_empty()
-            && self.expose_as_collisions.is_empty()
+        self.issue_count() == 0
     }
 
+    /// `unverified_repoints` is deliberately excluded: it records what could not
+    /// be checked, not drift that was found, and must not fail `diff`.
     pub fn issue_count(&self) -> usize {
         self.missing_tables.len()
             + self.missing_columns.len()
             + self.missing_relation_targets.len()
             + self.expose_as_collisions.len()
+            + self.bad_repoints.len()
     }
 }
 
@@ -114,6 +150,51 @@ pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter
         };
         let col_set: std::collections::BTreeSet<&str> =
             table.columns.iter().map(|c| c.name.as_str()).collect();
+
+        // `schema = "..."` renders this table out of a different physical schema
+        // while keeping the columns introspection read here, so the target has to
+        // exist and carry them.
+        if let Some(target_schema) = &overlay.schema {
+            let introspected = db.schemas.iter().any(|s| s == target_schema)
+                // A hand-built IntrospectedDb carries no schema list; fall back to
+                // whether any table from that schema is present.
+                || (db.schemas.is_empty()
+                    && db.tables.keys().any(|(s, _)| s == target_schema));
+
+            if !introspected {
+                report.unverified_repoints.push(UnverifiedRepoint {
+                    table: key.clone(),
+                    schema: target_schema.clone(),
+                });
+            } else {
+                match db.tables.get(&(target_schema.clone(), table.name.clone())) {
+                    None => report.bad_repoints.push(BadRepoint {
+                        table: key.clone(),
+                        schema: target_schema.clone(),
+                        problem: RepointProblem::TableMissing,
+                        missing_columns: Vec::new(),
+                    }),
+                    Some(target) => {
+                        let target_cols: std::collections::BTreeSet<&str> =
+                            target.columns.iter().map(|c| c.name.as_str()).collect();
+                        let missing: Vec<String> = col_set
+                            .iter()
+                            .filter(|c| !target_cols.contains(*c))
+                            .map(|c| (*c).to_string())
+                            .collect();
+                        if !missing.is_empty() {
+                            report.bad_repoints.push(BadRepoint {
+                                table: key.clone(),
+                                schema: target_schema.clone(),
+                                problem: RepointProblem::ColumnsMissing,
+                                missing_columns: missing,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         for hidden in &overlay.hide_columns {
             if !col_set.contains(hidden.as_str()) {
                 report.missing_columns.push(MissingColumn {
@@ -207,6 +288,102 @@ mod tests {
 
     fn no_filter() -> TableFilter {
         TableFilter::new(None, None).unwrap()
+    }
+
+    fn col(name: &str) -> IntrospectedColumn {
+        IntrospectedColumn {
+            name: name.into(),
+            pg_type: PgType::Text,
+            nullable: true,
+        }
+    }
+
+    /// `db_users_only` plus an `archive` schema, introspected, holding a `users`
+    /// table with the given columns.
+    fn db_with_archive(archive_cols: Vec<IntrospectedColumn>) -> IntrospectedDb {
+        let mut db = db_users_only();
+        db.schemas = vec!["public".into(), "archive".into()];
+        db.tables.insert(
+            ("archive".into(), "users".into()),
+            IntrospectedTable {
+                schema: "archive".into(),
+                name: "users".into(),
+                columns: archive_cols,
+                primary_key: vec!["id".into()],
+                unique_constraints: Default::default(),
+                foreign_keys: vec![],
+                read_only: false,
+            },
+        );
+        db
+    }
+
+    fn repoint_cfg(to: &str) -> ConfigOverlay {
+        let mut cfg = ConfigOverlay::default();
+        cfg.tables.insert(
+            "users".into(),
+            TableOverlay {
+                schema: Some(to.into()),
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    /// A repoint keeps the columns introspection read here, so a target carrying
+    /// all of them is fine.
+    #[test]
+    fn repoint_to_matching_table_is_clean() {
+        let db = db_with_archive(vec![col("id"), col("email")]);
+        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        assert!(r.is_clean(), "expected clean, got {r:?}");
+    }
+
+    /// The target exists but lacks a column the exposed table declares — that is
+    /// a Postgres error at query time, which is what `diff` is for.
+    #[test]
+    fn repoint_to_table_missing_columns_is_reported() {
+        let db = db_with_archive(vec![col("id")]);
+        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        assert_eq!(r.bad_repoints.len(), 1, "got {r:?}");
+        assert_eq!(r.bad_repoints[0].problem, RepointProblem::ColumnsMissing);
+        assert_eq!(r.bad_repoints[0].missing_columns, vec!["email".to_string()]);
+        assert!(!r.is_clean());
+    }
+
+    /// The schema was introspected and simply has no such table.
+    #[test]
+    fn repoint_to_absent_table_is_reported() {
+        let mut db = db_users_only();
+        db.schemas = vec!["public".into(), "archive".into()];
+        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        assert_eq!(r.bad_repoints.len(), 1, "got {r:?}");
+        assert_eq!(r.bad_repoints[0].problem, RepointProblem::TableMissing);
+        assert!(!r.is_clean());
+    }
+
+    /// Aimed at a schema nobody introspected: report the hole, but do not call
+    /// it drift — `diff` did not look, which is different from finding nothing.
+    #[test]
+    fn repoint_to_uintrospected_schema_is_unverified_not_drift() {
+        let mut db = db_users_only();
+        db.schemas = vec!["public".into()];
+        let r = find_drift(&repoint_cfg("cold_storage"), &db, &no_filter());
+
+        assert!(r.bad_repoints.is_empty(), "got {r:?}");
+        assert_eq!(r.unverified_repoints.len(), 1);
+        assert_eq!(r.unverified_repoints[0].schema, "cold_storage");
+        assert!(r.is_clean(), "unverifiable must not fail diff");
+    }
+
+    /// No `schema` key at all: none of this machinery fires.
+    #[test]
+    fn overlay_without_repoint_reports_nothing_new() {
+        let db = db_with_archive(vec![col("id")]);
+        let r = find_drift(&ConfigOverlay::default(), &db, &no_filter());
+        assert!(r.bad_repoints.is_empty());
+        assert!(r.unverified_repoints.is_empty());
+        assert!(r.is_clean());
     }
 
     #[test]

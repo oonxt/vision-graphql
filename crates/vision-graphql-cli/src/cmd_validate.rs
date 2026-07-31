@@ -39,6 +39,15 @@ pub fn run(path: &Path) -> Result<()> {
                 ));
             }
         }
+        // Whether the schema *exists* needs a database — that is `diff`'s job.
+        // A blank one is wrong without looking: it renders as `""."table"`.
+        if overlay
+            .schema
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            issues.push(format!("{key}: schema must not be empty"));
+        }
     }
 
     if issues.is_empty() {
@@ -100,6 +109,31 @@ mod tests {
         );
         let err = run(f.path()).unwrap_err();
         assert!(format!("{err:#}").contains("structural issues"));
+    }
+
+    #[test]
+    fn rejects_empty_schema_repoint() {
+        let f = temp_file(
+            r#"
+            [tables.users]
+            schema = "  "
+        "#,
+        );
+        let err = run(f.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("structural issues"));
+    }
+
+    /// A named schema is structurally fine offline; whether it exists is `diff`'s
+    /// job, and `validate` must not need a database to say so.
+    #[test]
+    fn accepts_named_schema_repoint() {
+        let f = temp_file(
+            r#"
+            [tables.users]
+            schema = "archive"
+        "#,
+        );
+        assert!(run(f.path()).is_ok());
     }
 
     #[test]
