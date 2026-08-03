@@ -1,6 +1,167 @@
 //! Intermediate representation for queries.
 
 use serde_json::Value;
+use std::borrow::Cow;
+
+use crate::error::{Error, Result};
+use crate::types::Inputs;
+
+/// A value position in the IR: known when the query was lowered, or a name
+/// resolved when it executes.
+///
+/// Eager lowering ([`crate::Engine::query`]) substitutes variables while it
+/// lowers, so it only ever produces [`Val::Lit`]. Symbolic lowering
+/// ([`crate::Engine::compile`]) leaves them as [`Val::Var`] / [`Val::ScopeParam`],
+/// which is what lets one lowered query — and one rendered SQL string — serve
+/// every set of variable values and every principal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    /// A constant of the query text.
+    Lit(Value),
+    /// GraphQL variable `$name`, taken from the request's variables.
+    Var(String),
+    /// Scope parameter, taken from the request's [`crate::predicate::Principal`].
+    ScopeParam(String),
+    /// A list with value positions of its own, e.g. `_in: [1, $x]`.
+    Array(Vec<Val>),
+    /// An object with value positions of its own, e.g. `_eq: {a: $x}` on a
+    /// json/jsonb column.
+    Object(Vec<(String, Val)>),
+}
+
+impl Val {
+    /// The literal this value carries, if it is one.
+    pub fn as_lit(&self) -> Option<&Value> {
+        match self {
+            Val::Lit(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether this value is fully determined by the query text — i.e. it needs
+    /// no variables and no principal to become a bind.
+    pub fn is_lit(&self) -> bool {
+        match self {
+            Val::Lit(_) => true,
+            Val::Array(items) => items.iter().all(Val::is_lit),
+            Val::Object(items) => items.iter().all(|(_, v)| v.is_lit()),
+            Val::Var(_) | Val::ScopeParam(_) => false,
+        }
+    }
+
+    /// Fold a composite that turned out to contain no variables back into a
+    /// plain [`Val::Lit`], so everything downstream only has to special-case
+    /// composites that actually defer something.
+    pub fn collapse(self) -> Val {
+        if !self.is_lit() {
+            return self;
+        }
+        match self {
+            Val::Array(items) => Val::Lit(Value::Array(
+                items
+                    .into_iter()
+                    .map(|i| match i.collapse() {
+                        Val::Lit(v) => v,
+                        _ => unreachable!("checked is_lit"),
+                    })
+                    .collect(),
+            )),
+            Val::Object(items) => Val::Lit(Value::Object(
+                items
+                    .into_iter()
+                    .map(|(k, i)| match i.collapse() {
+                        Val::Lit(v) => (k, v),
+                        _ => unreachable!("checked is_lit"),
+                    })
+                    .collect(),
+            )),
+            other => other,
+        }
+    }
+
+    /// Substitute variables and scope parameters, yielding a concrete JSON
+    /// value. Borrows when nothing needs building.
+    pub fn resolve<'a>(&'a self, inputs: &'a Inputs<'a>) -> Result<Cow<'a, Value>> {
+        match self {
+            Val::Lit(v) => Ok(Cow::Borrowed(v)),
+            Val::Var(name) => inputs.variable(name).map(Cow::Borrowed),
+            Val::ScopeParam(name) => inputs.scope_param(name).map(Cow::Borrowed),
+            Val::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(item.resolve(inputs)?.into_owned());
+                }
+                Ok(Cow::Owned(Value::Array(out)))
+            }
+            Val::Object(items) => {
+                let mut out = serde_json::Map::with_capacity(items.len());
+                for (k, item) in items {
+                    out.insert(k.clone(), item.resolve(inputs)?.into_owned());
+                }
+                Ok(Cow::Owned(Value::Object(out)))
+            }
+        }
+    }
+
+    /// Names of the GraphQL variables this value reads.
+    pub fn collect_vars(&self, out: &mut Vec<String>) {
+        match self {
+            Val::Var(name) => out.push(name.clone()),
+            Val::Array(items) => items.iter().for_each(|i| i.collect_vars(out)),
+            Val::Object(items) => items.iter().for_each(|(_, i)| i.collect_vars(out)),
+            Val::Lit(_) | Val::ScopeParam(_) => {}
+        }
+    }
+}
+
+impl<T: Into<Value>> From<T> for Val {
+    fn from(v: T) -> Self {
+        Val::Lit(v.into())
+    }
+}
+
+/// Compare against a plain JSON value. Only a literal can match one: a value
+/// still waiting on a variable is not equal to anything yet.
+impl PartialEq<Value> for Val {
+    fn eq(&self, other: &Value) -> bool {
+        matches!(self, Val::Lit(v) if v == other)
+    }
+}
+
+/// A row count (`limit` / `offset`): a constant of the query text, or a
+/// variable.
+///
+/// A literal renders inline (`LIMIT 10`) exactly as it always has — it comes
+/// from the query text, so it is as stable as the rest of the SQL. Only a
+/// variable becomes a bind, which is what keeps `limit: $n` from forcing a
+/// different SQL string per page size.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Count {
+    Lit(u64),
+    Var(String),
+}
+
+impl Count {
+    /// Resolve a variable count to a non-negative integer.
+    pub fn resolve(&self, inputs: &Inputs<'_>, path: &str) -> Result<u64> {
+        match self {
+            Count::Lit(n) => Ok(*n),
+            Count::Var(name) => {
+                let v = inputs.variable(name)?;
+                v.as_u64().ok_or_else(|| Error::Validate {
+                    path: path.to_string(),
+                    message: format!("expected a non-negative integer, got {v}"),
+                })
+            }
+        }
+    }
+}
+
+impl From<u64> for Count {
+    fn from(n: u64) -> Self {
+        Count::Lit(n)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Operation {
@@ -27,7 +188,7 @@ pub enum RootBody {
     },
     ByPk {
         /// `(exposed_column, value)` pairs. All PK columns must be present.
-        pk: Vec<(String, serde_json::Value)>,
+        pk: Vec<(String, Val)>,
         selection: Vec<Field>,
     },
 }
@@ -45,8 +206,8 @@ pub enum AggOp {
 pub struct QueryArgs {
     pub where_: Option<BoolExpr>,
     pub order_by: Vec<OrderBy>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<Count>,
+    pub offset: Option<Count>,
     pub distinct_on: Vec<String>,
 }
 
@@ -159,7 +320,7 @@ pub enum BoolExpr {
     Compare {
         column: String,
         op: CmpOp,
-        value: Value,
+        value: Val,
     },
     IsNull {
         column: String,
@@ -167,9 +328,12 @@ pub enum BoolExpr {
     },
     /// `column = ANY($n)` over a single bound array (`<> ALL($n)` when
     /// negated). NULL elements keep SQL `IN` semantics: they never match.
+    ///
+    /// `values` must resolve to a JSON array; it is a single [`Val`] rather
+    /// than a `Vec` so the whole list can be one variable (`_in: $ids`).
     InList {
         column: String,
-        values: Vec<Value>,
+        values: Val,
         negated: bool,
     },
     /// Match rows where the named relation has at least one matching row.
@@ -216,7 +380,7 @@ pub enum MutationField {
         table: String,
         where_: BoolExpr,
         /// `{ exposed_column -> new_value }`
-        set: std::collections::BTreeMap<String, serde_json::Value>,
+        set: std::collections::BTreeMap<String, Val>,
         returning: Vec<Field>,
         /// Post-update scope check under deny-by-default scoped execution: every
         /// row left by the UPDATE must still satisfy this predicate or the whole
@@ -229,8 +393,8 @@ pub enum MutationField {
     UpdateByPk {
         alias: String,
         table: String,
-        pk: Vec<(String, serde_json::Value)>,
-        set: std::collections::BTreeMap<String, serde_json::Value>,
+        pk: Vec<(String, Val)>,
+        set: std::collections::BTreeMap<String, Val>,
         selection: Vec<Field>,
         /// Scope predicate under deny-by-default scoped execution, used twice:
         /// AND-ed onto the PK match as a pre-image filter (a row failing it does
@@ -249,7 +413,7 @@ pub enum MutationField {
     DeleteByPk {
         alias: String,
         table: String,
-        pk: Vec<(String, serde_json::Value)>,
+        pk: Vec<(String, Val)>,
         selection: Vec<Field>,
         /// Scope predicate AND-ed onto the PK match under deny-by-default
         /// scoped execution. `None` for unscoped runs and unrestricted tables.
@@ -284,7 +448,7 @@ pub struct OnConflict {
 #[derive(Debug, Clone, Default)]
 pub struct InsertObject {
     /// `{ exposed_column -> value }` for this parent row.
-    pub columns: std::collections::BTreeMap<String, serde_json::Value>,
+    pub columns: std::collections::BTreeMap<String, Val>,
     /// Array-relation (one-to-many) nested inserts, keyed by the parent-side
     /// relation name. Each value carries the rows to insert as children of
     /// *this* parent row.
@@ -370,7 +534,7 @@ mod tests {
         let expr = BoolExpr::Compare {
             column: "id".into(),
             op: CmpOp::Eq,
-            value: json!(42),
+            value: json!(42).into(),
         };
         match expr {
             BoolExpr::Compare { op: CmpOp::Eq, .. } => {}
@@ -427,7 +591,7 @@ mod tests {
     fn build_insert_mutation() {
         use std::collections::BTreeMap;
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let m = MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -457,7 +621,7 @@ mod tests {
             inner: Box::new(BoolExpr::Compare {
                 column: "published".into(),
                 op: CmpOp::Eq,
-                value: json!(true),
+                value: json!(true).into(),
             }),
         };
         match e {

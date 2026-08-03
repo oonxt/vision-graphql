@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::ast::BoolExpr;
+use crate::ast::{BoolExpr, Val};
 use crate::error::{Error, Result};
 use crate::parser::lower_where;
 use crate::policy::{ScopePolicy, ScopeRule};
@@ -94,7 +94,15 @@ fn build_rule(table_name: &str, tr: &TableRule, schema: &Schema) -> Result<Scope
         Error::Scope(format!("tables.{table_name}: unknown table '{table_name}'"))
     })?;
     let json = toml_to_json(where_toml);
-    let lowered = lower_where(&json, table, schema, &format!("scope.{table_name}.where"))?;
+    // The TOML has no GraphQL variables in it, so the lowering mode is moot;
+    // it goes through the same walker as a written-out `where` argument.
+    let lowered = lower_where(
+        &crate::parser::json_to_gql(&json),
+        table,
+        schema,
+        crate::parser::Bindings::Eager(&Value::Null),
+        &format!("scope.{table_name}.where"),
+    )?;
     Ok(ScopeRule::Allow(to_template(lowered)))
 }
 
@@ -139,15 +147,32 @@ fn to_template(expr: BoolExpr) -> ScopeExpr {
             negated,
         } => ScopeExpr::InList {
             column,
-            values: values.into_iter().map(to_operand).collect(),
+            values: val_to_operands(values),
             negated,
         },
     }
 }
 
+/// Map a lowered `_in` list to operands. TOML cannot produce anything but a
+/// literal list here, so a non-list is treated as a single element.
+fn val_to_operands(v: Val) -> Vec<Operand> {
+    match v {
+        Val::Lit(Value::Array(items)) => {
+            items.into_iter().map(|i| to_operand(Val::Lit(i))).collect()
+        }
+        Val::Lit(other) => vec![to_operand(Val::Lit(other))],
+        // Unreachable from TOML: no GraphQL variables and no principal exist here.
+        _ => Vec::new(),
+    }
+}
+
 /// Map one lowered value leaf to an [`Operand`]: `"$name"` → a parameter, `$$…`
 /// → an unescaped literal, anything else → the literal itself.
-fn to_operand(v: Value) -> Operand {
+fn to_operand(v: Val) -> Operand {
+    let Val::Lit(v) = v else {
+        // Same as above: TOML predicates contain literals only.
+        return Operand::Lit(Value::Null);
+    };
     if let Value::String(s) = &v {
         if let Some(rest) = s.strip_prefix("$$") {
             return Operand::Lit(Value::String(format!("${rest}")));

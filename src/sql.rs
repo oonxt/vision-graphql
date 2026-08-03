@@ -1,14 +1,20 @@
 //! SQL generation from IR.
 
-use crate::ast::{Field, Operation, QueryArgs, RootField};
+use crate::ast::{Count, Field, Operation, QueryArgs, RootField, Val};
 use crate::error::{Error, Result};
-use crate::schema::{Schema, Table};
-use crate::types::Bind;
+use crate::schema::{PgType, Schema, Table};
+use crate::types::{Bind, BindSpec, Inputs};
 use std::fmt::Write as _;
 
-/// Render an [`Operation`] into a single SQL statement plus bound parameters.
+/// Render an [`Operation`] into a single SQL statement plus its parameter list.
+///
+/// The parameters come back as [`BindSpec`]s rather than [`Bind`]s: an operation
+/// lowered symbolically still has variables in it, and those only become values
+/// once a request supplies them. Everything the operation *does* pin down is
+/// converted here, so literal type errors surface at render time either way.
+/// Use [`render_now`] when the operation is already fully literal.
 #[tracing::instrument(level = "trace", skip_all)]
-pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
+pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<BindSpec>)> {
     let mut ctx = RenderCtx::default();
     match op {
         Operation::Query(roots) => render_query(roots, schema, &mut ctx),
@@ -17,10 +23,22 @@ pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
     Ok((ctx.sql, ctx.binds))
 }
 
+/// Render and immediately resolve every parameter against `inputs`.
+#[tracing::instrument(level = "trace", skip_all)]
+pub fn render_now(
+    op: &Operation,
+    schema: &Schema,
+    inputs: &Inputs<'_>,
+) -> Result<(String, Vec<Bind>)> {
+    let (sql, specs) = render(op, schema)?;
+    let binds = crate::types::resolve_binds(&specs, inputs)?;
+    Ok((sql, binds))
+}
+
 #[derive(Default)]
 struct RenderCtx {
     sql: String,
-    binds: Vec<Bind>,
+    binds: Vec<BindSpec>,
     alias_counter: usize,
     /// Maps target-table-name → CTE alias for INSERT CTEs emitted in this
     /// statement. Used by nested-returning render to decide whether to read
@@ -43,6 +61,43 @@ impl RenderCtx {
         let a = format!("{prefix}{}", self.alias_counter);
         self.alias_counter += 1;
         a
+    }
+
+    /// Append a scalar parameter; returns its 1-based placeholder number.
+    fn push_scalar(
+        &mut self,
+        val: &Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds.push(BindSpec::scalar(val.clone(), pg, path)?);
+        Ok(self.binds.len())
+    }
+
+    /// Append an `_in` / `_nin` list parameter.
+    fn push_array(
+        &mut self,
+        val: &Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds.push(BindSpec::array(val.clone(), pg, path)?);
+        Ok(self.binds.len())
+    }
+
+    /// Append a parameter the renderer determined on its own.
+    fn push_fixed(&mut self, bind: Bind) -> usize {
+        self.binds.push(BindSpec::Fixed(bind));
+        self.binds.len()
+    }
+
+    /// Append a `limit` / `offset` supplied as a variable.
+    fn push_count(&mut self, count: &Count, path: impl FnOnce() -> String) -> usize {
+        self.binds.push(BindSpec::Count {
+            val: count.clone(),
+            path: path(),
+        });
+        self.binds.len()
     }
 }
 
@@ -179,7 +234,7 @@ fn render_inner_select(
     .unwrap();
     render_where(&root.args, table, table_alias, schema, ctx)?;
     render_order_by(&root.args, table, table_alias, schema, ctx)?;
-    render_limit_offset(&root.args, ctx);
+    render_limit_offset(&root.args, &root.alias, ctx);
     Ok(())
 }
 
@@ -220,13 +275,8 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let bind =
-                crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                    path: format!("where.{column}"),
-                    message: format!("{e}"),
-                })?;
-            ctx.binds.push(bind);
-            let placeholder = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
+            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -270,23 +320,16 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            if values.is_empty() {
+            if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
             }
-            let bind = crate::types::json_to_bind_array(values, &col.pg_type).map_err(|e| {
-                Error::Validate {
-                    path: format!("where.{column}"),
-                    message: format!("{e}"),
-                }
-            })?;
-            ctx.binds.push(bind);
+            let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
             let pred = if *negated { "<> ALL" } else { "= ANY" };
             write!(
                 ctx.sql,
-                "{table_alias}.{} {pred} (${}::{}[])",
+                "{table_alias}.{} {pred} (${n}::{}[])",
                 quote_ident(&col.physical_name),
-                ctx.binds.len(),
                 pg_type_cast(&col.pg_type)
             )
             .unwrap();
@@ -550,13 +593,18 @@ fn render_relation_subquery(
         }
     }
 
-    if let Some(n) = args.limit {
-        write!(ctx.sql, " LIMIT {n}").unwrap();
+    if let Some(limit) = args.limit.as_ref() {
+        render_count(limit, "LIMIT", &format!("{parent_path}.{alias}.limit"), ctx);
     } else if matches!(rel.kind, crate::schema::RelKind::Object) {
         ctx.sql.push_str(" LIMIT 1");
     }
-    if let Some(n) = args.offset {
-        write!(ctx.sql, " OFFSET {n}").unwrap();
+    if let Some(offset) = args.offset.as_ref() {
+        render_count(
+            offset,
+            "OFFSET",
+            &format!("{parent_path}.{alias}.offset"),
+            ctx,
+        );
     }
 
     ctx.sql.push_str(") ");
@@ -797,12 +845,37 @@ fn render_order_by(
     Ok(())
 }
 
-fn render_limit_offset(args: &QueryArgs, ctx: &mut RenderCtx) {
-    if let Some(n) = args.limit {
-        write!(ctx.sql, " LIMIT {n}").unwrap();
+fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
+    if let Some(limit) = args.limit.as_ref() {
+        render_count(limit, "LIMIT", &format!("{path}.limit"), ctx);
     }
-    if let Some(n) = args.offset {
-        write!(ctx.sql, " OFFSET {n}").unwrap();
+    if let Some(offset) = args.offset.as_ref() {
+        render_count(offset, "OFFSET", &format!("{path}.offset"), ctx);
+    }
+}
+
+/// A literal count renders inline — it is part of the query text, so it is as
+/// fixed as the rest of the SQL. A variable becomes a bind, which is what keeps
+/// `limit: $n` from producing a different statement per page size.
+fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
+    match count {
+        Count::Lit(n) => write!(ctx.sql, " {keyword} {n}").unwrap(),
+        Count::Var(_) => {
+            let n = ctx.push_count(count, || path.to_string());
+            write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
+        }
+    }
+}
+
+/// An `_in` list that is literally empty, and so can collapse to TRUE/FALSE.
+/// A list that only *might* be empty at request time keeps the `= ANY` form:
+/// `x = ANY('{}')` is already false and `x <> ALL('{}')` already true, so the
+/// collapse is an optimisation, not a semantic requirement.
+fn is_empty_literal_list(values: &Val) -> bool {
+    match values {
+        Val::Array(items) => items.is_empty(),
+        Val::Lit(v) => v.as_array().is_some_and(|a| a.is_empty()),
+        _ => false,
     }
 }
 
@@ -830,13 +903,12 @@ fn render_json_path_expr(
             ),
         });
     }
-    ctx.binds.push(Bind::TextArray(
+    let n = ctx.push_fixed(Bind::TextArray(
         path.iter().map(|c| Some(c.clone())).collect(),
     ));
     Ok(format!(
-        "{table_alias}.{} #> ${}::text[]",
+        "{table_alias}.{} #> ${n}::text[]",
         quote_ident(&col.physical_name),
-        ctx.binds.len()
     ))
 }
 
@@ -889,7 +961,7 @@ fn escape_string_literal(s: &str) -> String {
 
 fn render_by_pk(
     root: &RootField,
-    pk: &[(String, serde_json::Value)],
+    pk: &[(String, Val)],
     selection: &[Field],
     table: &Table,
     schema: &Schema,
@@ -966,13 +1038,10 @@ fn render_by_pk(
             path: format!("{}.pk.{col_name}", root.alias),
             message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
-        let bind =
-            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                path: format!("{}.pk.{col_name}", root.alias),
-                message: format!("{e}"),
-            })?;
-        ctx.binds.push(bind);
-        let ph = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
+        let n = ctx.push_scalar(value, &col.pg_type, || {
+            format!("{}.pk.{col_name}", root.alias)
+        })?;
+        let ph = format!("${n}::{}", pg_type_cast(&col.pg_type));
         write!(
             ctx.sql,
             "{inner_alias}.{} = {ph}",
@@ -1336,14 +1405,9 @@ fn render_insert_cte_recursive(
             match obj.columns.get(exposed) {
                 None => write!(ctx.sql, "NULL::{cast}").unwrap(),
                 Some(v) => {
-                    let bind = crate::types::json_to_bind(v, &col.pg_type).map_err(|e| {
-                        Error::Validate {
-                            path: format!("{cte}.objects[{r}].{exposed}"),
-                            message: format!("{e}"),
-                        }
-                    })?;
-                    ctx.binds.push(bind);
-                    write!(ctx.sql, "${}::{cast}", ctx.binds.len()).unwrap();
+                    let n = ctx
+                        .push_scalar(v, &col.pg_type, || format!("{cte}.objects[{r}].{exposed}"))?;
+                    write!(ctx.sql, "${n}::{cast}").unwrap();
                 }
             }
         }
@@ -1686,7 +1750,7 @@ fn render_update_cte(
     cte: &str,
     table_name: &str,
     where_: &crate::ast::BoolExpr,
-    set: &std::collections::BTreeMap<String, serde_json::Value>,
+    set: &std::collections::BTreeMap<String, Val>,
     scope_check: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -1710,17 +1774,11 @@ fn render_update_cte(
             path: format!("{cte}._set.{exposed}"),
             message: format!("unknown column '{exposed}'"),
         })?;
-        let bind =
-            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                path: format!("{cte}._set.{exposed}"),
-                message: format!("{e}"),
-            })?;
-        ctx.binds.push(bind);
+        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
-            "{} = ${}::{}",
+            "{} = ${n}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len(),
             pg_type_cast(&col.pg_type)
         )
         .unwrap();
@@ -1740,8 +1798,8 @@ fn render_update_cte(
 fn render_update_by_pk_cte(
     cte: &str,
     table_name: &str,
-    pk: &[(String, serde_json::Value)],
-    set: &std::collections::BTreeMap<String, serde_json::Value>,
+    pk: &[(String, Val)],
+    set: &std::collections::BTreeMap<String, Val>,
     scope: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -1765,17 +1823,11 @@ fn render_update_by_pk_cte(
             path: format!("{cte}._set.{exposed}"),
             message: format!("unknown column '{exposed}'"),
         })?;
-        let bind =
-            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                path: format!("{cte}._set.{exposed}"),
-                message: format!("{e}"),
-            })?;
-        ctx.binds.push(bind);
+        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
-            "{} = ${}::{}",
+            "{} = ${n}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len(),
             pg_type_cast(&col.pg_type)
         )
         .unwrap();
@@ -1789,17 +1841,11 @@ fn render_update_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let bind =
-            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                path: format!("{cte}.pk.{col_name}"),
-                message: format!("{e}"),
-            })?;
-        ctx.binds.push(bind);
+        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
-            "{} = ${}::{}",
+            "{} = ${n}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len(),
             pg_type_cast(&col.pg_type)
         )
         .unwrap();
@@ -1846,7 +1892,7 @@ fn render_delete_cte(
 fn render_delete_by_pk_cte(
     cte: &str,
     table_name: &str,
-    pk: &[(String, serde_json::Value)],
+    pk: &[(String, Val)],
     scope: Option<&crate::ast::BoolExpr>,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -1870,17 +1916,11 @@ fn render_delete_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let bind =
-            crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                path: format!("{cte}.pk.{col_name}"),
-                message: format!("{e}"),
-            })?;
-        ctx.binds.push(bind);
+        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
-            "{} = ${}::{}",
+            "{} = ${n}::{}",
             quote_ident(&col.physical_name),
-            ctx.binds.len(),
             pg_type_cast(&col.pg_type)
         )
         .unwrap();
@@ -2311,12 +2351,7 @@ fn render_aggregate_source(
             write!(ctx.sql, "{} {dir}", quote_ident(&col.physical_name)).unwrap();
         }
     }
-    if let Some(n) = root.args.limit {
-        write!(ctx.sql, " LIMIT {n}").unwrap();
-    }
-    if let Some(n) = root.args.offset {
-        write!(ctx.sql, " OFFSET {n}").unwrap();
-    }
+    render_limit_offset(&root.args, &root.alias, ctx);
     Ok(())
 }
 
@@ -2370,13 +2405,8 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let bind =
-                crate::types::json_to_bind(value, &col.pg_type).map_err(|e| Error::Validate {
-                    path: format!("where.{column}"),
-                    message: format!("{e}"),
-                })?;
-            ctx.binds.push(bind);
-            let placeholder = format!("${}::{}", ctx.binds.len(), pg_type_cast(&col.pg_type));
+            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -2415,23 +2445,16 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            if values.is_empty() {
+            if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
             }
-            let bind = crate::types::json_to_bind_array(values, &col.pg_type).map_err(|e| {
-                Error::Validate {
-                    path: format!("where.{column}"),
-                    message: format!("{e}"),
-                }
-            })?;
-            ctx.binds.push(bind);
+            let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
             let pred = if *negated { "<> ALL" } else { "= ANY" };
             write!(
                 ctx.sql,
-                "{} {pred} (${}::{}[])",
+                "{} {pred} (${n}::{}[])",
                 quote_ident(&col.physical_name),
-                ctx.binds.len(),
                 pg_type_cast(&col.pg_type)
             )
             .unwrap();
@@ -2497,6 +2520,13 @@ mod tests {
     use super::*;
     use crate::ast::{Field, Operation, QueryArgs, RootBody, RootField};
     use crate::schema::{PgType, Schema, Table};
+
+    /// Tests build fully literal operations, so rendering can resolve the
+    /// parameters straight away — the shape every caller of `Engine::query`
+    /// sees.
+    fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
+        render_now(op, schema, &Inputs::none())
+    }
 
     fn users_schema() -> Schema {
         Schema::builder()
@@ -2623,7 +2653,7 @@ mod tests {
                 where_: Some(BoolExpr::Compare {
                     column: "id".into(),
                     op: CmpOp::Eq,
-                    value: json!(42),
+                    value: json!(42).into(),
                 }),
                 ..Default::default()
             },
@@ -2671,7 +2701,7 @@ mod tests {
                 where_: Some(BoolExpr::Compare {
                     column: "role".into(),
                     op: CmpOp::Eq,
-                    value: json!("admin"),
+                    value: json!("admin").into(),
                 }),
                 ..Default::default()
             },
@@ -2699,7 +2729,7 @@ mod tests {
             args: QueryArgs {
                 where_: Some(BoolExpr::InList {
                     column: "role".into(),
-                    values: vec![json!("admin"), json!("staff")],
+                    values: json!(["admin", "staff"]).into(),
                     negated: false,
                 }),
                 ..Default::default()
@@ -2729,7 +2759,7 @@ mod tests {
                 where_: Some(BoolExpr::Compare {
                     column: "birthday".into(),
                     op: CmpOp::Gte,
-                    value: json!("2000-01-01"),
+                    value: json!("2000-01-01").into(),
                 }),
                 ..Default::default()
             },
@@ -2759,12 +2789,12 @@ mod tests {
                     BoolExpr::Compare {
                         column: "id".into(),
                         op: CmpOp::Gt,
-                        value: json!(1),
+                        value: json!(1).into(),
                     },
                     BoolExpr::Compare {
                         column: "name".into(),
                         op: CmpOp::Neq,
-                        value: json!("bob"),
+                        value: json!("bob").into(),
                     },
                 ])),
                 ..Default::default()
@@ -2793,8 +2823,8 @@ mod tests {
                     OrderBy::column("name", OrderDir::Asc),
                     OrderBy::column("id", OrderDir::Desc),
                 ],
-                limit: Some(10),
-                offset: Some(5),
+                limit: Some(Count::Lit(10)),
+                offset: Some(Count::Lit(5)),
                 ..Default::default()
             },
             body: RootBody::List {
@@ -3040,7 +3070,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -3068,7 +3098,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users_one".into(),
             table: "users".into(),
@@ -3095,7 +3125,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -3113,7 +3143,7 @@ mod tests {
             scope_check: Some(BoolExpr::Compare {
                 column: "name".into(),
                 op: CmpOp::Eq,
-                value: serde_json::json!("alice"),
+                value: serde_json::json!("alice").into(),
             }),
         }]);
         let (sql, _) = render(&op, &users_schema()).unwrap();
@@ -3137,7 +3167,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -3161,11 +3191,11 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut set = BTreeMap::new();
-        set.insert("name".to_string(), serde_json::json!("bob"));
+        set.insert("name".to_string(), serde_json::json!("bob").into());
         let scope = BoolExpr::Compare {
             column: "name".into(),
             op: CmpOp::Eq,
-            value: serde_json::json!("alice"),
+            value: serde_json::json!("alice").into(),
         };
         let op = Operation::Mutation(vec![MutationField::Update {
             alias: "update_users".into(),
@@ -3175,7 +3205,7 @@ mod tests {
                 BoolExpr::Compare {
                     column: "id".into(),
                     op: CmpOp::Gt,
-                    value: serde_json::json!(0),
+                    value: serde_json::json!(0).into(),
                 },
                 scope.clone(),
             ]),
@@ -3204,14 +3234,14 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut set = BTreeMap::new();
-        set.insert("name".to_string(), serde_json::json!("bob"));
+        set.insert("name".to_string(), serde_json::json!("bob").into());
         let op = Operation::Mutation(vec![MutationField::Update {
             alias: "update_users".into(),
             table: "users".into(),
             where_: BoolExpr::Compare {
                 column: "id".into(),
                 op: CmpOp::Gt,
-                value: serde_json::json!(0),
+                value: serde_json::json!(0).into(),
             },
             set,
             returning: Vec::new(),
@@ -3227,8 +3257,8 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), serde_json::json!(1));
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("id".to_string(), serde_json::json!(1).into());
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -3247,7 +3277,7 @@ mod tests {
             scope_check: Some(BoolExpr::Compare {
                 column: "name".into(),
                 op: CmpOp::Eq,
-                value: serde_json::json!("alice"),
+                value: serde_json::json!("alice").into(),
             }),
         }]);
         let (sql, _) = render(&op, &users_schema()).unwrap();
@@ -3270,11 +3300,11 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut set = BTreeMap::new();
-        set.insert("name".to_string(), serde_json::json!("bob"));
+        set.insert("name".to_string(), serde_json::json!("bob").into());
         let op = Operation::Mutation(vec![MutationField::UpdateByPk {
             alias: "update_users_by_pk".into(),
             table: "users".into(),
-            pk: vec![("id".into(), serde_json::json!(1))],
+            pk: vec![("id".into(), serde_json::json!(1).into())],
             set,
             selection: vec![Field::Column {
                 physical: "id".into(),
@@ -3283,7 +3313,7 @@ mod tests {
             scope: Some(BoolExpr::Compare {
                 column: "name".into(),
                 op: CmpOp::Eq,
-                value: serde_json::json!("alice"),
+                value: serde_json::json!("alice").into(),
             }),
         }]);
         let (sql, binds) = render(&op, &users_schema()).unwrap();
@@ -3317,7 +3347,7 @@ mod tests {
         let op = Operation::Mutation(vec![MutationField::DeleteByPk {
             alias: "delete_users_by_pk".into(),
             table: "users".into(),
-            pk: vec![("id".into(), serde_json::json!(1))],
+            pk: vec![("id".into(), serde_json::json!(1).into())],
             selection: vec![Field::Column {
                 physical: "id".into(),
                 alias: "id".into(),
@@ -3366,7 +3396,7 @@ mod tests {
             alias: "users_by_pk".into(),
             args: QueryArgs::default(),
             body: RootBody::ByPk {
-                pk: vec![("id".into(), json!(7))],
+                pk: vec![("id".into(), json!(7).into())],
                 selection: vec![Field::Column {
                     physical: "name".into(),
                     alias: "name".into(),
@@ -3434,7 +3464,7 @@ mod tests {
                     inner: Box::new(BoolExpr::Compare {
                         column: "title".into(),
                         op: CmpOp::Eq,
-                        value: json!("hello"),
+                        value: json!("hello").into(),
                     }),
                 }),
                 ..Default::default()
@@ -3532,7 +3562,7 @@ mod tests {
             .build();
 
         let mut columns = BTreeMap::new();
-        columns.insert("name".to_string(), serde_json::json!("alice"));
+        columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
             alias: "insert_users".into(),
             table: "users".into(),
@@ -3589,10 +3619,10 @@ mod tests {
             .build();
 
         let mut parent_cols = BTreeMap::new();
-        parent_cols.insert("name".into(), serde_json::json!("alice"));
+        parent_cols.insert("name".into(), serde_json::json!("alice").into());
 
         let mut child_cols = BTreeMap::new();
-        child_cols.insert("title".into(), serde_json::json!("p1"));
+        child_cols.insert("title".into(), serde_json::json!("p1").into());
 
         let mut nested_arrays = BTreeMap::new();
         nested_arrays.insert(
@@ -3665,10 +3695,10 @@ mod tests {
             .build();
 
         let mut parent_cols = BTreeMap::new();
-        parent_cols.insert("title".into(), serde_json::json!("p1"));
+        parent_cols.insert("title".into(), serde_json::json!("p1").into());
 
         let mut child_cols = BTreeMap::new();
-        child_cols.insert("name".into(), serde_json::json!("alice"));
+        child_cols.insert("name".into(), serde_json::json!("alice").into());
 
         let mut nested_objects = BTreeMap::new();
         nested_objects.insert(
@@ -3741,10 +3771,10 @@ mod tests {
             .build();
 
         let mut parent_cols = BTreeMap::new();
-        parent_cols.insert("title".into(), serde_json::json!("p1"));
+        parent_cols.insert("title".into(), serde_json::json!("p1").into());
 
         let mut child_cols = BTreeMap::new();
-        child_cols.insert("name".into(), serde_json::json!("alice"));
+        child_cols.insert("name".into(), serde_json::json!("alice").into());
 
         let mut nested_objects = BTreeMap::new();
         nested_objects.insert(

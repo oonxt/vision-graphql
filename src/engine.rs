@@ -1,11 +1,15 @@
 //! Public engine API.
 
 use crate::ast::Operation;
+use crate::compiled::CompiledQuery;
 use crate::error::{Error, Result};
-use crate::parser::parse_and_lower;
+use crate::parse_cache::ParseCache;
+use crate::policy::ScopePolicy;
+use crate::predicate::Principal;
 use crate::schema::Schema;
 use crate::scope::{apply_scope, ScopeSet};
-use crate::sql::render;
+use crate::sql::{render, render_now};
+use crate::types::Inputs;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::postgres::Postgres;
@@ -46,6 +50,7 @@ fn unwrap_and_deserialize<T: DeserializeOwned>(mut data: Value, alias: Option<&s
 pub struct Engine {
     pool: PgPool,
     schema: Arc<Schema>,
+    parse_cache: Arc<ParseCache>,
 }
 
 impl Engine {
@@ -53,7 +58,30 @@ impl Engine {
         Self {
             pool,
             schema: Arc::new(schema),
+            parse_cache: Arc::new(ParseCache::default()),
         }
+    }
+
+    /// Same as [`Engine::new`], with an explicit parse-cache capacity.
+    /// `capacity == 0` parses every request from scratch.
+    pub fn with_parse_cache_capacity(pool: PgPool, schema: Schema, capacity: usize) -> Self {
+        Self {
+            pool,
+            schema: Arc::new(schema),
+            parse_cache: Arc::new(ParseCache::new(capacity)),
+        }
+    }
+
+    /// The shared document cache. Exposed for `clear()` and for size
+    /// inspection; every handle spawned from this engine uses the same one.
+    pub fn parse_cache(&self) -> &Arc<ParseCache> {
+        &self.parse_cache
+    }
+
+    /// Parse (via the cache) and lower `source` against this engine's schema.
+    fn lower(&self, source: &str, vars: &Value) -> Result<Operation> {
+        let doc = self.parse_cache.get(source)?;
+        crate::parser::lower(&doc, vars, None, &self.schema)
     }
 
     /// Parse a GraphQL query string, execute against PostgreSQL, return the
@@ -61,8 +89,8 @@ impl Engine {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = parse_and_lower(source, &vars, None, &self.schema)?;
-        let (sql, binds) = render(&op, &self.schema)?;
+        let op = self.lower(source, &vars)?;
+        let (sql, binds) = render_now(&op, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
     }
@@ -71,7 +99,7 @@ impl Engine {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         let operation = op.into_operation();
-        let (sql, binds) = render(&operation, &self.schema)?;
+        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
     }
@@ -101,10 +129,142 @@ impl Engine {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = render(&operation, &self.schema)?;
+        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         let data = crate::executor::execute(&self.pool, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
+    }
+
+    /// Lower `source` once, with variables left symbolic, and render it to SQL.
+    ///
+    /// The result runs with any variables via [`Engine::execute`]. See
+    /// [`crate::compiled`] for which queries can be compiled — a variable in a
+    /// position that decides the shape of the SQL cannot be, and yields
+    /// [`Error::NotCompilable`].
+    pub fn compile(&self, source: &str) -> Result<CompiledQuery> {
+        self.compile_inner(source, None, None)
+    }
+
+    /// Same as [`Engine::compile`], with `policy`'s predicates applied to every
+    /// table access point.
+    ///
+    /// The policy is applied *symbolically*: the compiled SQL carries the
+    /// predicates, but which rows they admit is decided per request by the
+    /// principal passed to [`Engine::execute_scoped`]. One statement therefore
+    /// serves every principal, and — because tables absent from the policy are
+    /// denied at compile time — a table the policy does not mention fails here
+    /// rather than at request time.
+    pub fn compile_scoped(&self, source: &str, policy: &ScopePolicy) -> Result<CompiledQuery> {
+        self.compile_inner(source, None, Some(policy))
+    }
+
+    /// [`Engine::compile`] / [`Engine::compile_scoped`] with an explicit
+    /// operation name, for documents holding more than one operation.
+    pub fn compile_with(
+        &self,
+        source: &str,
+        operation_name: Option<&str>,
+        policy: Option<&ScopePolicy>,
+    ) -> Result<CompiledQuery> {
+        self.compile_inner(source, operation_name, policy)
+    }
+
+    fn compile_inner(
+        &self,
+        source: &str,
+        operation_name: Option<&str>,
+        policy: Option<&ScopePolicy>,
+    ) -> Result<CompiledQuery> {
+        let doc = self.parse_cache.get(source)?;
+        let mut op = crate::parser::lower_with(
+            &doc,
+            crate::parser::Bindings::Symbolic,
+            operation_name,
+            &self.schema,
+        )?;
+        if let Some(policy) = policy {
+            apply_scope(&mut op, &policy.symbolic(), &self.schema)?;
+        }
+        let root_alias = single_root_alias(&op).map(String::from);
+        let (sql, specs) = render(&op, &self.schema)?;
+        Ok(CompiledQuery {
+            sql,
+            specs,
+            root_alias,
+            scoped: policy.is_some(),
+        })
+    }
+
+    /// Run a statement compiled by [`Engine::compile`] with this request's
+    /// variables.
+    ///
+    /// Refuses a statement compiled against a policy: that one needs a
+    /// principal, and running it without one would mean running a scoped query
+    /// unscoped.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute(
+        &self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<Value> {
+        if compiled.scoped {
+            return Err(Error::Scope(
+                "this query was compiled against a policy; run it with execute_scoped".into(),
+            ));
+        }
+        let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let binds = crate::types::resolve_binds(&compiled.specs, &Inputs::variables(&vars))?;
+        tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled");
+        crate::executor::execute(&self.pool, &compiled.sql, &binds).await
+    }
+
+    /// Run a statement compiled by [`Engine::compile_scoped`], binding
+    /// `principal` into the policy's predicates.
+    ///
+    /// Refuses a statement that was compiled without a policy, since its SQL
+    /// carries no predicates and the principal would silently have no effect.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute_scoped(
+        &self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<Value> {
+        if !compiled.scoped {
+            return Err(Error::Scope(
+                "this query was compiled without a policy, so a principal would not restrict it; \
+                 compile it with compile_scoped"
+                    .into(),
+            ));
+        }
+        let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let inputs = Inputs::variables(&vars).with_principal(principal);
+        let binds = crate::types::resolve_binds(&compiled.specs, &inputs)?;
+        tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled scoped");
+        crate::executor::execute(&self.pool, &compiled.sql, &binds).await
+    }
+
+    /// Same as [`Engine::execute`], unwrapping the single root field and
+    /// deserializing into `T`.
+    pub async fn execute_as<T: DeserializeOwned>(
+        &self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<T> {
+        let data = self.execute(compiled, variables).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+    }
+
+    /// Same as [`Engine::execute_scoped`], unwrapping the single root field and
+    /// deserializing into `T`.
+    pub async fn execute_scoped_as<T: DeserializeOwned>(
+        &self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<T> {
+        let data = self.execute_scoped(compiled, variables, principal).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
     }
 
     /// Scoped execution handle: every query it runs is rewritten so each
@@ -131,6 +291,7 @@ impl Engine {
         let mut tc = TxClient {
             tx,
             schema: self.schema.clone(),
+            parse_cache: self.parse_cache.clone(),
         };
         match f(&mut tc).await {
             Ok(v) => {
@@ -152,6 +313,7 @@ impl Engine {
 pub struct TxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
+    parse_cache: Arc<ParseCache>,
 }
 
 impl TxClient {
@@ -159,8 +321,9 @@ impl TxClient {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = parse_and_lower(source, &vars, None, &self.schema)?;
-        let (sql, binds) = render(&op, &self.schema)?;
+        let doc = self.parse_cache.get(source)?;
+        let op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
+        let (sql, binds) = render_now(&op, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
@@ -169,7 +332,7 @@ impl TxClient {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         let operation = op.into_operation();
-        let (sql, binds) = render(&operation, &self.schema)?;
+        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
@@ -191,7 +354,7 @@ impl TxClient {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = render(&operation, &self.schema)?;
+        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
@@ -211,14 +374,14 @@ pub struct ScopedEngine<'e> {
 impl ScopedEngine<'_> {
     fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
         apply_scope(&mut op, &self.scope, &self.engine.schema)?;
-        render(&op, &self.engine.schema)
+        render_now(&op, &self.engine.schema, &Inputs::none())
     }
 
     /// Same as [`Engine::query`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = parse_and_lower(source, &vars, None, &self.engine.schema)?;
+        let op = self.engine.lower(source, &vars)?;
         let (sql, binds) = self.prepare(op)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped");
         crate::executor::execute(&self.engine.pool, &sql, &binds).await
@@ -267,6 +430,7 @@ impl ScopedEngine<'_> {
         let mut tc = ScopedTxClient {
             tx,
             schema: self.engine.schema.clone(),
+            parse_cache: self.engine.parse_cache.clone(),
             scope: self.scope.clone(),
         };
         match f(&mut tc).await {
@@ -287,20 +451,22 @@ impl ScopedEngine<'_> {
 pub struct ScopedTxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
+    parse_cache: Arc<ParseCache>,
     scope: ScopeSet,
 }
 
 impl ScopedTxClient {
     fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        render(&op, &self.schema)
+        render_now(&op, &self.schema, &Inputs::none())
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = parse_and_lower(source, &vars, None, &self.schema)?;
+        let doc = self.parse_cache.get(source)?;
+        let op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
         let (sql, binds) = self.prepare(op)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await

@@ -110,12 +110,78 @@ non-`json`/`jsonb` column is a validation error.
 ## Architecture
 
 ```
-[GraphQL string] ─┐
-                  ├─→ IR (Operation) ─→ SQL + binds ─→ PostgreSQL ─→ serde_json::Value
-[Rust builder]  ─┘
+[GraphQL string] ─→ parse ─┐
+                           ├─→ IR (Operation) ─→ SQL + bind specs ─→ PostgreSQL ─→ serde_json::Value
+[Rust builder]  ──────────ᐤ                            ↑
+                                          variables + principal bind here
 ```
 
 One SQL per request. All user values go through parameterized binds — there is no string interpolation of values. See `docs/superpowers/specs/2026-04-17-rust-hasura-orm-design.md` for the full design.
+
+Two things follow from where the arrows join:
+
+- **Parsing depends only on the query text**, so it is cached across requests
+  (`ParseCache`, 256 documents by default, keyed on the full source string).
+  It is ~70% of the per-request CPU: 18.9 µs → 4.0 µs on a moderately complex
+  query. `Engine::with_parse_cache_capacity(pool, schema, 0)` turns it off.
+- **Variables bind at the end, not during lowering**, so a query can be
+  compiled once and run many times — see below.
+
+## Compile once, execute many
+
+`Engine::compile` does everything that does not depend on the request —
+lowering, schema resolution, scope rewriting, SQL generation — and hands back a
+`CompiledQuery`. `Engine::execute` supplies the variables and runs it.
+
+```rust
+# use vision_graphql::{Engine, ScopePolicy, predicate::{col, principal, Principal}};
+# async fn example(engine: Engine, schema: vision_graphql::Schema) -> vision_graphql::error::Result<()> {
+// once, at startup
+let q = engine.compile(
+    "query($ids: [Int!], $n: Int!) { users(where: {id: {_in: $ids}}, limit: $n) { id name } }",
+)?;
+println!("{}", q.sql());          // stable — EXPLAIN it, log it, diff it in review
+assert_eq!(q.variables(), ["ids", "n"]);
+
+// per request — 43 ns of CPU before the query hits PostgreSQL
+let data = engine.execute(&q, Some(serde_json::json!({"ids": [1, 2], "n": 10}))).await?;
+
+// with a scope policy: one statement serves every principal
+let policy = ScopePolicy::builder()
+    .allow("orders", col("user_id").eq(principal()))
+    .validate(&schema)?;
+let scoped = engine.compile_scoped("{ orders { id } }", &policy)?;
+let mine = engine
+    .execute_scoped(&scoped, None, &Principal::new().set("principal", 7))
+    .await?;
+# let _ = (data, mine); Ok(()) }
+```
+
+The policy is applied *symbolically*: the compiled SQL carries the predicates,
+but which rows they admit is decided per request. A statement compiled with a
+policy refuses to run without a principal, and one compiled without a policy
+refuses to run with one — a principal that silently restricted nothing would be
+worse than an error.
+
+The point is not only the 18.9 µs saved. Compiling moves work that used to fail
+at request time to startup: unknown columns, literal type errors, and tables
+outside the policy all surface at `compile`, and the SQL becomes a stable
+artifact you can review, `EXPLAIN`, or hold in an allowlist of persisted
+queries.
+
+**What cannot be compiled.** A variable that decides the *shape* of the SQL
+rather than a value in it returns `Error::NotCompilable` naming the position:
+`where: $w`, `order_by: $o`, `distinct_on: $d`, `_is_null: $b`, and any
+variable inside an `insert` argument (a VALUES list's row count and column set
+come from the argument itself, so `objects: $rows` could never compile, and
+this first cut does not thread variables into written-out rows either).
+Everything else compiles: comparison values, `_in` lists including `_in: $ids`,
+`limit`/`offset`, `_by_pk` arguments, `update`'s `where` and `_set` values,
+`delete`'s `where`. Uncompilable queries still run through `Engine::query`,
+which is unchanged.
+
+A `CompiledQuery` runs on the pool, not inside `Engine::transaction` —
+mutations needing a transaction still go through `TxClient`.
 
 ## Building the schema
 

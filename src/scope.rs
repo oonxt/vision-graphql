@@ -455,7 +455,7 @@ mod tests {
         BoolExpr::Compare {
             column: col.into(),
             op: CmpOp::Eq,
-            value: json!(v),
+            value: json!(v).into(),
         }
     }
 
@@ -742,7 +742,7 @@ mod tests {
         let mut op = Operation::Mutation(vec![MutationField::UpdateByPk {
             alias: "update_posts_by_pk".into(),
             table: "posts".into(),
-            pk: vec![("id".into(), json!(1))],
+            pk: vec![("id".into(), json!(1).into())],
             set: std::collections::BTreeMap::new(),
             selection: Vec::new(),
             scope: None,
@@ -766,7 +766,7 @@ mod tests {
         let mut op = Operation::Mutation(vec![MutationField::DeleteByPk {
             alias: "delete_posts_by_pk".into(),
             table: "posts".into(),
-            pk: vec![("id".into(), json!(1))],
+            pk: vec![("id".into(), json!(1).into())],
             selection: Vec::new(),
             scope: None,
         }]);

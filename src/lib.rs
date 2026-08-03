@@ -45,12 +45,18 @@
 //! - GraphQL variables and fragments (named + inline)
 //! - Schema introspection plus TOML config overlays
 //! - Typed builder API equivalent to the GraphQL path
+//! - Compile once, execute many: [`Engine::compile`] renders the SQL ahead of
+//!   time and [`Engine::execute`] runs it with any variables — see
+//!   [`compiled`]. Parsing is cached across requests either way
+//!   ([`parse_cache`]).
 
 pub mod ast;
 pub mod builder;
+pub mod compiled;
 pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod parse_cache;
 pub mod parser;
 pub mod policy;
 pub mod predicate;
@@ -64,8 +70,10 @@ pub use builder::{
     AggregateBuilder, ByPkBuilder, DeleteBuilder, DeleteByPkBuilder, InsertBuilder, IntoOperation,
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,
 };
+pub use compiled::CompiledQuery;
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::Error;
+pub use parse_cache::ParseCache;
 pub use policy::{ScopePolicy, ScopePolicyBuilder, ScopeRule};
 pub use predicate::{and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr};
 pub use schema::Schema;
