@@ -102,7 +102,7 @@ fn eq(column: &str, v: i64) -> BoolExpr {
     BoolExpr::Compare {
         column: column.into(),
         op: CmpOp::Eq,
-        value: json!(v),
+        value: json!(v).into(),
     }
 }
 
@@ -402,7 +402,7 @@ async fn scoped_delete_cannot_remove_foreign_rows() {
                 .where_expr(BoolExpr::Compare {
                     column: "id".into(),
                     op: CmpOp::Gt,
-                    value: json!(0),
+                    value: json!(0).into(),
                 })
                 .returning(&["id"]),
         )
@@ -506,7 +506,7 @@ fn nested_insert_scope() -> ScopeSet {
         BoolExpr::Compare {
             column: "title".into(),
             op: CmpOp::Like,
-            value: json!("ok-%"),
+            value: json!("ok-%").into(),
         },
     )
 }

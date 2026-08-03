@@ -30,6 +30,11 @@ pub enum Error {
 
     #[error("scope: {0}")]
     Scope(String),
+
+    /// The query cannot be lowered without its variable values, so it cannot be
+    /// compiled once and reused. See [`crate::Engine::compile`].
+    #[error("not compilable at {path}: {message}")]
+    NotCompilable { path: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

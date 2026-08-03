@@ -84,6 +84,26 @@ impl ScopePolicy {
         Ok(set)
     }
 
+    /// A [`ScopeSet`] with every rule lowered but no principal substituted:
+    /// parameters stay as [`crate::ast::Val::ScopeParam`] for the request to
+    /// fill in.
+    ///
+    /// This is what [`crate::Engine::compile`] applies, so a compiled statement
+    /// carries the policy's predicates while still serving every principal.
+    /// Binding a principal at compile time instead would mint one statement per
+    /// tenant.
+    pub fn symbolic(&self) -> ScopeSet {
+        let mut set = ScopeSet::new();
+        for (table, rule) in &self.tables {
+            set = match rule {
+                ScopeRule::Allow(expr) => set.allow(table.clone(), expr.symbolic()),
+                ScopeRule::Unrestricted => set.unrestricted(table.clone()),
+                ScopeRule::Deny => set.deny(table.clone()),
+            };
+        }
+        set
+    }
+
     /// Convenience for single-key scopes: binds the `principal` parameter to
     /// `value`. Equivalent to `bind(&Principal::new().set("principal", value))`.
     pub fn bind_value(&self, value: impl Into<Value>) -> Result<ScopeSet> {

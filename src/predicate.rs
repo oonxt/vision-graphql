@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::ast::{BoolExpr, CmpOp};
+use crate::ast::{BoolExpr, CmpOp, Val};
 use crate::error::{Error, Result};
 
 /// A value position in a scope template: a literal, or a named parameter
@@ -231,6 +231,14 @@ impl Principal {
 }
 
 impl Operand {
+    /// This operand as a [`Val`], keeping parameters unresolved.
+    fn symbolic(&self) -> Val {
+        match self {
+            Operand::Lit(v) => Val::Lit(v.clone()),
+            Operand::Param(name) => Val::ScopeParam(name.clone()),
+        }
+    }
+
     fn resolve(&self, p: &Principal) -> Result<Value> {
         match self {
             Operand::Lit(v) => Ok(v.clone()),
@@ -261,7 +269,7 @@ impl ScopeExpr {
             ScopeExpr::Compare { column, op, value } => BoolExpr::Compare {
                 column: column.clone(),
                 op: *op,
-                value: value.resolve(p)?,
+                value: Val::Lit(value.resolve(p)?),
             },
             ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
                 column: column.clone(),
@@ -273,10 +281,52 @@ impl ScopeExpr {
                 negated,
             } => BoolExpr::InList {
                 column: column.clone(),
-                values: values.iter().map(|v| v.resolve(p)).collect::<Result<_>>()?,
+                values: Val::Lit(Value::Array(
+                    values
+                        .iter()
+                        .map(|v| v.resolve(p))
+                        .collect::<Result<Vec<_>>>()?,
+                )),
                 negated: *negated,
             },
         })
+    }
+
+    /// Lower this template *without* a principal, leaving each parameter as a
+    /// [`Val::ScopeParam`] for the request to supply.
+    ///
+    /// This is what lets a query be compiled against a policy rather than
+    /// against one caller: the predicate is baked into the SQL, but whose rows
+    /// it selects is still decided per request. Compiling per principal would
+    /// give every tenant its own copy of the same statement.
+    pub fn symbolic(&self) -> BoolExpr {
+        match self {
+            ScopeExpr::And(parts) => BoolExpr::And(parts.iter().map(Self::symbolic).collect()),
+            ScopeExpr::Or(parts) => BoolExpr::Or(parts.iter().map(Self::symbolic).collect()),
+            ScopeExpr::Not(inner) => BoolExpr::Not(Box::new(inner.symbolic())),
+            ScopeExpr::Relation { name, inner } => BoolExpr::Relation {
+                name: name.clone(),
+                inner: Box::new(inner.symbolic()),
+            },
+            ScopeExpr::Compare { column, op, value } => BoolExpr::Compare {
+                column: column.clone(),
+                op: *op,
+                value: value.symbolic(),
+            },
+            ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
+                column: column.clone(),
+                negated: *negated,
+            },
+            ScopeExpr::InList {
+                column,
+                values,
+                negated,
+            } => BoolExpr::InList {
+                column: column.clone(),
+                values: Val::Array(values.iter().map(Operand::symbolic).collect()).collapse(),
+                negated: *negated,
+            },
+        }
     }
 
     /// Resolve a placeholder-free template. Errors if any parameter remains —

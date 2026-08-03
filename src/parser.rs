@@ -1,7 +1,8 @@
 //! GraphQL string → IR.
 
 use crate::ast::{
-    BoolExpr, CmpOp, Field, NullsOrder, Operation, OrderBy, OrderDir, QueryArgs, RootField,
+    BoolExpr, CmpOp, Count, Field, NullsOrder, Operation, OrderBy, OrderDir, QueryArgs, RootField,
+    Val,
 };
 use crate::error::{Error, Result};
 use crate::schema::{Schema, Table};
@@ -24,12 +25,45 @@ pub fn parse_and_lower(
     operation_name: Option<&str>,
     schema: &Schema,
 ) -> Result<Operation> {
-    let doc = parse_query(source).map_err(|e| Error::Parse(e.to_string()))?;
+    let doc = parse_document(source)?;
+    lower(&doc, variables, operation_name, schema)
+}
+
+/// Parse GraphQL text into a document. Depends on nothing but the text, which
+/// is what makes it cacheable — see [`crate::parse_cache`].
+pub fn parse_document(source: &str) -> Result<ExecutableDocument> {
+    parse_query(source).map_err(|e| Error::Parse(e.to_string()))
+}
+
+/// Lower an already-parsed document to the IR.
+///
+/// Split out from [`parse_and_lower`] so a parsed document can be reused
+/// across requests: parsing depends only on the source text, while lowering
+/// depends on this request's `variables`. See [`crate::parse_cache`].
+#[tracing::instrument(level = "trace", skip_all)]
+pub fn lower(
+    doc: &ExecutableDocument,
+    variables: &Value,
+    operation_name: Option<&str>,
+    schema: &Schema,
+) -> Result<Operation> {
+    lower_with(doc, Bindings::Eager(variables), operation_name, schema)
+}
+
+/// Lower under an explicit [`Bindings`] mode. `Symbolic` keeps variables
+/// unresolved so the result can be rendered once and reused.
+#[tracing::instrument(level = "trace", skip_all)]
+pub fn lower_with(
+    doc: &ExecutableDocument,
+    variables: Bindings<'_>,
+    operation_name: Option<&str>,
+    schema: &Schema,
+) -> Result<Operation> {
     let mut fragments: Fragments<'_> = HashMap::new();
     for (name, def) in &doc.fragments {
         fragments.insert(name.as_str().to_string(), &def.node);
     }
-    let op = pick_operation(&doc, operation_name)?;
+    let op = pick_operation(doc, operation_name)?;
     match op.ty {
         OperationType::Query => lower_query(op.selection_set, schema, variables, &fragments),
         OperationType::Mutation => lower_mutation(op.selection_set, schema, variables, &fragments),
@@ -77,7 +111,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
 fn lower_query(
     set: &SelectionSet,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     fragments: &Fragments<'_>,
 ) -> Result<Operation> {
     let mut roots = Vec::new();
@@ -145,7 +179,7 @@ fn lower_query(
                                 ),
                             });
                         }
-                        let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+                        let mut pk: Vec<(String, Val)> = Vec::new();
                         for pk_col in &table.primary_key {
                             let found = field
                                 .arguments
@@ -157,9 +191,9 @@ fn lower_query(
                                     "required primary key argument '{pk_col}' missing"
                                 ),
                             })?;
-                            let json =
-                                gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
-                            pk.push((pk_col.clone(), json));
+                            let val =
+                                gql_to_val(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
+                            pk.push((pk_col.clone(), val));
                         }
                         let selection = lower_selection_set(
                             &field.selection_set.node,
@@ -208,7 +242,7 @@ fn lower_query(
 fn lower_mutation(
     set: &SelectionSet,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     fragments: &Fragments<'_>,
 ) -> Result<Operation> {
     let mut fields: Vec<crate::ast::MutationField> = Vec::new();
@@ -278,7 +312,7 @@ fn lower_mutation_field(
     alias: &str,
     field: &GqlField,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     fragments: &Fragments<'_>,
 ) -> Result<crate::ast::MutationField> {
     use crate::ast::MutationField;
@@ -410,7 +444,7 @@ fn lower_mutation_field(
                         ),
                     });
                 }
-                let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+                let mut pk: Vec<(String, Val)> = Vec::new();
                 for pk_col in &table.primary_key {
                     let found = field
                         .arguments
@@ -420,8 +454,8 @@ fn lower_mutation_field(
                         path: alias.into(),
                         message: format!("required primary key argument '{pk_col}' missing"),
                     })?;
-                    let json = gql_to_json(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
-                    pk.push((pk_col.clone(), json));
+                    let val = gql_to_val(&value_p.node, vars, &format!("{alias}.{pk_col}"))?;
+                    pk.push((pk_col.clone(), val));
                 }
                 let selection = lower_selection_set(
                     &field.selection_set.node,
@@ -451,11 +485,11 @@ fn lower_mutation_field(
                 let aname = name_p.node.as_str();
                 let v = &value_p.node;
                 if aname == "where" {
-                    let json = gql_to_json(v, vars, &format!("{alias}.where"))?;
                     where_ = Some(lower_where(
-                        &json,
+                        v,
                         table,
                         schema,
+                        vars,
                         &format!("{alias}.where"),
                     )?);
                 } else {
@@ -497,7 +531,7 @@ fn parse_insert_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
     single: bool,
 ) -> Result<(
@@ -645,14 +679,14 @@ fn parse_insert_object(
         message: "expected object".into(),
     })?;
 
-    let mut columns: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut columns: BTreeMap<String, Val> = BTreeMap::new();
     let mut nested_arrays: BTreeMap<String, crate::ast::NestedArrayInsert> = BTreeMap::new();
     let mut nested_objects: BTreeMap<String, crate::ast::NestedObjectInsert> = BTreeMap::new();
 
     for (k, v) in obj {
         // Try column first.
         if table.find_column(k).is_some() {
-            columns.insert(k.clone(), v.clone());
+            columns.insert(k.clone(), Val::Lit(v.clone()));
             continue;
         }
 
@@ -859,20 +893,28 @@ fn parse_insert_object(
     })
 }
 
-/// Validate that every key in `json` is a known column on `table` and return
-/// a plain column map.  Used by the update helpers which do not support
-/// nested relations.
-fn json_object_to_map(
-    json: &Value,
+/// Validate that every key of an `_set`-shaped object is a known column on
+/// `table` and return the column map. Used by the update helpers, which do not
+/// support nested relations.
+///
+/// The *keys* are structure — they become the SET list of the UPDATE — so an
+/// object supplied wholesale as `$set` has to be known when lowering. The
+/// values are ordinary value positions and may stay symbolic.
+fn gql_object_to_val_map(
+    value: &GqlValue,
     table: &Table,
+    vars: Bindings<'_>,
     path: &str,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+) -> Result<std::collections::BTreeMap<String, Val>> {
     use std::collections::BTreeMap;
-    let obj = json.as_object().ok_or_else(|| Error::Validate {
-        path: path.into(),
-        message: "expected object".into(),
-    })?;
-    let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let value = structural(value, vars, path)?;
+    let GqlValue::Object(obj) = value.as_ref() else {
+        return Err(Error::Validate {
+            path: path.into(),
+            message: "expected object".into(),
+        });
+    };
+    let mut out: BTreeMap<String, Val> = BTreeMap::new();
     for (k, v) in obj {
         if table.find_column(k).is_none() {
             return Err(Error::Validate {
@@ -880,7 +922,7 @@ fn json_object_to_map(
                 message: format!("unknown column '{k}' on '{}'", table.exposed_name),
             });
         }
-        out.insert(k.clone(), v.clone());
+        out.insert(k.to_string(), gql_to_val(v, vars, &format!("{path}.{k}"))?);
     }
     if out.is_empty() {
         return Err(Error::Validate {
@@ -928,9 +970,12 @@ fn parse_on_conflict(json: &Value, table: &Table, path: &str) -> Result<crate::a
         .get("where")
         .map(|w| {
             lower_where(
-                w,
+                &json_to_gql(w),
                 table,
                 &Schema::builder().build(),
+                // `w` came from `gql_to_json`, so every variable in it is
+                // already substituted and the mode cannot matter.
+                Bindings::Eager(&Value::Null),
                 &format!("{path}.where"),
             )
         })
@@ -946,31 +991,30 @@ fn parse_update_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
 ) -> Result<(
     crate::ast::BoolExpr,
-    std::collections::BTreeMap<String, serde_json::Value>,
+    std::collections::BTreeMap<String, Val>,
 )> {
     use std::collections::BTreeMap;
     let mut where_: Option<crate::ast::BoolExpr> = None;
-    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut set: BTreeMap<String, Val> = BTreeMap::new();
     for (name_p, value_p) in args {
         let aname = name_p.node.as_str();
         let v = &value_p.node;
         match aname {
             "where" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}.where"))?;
                 where_ = Some(lower_where(
-                    &json,
+                    v,
                     table,
                     schema,
+                    vars,
                     &format!("{parent_path}.where"),
                 )?);
             }
             "_set" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
-                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+                set = gql_object_to_val_map(v, table, vars, &format!("{parent_path}._set"))?;
             }
             other => {
                 return Err(Error::Validate {
@@ -997,30 +1041,36 @@ fn parse_update_args(
 fn parse_update_by_pk_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
-) -> Result<(
-    Vec<(String, serde_json::Value)>,
-    std::collections::BTreeMap<String, serde_json::Value>,
-)> {
+) -> Result<(Vec<(String, Val)>, std::collections::BTreeMap<String, Val>)> {
     use std::collections::BTreeMap;
-    let mut pk_obj: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut set: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut pk_obj: Option<std::collections::BTreeMap<String, Val>> = None;
+    let mut set: BTreeMap<String, Val> = BTreeMap::new();
     for (name_p, value_p) in args {
         let aname = name_p.node.as_str();
         let v = &value_p.node;
         match aname {
             "pk_columns" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}.pk_columns"))?;
-                let obj = json.as_object().ok_or_else(|| Error::Validate {
-                    path: format!("{parent_path}.pk_columns"),
-                    message: "expected object".into(),
-                })?;
-                pk_obj = Some(obj.clone());
+                let path = format!("{parent_path}.pk_columns");
+                let obj = structural(v, vars, &path)?;
+                let GqlValue::Object(kv) = obj.as_ref() else {
+                    return Err(Error::Validate {
+                        path,
+                        message: "expected object".into(),
+                    });
+                };
+                let mut map = std::collections::BTreeMap::new();
+                for (k, val) in kv {
+                    map.insert(
+                        k.to_string(),
+                        gql_to_val(val, vars, &format!("{path}.{k}"))?,
+                    );
+                }
+                pk_obj = Some(map);
             }
             "_set" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}._set"))?;
-                set = json_object_to_map(&json, table, &format!("{parent_path}._set"))?;
+                set = gql_object_to_val_map(v, table, vars, &format!("{parent_path}._set"))?;
             }
             other => {
                 return Err(Error::Validate {
@@ -1040,7 +1090,7 @@ fn parse_update_by_pk_args(
             message: "update_by_pk requires non-empty '_set'".into(),
         });
     }
-    let mut pk: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut pk: Vec<(String, Val)> = Vec::new();
     for pk_col in &table.primary_key {
         let v = pk_obj.get(pk_col).ok_or_else(|| Error::Validate {
             path: format!("{parent_path}.pk_columns.{pk_col}"),
@@ -1055,7 +1105,7 @@ fn parse_returning(
     set: &SelectionSet,
     table: &Table,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     fragments: &Fragments<'_>,
     parent_path: &str,
 ) -> Result<Vec<Field>> {
@@ -1095,7 +1145,7 @@ fn lower_selection_set(
     set: &SelectionSet,
     table: &Table,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     fragments: &Fragments<'_>,
     parent_path: &str,
 ) -> Result<Vec<Field>> {
@@ -1202,7 +1252,7 @@ fn lower_scalar_field(
     arguments: &[(Positioned<Name>, Positioned<GqlValue>)],
     col: &crate::schema::Column,
     alias: String,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
 ) -> Result<Field> {
     let mut path_value: Option<&GqlValue> = None;
@@ -1267,7 +1317,7 @@ fn lower_args(
     args: &[(Positioned<Name>, Positioned<GqlValue>)],
     table: &Table,
     schema: &Schema,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
 ) -> Result<QueryArgs> {
     let mut out = QueryArgs::default();
@@ -1276,11 +1326,11 @@ fn lower_args(
         let v = &value_p.node;
         match name {
             "where" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}.where"))?;
                 out.where_ = Some(lower_where(
-                    &json,
+                    v,
                     table,
                     schema,
+                    vars,
                     &format!("{parent_path}.where"),
                 )?);
             }
@@ -1289,10 +1339,10 @@ fn lower_args(
                     lower_order_by(v, vars, &format!("{parent_path}.order_by"), table, schema)?;
             }
             "limit" => {
-                out.limit = Some(gql_u64(v, vars, &format!("{parent_path}.limit"))?);
+                out.limit = Some(gql_count(v, vars, &format!("{parent_path}.limit"))?);
             }
             "offset" => {
-                out.offset = Some(gql_u64(v, vars, &format!("{parent_path}.offset"))?);
+                out.offset = Some(gql_count(v, vars, &format!("{parent_path}.offset"))?);
             }
             "distinct_on" => {
                 let json = gql_to_json(v, vars, &format!("{parent_path}.distinct_on"))?;
@@ -1327,48 +1377,58 @@ fn lower_args(
     Ok(out)
 }
 
+/// Lower a Hasura-style `where` argument.
+///
+/// Walks the GraphQL value rather than a pre-substituted JSON one, because that
+/// is where variables still exist: a variable in a *value* position becomes a
+/// [`Val::Var`], while a variable standing in for structure (`where: $w`,
+/// `_is_null: $b`) is resolved through [`structural`] and so is only allowed
+/// when its value is already known.
 pub(crate) fn lower_where(
-    json: &Value,
+    value: &GqlValue,
     table: &Table,
     schema: &Schema,
+    vars: Bindings<'_>,
     path: &str,
 ) -> Result<BoolExpr> {
-    let obj = json.as_object().ok_or_else(|| Error::Validate {
-        path: path.into(),
-        message: "expected object".into(),
-    })?;
+    let value = structural(value, vars, path)?;
+    let GqlValue::Object(obj) = value.as_ref() else {
+        return Err(Error::Validate {
+            path: path.into(),
+            message: "expected object".into(),
+        });
+    };
     let mut parts: Vec<BoolExpr> = Vec::new();
     for (k, v) in obj {
         match k.as_str() {
-            "_and" => {
-                let arr = v.as_array().ok_or_else(|| Error::Validate {
-                    path: format!("{path}._and"),
-                    message: "expected array".into(),
-                })?;
-                let inner: Result<Vec<BoolExpr>> = arr
+            "_and" | "_or" => {
+                let key = k.as_str();
+                let list = structural(v, vars, &format!("{path}.{key}"))?;
+                let GqlValue::List(items) = list.as_ref() else {
+                    return Err(Error::Validate {
+                        path: format!("{path}.{key}"),
+                        message: "expected array".into(),
+                    });
+                };
+                let inner: Result<Vec<BoolExpr>> = items
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| lower_where(x, table, schema, &format!("{path}._and[{i}]")))
+                    .map(|(i, x)| {
+                        lower_where(x, table, schema, vars, &format!("{path}.{key}[{i}]"))
+                    })
                     .collect();
-                parts.push(BoolExpr::And(inner?));
-            }
-            "_or" => {
-                let arr = v.as_array().ok_or_else(|| Error::Validate {
-                    path: format!("{path}._or"),
-                    message: "expected array".into(),
-                })?;
-                let inner: Result<Vec<BoolExpr>> = arr
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| lower_where(x, table, schema, &format!("{path}._or[{i}]")))
-                    .collect();
-                parts.push(BoolExpr::Or(inner?));
+                parts.push(if key == "_and" {
+                    BoolExpr::And(inner?)
+                } else {
+                    BoolExpr::Or(inner?)
+                });
             }
             "_not" => {
                 parts.push(BoolExpr::Not(Box::new(lower_where(
                     v,
                     table,
                     schema,
+                    vars,
                     &format!("{path}._not"),
                 )?)));
             }
@@ -1384,7 +1444,8 @@ pub(crate) fn lower_where(
                                     rel.target_table
                                 ),
                             })?;
-                    let inner = lower_where(v, target, schema, &format!("{path}.{col_name}"))?;
+                    let inner =
+                        lower_where(v, target, schema, vars, &format!("{path}.{col_name}"))?;
                     parts.push(BoolExpr::Relation {
                         name: col_name.to_string(),
                         inner: Box::new(inner),
@@ -1396,101 +1457,76 @@ pub(crate) fn lower_where(
                     path: format!("{path}.{col_name}"),
                     message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
                 })?;
-                let op_obj = v.as_object().ok_or_else(|| Error::Validate {
-                    path: format!("{path}.{col_name}"),
-                    message: "expected operator object".into(),
-                })?;
+                let ops = structural(v, vars, &format!("{path}.{col_name}"))?;
+                let GqlValue::Object(op_obj) = ops.as_ref() else {
+                    return Err(Error::Validate {
+                        path: format!("{path}.{col_name}"),
+                        message: "expected operator object".into(),
+                    });
+                };
                 for (op_name, op_val) in op_obj {
-                    match op_name.as_str() {
-                        "_eq" => parts.push(BoolExpr::Compare {
+                    let op_path = || format!("{path}.{col_name}.{op_name}");
+                    let cmp = |op: CmpOp, v: &GqlValue| -> Result<BoolExpr> {
+                        Ok(BoolExpr::Compare {
                             column: col.exposed_name.clone(),
-                            op: CmpOp::Eq,
-                            value: op_val.clone(),
-                        }),
-                        "_neq" => parts.push(BoolExpr::Compare {
+                            op,
+                            value: gql_to_val(v, vars, &op_path())?,
+                        })
+                    };
+                    let in_list = |negated: bool, v: &GqlValue| -> Result<BoolExpr> {
+                        let values = gql_to_val(v, vars, &op_path())?;
+                        // A written-out list must be a list; `_in: $ids` is
+                        // checked when the request supplies it.
+                        if let Val::Lit(lit) = &values {
+                            if !lit.is_array() {
+                                return Err(Error::Validate {
+                                    path: op_path(),
+                                    message: "expected array".into(),
+                                });
+                            }
+                        }
+                        Ok(BoolExpr::InList {
                             column: col.exposed_name.clone(),
-                            op: CmpOp::Neq,
-                            value: op_val.clone(),
-                        }),
-                        "_gt" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::Gt,
-                            value: op_val.clone(),
-                        }),
-                        "_gte" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::Gte,
-                            value: op_val.clone(),
-                        }),
-                        "_lt" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::Lt,
-                            value: op_val.clone(),
-                        }),
-                        "_lte" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::Lte,
-                            value: op_val.clone(),
-                        }),
-                        "_like" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::Like,
-                            value: op_val.clone(),
-                        }),
-                        "_ilike" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::ILike,
-                            value: op_val.clone(),
-                        }),
-                        "_nlike" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::NLike,
-                            value: op_val.clone(),
-                        }),
-                        "_nilike" => parts.push(BoolExpr::Compare {
-                            column: col.exposed_name.clone(),
-                            op: CmpOp::NILike,
-                            value: op_val.clone(),
-                        }),
+                            values,
+                            negated,
+                        })
+                    };
+                    let part = match op_name.as_str() {
+                        "_eq" => cmp(CmpOp::Eq, op_val)?,
+                        "_neq" => cmp(CmpOp::Neq, op_val)?,
+                        "_gt" => cmp(CmpOp::Gt, op_val)?,
+                        "_gte" => cmp(CmpOp::Gte, op_val)?,
+                        "_lt" => cmp(CmpOp::Lt, op_val)?,
+                        "_lte" => cmp(CmpOp::Lte, op_val)?,
+                        "_like" => cmp(CmpOp::Like, op_val)?,
+                        "_ilike" => cmp(CmpOp::ILike, op_val)?,
+                        "_nlike" => cmp(CmpOp::NLike, op_val)?,
+                        "_nilike" => cmp(CmpOp::NILike, op_val)?,
+                        // `_is_null` picks between `IS NULL` and `IS NOT NULL`,
+                        // so its value is structure, not a bound parameter.
                         "_is_null" => {
-                            let b = op_val.as_bool().ok_or_else(|| Error::Validate {
-                                path: format!("{path}.{col_name}._is_null"),
-                                message: "expected boolean".into(),
-                            })?;
-                            parts.push(BoolExpr::IsNull {
+                            let b = structural(op_val, vars, &op_path())?;
+                            let GqlValue::Boolean(b) = b.as_ref() else {
+                                return Err(Error::Validate {
+                                    path: op_path(),
+                                    message: "expected boolean".into(),
+                                });
+                            };
+                            BoolExpr::IsNull {
                                 column: col.exposed_name.clone(),
                                 negated: !b,
-                            });
+                            }
                         }
-                        "_in" => {
-                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
-                                path: format!("{path}.{col_name}._in"),
-                                message: "expected array".into(),
-                            })?;
-                            parts.push(BoolExpr::InList {
-                                column: col.exposed_name.clone(),
-                                values: arr.clone(),
-                                negated: false,
-                            });
-                        }
-                        "_nin" => {
-                            let arr = op_val.as_array().ok_or_else(|| Error::Validate {
-                                path: format!("{path}.{col_name}._nin"),
-                                message: "expected array".into(),
-                            })?;
-                            parts.push(BoolExpr::InList {
-                                column: col.exposed_name.clone(),
-                                values: arr.clone(),
-                                negated: true,
-                            });
-                        }
+                        "_in" => in_list(false, op_val)?,
+                        "_nin" => in_list(true, op_val)?,
                         other => {
                             return Err(Error::Validate {
                                 path: format!("{path}.{col_name}"),
                                 message: format!("unsupported operator '{other}'"),
                             });
                         }
-                    }
+                    };
+                    parts.push(part);
                 }
             }
         }
@@ -1504,7 +1540,7 @@ pub(crate) fn lower_where(
 
 fn lower_order_by(
     v: &GqlValue,
-    vars: &Value,
+    vars: Bindings<'_>,
     path: &str,
     table: &Table,
     schema: &Schema,
@@ -1636,16 +1672,23 @@ fn lower_order_by_entry(
     Ok(())
 }
 
-fn gql_u64(v: &GqlValue, vars: &Value, path: &str) -> Result<u64> {
+/// Lower a `limit` / `offset`. A variable stays a variable: the count is a
+/// bound parameter, not part of the statement's shape.
+fn gql_count(v: &GqlValue, vars: Bindings<'_>, path: &str) -> Result<Count> {
+    if let (GqlValue::Variable(name), Bindings::Symbolic) = (v, vars) {
+        return Ok(Count::Var(name.as_str().to_string()));
+    }
     let json = gql_to_json(v, vars, path)?;
-    json.as_u64().ok_or_else(|| Error::Validate {
-        path: path.into(),
-        message: "expected non-negative integer".into(),
-    })
+    json.as_u64()
+        .map(Count::Lit)
+        .ok_or_else(|| Error::Validate {
+            path: path.into(),
+            message: "expected non-negative integer".into(),
+        })
 }
 
 /// Convert a GraphQL value to JSON, resolving variable references from `vars`.
-fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
+fn gql_to_json(v: &GqlValue, vars: Bindings<'_>, path: &str) -> Result<Value> {
     match v {
         GqlValue::Null => Ok(Value::Null),
         GqlValue::Number(n) => serde_json::to_value(n).map_err(|e| Error::Parse(e.to_string())),
@@ -1669,21 +1712,126 @@ fn gql_to_json(v: &GqlValue, vars: &Value, path: &str) -> Result<Value> {
             }
             Ok(Value::Object(out))
         }
-        GqlValue::Variable(name) => {
-            let nm = name.as_str();
-            vars.get(nm).cloned().ok_or_else(|| Error::Variable {
-                name: nm.to_string(),
-                message: "not bound".into(),
-            })
-        }
+        GqlValue::Variable(name) => vars.require_value(name.as_str(), path).cloned(),
         GqlValue::Binary(_) => Err(Error::Parse("binary literals not supported".into())),
+    }
+}
+
+/// How lowering treats `$variables`.
+///
+/// The two modes produce the same IR shape; they differ only in what happens at
+/// a variable. Eager lowering has the values in hand and substitutes them, so
+/// the IR it produces is specific to one request. Symbolic lowering keeps them
+/// as names, so the IR — and the SQL rendered from it — is reusable across
+/// requests; the price is that a variable in a position that decides the
+/// *shape* of the SQL cannot be lowered at all.
+#[derive(Clone, Copy)]
+pub enum Bindings<'a> {
+    /// Substitute from this request's variables while lowering.
+    Eager(&'a Value),
+    /// Leave variables as [`Val::Var`] for the request to fill in.
+    Symbolic,
+}
+
+impl<'a> Bindings<'a> {
+    /// Value of `$name`, for a position that needs it *now*.
+    ///
+    /// Under [`Bindings::Symbolic`] this is exactly the case that cannot be
+    /// compiled: the caller is about to branch on the value, so leaving it
+    /// symbolic would mean the rendered SQL depended on it.
+    fn require_value(&self, name: &str, path: &str) -> Result<&'a Value> {
+        match self {
+            Bindings::Eager(vars) => vars.get(name).ok_or_else(|| Error::Variable {
+                name: name.to_string(),
+                message: "not bound".into(),
+            }),
+            Bindings::Symbolic => Err(Error::NotCompilable {
+                path: path.to_string(),
+                message: format!(
+                    "'${name}' decides the shape of the SQL here, so it cannot be left \
+                     to execution time; move it to a value position or run this query \
+                     with Engine::query instead"
+                ),
+            }),
+        }
+    }
+}
+
+/// Prepare a value that lowering is about to *walk into* rather than store.
+///
+/// A variable standing in for a whole `where` object, list of rows, or argument
+/// object is fine when its value is already known — the walk simply continues
+/// through the substituted value. It is not fine symbolically, because the
+/// structure being walked is what the SQL is generated from.
+fn structural<'v>(
+    v: &'v GqlValue,
+    vars: Bindings<'_>,
+    path: &str,
+) -> Result<std::borrow::Cow<'v, GqlValue>> {
+    match v {
+        GqlValue::Variable(name) => {
+            let json = vars.require_value(name.as_str(), path)?;
+            Ok(std::borrow::Cow::Owned(json_to_gql(json)))
+        }
+        other => Ok(std::borrow::Cow::Borrowed(other)),
+    }
+}
+
+/// Lower a value position: a variable here becomes a [`Val::Var`] under
+/// symbolic lowering, and is substituted under eager lowering.
+fn gql_to_val(v: &GqlValue, vars: Bindings<'_>, path: &str) -> Result<Val> {
+    let val = match v {
+        GqlValue::Variable(name) => match vars {
+            Bindings::Symbolic => Val::Var(name.as_str().to_string()),
+            Bindings::Eager(_) => Val::Lit(vars.require_value(name.as_str(), path)?.clone()),
+        },
+        GqlValue::List(xs) => {
+            let mut items = Vec::with_capacity(xs.len());
+            for (i, x) in xs.iter().enumerate() {
+                items.push(gql_to_val(x, vars, &format!("{path}[{i}]"))?);
+            }
+            Val::Array(items)
+        }
+        GqlValue::Object(kv) => {
+            let mut items = Vec::with_capacity(kv.len());
+            for (k, val) in kv {
+                items.push((
+                    k.to_string(),
+                    gql_to_val(val, vars, &format!("{path}.{k}"))?,
+                ));
+            }
+            Val::Object(items)
+        }
+        scalar => Val::Lit(gql_to_json(scalar, vars, path)?),
+    };
+    // Collapse a composite with no variables in it back to a plain literal, so
+    // downstream code sees the same `Val::Lit` it would have seen before.
+    Ok(val.collapse())
+}
+
+/// Convert JSON back into a (variable-free) GraphQL value, so a substituted
+/// variable can be walked by the same code that walks a written-out literal.
+pub(crate) fn json_to_gql(v: &Value) -> GqlValue {
+    match v {
+        Value::Null => GqlValue::Null,
+        Value::Bool(b) => GqlValue::Boolean(*b),
+        // `async_graphql_value::Number` is a re-export of serde_json's, so this
+        // is a move, not a reparse.
+        Value::Number(n) => GqlValue::Number(n.clone()),
+        Value::String(s) => GqlValue::String(s.clone()),
+        Value::Array(xs) => GqlValue::List(xs.iter().map(json_to_gql).collect()),
+        Value::Object(kv) => GqlValue::Object(
+            kv.iter()
+                .map(|(k, v)| (Name::new(k), json_to_gql(v)))
+                .collect(),
+        ),
     }
 }
 
 fn lower_aggregate_selection(
     set: &SelectionSet,
     table: &Table,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
 ) -> Result<(Vec<crate::ast::AggOp>, Option<Vec<Field>>)> {
     let mut ops: Vec<crate::ast::AggOp> = Vec::new();
@@ -1771,7 +1919,7 @@ fn lower_aggregate_selection(
 fn lower_selection_columns_only(
     set: &SelectionSet,
     table: &Table,
-    vars: &Value,
+    vars: Bindings<'_>,
     parent_path: &str,
 ) -> Result<Vec<Field>> {
     let mut out = Vec::new();
@@ -1977,7 +2125,7 @@ mod tests {
             panic!("expected Query");
         };
         let args = &roots[0].args;
-        assert_eq!(args.limit, Some(10));
+        assert_eq!(args.limit, Some(Count::Lit(10)));
         match args.where_.as_ref().unwrap() {
             crate::ast::BoolExpr::Compare { column, op, value } => {
                 assert_eq!(column, "id");
@@ -2069,7 +2217,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "posts");
-                assert_eq!(args.limit, Some(3));
+                assert_eq!(args.limit, Some(Count::Lit(3)));
                 assert_eq!(selection.len(), 1);
             }
             _ => panic!("expected Relation"),
@@ -2281,7 +2429,10 @@ mod tests {
                 negated,
             } => {
                 assert_eq!(column, "id");
-                assert_eq!(values.len(), 3);
+                assert_eq!(
+                    values.as_lit().and_then(|v| v.as_array()).map(Vec::len),
+                    Some(3)
+                );
                 assert!(!negated);
             }
             _ => panic!("expected InList"),

@@ -52,3 +52,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "sql_render"
 harness = false
+
+[[bench]]
+name = "compile_vs_query"
+harness = false

@@ -1,8 +1,183 @@
-//! PostgreSQL ↔ JSON type mapping.
+//! PostgreSQL ↔ JSON type mapping, and the deferred form of a bound parameter.
 
+use crate::ast::Val;
 use crate::error::{Error, Result};
+use crate::predicate::Principal;
 use crate::schema::PgType;
 use serde_json::Value;
+
+/// Everything a rendered statement needs to turn its [`BindSpec`]s into
+/// [`Bind`]s: this request's GraphQL variables and its principal.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs<'a> {
+    variables: Option<&'a Value>,
+    principal: Option<&'a Principal>,
+}
+
+/// The empty variables object, so `Inputs::none()` can hand out a `&Value`.
+static NO_VARIABLES: Value = Value::Null;
+
+impl<'a> Inputs<'a> {
+    /// No variables and no principal — the shape an eagerly-lowered operation
+    /// needs, since every value in it is already a literal.
+    pub fn none() -> Self {
+        Inputs {
+            variables: None,
+            principal: None,
+        }
+    }
+
+    /// Variables for this request. `variables` should be a JSON object.
+    pub fn variables(variables: &'a Value) -> Self {
+        Inputs {
+            variables: Some(variables),
+            principal: None,
+        }
+    }
+
+    /// Attach the principal whose parameters back [`Val::ScopeParam`].
+    pub fn with_principal(mut self, principal: &'a Principal) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
+    fn vars(&self) -> &'a Value {
+        self.variables.unwrap_or(&NO_VARIABLES)
+    }
+
+    /// Value of GraphQL variable `name`. Unbound is an error rather than null:
+    /// silently treating a missing variable as null turns a client mistake into
+    /// a query that runs and returns the wrong rows.
+    pub fn variable(&self, name: &str) -> Result<&'a Value> {
+        self.vars().get(name).ok_or_else(|| Error::Variable {
+            name: name.to_string(),
+            message: "not bound".into(),
+        })
+    }
+
+    /// Value of scope parameter `name`, from the principal.
+    pub fn scope_param(&self, name: &str) -> Result<&'a Value> {
+        self.principal
+            .and_then(|p| p.get(name))
+            .ok_or_else(|| Error::Validate {
+                path: format!("principal.{name}"),
+                message: format!("scope parameter '{name}' not supplied"),
+            })
+    }
+}
+
+/// A bound parameter that may not be known yet.
+///
+/// [`crate::sql::render`] emits one of these per placeholder. Anything the query
+/// text alone determines is converted right there and stored as [`Fixed`], so a
+/// literal's type error surfaces when the query is compiled rather than on the
+/// request that happens to run it. Only genuinely per-request values stay
+/// symbolic.
+///
+/// [`Fixed`]: BindSpec::Fixed
+#[derive(Debug, Clone)]
+pub enum BindSpec {
+    /// Already converted: a literal, or a value the renderer synthesised.
+    Fixed(Bind),
+    /// A scalar column value.
+    Scalar {
+        val: Val,
+        pg: PgType,
+        /// Error path, e.g. `where.user_id`.
+        path: String,
+    },
+    /// An `_in` / `_nin` list, resolving to a JSON array.
+    Array { val: Val, pg: PgType, path: String },
+    /// A `limit` / `offset` supplied as a variable.
+    Count {
+        val: crate::ast::Count,
+        path: String,
+    },
+}
+
+impl BindSpec {
+    /// Convert `val` now when it is a literal, so errors are caught at render
+    /// time; otherwise keep it for the request that supplies the value.
+    pub(crate) fn scalar(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        match val.as_lit() {
+            Some(v) => {
+                let path = path();
+                json_to_bind(v, pg)
+                    .map(BindSpec::Fixed)
+                    .map_err(|e| Error::Validate {
+                        path,
+                        message: format!("{e}"),
+                    })
+            }
+            None => Ok(BindSpec::Scalar {
+                val,
+                pg: pg.clone(),
+                path: path(),
+            }),
+        }
+    }
+
+    /// Same as [`BindSpec::scalar`] for an `_in` / `_nin` list.
+    pub(crate) fn array(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        if val.is_lit() {
+            let path = path();
+            let no_inputs = Inputs::none();
+            let resolved = val.resolve(&no_inputs).map_err(|e| Error::Validate {
+                path: path.clone(),
+                message: format!("{e}"),
+            })?;
+            return bind_array(&resolved, pg, &path).map(BindSpec::Fixed);
+        }
+        Ok(BindSpec::Array {
+            val,
+            pg: pg.clone(),
+            path: path(),
+        })
+    }
+
+    /// Resolve to a concrete parameter for this request.
+    pub fn resolve(&self, inputs: &Inputs<'_>) -> Result<Bind> {
+        match self {
+            BindSpec::Fixed(b) => Ok(b.clone()),
+            BindSpec::Scalar { val, pg, path } => {
+                let v = val.resolve(inputs)?;
+                json_to_bind(&v, pg).map_err(|e| Error::Validate {
+                    path: path.clone(),
+                    message: format!("{e}"),
+                })
+            }
+            BindSpec::Array { val, pg, path } => {
+                let v = val.resolve(inputs)?;
+                bind_array(&v, pg, path)
+            }
+            BindSpec::Count { val, path } => {
+                let n = val.resolve(inputs, path)?;
+                i64::try_from(n)
+                    .map(Bind::Int8)
+                    .map_err(|_| Error::Validate {
+                        path: path.clone(),
+                        message: format!("{n} is too large"),
+                    })
+            }
+        }
+    }
+}
+
+fn bind_array(v: &Value, pg: &PgType, path: &str) -> Result<Bind> {
+    let items = v.as_array().ok_or_else(|| Error::Validate {
+        path: path.to_string(),
+        message: format!("expected a list, got {v}"),
+    })?;
+    json_to_bind_array(items, pg).map_err(|e| Error::Validate {
+        path: path.to_string(),
+        message: format!("{e}"),
+    })
+}
+
+/// Resolve a rendered statement's parameters in placeholder order.
+pub fn resolve_binds(specs: &[BindSpec], inputs: &Inputs<'_>) -> Result<Vec<Bind>> {
+    specs.iter().map(|s| s.resolve(inputs)).collect()
+}
 
 /// A single bound parameter ready to pass to sqlx.
 ///

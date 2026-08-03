@@ -1,5 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use vision_graphql::ast::{BoolExpr, CmpOp, Field, Operation, QueryArgs, RootBody, RootField};
+use vision_graphql::ast::{
+    BoolExpr, CmpOp, Count, Field, Operation, QueryArgs, RootBody, RootField,
+};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::sql::render;
 
@@ -32,9 +34,9 @@ fn moderately_complex_query() -> Operation {
             where_: Some(BoolExpr::Compare {
                 column: "active".into(),
                 op: CmpOp::Eq,
-                value: serde_json::json!(true),
+                value: serde_json::json!(true).into(),
             }),
-            limit: Some(10),
+            limit: Some(Count::Lit(10)),
             ..Default::default()
         },
         body: RootBody::List {
@@ -51,7 +53,7 @@ fn moderately_complex_query() -> Operation {
                     name: "posts".into(),
                     alias: "posts".into(),
                     args: QueryArgs {
-                        limit: Some(5),
+                        limit: Some(Count::Lit(5)),
                         ..Default::default()
                     },
                     selection: vec![Field::Column {

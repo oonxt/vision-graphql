@@ -4,8 +4,8 @@
 //! so the engine runs them through the same pipeline.
 
 use crate::ast::{
-    AggOp, BoolExpr, CmpOp, Field, InsertObject, MutationField, OnConflict, Operation, OrderBy,
-    OrderDir, QueryArgs, RootBody, RootField,
+    AggOp, BoolExpr, CmpOp, Count, Field, InsertObject, MutationField, OnConflict, Operation,
+    OrderBy, OrderDir, QueryArgs, RootBody, RootField, Val,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -63,7 +63,7 @@ impl Query {
             alias: format!("{t}_by_pk"),
             pk: pk
                 .iter()
-                .map(|(k, v)| (k.clone().into(), v.clone()))
+                .map(|(k, v)| (k.clone().into(), Val::Lit(v.clone())))
                 .collect(),
             selection: Vec::new(),
         }
@@ -134,7 +134,7 @@ impl QueryBuilder {
         let cmp = BoolExpr::Compare {
             column: col.into(),
             op,
-            value,
+            value: Val::Lit(value),
         };
         self.args.where_ = Some(merge_and(self.args.where_.take(), cmp));
         self
@@ -173,12 +173,12 @@ impl QueryBuilder {
     }
 
     pub fn limit(mut self, n: u64) -> Self {
-        self.args.limit = Some(n);
+        self.args.limit = Some(Count::Lit(n));
         self
     }
 
     pub fn offset(mut self, n: u64) -> Self {
-        self.args.offset = Some(n);
+        self.args.offset = Some(Count::Lit(n));
         self
     }
 
@@ -201,7 +201,7 @@ impl QueryBuilder {
     pub fn where_in(mut self, col: impl Into<String>, values: &[Value]) -> Self {
         let cmp = BoolExpr::InList {
             column: col.into(),
-            values: values.to_vec(),
+            values: Val::Lit(Value::Array(values.to_vec())),
             negated: false,
         };
         self.args.where_ = Some(merge_and(self.args.where_.take(), cmp));
@@ -277,7 +277,7 @@ impl AggregateBuilder {
         let cmp = BoolExpr::Compare {
             column: col.into(),
             op: CmpOp::Eq,
-            value: value.into(),
+            value: Val::Lit(value.into()),
         };
         self.args.where_ = Some(merge_and(self.args.where_.take(), cmp));
         self
@@ -352,7 +352,7 @@ impl IntoOperation for AggregateBuilder {
 pub struct ByPkBuilder {
     table: String,
     alias: String,
-    pk: Vec<(String, Value)>,
+    pk: Vec<(String, Val)>,
     selection: Vec<Field>,
 }
 
@@ -415,8 +415,8 @@ impl Mutation {
         let t: String = table.into();
         let insert_objects = objects
             .into_iter()
-            .map(|columns| InsertObject {
-                columns,
+            .map(|columns: BTreeMap<String, Value>| InsertObject {
+                columns: columns.into_iter().map(|(k, v)| (k, Val::Lit(v))).collect(),
                 nested_arrays: BTreeMap::new(),
                 nested_objects: BTreeMap::new(),
             })
@@ -437,8 +437,10 @@ impl Mutation {
         K: Into<String>,
     {
         let t: String = table.into();
-        let columns: BTreeMap<String, Value> =
-            obj.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        let columns: BTreeMap<String, Val> = obj
+            .into_iter()
+            .map(|(k, v)| (k.into(), Val::Lit(v)))
+            .collect();
         InsertBuilder {
             alias: format!("insert_{t}_one"),
             table: t,
@@ -474,7 +476,7 @@ impl Mutation {
             table: t,
             pk: pk
                 .iter()
-                .map(|(k, v)| (k.clone().into(), v.clone()))
+                .map(|(k, v)| (k.clone().into(), Val::Lit(v.clone())))
                 .collect(),
             set: BTreeMap::new(),
             selection: Vec::new(),
@@ -501,7 +503,7 @@ impl Mutation {
             table: t,
             pk: pk
                 .iter()
-                .map(|(k, v)| (k.clone().into(), v.clone()))
+                .map(|(k, v)| (k.clone().into(), Val::Lit(v.clone())))
                 .collect(),
             selection: Vec::new(),
         }
@@ -562,7 +564,7 @@ pub struct UpdateBuilder {
     alias: String,
     table: String,
     where_: Option<BoolExpr>,
-    set: BTreeMap<String, Value>,
+    set: BTreeMap<String, Val>,
     returning: Vec<Field>,
 }
 
@@ -581,14 +583,14 @@ impl UpdateBuilder {
         let cmp = BoolExpr::Compare {
             column: col.into(),
             op: CmpOp::Eq,
-            value: value.into(),
+            value: Val::Lit(value.into()),
         };
         self.where_ = Some(merge_and(self.where_.take(), cmp));
         self
     }
 
     pub fn set(mut self, col: impl Into<String>, value: Value) -> Self {
-        self.set.insert(col.into(), value);
+        self.set.insert(col.into(), Val::Lit(value));
         self
     }
 
@@ -624,14 +626,14 @@ impl IntoOperation for UpdateBuilder {
 pub struct UpdateByPkBuilder {
     alias: String,
     table: String,
-    pk: Vec<(String, Value)>,
-    set: BTreeMap<String, Value>,
+    pk: Vec<(String, Val)>,
+    set: BTreeMap<String, Val>,
     selection: Vec<Field>,
 }
 
 impl UpdateByPkBuilder {
     pub fn set(mut self, col: impl Into<String>, value: Value) -> Self {
-        self.set.insert(col.into(), value);
+        self.set.insert(col.into(), Val::Lit(value));
         self
     }
 
@@ -681,7 +683,7 @@ impl DeleteBuilder {
         let cmp = BoolExpr::Compare {
             column: col.into(),
             op: CmpOp::Eq,
-            value: value.into(),
+            value: Val::Lit(value.into()),
         };
         self.where_ = Some(merge_and(self.where_.take(), cmp));
         self
@@ -717,7 +719,7 @@ impl IntoOperation for DeleteBuilder {
 pub struct DeleteByPkBuilder {
     alias: String,
     table: String,
-    pk: Vec<(String, Value)>,
+    pk: Vec<(String, Val)>,
     selection: Vec<Field>,
 }
 
@@ -777,7 +779,7 @@ mod tests {
             .build();
         assert_eq!(rf.table, "users");
         assert_eq!(rf.alias, "users");
-        assert_eq!(rf.args.limit, Some(10));
+        assert_eq!(rf.args.limit, Some(Count::Lit(10)));
         let RootBody::List { selection } = &rf.body else {
             panic!("expected List");
         };
@@ -802,7 +804,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "posts");
-                assert_eq!(args.limit, Some(5));
+                assert_eq!(args.limit, Some(Count::Lit(5)));
                 assert_eq!(selection.len(), 1);
             }
             _ => panic!("expected Relation"),
@@ -864,7 +866,7 @@ mod tests {
             BoolExpr::InList {
                 values, negated, ..
             } => {
-                assert_eq!(values.len(), 2);
+                assert_eq!(*values, json!([1, 2]));
                 assert!(!negated);
             }
             _ => panic!("expected InList"),
