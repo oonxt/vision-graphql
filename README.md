@@ -116,7 +116,7 @@ non-`json`/`jsonb` column is a validation error.
                                           variables + principal bind here
 ```
 
-One SQL per request. All user values go through parameterized binds — there is no string interpolation of values. See `docs/superpowers/specs/2026-04-17-rust-hasura-orm-design.md` for the full design.
+One SQL per request. All user values go through parameterized binds — there is no string interpolation of values. See `docs/superpowers/specs/2026-04-17-rust-hasura-orm-design.md` for the full design, and `docs/superpowers/specs/2026-08-03-compile-execute-split-design.md` for the compile/execute split and parse cache.
 
 Two things follow from where the arrows join:
 
