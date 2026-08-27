@@ -17,7 +17,9 @@ use async_graphql_value::{Name, Value as GqlValue};
 use serde_json::Value;
 use std::collections::HashMap;
 
-type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
+/// Fragment definitions by name, as gathered from the document. Public so the
+/// introspection resolver can spread the same fragments the data path does.
+pub type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
 
 #[tracing::instrument(level = "trace", skip_all)]
 pub fn parse_and_lower(
@@ -77,6 +79,7 @@ pub fn lower_with(
         fragments.insert(name.as_str().to_string(), &def.node);
     }
     let op = pick_operation(doc, operation_name)?;
+    reject_directives(op.selection_set, &fragments)?;
 
     // `query($n: Int = 10)` means the request may leave `$n` out. Filling the
     // defaults in here, once, is what keeps every variable position below from
@@ -340,6 +343,110 @@ fn ensure_unique_root_aliases<'a>(aliases: impl Iterator<Item = &'a str>) -> Res
     Ok(())
 }
 
+/// Answer `__schema` / `__type` now, from the schema's type system.
+///
+/// It happens here, in lowering, because this is where the document's fragments
+/// and variables are — and because the answer then travels as an ordinary value
+/// in the IR, which every path downstream already knows how to carry.
+fn lower_introspection(
+    name: &str,
+    field: &async_graphql_parser::types::Field,
+    schema: &Schema,
+    vars: Bindings<'_>,
+    fragments: &Fragments<'_>,
+) -> Result<Value> {
+    if !schema.introspection_enabled() {
+        return Err(Error::Validate {
+            path: name.to_string(),
+            message: "introspection is disabled; enable it with \
+                      Schema::builder().enable_introspection()"
+                .into(),
+        });
+    }
+    let ts = schema.type_system();
+    if name == "__schema" {
+        return crate::introspection::resolve_schema(&field.selection_set.node, ts, fragments);
+    }
+
+    let mut wanted: Option<String> = None;
+    for (arg_name, value) in &field.arguments {
+        match arg_name.node.as_str() {
+            "name" => {
+                let json = gql_to_json(&value.node, vars, "__type.name")?;
+                wanted = Some(
+                    json.as_str()
+                        .ok_or_else(|| Error::Validate {
+                            path: "__type.name".into(),
+                            message: format!("expected a string, got {json}"),
+                        })?
+                        .to_string(),
+                );
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("__type.{other}"),
+                    message: format!("unknown argument '{other}' on '__type'"),
+                })
+            }
+        }
+    }
+    let wanted = wanted.ok_or_else(|| Error::Validate {
+        path: "__type".into(),
+        message: "missing required argument 'name'".into(),
+    })?;
+    crate::introspection::resolve_type_by_name(&wanted, &field.selection_set.node, ts, fragments)
+}
+
+/// Refuse a document carrying directives.
+///
+/// This engine implements none — not `@include`, not `@skip` — and until this
+/// check existed they were simply not looked at, so `field @include(if: false)`
+/// came back included. A directive that silently does not happen is the worst of
+/// the three options; erroring is the honest one, and it is why the introspection
+/// answer publishes an empty directive list.
+fn reject_directives(set: &SelectionSet, fragments: &Fragments<'_>) -> Result<()> {
+    fn named(d: &[Positioned<async_graphql_parser::types::Directive>]) -> Option<String> {
+        d.first().map(|d| d.node.name.node.as_str().to_string())
+    }
+
+    fn walk(set: &SelectionSet, fragments: &Fragments<'_>, seen: &mut Vec<String>) -> Result<()> {
+        for sel in &set.items {
+            let (directives, inner) = match &sel.node {
+                Selection::Field(f) => (&f.node.directives, Some(&f.node.selection_set.node)),
+                Selection::InlineFragment(f) => {
+                    (&f.node.directives, Some(&f.node.selection_set.node))
+                }
+                Selection::FragmentSpread(f) => {
+                    let name = f.node.fragment_name.node.as_str();
+                    // Guard against a fragment cycle: an invalid document, but
+                    // one that would otherwise recurse until the stack ran out.
+                    if !seen.contains(&name.to_string()) {
+                        seen.push(name.to_string());
+                        if let Some(frag) = fragments.get(name) {
+                            walk(&frag.selection_set.node, fragments, seen)?;
+                        }
+                    }
+                    (&f.node.directives, None)
+                }
+            };
+            if let Some(name) = named(directives) {
+                return Err(Error::Validate {
+                    path: format!("@{name}"),
+                    message: format!(
+                        "directives are not supported; '@{name}' would have no effect"
+                    ),
+                });
+            }
+            if let Some(inner) = inner {
+                walk(inner, fragments, seen)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk(set, fragments, &mut Vec::new())
+}
+
 fn lower_query(
     set: &SelectionSet,
     schema: &Schema,
@@ -452,6 +559,18 @@ fn lower_query(
                         });
                         continue;
                     }
+                }
+
+                if name == "__schema" || name == "__type" {
+                    roots.push(RootField {
+                        table: String::new(),
+                        alias,
+                        args: QueryArgs::default(),
+                        body: crate::ast::RootBody::Introspection(lower_introspection(
+                            name, field, schema, vars, fragments,
+                        )?),
+                    });
+                    continue;
                 }
 
                 let table = schema.table(name).ok_or_else(|| {

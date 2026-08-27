@@ -74,7 +74,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
 | Field aliases (`abundance: data`) | ✓ |
 | `__typename` in every selection set | ✓ |
-| Schema introspection (`__schema` / `__type`), SDL export | Not implemented |
+| Schema introspection (`__schema` / `__type`), off by default | ✓ |
+| SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | Schema introspection | ✓ |
@@ -563,9 +564,69 @@ types are `<table>_aggregate`, `<table>_aggregate_fields`, `<table>_sum_fields`
 literals — no bind, no round trip.
 
 `__typename` is not accepted as a *root* field (`{ __typename }`), which would
-name the operation root type; put it inside a field's selection set. Full schema
-introspection — `__schema` and `__type`, what GraphiQL and codegen ask for — is
-not implemented.
+name the operation root type; put it inside a field's selection set.
+
+## Schema introspection and SDL
+
+The GraphQL type system this engine exposes is derived from the schema —
+Hasura's shape, so a client or codegen setup written against a Hasura endpoint
+reads it unchanged:
+
+```
+users                         users_bool_exp        Int_comparison_exp
+users_aggregate               users_order_by        order_by
+users_aggregate_fields        users_insert_input    users_select_column
+users_sum_fields (avg/max/min) users_set_input      users_constraint
+users_mutation_response       users_on_conflict     users_pk_columns_input
+```
+
+Everything published is something the engine implements. `String_comparison_exp`
+carries the operators the lowering actually lowers and not one more — no
+`_regex`, no `_similar` — because a client generates code against what it is
+told. A read-only table gets read types and no mutation fields. `on_conflict`
+appears only where a unique constraint exists to name in it. `path` appears only
+on `json`/`jsonb` columns. The directive list is empty, and a document carrying
+`@include`/`@skip` is rejected rather than having it silently not happen.
+
+### `__schema` / `__type` — off by default
+
+```rust
+# use vision_graphql::Schema;
+# async fn f(pool: sqlx::PgPool) -> vision_graphql::error::Result<()> {
+let schema = Schema::introspect(&pool).await?.enable_introspection().build();
+# let _ = schema; Ok(()) }
+```
+
+Introspection hands the caller the whole data model — every table, column, type
+and relation. That is a wider disclosure than answering data queries, so
+upgrading does not turn it on. Enable it where the endpoint is internal or the
+model is public anyway; leave it off where clients ship pre-generated documents.
+
+It is answered from the schema in memory, and the JSON rides into the statement
+as a bound parameter — so a document mixing introspection with data is still one
+request, and a compiled introspection query works like any other.
+
+A Postgres enum column is published as a custom scalar named after the type
+rather than a GraphQL enum: introspection reads the type's name but not its
+variants.
+
+### SDL export
+
+```bash
+vision-gql sdl --url $DATABASE_URL --config schema.toml -o schema.graphql --force
+vision-gql sdl --url $DATABASE_URL --config schema.toml -o schema.graphql --check
+```
+
+The exposed surface is otherwise implicit — what introspection found, minus
+`hide_columns`, renamed by `expose_as`, plus what the overlay declared.
+Committing the SDL turns "did that migration expose a new column" into a line in
+a diff. `--check` is the CI half: exit 0 when the file matches the database, 1
+when it does not, with a summary that leads with the types that appeared or went
+away. Output is byte-stable for a given schema.
+
+Unlike runtime introspection, this needs no flag: it is a build-time artifact,
+not something a request can ask for. In code it is
+`vision_graphql::sdl::render(schema.type_system())`.
 
 ## Aggregates
 

@@ -60,6 +60,7 @@ pub mod compiled;
 pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod introspection;
 pub mod limits;
 pub mod parse_cache;
 pub mod parser;
@@ -68,8 +69,10 @@ pub mod predicate;
 pub mod schema;
 pub mod scope;
 pub mod scope_config;
+pub mod sdl;
 pub mod sql;
 pub mod type_names;
+pub mod type_system;
 pub mod types;
 
 pub use builder::{

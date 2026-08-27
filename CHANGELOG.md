@@ -36,6 +36,15 @@ used to be silent, so read **Breaking** before upgrading.
   `users_by_pk(id: 1, where: {…})` ran and dropped the `where`. Applies to the
   query root, `delete_*_by_pk`, and the `pk_columns` object of
   `update_*_by_pk`.
+- **Directives were read by nobody.** `field @include(if: false)` came back
+  included. No directive is implemented, so a document carrying one is now
+  rejected — which is also what makes the empty directive list in the
+  introspection answer honest.
+- **Column and relation order was whatever the hash map felt like.** Anything
+  derived from the whole schema differed run to run for reasons unrelated to the
+  schema; columns now keep the order introspection read them in
+  (`ordinal_position`), relations the order they were added, and
+  `Schema::tables` comes out sorted.
 - **Variable defaults declared by an operation were ignored.**
   `query($n: Int = 10)` with `$n` unsupplied failed with "not bound" instead of
   using 10. Applied on both paths: while lowering for `Engine::query`, and at
@@ -52,6 +61,29 @@ used to be silent, so read **Breaking** before upgrading.
   (`users`, `users_aggregate_fields`, `users_mutation_response`, …), exposed as
   `type_names`. Not accepted as a root field; `__schema` / `__type`
   introspection is still unimplemented.
+- **Schema introspection**: `__schema` and `__type`, answered in memory from a
+  type system derived from the schema — the full Hasura-shaped surface, input
+  types included (`<t>_bool_exp`, `<t>_order_by`, `<t>_insert_input`,
+  `<t>_set_input`, `<t>_on_conflict`, `<t>_constraint`, `<t>_select_column`,
+  `<scalar>_comparison_exp`, `order_by`), so GraphiQL's argument completion and
+  `graphql-codegen`'s variable types work rather than merely connecting.
+  **Off unless `SchemaBuilder::enable_introspection` is called**: it publishes
+  the whole data model, and upgrading should not widen what a deployment
+  exposes. Only what the engine implements is published — the comparison inputs
+  carry exactly the operators the lowering accepts, read-only tables get no
+  mutation fields, `on_conflict` appears only where a unique constraint exists.
+  The answer travels as a bound parameter, so a document mixing introspection
+  with data is still one statement.
+- **SDL export**: `vision-gql sdl` writes the schema a database plus overlay
+  exposes, with `--check` for CI (exit 1 on drift, summarised by type). Needs no
+  runtime flag — it is a build-time artifact. In code:
+  `vision_graphql::sdl::render(schema.type_system())`.
+- `type_system::TypeSystem`, `sdl`, `introspection` modules; `Schema::type_system`,
+  `Schema::introspection_enabled`, `SchemaBuilder::enable_introspection`,
+  `SchemaBuilder::retain_tables`.
+- `Table::unique_constraints`, `Table::unique_constraint` — introspection has
+  always read these and merge threw them away; they are what `<t>_constraint` is
+  built from.
 - `Schema::tables`, `Schema::len`, `Schema::is_empty`, `Table::columns`,
   `Table::relations` — the schema an overlay actually produced can now be walked
   from outside the crate, which is what any SDL export, admin tooling, or test
@@ -82,8 +114,9 @@ used to be silent, so read **Breaking** before upgrading.
 - An `_aggregate` field selecting only `nodes` no longer returns an empty
   `aggregate` key the document did not ask for.
 - Queries that previously ran now fail: unknown arguments on `_by_pk` and on
-  aggregate functions, and conflicting fields under one response key. Each was
-  producing a wrong answer or a truncated response before.
+  aggregate functions, conflicting fields under one response key, and any
+  document carrying a directive. Each was producing a wrong answer or a
+  truncated response before.
 
 ## 0.12.0
 

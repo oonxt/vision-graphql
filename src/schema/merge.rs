@@ -108,6 +108,15 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
             let refs: Vec<&str> = it.primary_key.iter().map(String::as_str).collect();
             t = t.primary_key(&refs);
         }
+        for (name, cols) in &it.unique_constraints {
+            // Only constraints every column of which is still exposed: one over
+            // a hidden column cannot be named in an `on_conflict` that the
+            // caller could satisfy.
+            if cols.iter().all(|c| column_names.contains(c.as_str())) {
+                let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+                t = t.unique_constraint(name, &refs);
+            }
+        }
         for (src, name, rel) in &rels {
             if src != exposed {
                 continue;
@@ -222,6 +231,16 @@ pub fn apply_config(
         if !pk.is_empty() {
             let refs: Vec<&str> = pk.iter().map(String::as_str).collect();
             t = t.primary_key(&refs);
+        }
+
+        // Constraints survive the overlay only while every column they cover is
+        // still exposed — `hide_columns` can take one out from under them, and a
+        // constraint the caller cannot satisfy is worse than no constraint.
+        for (name, cols) in &old.unique_constraints {
+            if cols.iter().all(|c| t.find_column(c).is_some()) {
+                let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+                t = t.unique_constraint(name, &refs);
+            }
         }
 
         let overlay_rel_names: std::collections::BTreeSet<&str> = overlay

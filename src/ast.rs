@@ -194,6 +194,13 @@ pub enum RootBody {
         pk: Vec<(String, Val)>,
         selection: Vec<Field>,
     },
+    /// `__schema` / `__type`, answered from the schema rather than from
+    /// Postgres and carried into the statement as a bound `json` parameter.
+    ///
+    /// Resolving at lowering time rather than around the SQL is what lets a
+    /// document that mixes introspection with data stay one request, and what
+    /// lets an introspection query be compiled like any other.
+    Introspection(Value),
 }
 
 /// One entry under `aggregate { … }`: the response key it answers to, and the

@@ -115,6 +115,14 @@ fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Re
 }
 
 fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result<()> {
+    // Answered while lowering; it rides along as a bound parameter so a document
+    // mixing introspection with data is still one statement, and so the JSON
+    // never has to be escaped into the SQL text.
+    if let crate::ast::RootBody::Introspection(value) = &root.body {
+        let n = ctx.push_fixed(crate::types::Bind::Text(value.to_string()));
+        write!(ctx.sql, "${n}::json").unwrap();
+        return Ok(());
+    }
     let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
         path: root.alias.clone(),
         message: format!("unknown table '{}'", root.table),
@@ -131,6 +139,8 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::ByPk { pk, selection } => {
             render_by_pk(root, pk, selection, table, schema, ctx)
         }
+        // Returned above, before the table lookup this arm sits behind.
+        crate::ast::RootBody::Introspection(_) => unreachable!("handled at the top of render_root"),
     }
 }
 

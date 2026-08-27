@@ -166,6 +166,15 @@ pub(crate) fn apply_scope(op: &mut Operation, scope: &ScopeSet, schema: &Schema)
 /// Rewrite one query root field so its table — and every nested relation it
 /// reaches — carries the scope predicate.
 fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schema) -> Result<()> {
+    // Introspection describes the schema, not rows, so a scope has nothing to
+    // restrict here — and it names no table, so the lookup below would fail.
+    // What a scoped caller may *read* is still decided per row by the
+    // predicates on the data roots; the schema is the same for everyone, which
+    // is why enabling introspection is a deployment decision rather than a
+    // per-principal one.
+    if matches!(root.body, RootBody::Introspection(_)) {
+        return Ok(());
+    }
     let table = lookup_table(schema, &root.table, &root.alias)?;
     // Scope EXISTS targets inside the user-written where FIRST, so the
     // predicate we inject afterwards is never itself re-scoped.
@@ -185,6 +194,8 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
                 scope_fields(fields, table, scope, schema)?;
             }
         }
+        // Returned above.
+        RootBody::Introspection(_) => {}
     }
     Ok(())
 }
