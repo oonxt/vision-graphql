@@ -87,7 +87,7 @@ impl QueryBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -97,7 +97,7 @@ impl QueryBuilder {
     pub fn column(mut self, col: impl Into<String>) -> Self {
         let c: String = col.into();
         self.selection.push(Field::Column {
-            physical: c.clone(),
+            column: c.clone(),
             alias: c,
         });
         self
@@ -114,7 +114,7 @@ impl QueryBuilder {
         path: &[&str],
     ) -> Self {
         self.selection.push(Field::JsonPath {
-            physical: col.into(),
+            column: col.into(),
             alias: alias.into(),
             path: path.iter().map(|c| (*c).to_string()).collect(),
         });
@@ -258,7 +258,7 @@ pub struct AggregateBuilder {
     table: String,
     alias: String,
     args: QueryArgs,
-    ops: Vec<AggOp>,
+    ops: Vec<crate::ast::AggSelect>,
     nodes: Option<Vec<Field>>,
 }
 
@@ -283,36 +283,101 @@ impl AggregateBuilder {
         self
     }
 
+    /// `count(*)`.
     pub fn count(mut self) -> Self {
-        self.ops.push(AggOp::Count);
+        self.push("count", AggOp::count());
         self
     }
 
-    pub fn sum(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Sum {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
+    /// `count(<cols>)` — rows where the named columns are not null.
+    pub fn count_columns(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "count",
+            AggOp::Count {
+                columns: cols.iter().map(|s| (*s).to_string()).collect(),
+                distinct: false,
+            },
+        );
+        self
+    }
+
+    /// `count(DISTINCT <cols>)`.
+    pub fn count_distinct(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "count",
+            AggOp::Count {
+                columns: cols.iter().map(|s| (*s).to_string()).collect(),
+                distinct: true,
+            },
+        );
+        self
+    }
+
+    /// Response key for the aggregate added last, so two counts can coexist:
+    /// `.count().key("total").count_distinct(&["city"]).key("cities")`.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        if let Some(last) = self.ops.last_mut() {
+            last.alias = key.into();
+        }
+        self
+    }
+
+    fn push(&mut self, alias: &str, op: AggOp) {
+        self.ops.push(crate::ast::AggSelect {
+            alias: alias.to_string(),
+            op,
         });
+    }
+
+    pub fn sum(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "sum",
+            AggOp::Sum {
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
+            },
+        );
         self
     }
 
     pub fn avg(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Avg {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "avg",
+            AggOp::Avg {
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
+            },
+        );
         self
     }
 
     pub fn max(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Max {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "max",
+            AggOp::Max {
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
+            },
+        );
         self
     }
 
     pub fn min(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Min {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "min",
+            AggOp::Min {
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
+            },
+        );
         self
     }
 
@@ -320,7 +385,7 @@ impl AggregateBuilder {
         self.nodes = Some(
             cols.iter()
                 .map(|c| Field::Column {
-                    physical: (*c).to_string(),
+                    column: (*c).to_string(),
                     alias: (*c).to_string(),
                 })
                 .collect(),
@@ -334,6 +399,7 @@ impl AggregateBuilder {
             alias: self.alias,
             args: self.args,
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: self.ops,
                 nodes: self.nodes,
             },
@@ -366,7 +432,7 @@ impl ByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -534,7 +600,7 @@ impl InsertBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -548,6 +614,7 @@ impl InsertBuilder {
             objects: self.objects,
             on_conflict: self.on_conflict,
             returning: self.returning,
+            response_typenames: Vec::new(),
             one: self.one,
             scope_check: None,
         }
@@ -598,7 +665,7 @@ impl UpdateBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -607,6 +674,7 @@ impl UpdateBuilder {
 
     pub fn build(self) -> MutationField {
         MutationField::Update {
+            response_typenames: Vec::new(),
             alias: self.alias,
             table: self.table,
             where_: self.where_.expect("update builder: where clause required"),
@@ -641,7 +709,7 @@ impl UpdateByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -693,7 +761,7 @@ impl DeleteBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -702,6 +770,7 @@ impl DeleteBuilder {
 
     pub fn build(self) -> MutationField {
         MutationField::Delete {
+            response_typenames: Vec::new(),
             alias: self.alias,
             table: self.table,
             where_: self.where_.expect("delete builder: where clause required"),
@@ -728,7 +797,7 @@ impl DeleteByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -815,7 +884,7 @@ mod tests {
     fn aggregate_builder_count_sum() {
         let rf = Query::aggregate("users").count().sum(&["age"]).build();
         assert_eq!(rf.alias, "users_aggregate");
-        let RootBody::Aggregate { ops, nodes } = &rf.body else {
+        let RootBody::Aggregate { ops, nodes, .. } = &rf.body else {
             panic!("expected Aggregate");
         };
         assert_eq!(ops.len(), 2);
@@ -833,11 +902,11 @@ mod tests {
         };
         match &selection[1] {
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                assert_eq!(physical, "data");
+                assert_eq!(column, "data");
                 assert_eq!(alias, "abundance");
                 assert_eq!(path, &vec!["a".to_string(), "b".to_string()]);
             }

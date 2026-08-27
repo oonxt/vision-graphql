@@ -108,6 +108,10 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
             let refs: Vec<&str> = it.primary_key.iter().map(String::as_str).collect();
             t = t.primary_key(&refs);
         }
+        for (name, cols) in &it.unique_constraints {
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_constraint(name, &refs);
+        }
         for (src, name, rel) in &rels {
             if src != exposed {
                 continue;
@@ -222,6 +226,16 @@ pub fn apply_config(
         if !pk.is_empty() {
             let refs: Vec<&str> = pk.iter().map(String::as_str).collect();
             t = t.primary_key(&refs);
+        }
+
+        // Constraints survive `hide_columns` intact. Postgres resolves an
+        // `ON CONFLICT` target by constraint name, so one covering a hidden
+        // column is still a usable target — it is only its *name* that should
+        // not be published, and that is decided where publishing happens
+        // (`type_system`), not here where the engine's own knowledge lives.
+        for (name, cols) in &old.unique_constraints {
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_constraint(name, &refs);
         }
 
         let overlay_rel_names: std::collections::BTreeSet<&str> = overlay
@@ -590,6 +604,7 @@ mod tests {
         }
 
         let mut db = IntrospectedDb {
+            skipped_columns: Vec::new(),
             tables: Default::default(),
             schemas: schemas.iter().map(|s| (*s).to_string()).collect(),
         };

@@ -64,6 +64,9 @@ pub struct CompiledQuery {
     /// Response key when the operation has exactly one root field, so typed
     /// execution can unwrap the data envelope.
     pub(crate) root_alias: Option<String>,
+    /// Defaults the operation declared for its variables. Applied at execute
+    /// time, since compiling happens before any request exists.
+    pub(crate) defaults: serde_json::Map<String, serde_json::Value>,
     /// Whether a scope policy was applied when this was compiled.
     ///
     /// Tracked explicitly rather than inferred from whether any scope parameter
@@ -92,6 +95,12 @@ impl CompiledQuery {
         self.scoped
     }
 
+    /// Default values this statement's operation declared, by variable name.
+    /// A request that omits one of these still runs.
+    pub fn defaults(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.defaults
+    }
+
     /// Names of the GraphQL variables this statement reads, in placeholder
     /// order and with duplicates kept out. Useful for checking a request
     /// supplies what a persisted query needs before running it.
@@ -104,7 +113,7 @@ impl CompiledQuery {
                     val.collect_vars(&mut found)
                 }
                 BindSpec::Count {
-                    val: crate::ast::Count::Var(name),
+                    val: crate::ast::Count::Var { name, .. },
                     ..
                 } => found.push(name.clone()),
                 _ => {}
@@ -198,7 +207,11 @@ mod tests {
         let (_, specs) =
             compile("query($id: Int!) { users(where: {id: {_eq: $id}}) { name } }").unwrap();
         let err = binds(&specs, json!({"id": "nope"})).unwrap_err();
-        assert!(format!("{err}").contains("Int4"), "{err}");
+        assert!(format!("{err}").contains("expected an integer"), "{err}");
+        assert!(
+            format!("{err}").contains("where.id"),
+            "the position is named: {err}"
+        );
     }
 
     #[test]
@@ -316,6 +329,38 @@ mod tests {
     }
 
     #[test]
+    fn declared_defaults_apply_at_execute_time() {
+        let schema = schema();
+        let src = r#"query($t: String = "fallback") { orders(where: {title: {_eq: $t}}) { id } }"#;
+        let doc = parse_document(src).unwrap();
+        let op = lower_with(&doc, Bindings::Symbolic, None, &schema).unwrap();
+        let (_sql, specs) = render(&op, &schema).unwrap();
+        let defaults = crate::parser::variable_defaults(&doc, None).unwrap();
+
+        // Nothing supplied: the default stands in.
+        let empty = json!({});
+        assert_eq!(
+            resolve_binds(&specs, &Inputs::variables(&empty).with_defaults(&defaults)).unwrap(),
+            vec![Bind::Text("fallback".into())]
+        );
+        // Supplied: the request wins.
+        let given = json!({"t": "given"});
+        assert_eq!(
+            resolve_binds(&specs, &Inputs::variables(&given).with_defaults(&defaults)).unwrap(),
+            vec![Bind::Text("given".into())]
+        );
+        // Supplied as null: still the request, not the default — an explicit
+        // null is a value, not an absence. In a comparison it is now refused
+        // rather than compared (see `types::null_comparison`), and that refusal
+        // is itself the proof: falling back to the default would have succeeded
+        // with "fallback".
+        let null = json!({"t": null});
+        let err =
+            resolve_binds(&specs, &Inputs::variables(&null).with_defaults(&defaults)).unwrap_err();
+        assert!(format!("{err}").contains("_is_null"), "{err}");
+    }
+
+    #[test]
     fn compiling_against_a_policy_defers_the_principal() {
         let schema = schema();
         let policy = ScopePolicy::builder()
@@ -388,6 +433,7 @@ mod tests {
             sql,
             specs,
             root_alias: None,
+            defaults: Default::default(),
             scoped: true,
         };
         assert_eq!(compiled.variables(), vec!["t".to_string()]);

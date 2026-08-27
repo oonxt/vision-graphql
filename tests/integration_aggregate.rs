@@ -110,3 +110,56 @@ async fn aggregate_max_min() {
     assert_eq!(v["users_aggregate"]["aggregate"]["max"]["score"], json!(30));
     assert_eq!(v["users_aggregate"]["aggregate"]["min"]["score"], json!(10));
 }
+
+/// `count(columns:)` and `count(distinct:)` against a real server: the row
+/// constructor is unusual enough SQL to be worth executing rather than
+/// asserting on the rendered string, and these are the semantics the AST
+/// documents.
+#[tokio::test]
+async fn count_over_columns_and_distinct() {
+    let (engine, _c) = setup().await;
+    let v = engine
+        .query(
+            r#"{ users_aggregate { aggregate {
+                   all: count
+                   scores: count(columns: [score])
+                   distinct_scores: count(columns: [score], distinct: true)
+                   pairs: count(columns: [name, score], distinct: true)
+                 } } }"#,
+            None,
+        )
+        .await
+        .expect("count with columns must be valid SQL");
+    let agg = &v["users_aggregate"]["aggregate"];
+    assert_eq!(
+        agg["all"], agg["scores"],
+        "no score is null, so both count every row"
+    );
+    assert!(
+        agg["distinct_scores"].as_i64().unwrap() <= agg["all"].as_i64().unwrap(),
+        "{agg}"
+    );
+    assert!(
+        agg["pairs"].as_i64().unwrap() >= agg["distinct_scores"].as_i64().unwrap(),
+        "{agg}"
+    );
+}
+
+/// A selection that reads no rows must not read any: before this, it rendered a
+/// scalar subquery over an unaggregated source, which errors at two rows.
+#[tokio::test]
+async fn typename_only_aggregate_runs() {
+    let (engine, _c) = setup().await;
+    let v = engine
+        .query(
+            "{ users_aggregate { __typename aggregate { __typename } } }",
+            None,
+        )
+        .await
+        .expect("a typename-only aggregate must not read rows");
+    assert_eq!(v["users_aggregate"]["__typename"], "users_aggregate");
+    assert_eq!(
+        v["users_aggregate"]["aggregate"]["__typename"],
+        "users_aggregate_fields"
+    );
+}

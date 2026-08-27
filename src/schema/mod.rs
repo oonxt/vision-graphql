@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgType {
+    Int2,
     Int4,
     Int8,
     Text,
@@ -108,8 +109,27 @@ pub struct Table {
     pub physical_schema: String,
     pub physical_name: String,
     columns_by_exposed: HashMap<String, Column>,
+    /// Exposed column names in the order they were added, which for an
+    /// introspected table is Postgres' `ordinal_position`.
+    ///
+    /// The map alone gives no order at all, and an unordered column list makes
+    /// every artifact built from the schema — SDL above all — differ run to run
+    /// for reasons that have nothing to do with the schema.
+    column_order: Vec<String>,
     pub primary_key: Vec<String>,
+    /// Unique (and primary key) constraints, as `constraint name -> columns`.
+    ///
+    /// Every constraint introspection found, including any covering a column
+    /// `hide_columns` removed: Postgres resolves an `ON CONFLICT` target by
+    /// name, so such a constraint is still a usable target. Deciding which of
+    /// them to *publish* is a separate question, answered in
+    /// [`crate::type_system`] — a constraint name tends to contain its column
+    /// names, which is exactly what hiding a column meant to withhold.
+    pub unique_constraints: std::collections::BTreeMap<String, Vec<String>>,
     relations_by_name: HashMap<String, Relation>,
+    /// Relation names in the order they were added. Same reason as
+    /// [`Table::column_order`].
+    relation_order: Vec<String>,
     /// No `insert_` / `update_` / `delete_` root is derived for this table, and
     /// it cannot be the target of a nested insert.
     ///
@@ -131,8 +151,11 @@ impl Table {
             physical_schema: schema.into(),
             physical_name: physical.into(),
             columns_by_exposed: HashMap::new(),
+            column_order: Vec::new(),
             primary_key: Vec::new(),
+            unique_constraints: Default::default(),
             relations_by_name: HashMap::new(),
+            relation_order: Vec::new(),
             read_only: false,
         }
     }
@@ -150,6 +173,9 @@ impl Table {
         pg_type: PgType,
         nullable: bool,
     ) -> Self {
+        if !self.columns_by_exposed.contains_key(exposed) {
+            self.column_order.push(exposed.to_string());
+        }
         self.columns_by_exposed.insert(
             exposed.into(),
             Column {
@@ -162,12 +188,24 @@ impl Table {
         self
     }
 
+    /// Declare a unique constraint by name.
+    pub fn unique_constraint(mut self, name: &str, cols: &[&str]) -> Self {
+        self.unique_constraints.insert(
+            name.to_string(),
+            cols.iter().map(|c| (*c).to_string()).collect(),
+        );
+        self
+    }
+
     pub fn primary_key(mut self, cols: &[&str]) -> Self {
         self.primary_key = cols.iter().map(|s| (*s).into()).collect();
         self
     }
 
     pub fn relation(mut self, name: &str, rel: Relation) -> Self {
+        if !self.relations_by_name.contains_key(name) {
+            self.relation_order.push(name.to_string());
+        }
         self.relations_by_name.insert(name.into(), rel);
         self
     }
@@ -180,25 +218,88 @@ impl Table {
         self.relations_by_name.get(name)
     }
 
+    /// Every exposed column, in no particular order.
+    ///
+    /// Public so an application can see what its schema actually exposes —
+    /// which is the only way to check that an overlay's `hide_columns` did what
+    /// was intended, and what any SDL export or admin tooling has to walk.
+    pub fn columns(&self) -> impl Iterator<Item = &Column> {
+        self.column_order
+            .iter()
+            .filter_map(|n| self.columns_by_exposed.get(n))
+    }
+
+    /// Every relation, as `(exposed name, relation)`.
+    pub fn relations(&self) -> impl Iterator<Item = (&String, &Relation)> {
+        self.relation_order
+            .iter()
+            .filter_map(|n| self.relations_by_name.get_key_value(n))
+    }
+
     pub(crate) fn columns_iter(&self) -> impl Iterator<Item = &Column> {
-        self.columns_by_exposed.values()
+        self.columns()
     }
 
     pub(crate) fn relations_iter(&self) -> impl Iterator<Item = (&String, &Relation)> {
-        self.relations_by_name.iter()
+        self.relations()
     }
 }
 
 #[derive(Debug)]
 pub struct Schema {
     tables_by_exposed: HashMap<String, Arc<Table>>,
+    /// Whether `__schema` / `__type` may be answered at runtime.
+    ///
+    /// Off by default: introspection publishes the whole data model to anyone
+    /// who can reach the endpoint, and upgrading a dependency should not widen
+    /// what a deployment exposes.
+    introspection: bool,
+    /// Derived on first use and kept, since deriving it walks every table.
+    type_system: std::sync::OnceLock<crate::type_system::TypeSystem>,
 }
 
 impl Schema {
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder {
             tables: HashMap::new(),
+            introspection: false,
         }
+    }
+
+    /// Every exposed table, as `(exposed name, table)`, ordered by name.
+    ///
+    /// Sorted rather than in map order so anything derived from the whole schema
+    /// — SDL, an introspection answer — is the same on every run. Lookups stay
+    /// on the hash map; this is walked rarely.
+    pub fn tables(&self) -> impl Iterator<Item = (&String, &Arc<Table>)> {
+        let mut all: Vec<(&String, &Arc<Table>)> = self.tables_by_exposed.iter().collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all.into_iter()
+    }
+
+    /// How many tables are exposed.
+    pub fn len(&self) -> usize {
+        self.tables_by_exposed.len()
+    }
+
+    /// Whether the schema exposes nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.tables_by_exposed.is_empty()
+    }
+
+    /// The GraphQL type system this schema exposes, derived on first call.
+    ///
+    /// Always available — SDL export is a build-time artifact and has nothing to
+    /// do with whether runtime introspection is enabled.
+    pub fn type_system(&self) -> &crate::type_system::TypeSystem {
+        self.type_system
+            .get_or_init(|| crate::type_system::TypeSystem::build(self))
+    }
+
+    /// Whether `__schema` / `__type` are answerable. See
+    /// [`SchemaBuilder::enable_introspection`].
+    pub fn introspection_enabled(&self) -> bool {
+        self.introspection
     }
 
     pub fn table(&self, exposed: &str) -> Option<&Arc<Table>> {
@@ -239,6 +340,7 @@ impl Schema {
 
 pub struct SchemaBuilder {
     pub(crate) tables: HashMap<String, Arc<Table>>,
+    pub(crate) introspection: bool,
 }
 
 impl SchemaBuilder {
@@ -247,10 +349,38 @@ impl SchemaBuilder {
         self
     }
 
+    /// Let `__schema` and `__type` be answered at runtime.
+    ///
+    /// Off by default. Introspection hands the caller the whole data model —
+    /// every table, column, type and relation the schema exposes — which is a
+    /// wider disclosure than answering data queries, and not one that should
+    /// appear in an existing deployment because it upgraded. Turn it on where
+    /// the endpoint is internal, or where the data model is public anyway, and
+    /// leave it off on a public API whose clients ship pre-generated documents.
+    ///
+    /// SDL export ([`Schema::type_system`], [`crate::sdl`]) is unaffected: it is
+    /// a build-time artifact, not something a request can ask for.
+    pub fn enable_introspection(mut self) -> Self {
+        self.introspection = true;
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables_by_exposed: self.tables,
+            introspection: self.introspection,
+            type_system: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Keep only the tables whose exposed name satisfies `keep`.
+    ///
+    /// For a caller that builds from introspection and then narrows — the CLI's
+    /// `--include-tables` / `--ignore-tables`, or an application exposing one
+    /// slice of a large database.
+    pub fn retain_tables(mut self, keep: impl Fn(&str) -> bool) -> Self {
+        self.tables.retain(|name, _| keep(name));
+        self
     }
 
     pub(crate) fn insert_raw(&mut self, exposed: String, t: Arc<Table>) {

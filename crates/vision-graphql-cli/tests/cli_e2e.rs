@@ -418,3 +418,156 @@ fn missing_url_and_env_exits_two() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("DATABASE_URL"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdl_renders_the_exposed_schema_and_honours_the_overlay() {
+    let (url, _c) = boot_pg().await;
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+
+    let out = Command::new(bin)
+        .args(["sdl", "--url", &url])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plain = String::from_utf8(out.stdout).unwrap();
+    assert!(plain.contains("schema {"), "{plain}");
+    assert!(plain.contains("type users {"), "{plain}");
+    assert!(plain.contains("input users_bool_exp {"), "{plain}");
+
+    // The overlay is the whole point: what it renames and hides has to show up
+    // in the artifact, or the artifact does not describe what is exposed.
+    let p = write_temp_toml(
+        "sdl.toml",
+        r#"
+        [tables.users]
+        expose_as = "profiles"
+        hide_columns = ["secret"]
+        "#,
+    );
+    let out = Command::new(bin)
+        .args(["sdl", "--url", &url, "--config", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let overlaid = String::from_utf8(out.stdout).unwrap();
+    assert!(overlaid.contains("type profiles {"), "{overlaid}");
+    assert!(!overlaid.contains("type users {"), "{overlaid}");
+    assert!(
+        !overlaid.contains("secret"),
+        "hidden column leaked: {overlaid}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdl_check_exits_one_when_the_file_is_stale() {
+    let (url, _c) = boot_pg().await;
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let dir = std::env::temp_dir().join(format!("vision-gql-sdl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("schema.graphql");
+
+    let out = Command::new(bin)
+        .args([
+            "sdl",
+            "--url",
+            &url,
+            "-o",
+            path.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+
+    // Fresh from the same database: clean.
+    let out = Command::new(bin)
+        .args([
+            "sdl",
+            "--url",
+            &url,
+            "-o",
+            path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .expect("run cli");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stale: exit 1, and say what changed.
+    std::fs::write(&path, "schema {\n  query: query_root\n}\n").unwrap();
+    let out = Command::new(bin)
+        .args([
+            "sdl",
+            "--url",
+            &url,
+            "-o",
+            path.to_str().unwrap(),
+            "--check",
+        ])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("out of date"), "{stderr}");
+    // The summary leads with what types appeared, not with their fields, and
+    // says how much it left out rather than pretending that was all of it.
+    assert!(stderr.contains("+ type "), "{stderr}");
+    assert!(stderr.contains("more changed lines"), "{stderr}");
+}
+
+/// A column the engine cannot map is absent from the schema, which is invisible
+/// from the outside — `diff` is where that hole gets said out loud.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_reports_columns_with_no_type_mapping() {
+    let (url, _c) = boot_pg().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE users ADD COLUMN tags TEXT[], ADD COLUMN blob BYTEA;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["diff", "--url", &url, "--config", "/dev/null"])
+        .output()
+        .expect("run cli");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not exposed (no type mapping"), "{text}");
+    assert!(text.contains("users.tags (ARRAY (_text))"), "{text}");
+    assert!(text.contains("users.blob (bytea)"), "{text}");
+    // It is not drift: the overlay is not wrong, so the exit status is clean.
+    assert_eq!(out.status.code(), Some(0), "{text}");
+
+    // …and a table the filter excludes gets no notice about its columns.
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            &url,
+            "--config",
+            "/dev/null",
+            "--ignore-tables",
+            "users",
+        ])
+        .output()
+        .expect("run cli");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("users.tags"), "{text}");
+}

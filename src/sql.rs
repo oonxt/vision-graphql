@@ -74,6 +74,19 @@ impl RenderCtx {
         Ok(self.binds.len())
     }
 
+    /// Append a scalar in a comparison position, where a null is refused. See
+    /// [`BindSpec::comparison`].
+    fn push_comparison(
+        &mut self,
+        val: &Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds
+            .push(BindSpec::comparison(val.clone(), pg, path)?);
+        Ok(self.binds.len())
+    }
+
     /// Append an `_in` / `_nin` list parameter.
     fn push_array(
         &mut self,
@@ -115,6 +128,14 @@ fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Re
 }
 
 fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result<()> {
+    // Answered while lowering; it rides along as a bound parameter so a document
+    // mixing introspection with data is still one statement, and so the JSON
+    // never has to be escaped into the SQL text.
+    if let crate::ast::RootBody::Introspection(value) = &root.body {
+        let n = ctx.push_fixed(crate::types::Bind::Text(value.to_string()));
+        write!(ctx.sql, "${n}::json").unwrap();
+        return Ok(());
+    }
     let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
         path: root.alias.clone(),
         message: format!("unknown table '{}'", root.table),
@@ -123,12 +144,16 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::List { selection } => {
             render_list(root, selection, table, schema, ctx)
         }
-        crate::ast::RootBody::Aggregate { ops, nodes } => {
-            render_aggregate(root, ops, nodes.as_deref(), table, schema, ctx)
-        }
+        crate::ast::RootBody::Aggregate {
+            ops,
+            nodes,
+            typenames,
+        } => render_aggregate(root, ops, nodes.as_deref(), typenames, table, schema, ctx),
         crate::ast::RootBody::ByPk { pk, selection } => {
             render_by_pk(root, pk, selection, table, schema, ctx)
         }
+        // Returned above, before the table lookup this arm sits behind.
+        crate::ast::RootBody::Introspection(_) => unreachable!("handled at the top of render_root"),
     }
 }
 
@@ -179,10 +204,11 @@ fn render_inner_select(
             ctx.sql.push_str(", ");
         }
         match field {
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Typename { alias } => render_typename_select(table, alias, ctx),
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", root.table),
+                    message: format!("unknown column '{column}' on '{}'", root.table),
                 })?;
                 write!(
                     ctx.sql,
@@ -193,13 +219,13 @@ fn render_inner_select(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", root.table),
+                    message: format!("unknown column '{column}' on '{}'", root.table),
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
@@ -275,7 +301,7 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
@@ -462,19 +488,12 @@ fn render_relation_subquery(
             ctx.sql.push_str(", ");
         }
         match field {
-            Field::Column {
-                physical,
-                alias: fa,
-            } => {
-                let col = target
-                    .find_column(physical)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("{parent_path}.{alias}.{fa}"),
-                        message: format!(
-                            "unknown column '{physical}' on '{}'",
-                            target.exposed_name
-                        ),
-                    })?;
+            Field::Typename { alias: fa } => render_typename_select(target, fa, ctx),
+            Field::Column { column, alias: fa } => {
+                let col = target.find_column(column).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.{alias}.{fa}"),
+                    message: format!("unknown column '{column}' on '{}'", target.exposed_name),
+                })?;
                 write!(
                     ctx.sql,
                     r#"{remote_alias}.{} AS "{}""#,
@@ -484,19 +503,14 @@ fn render_relation_subquery(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias: fa,
                 path,
             } => {
-                let col = target
-                    .find_column(physical)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("{parent_path}.{alias}.{fa}"),
-                        message: format!(
-                            "unknown column '{physical}' on '{}'",
-                            target.exposed_name
-                        ),
-                    })?;
+                let col = target.find_column(column).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.{alias}.{fa}"),
+                    message: format!("unknown column '{column}' on '{}'", target.exposed_name),
+                })?;
                 let err_path = format!("{parent_path}.{alias}.{fa}");
                 let expr = render_json_path_expr(&remote_alias, col, path, &err_path, ctx)?;
                 write!(ctx.sql, r#"{expr} AS "{fa}""#).unwrap();
@@ -856,11 +870,17 @@ fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
 
 /// A literal count renders inline — it is part of the query text, so it is as
 /// fixed as the rest of the SQL. A variable becomes a bind, which is what keeps
-/// `limit: $n` from producing a different statement per page size.
+/// `limit: $n` from producing a different statement per page size. A literal the
+/// caller asked to be bound ([`Count::Bound`]) does the same for the same
+/// reason, at the cost of no longer showing in the rendered SQL.
 fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
     match count {
         Count::Lit(n) => write!(ctx.sql, " {keyword} {n}").unwrap(),
-        Count::Var(_) => {
+        Count::Bound(n) => {
+            let i = ctx.push_fixed(crate::types::Bind::Int8(*n as i64));
+            write!(ctx.sql, " {keyword} ${i}::int8").unwrap();
+        }
+        Count::Var { .. } => {
             let n = ctx.push_count(count, || path.to_string());
             write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
         }
@@ -918,6 +938,7 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
     use crate::schema::PgType;
     std::borrow::Cow::Borrowed(match pg {
         PgType::Bool => "bool",
+        PgType::Int2 => "int2",
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
         PgType::Float4 => "float4",
@@ -940,6 +961,33 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
             ));
         }
     })
+}
+
+/// `__typename` in a SELECT list: a literal of the type this selection set
+/// belongs to. Cast to text so `row_to_json` sees a string rather than an
+/// `unknown`-typed constant.
+/// `__typename` beside `affected_rows` / `returning`: the mutation-response
+/// type, which is not the row type the `returning` selection reads.
+fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCtx) {
+    for alias in names {
+        write!(
+            ctx.sql,
+            ", '{}', '{}'::text",
+            escape_string_literal(alias),
+            escape_string_literal(&crate::type_names::mutation_response(table))
+        )
+        .unwrap();
+    }
+}
+
+fn render_typename_select(table: &Table, alias: &str, ctx: &mut RenderCtx) {
+    write!(
+        ctx.sql,
+        r#"'{}'::text AS "{}""#,
+        escape_string_literal(crate::type_names::row(table)),
+        alias
+    )
+    .unwrap();
 }
 
 fn quote_ident(s: &str) -> String {
@@ -977,10 +1025,11 @@ fn render_by_pk(
             ctx.sql.push_str(", ");
         }
         match field {
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Typename { alias } => render_typename_select(table, alias, ctx),
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 write!(
                     ctx.sql,
@@ -991,13 +1040,13 @@ fn render_by_pk(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(&inner_alias, col, path, &err_path, ctx)?;
@@ -1038,7 +1087,7 @@ fn render_by_pk(
             path: format!("{}.pk.{col_name}", root.alias),
             message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || {
+        let n = ctx.push_comparison(value, &col.pg_type, || {
             format!("{}.pk.{col_name}", root.alias)
         })?;
         let ph = format!("${n}::{}", pg_type_cast(&col.pg_type));
@@ -1841,7 +1890,8 @@ fn render_update_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        // A primary key is never null, so a null here matches nothing either.
+        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = ${n}::{}",
@@ -1916,7 +1966,8 @@ fn render_delete_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        // A primary key is never null, so a null here matches nothing either.
+        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = ${n}::{}",
@@ -1958,6 +2009,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             one,
             ..
         } => {
@@ -2010,6 +2062,7 @@ fn render_mutation_output_for_inner(
                 } else {
                     ctx.sql.push_str(", 'returning', '[]'::json");
                 }
+                render_response_typenames(response_typenames, tbl, ctx);
                 ctx.sql.push(')');
             }
         }
@@ -2017,6 +2070,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             ..
         } => {
             let tbl = schema.table(table).ok_or_else(|| Error::Validate {
@@ -2038,6 +2092,7 @@ fn render_mutation_output_for_inner(
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
             }
+            render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
         }
         MutationField::UpdateByPk {
@@ -2062,6 +2117,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             ..
         } => {
             let tbl = schema.table(table).ok_or_else(|| Error::Validate {
@@ -2083,6 +2139,7 @@ fn render_mutation_output_for_inner(
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
             }
+            render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
         }
         MutationField::DeleteByPk {
@@ -2109,26 +2166,63 @@ fn render_mutation_output_for_inner(
 
 fn render_aggregate(
     root: &RootField,
-    ops: &[crate::ast::AggOp],
+    ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
+    typenames: &[String],
     table: &Table,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
 
+    // Whether anything in the projection actually reads the source rows. Type
+    // names do not, and neither does an empty `aggregate`. Without something
+    // that collapses — an aggregate function, or the `json_agg` over `nodes` —
+    // selecting FROM the source would yield one row per source row inside a
+    // scalar subquery, which Postgres rejects outright at two rows and answers
+    // with null at zero. So when nothing reads the rows, do not read them.
+    let needs_source = nodes.is_some()
+        || ops
+            .iter()
+            .any(|s| !matches!(s.op, crate::ast::AggOp::Typename));
+
     ctx.sql.push_str("(SELECT json_build_object(");
-    ctx.sql.push_str("'aggregate', json_build_object(");
-    for (i, op) in ops.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for alias in typenames {
+        if !first {
             ctx.sql.push_str(", ");
         }
-        render_agg_op(op, &inner_alias, table, ctx)?;
+        first = false;
+        write!(
+            ctx.sql,
+            "'{}', '{}'::text",
+            escape_string_literal(alias),
+            escape_string_literal(&crate::type_names::aggregate(table))
+        )
+        .unwrap();
     }
-    ctx.sql.push(')');
+    // Only when the document asked for it: an `aggregate` key in a response to
+    // `{ nodes { … } }` is a field the caller did not select.
+    if !ops.is_empty() {
+        if !first {
+            ctx.sql.push_str(", ");
+        }
+        first = false;
+        ctx.sql.push_str("'aggregate', json_build_object(");
+        for (i, op) in ops.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            render_agg_op(op, &inner_alias, table, ctx)?;
+        }
+        ctx.sql.push(')');
+    }
 
     if let Some(node_fields) = nodes {
-        ctx.sql.push_str(", 'nodes', coalesce(json_agg(");
+        if !first {
+            ctx.sql.push_str(", ");
+        }
+        ctx.sql.push_str("'nodes', coalesce(json_agg(");
         render_json_build_object_for_nodes(
             node_fields,
             &inner_alias,
@@ -2140,58 +2234,116 @@ fn render_aggregate(
         ctx.sql.push_str("), '[]'::json)");
     }
 
-    ctx.sql.push_str(") FROM (");
-    render_aggregate_source(root, ops, nodes, table, schema, ctx)?;
-    ctx.sql.push_str(") ");
-    ctx.sql.push_str(&inner_alias);
+    ctx.sql.push(')');
+    if needs_source {
+        ctx.sql.push_str(" FROM (");
+        render_aggregate_source(root, ops, nodes, table, schema, ctx)?;
+        ctx.sql.push_str(") ");
+        ctx.sql.push_str(&inner_alias);
+    }
     ctx.sql.push(')');
     Ok(())
 }
 
 fn render_agg_op(
-    op: &crate::ast::AggOp,
+    sel: &crate::ast::AggSelect,
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::AggOp;
-    match op {
-        AggOp::Count => {
-            ctx.sql.push_str("'count', count(*)");
+    let key = escape_string_literal(&sel.alias);
+    match &sel.op {
+        AggOp::Count { columns, distinct } => {
+            write!(ctx.sql, "'{key}', count(").unwrap();
+            if columns.is_empty() {
+                ctx.sql.push('*');
+            } else {
+                if *distinct {
+                    ctx.sql.push_str("DISTINCT ");
+                }
+                // More than one column counts the tuple: a row constructor is
+                // NULL only when every field is, which is the reading that makes
+                // `count(DISTINCT (a, b))` mean distinct pairs.
+                if columns.len() > 1 {
+                    ctx.sql.push('(');
+                }
+                for (i, exposed) in columns.iter().enumerate() {
+                    if i > 0 {
+                        ctx.sql.push_str(", ");
+                    }
+                    let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+                        path: format!("aggregate.{}", sel.alias),
+                        message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
+                    })?;
+                    write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+                }
+                if columns.len() > 1 {
+                    ctx.sql.push(')');
+                }
+            }
+            ctx.sql.push(')');
             Ok(())
         }
-        AggOp::Sum { columns } => render_agg_func("sum", "sum", columns, table_alias, table, ctx),
-        AggOp::Avg { columns } => render_agg_func("avg", "avg", columns, table_alias, table, ctx),
-        AggOp::Max { columns } => render_agg_func("max", "max", columns, table_alias, table, ctx),
-        AggOp::Min { columns } => render_agg_func("min", "min", columns, table_alias, table, ctx),
+        AggOp::Sum { fields } => render_agg_func(&key, "sum", fields, table_alias, table, ctx),
+        AggOp::Avg { fields } => render_agg_func(&key, "avg", fields, table_alias, table, ctx),
+        AggOp::Max { fields } => render_agg_func(&key, "max", fields, table_alias, table, ctx),
+        AggOp::Min { fields } => render_agg_func(&key, "min", fields, table_alias, table, ctx),
+        AggOp::Typename => {
+            write!(
+                ctx.sql,
+                "'{key}', '{}'::text",
+                escape_string_literal(&crate::type_names::aggregate_fields(table))
+            )
+            .unwrap();
+            Ok(())
+        }
     }
 }
 
 fn render_agg_func(
     key: &str,
     pg_func: &str,
-    columns: &[String],
+    fields: &[crate::ast::AggField],
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    use crate::ast::AggField;
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
-    for (i, col_exposed) in columns.iter().enumerate() {
+    for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        let col = table
-            .find_column(col_exposed)
-            .ok_or_else(|| Error::Validate {
-                path: format!("aggregate.{key}.{col_exposed}"),
-                message: format!("unknown column '{col_exposed}' on '{}'", table.exposed_name),
-            })?;
-        write!(
-            ctx.sql,
-            "'{col_exposed}', {pg_func}({table_alias}.{})",
-            quote_ident(&col.physical_name)
-        )
-        .unwrap();
+        match f {
+            AggField::Typename { alias } => {
+                write!(
+                    ctx.sql,
+                    "'{}', '{}'::text",
+                    escape_string_literal(alias),
+                    escape_string_literal(&crate::type_names::agg_op_fields(table, pg_func))
+                )
+                .unwrap();
+            }
+            AggField::Column(c) => {
+                let col = table
+                    .find_column(&c.column)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("aggregate.{key}.{}", c.alias),
+                        message: format!(
+                            "unknown column '{}' on '{}'",
+                            c.column, table.exposed_name
+                        ),
+                    })?;
+                write!(
+                    ctx.sql,
+                    "'{}', {pg_func}({table_alias}.{})",
+                    escape_string_literal(&c.alias),
+                    quote_ident(&col.physical_name)
+                )
+                .unwrap();
+            }
+        }
     }
     ctx.sql.push(')');
     Ok(())
@@ -2211,10 +2363,19 @@ fn render_json_build_object_for_nodes(
             ctx.sql.push_str(", ");
         }
         match f {
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Typename { alias } => {
+                write!(
+                    ctx.sql,
+                    "'{}', '{}'::text",
+                    escape_string_literal(alias),
+                    escape_string_literal(crate::type_names::row(table))
+                )
+                .unwrap();
+            }
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.nodes.{alias}"),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 write!(
                     ctx.sql,
@@ -2224,13 +2385,13 @@ fn render_json_build_object_for_nodes(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.nodes.{alias}"),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 let err_path = format!("{parent_path}.nodes.{alias}");
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
@@ -2263,7 +2424,7 @@ fn render_json_build_object_for_nodes(
 
 fn render_aggregate_source(
     root: &RootField,
-    ops: &[crate::ast::AggOp],
+    ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     table: &Table,
     schema: &Schema,
@@ -2273,15 +2434,24 @@ fn render_aggregate_source(
     use std::collections::BTreeSet;
 
     let mut cols_needed: BTreeSet<String> = BTreeSet::new();
-    for op in ops {
-        let columns = match op {
-            AggOp::Count => continue,
-            AggOp::Sum { columns }
-            | AggOp::Avg { columns }
-            | AggOp::Max { columns }
-            | AggOp::Min { columns } => columns,
+    for sel in ops {
+        // `count(columns: …)` reads columns too, so the inner select has to
+        // project them just like sum/avg/max/min do.
+        let names: Vec<&str> = match &sel.op {
+            AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
+            AggOp::Sum { fields }
+            | AggOp::Avg { fields }
+            | AggOp::Max { fields }
+            | AggOp::Min { fields } => fields
+                .iter()
+                .filter_map(|f| match f {
+                    crate::ast::AggField::Column(c) => Some(c.column.as_str()),
+                    crate::ast::AggField::Typename { .. } => None,
+                })
+                .collect(),
+            AggOp::Typename => Vec::new(),
         };
-        for c in columns {
+        for c in names {
             let col = table.find_column(c).ok_or_else(|| Error::Validate {
                 path: format!("{}.aggregate", root.alias),
                 message: format!("unknown column '{c}' on '{}'", table.exposed_name),
@@ -2291,13 +2461,13 @@ fn render_aggregate_source(
     }
     if let Some(fields) = nodes {
         for f in fields {
-            let physical = match f {
-                Field::Column { physical, .. } | Field::JsonPath { physical, .. } => physical,
-                Field::Relation { .. } => continue,
+            let column = match f {
+                Field::Column { column, .. } | Field::JsonPath { column, .. } => column,
+                Field::Typename { .. } | Field::Relation { .. } => continue,
             };
-            let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("{}.nodes", root.alias),
-                message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             cols_needed.insert(col.physical_name.clone());
         }
@@ -2405,7 +2575,7 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
@@ -2547,11 +2717,11 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                     Field::Column {
-                        physical: "name".into(),
+                        column: "name".into(),
                         alias: "name".into(),
                     },
                 ],
@@ -2582,7 +2752,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "data".into(),
+                    column: "data".into(),
                     alias: "abundance".into(),
                     path: vec!["a".into(), "b".into()],
                 }],
@@ -2608,7 +2778,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "meta".into(),
+                    column: "meta".into(),
                     alias: "tags".into(),
                     path: vec!["tags".into()],
                 }],
@@ -2628,7 +2798,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "oops".into(),
                     path: vec!["x".into()],
                 }],
@@ -2659,7 +2829,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2707,7 +2877,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2736,7 +2906,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2765,7 +2935,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2801,7 +2971,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2829,7 +2999,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3072,6 +3242,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3081,7 +3252,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: false,
@@ -3100,6 +3271,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users_one".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3109,7 +3281,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: true,
@@ -3127,6 +3299,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3136,7 +3309,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: false,
@@ -3169,6 +3342,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3198,6 +3372,7 @@ mod tests {
             value: serde_json::json!("alice").into(),
         };
         let op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_users".into(),
             table: "users".into(),
             // where already carries the AND-ed scope (as apply_scope leaves it).
@@ -3236,6 +3411,7 @@ mod tests {
         let mut set = BTreeMap::new();
         set.insert("name".to_string(), serde_json::json!("bob").into());
         let op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_users".into(),
             table: "users".into(),
             where_: BoolExpr::Compare {
@@ -3260,6 +3436,7 @@ mod tests {
         columns.insert("id".to_string(), serde_json::json!(1).into());
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3307,7 +3484,7 @@ mod tests {
             pk: vec![("id".into(), serde_json::json!(1).into())],
             set,
             selection: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             scope: Some(BoolExpr::Compare {
@@ -3349,7 +3526,7 @@ mod tests {
             table: "users".into(),
             pk: vec![("id".into(), serde_json::json!(1).into())],
             selection: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             scope: None,
@@ -3377,7 +3554,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3398,7 +3575,7 @@ mod tests {
             body: RootBody::ByPk {
                 pk: vec![("id".into(), json!(7).into())],
                 selection: vec![Field::Column {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "name".into(),
                 }],
             },
@@ -3410,21 +3587,28 @@ mod tests {
 
     #[test]
     fn render_aggregate_count_and_sum() {
-        use crate::ast::{AggOp, RootBody};
+        use crate::ast::{AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: vec![
-                    AggOp::Count,
-                    AggOp::Sum {
-                        columns: vec!["id".into()],
+                    AggSelect {
+                        alias: "count".into(),
+                        op: AggOp::count(),
+                    },
+                    AggSelect {
+                        alias: "sum".into(),
+                        op: AggOp::Sum {
+                            fields: vec![crate::ast::AggField::column("id")],
+                        },
                     },
                 ],
                 nodes: Some(vec![Field::Column {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "name".into(),
                 }]),
             },
@@ -3434,15 +3618,184 @@ mod tests {
     }
 
     #[test]
-    fn render_aggregate_no_nodes() {
-        use crate::ast::{AggOp, RootBody};
+    fn render_count_distinct_and_aliases() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
-                ops: vec![AggOp::Count],
+                typenames: Vec::new(),
+                ops: vec![
+                    AggSelect {
+                        alias: "total".into(),
+                        op: AggOp::count(),
+                    },
+                    AggSelect {
+                        alias: "names".into(),
+                        op: AggOp::Count {
+                            columns: vec!["name".into()],
+                            distinct: true,
+                        },
+                    },
+                    AggSelect {
+                        alias: "pairs".into(),
+                        op: AggOp::Count {
+                            columns: vec!["id".into(), "name".into()],
+                            distinct: true,
+                        },
+                    },
+                    AggSelect {
+                        alias: "highest".into(),
+                        op: AggOp::Max {
+                            fields: vec![crate::ast::AggField::Column(crate::ast::AggCol {
+                                alias: "newest".into(),
+                                column: "id".into(),
+                            })],
+                        },
+                    },
+                ],
+                nodes: None,
+            },
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains("'total', count(*)"), "{sql}");
+        assert!(
+            sql.contains(r#"'names', count(DISTINCT t0."name")"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"'pairs', count(DISTINCT (t0."id", t0."name"))"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"'highest', json_build_object('newest', max(t0."id"))"#),
+            "{sql}"
+        );
+        // The columns count() reads must be projected by the inner select.
+        assert!(sql.contains(r#"SELECT "id", "name" FROM"#), "{sql}");
+    }
+
+    #[test]
+    fn render_typename_is_a_literal_of_the_type_name() {
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: crate::ast::RootBody::List {
+                selection: vec![
+                    Field::Typename {
+                        alias: "__typename".into(),
+                    },
+                    Field::Column {
+                        column: "id".into(),
+                        alias: "id".into(),
+                    },
+                ],
+            },
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains(r#"'users'::text AS "__typename""#), "{sql}");
+        // A literal, not a bind: it comes from the schema, not the request.
+        assert!(binds.is_empty(), "{binds:?}");
+    }
+
+    #[test]
+    fn aggregate_key_is_omitted_when_only_nodes_were_asked_for() {
+        use crate::ast::RootBody;
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: Vec::new(),
+                nodes: Some(vec![Field::Column {
+                    column: "id".into(),
+                    alias: "id".into(),
+                }]),
+                typenames: Vec::new(),
+            },
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(!sql.contains("'aggregate'"), "{sql}");
+        assert!(sql.contains("'nodes'"), "{sql}");
+    }
+
+    /// Nothing in the projection reads a row, so the statement must not read
+    /// any: a scalar subquery over an unaggregated source errors at two rows and
+    /// answers null at zero.
+    #[test]
+    fn a_typename_only_aggregate_reads_no_rows() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        for body in [
+            RootBody::Aggregate {
+                ops: Vec::new(),
+                nodes: None,
+                typenames: vec!["__typename".into()],
+            },
+            RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "__typename".into(),
+                    op: AggOp::Typename,
+                }],
+                nodes: None,
+                typenames: Vec::new(),
+            },
+        ] {
+            let op = Operation::Query(vec![RootField {
+                table: "users".into(),
+                alias: "users_aggregate".into(),
+                args: QueryArgs::default(),
+                body,
+            }]);
+            let (sql, _) = render(&op, &users_schema()).unwrap();
+            assert!(!sql.contains("FROM"), "{sql}");
+        }
+    }
+
+    /// …but as soon as something does aggregate, the source comes back.
+    #[test]
+    fn an_aggregate_with_a_function_still_reads_rows() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![
+                    AggSelect {
+                        alias: "__typename".into(),
+                        op: AggOp::Typename,
+                    },
+                    AggSelect {
+                        alias: "count".into(),
+                        op: AggOp::count(),
+                    },
+                ],
+                nodes: None,
+                typenames: Vec::new(),
+            },
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains("count(*)"), "{sql}");
+        assert!(sql.contains(r#"FROM "public"."users""#), "{sql}");
+    }
+
+    #[test]
+    fn render_aggregate_no_nodes() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                typenames: Vec::new(),
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
                 nodes: None,
             },
         }]);
@@ -3471,7 +3824,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3490,7 +3843,7 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     },
                     Field::Relation {
@@ -3498,7 +3851,7 @@ mod tests {
                         alias: "user".into(),
                         args: QueryArgs::default(),
                         selection: vec![Field::Column {
-                            physical: "name".into(),
+                            column: "name".into(),
                             alias: "name".into(),
                         }],
                     },
@@ -3518,7 +3871,7 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                     Field::Relation {
@@ -3526,7 +3879,7 @@ mod tests {
                         alias: "posts".into(),
                         args: QueryArgs::default(),
                         selection: vec![Field::Column {
-                            physical: "title".into(),
+                            column: "title".into(),
                             alias: "title".into(),
                         }],
                     },
@@ -3564,6 +3917,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3574,7 +3928,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 },
                 Field::Relation {
@@ -3582,7 +3936,7 @@ mod tests {
                     alias: "posts".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     }],
                 },
@@ -3640,6 +3994,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3650,7 +4005,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 },
                 Field::Relation {
@@ -3658,7 +4013,7 @@ mod tests {
                     alias: "posts".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     }],
                 },
@@ -3716,6 +4071,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_posts".into(),
             table: "posts".into(),
             objects: vec![InsertObject {
@@ -3726,7 +4082,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "title".into(),
+                    column: "title".into(),
                     alias: "title".into(),
                 },
                 Field::Relation {
@@ -3734,7 +4090,7 @@ mod tests {
                     alias: "user".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "name".into(),
+                        column: "name".into(),
                         alias: "name".into(),
                     }],
                 },
@@ -3796,6 +4152,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_posts".into(),
             table: "posts".into(),
             objects: vec![InsertObject {
@@ -3805,7 +4162,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "title".into(),
+                column: "title".into(),
                 alias: "title".into(),
             }],
             one: false,

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failed test that has to be read from a wall of output is a failed test
+  # nobody reads.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything that needs no database, so a formatting slip or a lint failure
+  # comes back in a minute rather than after the container suite.
+  check:
+    name: fmt, clippy, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  # `rust-version` in Cargo.toml is a promise. This is what keeps it one.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares MSRV $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Only what gets published. `--all-targets` would drag in the test-only
+      # dependencies, which carry their own, higher floors — failing the job for
+      # something no consumer of the crate is affected by.
+      - name: Library and binary build on the declared MSRV
+        run: |
+          cargo check -p vision-graphql --lib
+          cargo check -p vision-graphql-cli --bins
+      - name: Both crates declare the same MSRV
+        run: |
+          lib=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          cli=$(grep -m1 '^rust-version' crates/vision-graphql-cli/Cargo.toml | cut -d'"' -f2)
+          test "$lib" = "$cli" || { echo "MSRV mismatch: lib $lib, cli $cli"; exit 1; }
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      # Every integration test boots its own Postgres through testcontainers.
+      # Pulling the image once here keeps that out of the tests' own timing, and
+      # off the critical path of the first few that would otherwise race for it.
+      - name: Pre-pull the Postgres image
+        run: docker pull postgres:17.4-alpine
+
+      # nextest schedules every binary's tests through one pool, which `cargo
+      # test` cannot: it runs test *binaries* in parallel with no shared budget,
+      # and ~25 of them each starting containers is how a runner ends up with
+      # Docker returning PortNotExposed. The cap is on containers, not on CPU.
+      - name: Tests
+        run: cargo nextest run --workspace --test-threads 4
+
+      # nextest does not run doctests; the examples in the docs are part of the
+      # public surface and go stale silently otherwise.
+      - name: Doctests
+        run: cargo test --workspace --doc

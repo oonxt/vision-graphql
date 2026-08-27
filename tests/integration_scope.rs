@@ -875,3 +875,99 @@ async fn ordering_through_restricted_relation_cannot_see_out_of_scope_rows() {
         "out-of-scope author names must sort as NULL, not by their real value"
     );
 }
+
+/// Column rules are the other half of scoping: rows decide *which* records a
+/// caller sees, columns decide *what* of each record. They compose, and they
+/// hold on the compiled path too — which is the one a scoped endpoint uses.
+#[tokio::test]
+async fn column_scope_holds_on_both_paths() {
+    use vision_graphql::predicate::{col, principal, Principal};
+    use vision_graphql::ScopePolicy;
+
+    let container = Postgres::default()
+        .with_tag("17.4-alpine")
+        .start()
+        .await
+        .expect("start pg");
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"CREATE TABLE staff (id SERIAL PRIMARY KEY, org INT NOT NULL, name TEXT, salary INT);
+           INSERT INTO staff (org, name, salary) VALUES
+             (1, 'alice', 100), (1, 'bob', 200), (2, 'cara', 300);"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect(&pool).await.unwrap().build();
+    let engine = Engine::new(
+        pool.clone(),
+        Schema::introspect(&pool).await.unwrap().build(),
+    );
+
+    let policy = ScopePolicy::builder()
+        .allow("staff", col("org").eq(principal()))
+        .columns("staff", ["id", "org", "name"])
+        .validate(&schema)
+        .unwrap();
+
+    // Rows and columns compose: org 1 sees two rows, and never a salary.
+    let scoped = engine.scoped(policy.bind_value(1).unwrap());
+    let v = scoped.query("{ staff { id name } }", None).await.unwrap();
+    assert_eq!(v["staff"].as_array().unwrap().len(), 2);
+
+    let err = scoped
+        .query("{ staff { name salary } }", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("salary"), "{err}");
+
+    // Not through a filter either — which rows come back would answer the
+    // question the selection was refused.
+    let err = scoped
+        .query("{ staff(where: {salary: {_gt: 150}}) { name } }", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("salary"), "{err}");
+
+    // Nor by sorting, nor by aggregating.
+    assert!(scoped
+        .query("{ staff(order_by: [{salary: desc}]) { name } }", None)
+        .await
+        .is_err());
+    assert!(scoped
+        .query("{ staff_aggregate { aggregate { max { salary } } } }", None)
+        .await
+        .is_err());
+
+    // The compiled path carries the same rules — a policy that checked rows and
+    // not columns here would be the more dangerous half missing.
+    let compiled = engine
+        .compile_scoped("{ staff { id name } }", &policy)
+        .unwrap();
+    let mine = engine
+        .execute_scoped(&compiled, None, &Principal::new().set("principal", 2))
+        .await
+        .unwrap();
+    assert_eq!(mine["staff"].as_array().unwrap().len(), 1);
+    assert_eq!(mine["staff"][0]["name"], "cara");
+
+    let err = engine
+        .compile_scoped("{ staff { salary } }", &policy)
+        .unwrap_err();
+    assert!(format!("{err}").contains("salary"), "{err}");
+
+    // A typo in the allowlist is caught when the policy is validated, not by
+    // quietly withholding the column it meant to admit.
+    let err = ScopePolicy::builder()
+        .unrestricted("staff")
+        .columns("staff", ["id", "naem"])
+        .validate(&schema)
+        .unwrap_err();
+    assert!(format!("{err}").contains("naem"), "{err}");
+}
