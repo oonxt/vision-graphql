@@ -756,9 +756,10 @@ as a selection set. The set is PostgreSQL's, under PostgreSQL's names — so
 `stddev` is `stddev_samp` and `variance` is `var_samp` here as there.
 
 A function is offered only where it means something: the arithmetic ones over
-numbers, `max` and `min` over anything with an order. Asking for `sum` of a
-`text` column is an error rather than a `function sum(text) does not exist` from
-the server.
+numbers, `max` and `min` where PostgreSQL defines them — text, dates and times
+included; `boolean`, `uuid` and enums not, since they order but have no
+`max`/`min` aggregate. Asking for `sum` of a `text` column is an error rather
+than a `function sum(text) does not exist` from the server.
 
 The published type is what PostgreSQL answers with, not the column's own: the
 `sum` of an `integer` is a `bigint`, its `avg` a `numeric`, and the `var_samp`
