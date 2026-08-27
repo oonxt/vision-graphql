@@ -3740,6 +3740,57 @@ mod tests {
         .unwrap();
     }
 
+    /// `col = NULL` is no rows, not "the rows whose column is null" — so the
+    /// answer to `_eq: null` looked like a right answer to a question nobody
+    /// asked. Refused, with the operator that does mean it.
+    #[test]
+    fn comparing_against_null_is_refused_and_names_is_null() {
+        let render = |q: &str, vars: serde_json::Value| {
+            let s = schema();
+            parse_and_lower(q, &vars, None, &s).and_then(|op| {
+                crate::sql::render_now(&op, &s, &crate::types::Inputs::none()).map(|_| ())
+            })
+        };
+
+        for q in [
+            "{ users(where: {id: {_eq: null}}) { id } }",
+            "{ users(where: {id: {_neq: null}}) { id } }",
+            "{ users(where: {id: {_gt: null}}) { id } }",
+            "{ users(where: {_or: [{id: {_eq: null}}]}) { id } }",
+            "{ users_by_pk(id: null) { id } }",
+        ] {
+            let err = render(q, json!({})).unwrap_err();
+            assert!(format!("{err}").contains("_is_null"), "{q} -> {err}");
+        }
+
+        // Through a variable, which is the shape a client produces by leaving
+        // an optional filter unset.
+        let err = render(
+            "query($x: Int) { users(where: {id: {_eq: $x}}) { id } }",
+            json!({ "x": null }),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("_is_null"), "{err}");
+
+        // `_is_null` itself, and a null where it is a value, are untouched.
+        render(
+            "{ users(where: {name: {_is_null: true}}) { id } }",
+            json!({}),
+        )
+        .unwrap();
+        render(
+            r#"mutation { insert_users(objects: [{name: null}]) { affected_rows } }"#,
+            json!({}),
+        )
+        .unwrap();
+        render(
+            r#"mutation { update_users(where: {id: {_eq: 1}}, _set: {name: null}) {
+                 affected_rows } }"#,
+            json!({}),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn parse_missing_variable_errors() {
         let err = parse_and_lower(

@@ -103,6 +103,16 @@ pub enum BindSpec {
         pg: PgType,
         /// Error path, e.g. `where.user_id`.
         path: String,
+        /// Whether a null here is refused.
+        ///
+        /// Set for a comparison, where SQL's answer to `col = NULL` is no rows
+        /// — not "the rows whose column is null", which is what a caller
+        /// writing `_eq: null` means. Answering with an empty result would be
+        /// the shape of a right answer to a question that was never asked.
+        ///
+        /// Not set where a null is a value: `_set: {col: null}` and an inserted
+        /// column mean exactly what they say.
+        reject_null: bool,
     },
     /// An `_in` / `_nin` list, resolving to a JSON array.
     Array { val: Val, pg: PgType, path: String },
@@ -117,9 +127,27 @@ impl BindSpec {
     /// Convert `val` now when it is a literal, so errors are caught at render
     /// time; otherwise keep it for the request that supplies the value.
     pub(crate) fn scalar(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        Self::scalar_inner(val, pg, path, false)
+    }
+
+    /// A scalar in a comparison, where a null is refused rather than compared.
+    /// See [`BindSpec::Scalar::reject_null`].
+    pub(crate) fn comparison(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        Self::scalar_inner(val, pg, path, true)
+    }
+
+    fn scalar_inner(
+        val: Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+        reject_null: bool,
+    ) -> Result<Self> {
         match val.as_lit() {
             Some(v) => {
                 let path = path();
+                if reject_null && v.is_null() {
+                    return Err(null_comparison(&path));
+                }
                 json_to_bind(v, pg)
                     .map(BindSpec::Fixed)
                     .map_err(|e| Error::Validate {
@@ -131,6 +159,7 @@ impl BindSpec {
                 val,
                 pg: pg.clone(),
                 path: path(),
+                reject_null,
             }),
         }
     }
@@ -157,8 +186,19 @@ impl BindSpec {
     pub fn resolve(&self, inputs: &Inputs<'_>) -> Result<Bind> {
         match self {
             BindSpec::Fixed(b) => Ok(b.clone()),
-            BindSpec::Scalar { val, pg, path } => {
+            BindSpec::Scalar {
+                val,
+                pg,
+                path,
+                reject_null,
+            } => {
                 let v = val.resolve(inputs)?;
+                // A variable carries the same refusal to where its value
+                // arrives: `_eq: $x` with `x` null is the same question as
+                // `_eq: null`, asked one request later.
+                if *reject_null && v.is_null() {
+                    return Err(null_comparison(path));
+                }
                 json_to_bind(&v, pg).map_err(|e| Error::Validate {
                     path: path.clone(),
                     message: format!("{e}"),
@@ -178,6 +218,16 @@ impl BindSpec {
                     })
             }
         }
+    }
+}
+
+/// The one error this refusal produces, in both places it can happen.
+fn null_comparison(path: &str) -> Error {
+    Error::Validate {
+        path: path.to_string(),
+        message: "comparing against null matches no rows, which is unlikely to be \
+                  what was meant; use `_is_null` to ask whether the column is null"
+            .into(),
     }
 }
 

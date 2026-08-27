@@ -74,6 +74,19 @@ impl RenderCtx {
         Ok(self.binds.len())
     }
 
+    /// Append a scalar in a comparison position, where a null is refused. See
+    /// [`BindSpec::comparison`].
+    fn push_comparison(
+        &mut self,
+        val: &Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds
+            .push(BindSpec::comparison(val.clone(), pg, path)?);
+        Ok(self.binds.len())
+    }
+
     /// Append an `_in` / `_nin` list parameter.
     fn push_array(
         &mut self,
@@ -288,7 +301,7 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
@@ -1074,7 +1087,7 @@ fn render_by_pk(
             path: format!("{}.pk.{col_name}", root.alias),
             message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || {
+        let n = ctx.push_comparison(value, &col.pg_type, || {
             format!("{}.pk.{col_name}", root.alias)
         })?;
         let ph = format!("${n}::{}", pg_type_cast(&col.pg_type));
@@ -1877,7 +1890,8 @@ fn render_update_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        // A primary key is never null, so a null here matches nothing either.
+        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = ${n}::{}",
@@ -1952,7 +1966,8 @@ fn render_delete_by_pk_cte(
             path: format!("{cte}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        // A primary key is never null, so a null here matches nothing either.
+        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = ${n}::{}",
@@ -2560,7 +2575,7 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
                 CmpOp::Eq => "=",
