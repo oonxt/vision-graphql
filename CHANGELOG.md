@@ -92,6 +92,12 @@ used to be silent, so read **Breaking** before upgrading.
   execute time for `Engine::compile`, which is lowered before any request
   exists. An explicitly supplied value wins, including an explicit `null`.
 
+- **Every execution copied the SQL string.** `executor::execute_on` handed sqlx
+  an owned `String` per request, which for a compiled statement is a copy of the
+  one thing that never changes between requests. Borrowed now. The benchmarks do
+  not cover this path (they stop before the database), so no number is claimed —
+  only the allocation is gone.
+
 ### Added
 
 - **`__typename`**, in every selection set: rows, relations, `_by_pk`, aggregate
