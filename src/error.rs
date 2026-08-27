@@ -43,6 +43,13 @@ pub enum Error {
     #[error("query rejected: {message}")]
     Limit { message: String },
 
+    /// The request would cost more than [`crate::limits::ExecutionLimits`]
+    /// allows. Distinct from [`Error::Limit`] because the two are different
+    /// answers: one says the document is too big to look at, the other that a
+    /// perfectly ordinary document asks for too much.
+    #[error("request rejected: {message}")]
+    CostLimit { message: String },
+
     /// The query cannot be lowered without its variable values, so it cannot be
     /// compiled once and reused. See [`crate::Engine::compile`].
     #[error("not compilable at {path}: {message}")]
@@ -110,11 +117,16 @@ impl Error {
         match self {
             Error::Parse(_) => ErrorCode::ParseFailed,
             Error::Limit { .. } => ErrorCode::DocumentRejected,
+            Error::CostLimit { .. } => ErrorCode::LimitExceeded,
             Error::Validate { .. } | Error::TypeMap(_) => ErrorCode::ValidationFailed,
             Error::Variable { .. } => ErrorCode::VariableMissing,
-            Error::ScopeDenied { .. } | Error::ScopeColumnDenied { .. } | Error::Scope(_) => {
-                ErrorCode::ScopeDenied
-            }
+            Error::ScopeDenied { .. } | Error::ScopeColumnDenied { .. } => ErrorCode::ScopeDenied,
+            // Not an answer about the caller's access: `Error::Scope` carries a
+            // policy that would not load and a compiled statement run through
+            // the wrong entry point — both the host's own mistakes. Reporting
+            // them as a denial would tell a client it lacks permission for a
+            // bug it had no part in.
+            Error::Scope(_) => ErrorCode::Internal,
             Error::NotCompilable { .. } => ErrorCode::NotCompilable,
             Error::Database(_) => ErrorCode::DatabaseError,
             Error::Schema(_) | Error::Decode(_) => ErrorCode::Internal,
@@ -141,7 +153,7 @@ impl Error {
                 Some(code) => format!("the database refused the statement (SQLSTATE {code})"),
                 None => "the database refused the statement".into(),
             },
-            Error::Schema(_) | Error::Decode(_) => {
+            Error::Schema(_) | Error::Decode(_) | Error::Scope(_) => {
                 "the engine could not complete this request".into()
             }
             other => other.to_string(),
@@ -255,12 +267,59 @@ mod tests {
         assert_eq!(body["errors"][0]["extensions"]["code"], "DOCUMENT_REJECTED");
     }
 
+    /// The two limits are different answers: one says the document is too big
+    /// to look at, the other that an ordinary document asks for too much.
+    #[test]
+    fn the_two_limits_answer_differently() {
+        assert_eq!(
+            Error::Limit {
+                message: "too deep".into()
+            }
+            .code(),
+            ErrorCode::DocumentRejected
+        );
+        assert_eq!(
+            Error::CostLimit {
+                message: "limit 5000 is over the limit of 100".into()
+            }
+            .code(),
+            ErrorCode::LimitExceeded
+        );
+    }
+
+    /// `Error::Scope` carries a policy that would not load and a compiled
+    /// statement run through the wrong entry point — the host's mistakes, not
+    /// an answer about the caller's access.
+    #[test]
+    fn a_host_mistake_is_not_reported_as_a_denial() {
+        let e = Error::Scope("this query was compiled against a policy".into());
+        assert_eq!(e.code(), ErrorCode::Internal);
+        let msg = e.to_graphql_error()["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!msg.contains("policy"), "{msg}");
+
+        // A real denial still reads as one.
+        assert_eq!(
+            Error::ScopeDenied {
+                table: "orders".into()
+            }
+            .code(),
+            ErrorCode::ScopeDenied
+        );
+    }
+
     #[test]
     fn codes_are_distinct_per_kind() {
         use std::collections::BTreeSet;
         let codes: BTreeSet<&str> = [
             Error::Parse("x".into()).code(),
             Error::Limit {
+                message: "x".into(),
+            }
+            .code(),
+            Error::CostLimit {
                 message: "x".into(),
             }
             .code(),
@@ -285,7 +344,7 @@ mod tests {
         .iter()
         .map(|c| c.as_str())
         .collect();
-        assert_eq!(codes.len(), 7, "each kind answers to its own code");
+        assert_eq!(codes.len(), 8, "each kind answers to its own code");
     }
 
     #[test]

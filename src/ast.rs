@@ -225,6 +225,15 @@ pub enum RootBody {
         /// Response keys asking for the `<table>_aggregate` type name — the
         /// level that holds `aggregate` and `nodes`, one above both of them.
         typenames: Vec<String>,
+        /// A row cap that applies to `nodes` alone.
+        ///
+        /// `aggregate` and `nodes` read one source, so a `LIMIT` on it caps
+        /// both — which is right for a limit the caller wrote (they asked about
+        /// that many rows) and wrong for one
+        /// [`ExecutionLimits`](crate::limits::ExecutionLimits) injected, where
+        /// it would quietly turn `count` into "up to the default". So an
+        /// injected cap lands here instead and `nodes` gets its own source.
+        nodes_limit: Option<Count>,
     },
     ByPk {
         /// `(exposed_column, value)` pairs. All PK columns must be present.
@@ -247,7 +256,7 @@ pub enum RootBody {
 /// `total: count` is a field alias like any other — deriving it would answer
 /// under `count` and hand the caller a response shaped differently from the
 /// document they sent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggSelect {
     pub alias: String,
     pub op: AggOp,
@@ -255,7 +264,7 @@ pub struct AggSelect {
 
 /// A column inside `sum { … }` / `avg` / `max` / `min`, with the response key
 /// it answers to. Same reason as [`AggSelect::alias`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggCol {
     pub alias: String,
     pub column: String,
@@ -266,7 +275,7 @@ pub struct AggCol {
 /// A client that injects `__typename` into every selection set — which is what
 /// Apollo does — injects it here too, so the group cannot be a list of columns
 /// alone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggField {
     Column(AggCol),
     Typename { alias: String },
@@ -290,7 +299,7 @@ impl AggCol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggOp {
     /// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
     ///
@@ -480,6 +489,8 @@ pub enum Field {
         nodes: Option<Vec<Field>>,
         /// Response keys asking for the `<table>_aggregate` type name.
         typenames: Vec<String>,
+        /// See [`RootBody::Aggregate::nodes_limit`].
+        nodes_limit: Option<Count>,
     },
 }
 
@@ -746,6 +757,7 @@ mod tests {
     fn build_aggregate_root() {
         let body = RootBody::Aggregate {
             typenames: Vec::new(),
+            nodes_limit: None,
             ops: vec![
                 AggSelect {
                     alias: "count".into(),

@@ -471,6 +471,17 @@ impl<'a> Builder<'a> {
                         )
                         .with_args(list_args(target)),
                     );
+                    // The same field the root offers, over this row's children.
+                    // Only for array relations: an object relation is one row
+                    // and the lowering refuses to aggregate it, so publishing
+                    // one would advertise what would then be rejected.
+                    fields.push(
+                        Field::new(
+                            format!("{name}_aggregate"),
+                            TypeRef::named(type_names::aggregate(target)).non_null(),
+                        )
+                        .with_args(aggregate_args(target)),
+                    );
                 }
             }
         }
@@ -772,7 +783,7 @@ impl<'a> Builder<'a> {
                     type_names::aggregate(t),
                     TypeRef::named(type_names::aggregate(t)).non_null(),
                 )
-                .with_args(list_args(t)),
+                .with_args(aggregate_args(t)),
             );
             if let Some(args) = pk_args(t) {
                 fields.push(
@@ -898,6 +909,18 @@ fn list_args(t: &Table) -> Vec<InputValue> {
             TypeRef::named(select_column_enum_name(t)).non_null().list(),
         ),
     ]
+}
+
+/// Arguments an `_aggregate` field takes.
+///
+/// [`list_args`] minus `distinct_on`: the aggregate source does not render it,
+/// and publishing an argument the lowering then refuses is the failure this
+/// type system exists not to have.
+fn aggregate_args(t: &Table) -> Vec<InputValue> {
+    list_args(t)
+        .into_iter()
+        .filter(|a| a.name != "distinct_on")
+        .collect()
 }
 
 /// `_by_pk` arguments, or `None` for a table with no primary key — where the

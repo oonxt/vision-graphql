@@ -32,6 +32,23 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Fixed
 
+- **An injected `default_limit` capped an aggregate's `count`.** `aggregate` and
+  `nodes` read one source, so the limit decided what was counted rather than how
+  many rows came back — the opposite of what it is for. `nodes` now gets a
+  source of its own when a default applies; a limit the caller writes still
+  applies to both.
+- **A relation aggregate in mutation `returning` read the base table** while the
+  relation beside it read the CTE, so one response reported a row under `posts`
+  and `count: 0` under `posts_aggregate`.
+- **`distinct_on` on an aggregate was parsed and dropped**, leaving `count` to
+  answer a different question with no error. Refused now, and no longer
+  published in the type system.
+- **`ErrorCode::LimitExceeded` was unreachable**: an execution-limit refusal was
+  reported as `DOCUMENT_REJECTED`. `Error::CostLimit` is a new variant and the
+  two now answer differently.
+- **`Error::Scope` was classified as an access denial.** It carries a policy that
+  would not load and a compiled statement run through the wrong entry point —
+  the host's mistakes. Reported as `INTERNAL_ERROR`.
 - **A named operation that matched nothing ran anyway** when the document held
   exactly one operation: the name was not looked at. Answering about the
   operation that happens to be there when the caller asked about another is the

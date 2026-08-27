@@ -269,6 +269,34 @@ fn reject_typename_arguments(
 /// carries arguments, since `posts(limit: 1)` and `posts` under one key have no
 /// single answer — that is a conflict, and the fix is an alias.
 fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
+    /// Whether two `nodes` selections ask for the same columns in the same
+    /// order. Enough for the case this exists for — the same fragment spread
+    /// twice — and anything less alike is a conflict, which is the safe way to
+    /// be wrong.
+    fn nodes_match(a: Option<&[Field]>, b: Option<&[Field]>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| match (x, y) {
+                        (
+                            Field::Column {
+                                column: xc,
+                                alias: xa,
+                            },
+                            Field::Column {
+                                column: yc,
+                                alias: ya,
+                            },
+                        ) => xc == yc && xa == ya,
+                        (Field::Typename { alias: xa }, Field::Typename { alias: ya }) => xa == ya,
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn key_of(f: &Field) -> &str {
         match f {
             Field::Column { alias, .. }
@@ -298,6 +326,32 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
         let alias = key_of(&field).to_string();
         match (&mut out[pos], field) {
             (Field::Typename { .. }, Field::Typename { .. }) => {}
+            // A fragment spread twice is ordinary, and two aggregates asking
+            // the same thing are the same request — but only then: differing
+            // functions under one key have no single answer, as with relations.
+            (
+                Field::RelationAggregate {
+                    name: a,
+                    args: aargs,
+                    ops: aops,
+                    nodes: anodes,
+                    typenames: atn,
+                    ..
+                },
+                Field::RelationAggregate {
+                    name: ref b,
+                    args: bargs,
+                    ops: ref bops,
+                    nodes: ref bnodes,
+                    typenames: ref btn,
+                    ..
+                },
+            ) if a == b
+                && aargs.is_empty()
+                && bargs.is_empty()
+                && aops == bops
+                && atn == btn
+                && nodes_match(anodes.as_deref(), bnodes.as_deref()) => {}
             (Field::Column { column: a, .. }, Field::Column { column: ref b, .. }) if a == b => {}
             (
                 Field::JsonPath {
@@ -553,6 +607,25 @@ fn validate_fragments(fragments: &Fragments<'_>) -> Result<()> {
     Ok(())
 }
 
+/// `distinct_on` on an aggregate is refused, not ignored.
+///
+/// The aggregate's source is built by a different renderer than a row list's,
+/// and that one does not emit `DISTINCT ON` — so the argument used to be parsed,
+/// column-checked, and then vanish, leaving `count` to answer a question nobody
+/// asked. Until the source renders it, saying so is the only honest option, and
+/// the type system does not publish the argument either.
+fn reject_distinct_on_aggregate(args: &QueryArgs, path: &str) -> Result<()> {
+    if args.distinct_on.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Validate {
+        path: format!("{path}.distinct_on"),
+        message: "an aggregate cannot take 'distinct_on'; \
+                  use `count(columns: [\u{2026}], distinct: true)` to count distinct values"
+            .into(),
+    })
+}
+
 fn lower_query(
     set: &SelectionSet,
     schema: &Schema,
@@ -596,6 +669,7 @@ fn lower_query(
                 if let Some(base_name) = name.strip_suffix("_aggregate") {
                     if let Some(table) = schema.table(base_name) {
                         let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
+                        reject_distinct_on_aggregate(&args, &alias)?;
                         let AggregateSelection {
                             ops,
                             nodes,
@@ -614,6 +688,7 @@ fn lower_query(
                                 ops,
                                 nodes,
                                 typenames,
+                                nodes_limit: None,
                             },
                         });
                         continue;
@@ -1823,6 +1898,7 @@ fn lower_selection_set(
                                     })?;
                             let path = format!("{parent_path}.{alias}");
                             let args = lower_args(&field.arguments, target, schema, vars, &path)?;
+                            reject_distinct_on_aggregate(&args, &path)?;
                             let AggregateSelection {
                                 ops,
                                 nodes,
@@ -1840,6 +1916,7 @@ fn lower_selection_set(
                                 ops,
                                 nodes,
                                 typenames,
+                                nodes_limit: None,
                             });
                             continue;
                         }
@@ -3633,6 +3710,7 @@ mod tests {
                 ops,
                 nodes,
                 typenames,
+                ..
             } => {
                 assert_eq!(typenames, &vec!["__typename".to_string()]);
                 assert!(matches!(ops[0].op, crate::ast::AggOp::Typename));
@@ -3960,6 +4038,54 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no array relation 'nope'"), "{msg}");
+    }
+
+    #[test]
+    fn a_relation_aggregate_spread_twice_collapses() {
+        let s = schema_with_relations();
+        let op = parse_and_lower(
+            "fragment F on users { posts_aggregate { aggregate { count } } } \
+             { users { posts_aggregate { aggregate { count } } ...F } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!()
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!()
+        };
+        assert_eq!(selection.len(), 1, "{selection:?}");
+
+        // Differing ones under one key still have no single answer.
+        let err = parse_and_lower(
+            "{ users { posts_aggregate { aggregate { count } } \
+               posts_aggregate { aggregate { max { id } } } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("both answer to 'posts_aggregate'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_refuses_distinct_on_rather_than_dropping_it() {
+        for q in [
+            "{ users_aggregate(distinct_on: [id]) { aggregate { count } } }",
+            "{ users { posts_aggregate(distinct_on: [id]) { aggregate { count } } } }",
+        ] {
+            let err = parse_and_lower(q, &json!({}), None, &schema_with_relations()).unwrap_err();
+            assert!(
+                format!("{err}").contains("cannot take 'distinct_on'"),
+                "{q} -> {err}"
+            );
+        }
     }
 
     #[test]

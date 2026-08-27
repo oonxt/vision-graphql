@@ -741,7 +741,8 @@ what a paginated list needs, since the page and its total are one request:
 ```
 
 It renders as a correlated subquery like any relation field, takes the same
-arguments, and answers `count: 0` for a parent with no children rather than
+arguments (except `distinct_on`, which the aggregate source does not render and
+so does not accept), and answers `count: 0` for a parent with no children rather than
 going missing. Object relations do not have one: a single row has nothing to
 aggregate, and asking says so.
 
@@ -865,12 +866,16 @@ each relation at any depth, each `EXISTS` filter inside a `where`, each
 statement will carry, and the thing a hundred aliases of one relation inflates
 while leaving depth at 1.
 
-`default_limit` reaches root lists and array relations, and an `_aggregate`
-that selects `nodes` — those rows are rows like any other. Not `_by_pk`, not
-object relations (one row by construction; a limit there would replace the
-`LIMIT 1` the renderer needs), and not an `_aggregate` selecting only
-`aggregate { … }`, where a cap would change what `count` counts rather than
-what it costs. It is the one limit here that silently changes an answer, which
+`default_limit` reaches root lists, array relations, and the `nodes` of an
+`_aggregate` — those rows are rows like any other. Not `_by_pk`, and not object
+relations (one row by construction; a limit there would replace the `LIMIT 1`
+the renderer needs).
+
+On an aggregate it reaches `nodes` **and nothing else**: `aggregate` and `nodes`
+otherwise read one source, so a cap on it would decide what `count` counted
+rather than how many rows came back. `nodes` gets a source of its own when a
+default applies. A limit the caller writes still applies to both — they asked
+about that many rows. It is the one limit here that silently changes an answer, which
 is the trade it exists to make; a client that needs to know whether more rows
 exist should ask `_aggregate { count }` as its own root field.
 
@@ -977,10 +982,16 @@ runs it whole, so there is no partial success to report alongside, and the first
 thing that goes wrong is the only thing that happens.
 
 **`extensions.code`** is the stable classification — `VALIDATION_FAILED`,
-`VARIABLE_MISSING`, `SCOPE_DENIED`, `DOCUMENT_REJECTED`, `LIMIT_EXCEEDED`,
-`PARSE_FAILED`, `NOT_COMPILABLE`, `DATABASE_ERROR`, `INTERNAL_ERROR` — and what
-an HTTP layer maps to a status. The string is the contract, not the enum
-variant.
+`VARIABLE_MISSING`, `SCOPE_DENIED`, `DOCUMENT_REJECTED` (the document was too
+large or too deep to look at), `LIMIT_EXCEEDED` (an ordinary document asking for
+too much), `PARSE_FAILED`, `NOT_COMPILABLE`, `DATABASE_ERROR`, `INTERNAL_ERROR`
+— and what an HTTP layer maps to a status. The string is the contract, not the
+enum variant.
+
+`SCOPE_DENIED` means the caller's access, and only that. A policy that would not
+load, or a compiled statement run through the wrong entry point, is the host's
+own mistake and comes back as `INTERNAL_ERROR`: telling a client it lacks
+permission for a bug it had no part in would send it looking in the wrong place.
 
 **What the message says depends on who caused it.** A validation error goes
 back whole: it names a column the document already named, and withholding it

@@ -148,7 +148,17 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
             ops,
             nodes,
             typenames,
-        } => render_aggregate(root, ops, nodes.as_deref(), typenames, table, schema, ctx),
+            nodes_limit,
+        } => render_aggregate(
+            root,
+            ops,
+            nodes.as_deref(),
+            typenames,
+            nodes_limit.as_ref(),
+            table,
+            schema,
+            ctx,
+        ),
         crate::ast::RootBody::ByPk { pk, selection } => {
             render_by_pk(root, pk, selection, table, schema, ctx)
         }
@@ -256,6 +266,7 @@ fn render_inner_select(
                 ops,
                 nodes,
                 typenames,
+                nodes_limit,
             } => {
                 render_relation_aggregate_field(
                     name,
@@ -264,6 +275,7 @@ fn render_inner_select(
                     ops,
                     nodes.as_deref(),
                     typenames,
+                    nodes_limit.as_ref(),
                     table,
                     table_alias,
                     schema,
@@ -562,6 +574,7 @@ fn render_relation_subquery(
                 ops,
                 nodes,
                 typenames,
+                nodes_limit,
             } => {
                 render_relation_aggregate_field(
                     cname,
@@ -570,6 +583,7 @@ fn render_relation_subquery(
                     ops,
                     nodes.as_deref(),
                     typenames,
+                    nodes_limit.as_ref(),
                     target,
                     &remote_alias,
                     schema,
@@ -681,6 +695,7 @@ fn render_relation_aggregate_field(
     ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     typenames: &[String],
+    nodes_limit: Option<&crate::ast::Count>,
     parent_table: &Table,
     parent_alias: &str,
     schema: &Schema,
@@ -694,6 +709,7 @@ fn render_relation_aggregate_field(
         ops,
         nodes,
         typenames,
+        nodes_limit,
         parent_table,
         parent_alias,
         schema,
@@ -1153,6 +1169,7 @@ fn render_by_pk(
                 ops,
                 nodes,
                 typenames,
+                nodes_limit,
             } => {
                 render_relation_aggregate_field(
                     name,
@@ -1161,6 +1178,7 @@ fn render_by_pk(
                     ops,
                     nodes.as_deref(),
                     typenames,
+                    nodes_limit.as_ref(),
                     table,
                     &inner_alias,
                     schema,
@@ -2262,11 +2280,13 @@ fn render_mutation_output_for_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_aggregate(
     root: &RootField,
     ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     typenames: &[String],
+    nodes_limit: Option<&crate::ast::Count>,
     table: &Table,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -2276,6 +2296,7 @@ fn render_aggregate(
         ops,
         nodes,
         typenames,
+        nodes_limit,
         table,
         &root.alias,
         None,
@@ -2297,6 +2318,7 @@ fn render_aggregate_object(
     ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     typenames: &[String],
+    nodes_limit: Option<&crate::ast::Count>,
     table: &Table,
     path: &str,
     correlation: Option<&Correlation<'_>>,
@@ -2311,7 +2333,8 @@ fn render_aggregate_object(
     // selecting FROM the source would yield one row per source row inside a
     // scalar subquery, which Postgres rejects outright at two rows and answers
     // with null at zero. So when nothing reads the rows, do not read them.
-    let needs_source = nodes.is_some()
+    // `nodes` on a source of its own does not need the shared one.
+    let needs_source = (nodes.is_some() && nodes_limit.is_none())
         || ops
             .iter()
             .any(|s| !matches!(s.op, crate::ast::AggOp::Typename));
@@ -2352,9 +2375,49 @@ fn render_aggregate_object(
         if !first {
             ctx.sql.push_str(", ");
         }
-        ctx.sql.push_str("'nodes', coalesce(json_agg(");
-        render_json_build_object_for_nodes(node_fields, &inner_alias, table, path, schema, ctx)?;
-        ctx.sql.push_str("), '[]'::json)");
+        match nodes_limit {
+            // A cap meant for `nodes` alone cannot ride on the shared source —
+            // the same `LIMIT` would decide what `count` counted — so `nodes`
+            // reads its own.
+            Some(limit) => {
+                let node_alias = ctx.next_alias("t");
+                let mut node_args = args.clone();
+                node_args.limit = Some(limit.clone());
+                ctx.sql.push_str("'nodes', (SELECT coalesce(json_agg(");
+                render_json_build_object_for_nodes(
+                    node_fields,
+                    &node_alias,
+                    table,
+                    path,
+                    schema,
+                    ctx,
+                )?;
+                ctx.sql.push_str("), '[]'::json) FROM (");
+                render_aggregate_source(
+                    &node_args,
+                    &[],
+                    nodes,
+                    table,
+                    path,
+                    correlation,
+                    schema,
+                    ctx,
+                )?;
+                write!(ctx.sql, ") {node_alias})").unwrap();
+            }
+            None => {
+                ctx.sql.push_str("'nodes', coalesce(json_agg(");
+                render_json_build_object_for_nodes(
+                    node_fields,
+                    &inner_alias,
+                    table,
+                    path,
+                    schema,
+                    ctx,
+                )?;
+                ctx.sql.push_str("), '[]'::json)");
+            }
+        }
     }
 
     ctx.sql.push(')');
@@ -2386,6 +2449,7 @@ fn render_relation_aggregate(
     ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     typenames: &[String],
+    nodes_limit: Option<&crate::ast::Count>,
     parent_table: &Table,
     parent_alias: &str,
     schema: &Schema,
@@ -2418,6 +2482,7 @@ fn render_relation_aggregate(
         ops,
         nodes,
         typenames,
+        nodes_limit,
         target,
         &path,
         Some(&correlation),
@@ -2604,6 +2669,7 @@ fn render_json_build_object_for_nodes(
                 ops,
                 nodes,
                 typenames,
+                nodes_limit,
             } => {
                 write!(ctx.sql, "'{rel_alias}', ").unwrap();
                 render_relation_aggregate(
@@ -2613,6 +2679,7 @@ fn render_json_build_object_for_nodes(
                     ops,
                     nodes.as_deref(),
                     typenames,
+                    nodes_limit.as_ref(),
                     table,
                     table_alias,
                     schema,
@@ -2699,13 +2766,33 @@ fn render_aggregate_source(
     // renderer, which supports EXISTS relation filters (needed both for
     // user-written relation filters and for scope-injected predicates).
     let src_alias = ctx.next_alias("s");
-    write!(
-        ctx.sql,
-        " FROM {}.{} {src_alias}",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
-    )
-    .unwrap();
+    // Inside a mutation, a relation reads the CTE holding the rows this
+    // statement just wrote — and an aggregate over that relation has to read
+    // the same thing, or one response reports a row under `posts` and `count: 0`
+    // under `posts_aggregate`.
+    let visible_cte = correlation.and_then(|c| {
+        match (
+            ctx.inserted_ctes.get(&c.rel.target_table),
+            ctx.current_mutation_cte.as_deref(),
+        ) {
+            (Some(cte_alias), Some(prefix))
+                if cte_alias == prefix || cte_alias.starts_with(&format!("{prefix}_")) =>
+            {
+                Some(cte_alias.clone())
+            }
+            _ => None,
+        }
+    });
+    match visible_cte {
+        Some(cte_alias) => write!(ctx.sql, " FROM {cte_alias} {src_alias}").unwrap(),
+        None => write!(
+            ctx.sql,
+            " FROM {}.{} {src_alias}",
+            quote_ident(&table.physical_schema),
+            quote_ident(&table.physical_name),
+        )
+        .unwrap(),
+    }
 
     // The correlation and the user's `where` are both filters on the same
     // source, so they are ANDed; the correlation goes first because it is the
@@ -3844,6 +3931,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
                 typenames: Vec::new(),
+                nodes_limit: None,
                 ops: vec![
                     AggSelect {
                         alias: "count".into(),
@@ -3876,6 +3964,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
                 typenames: Vec::new(),
+                nodes_limit: None,
                 ops: vec![
                     AggSelect {
                         alias: "total".into(),
@@ -3958,6 +4047,7 @@ mod tests {
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                nodes_limit: None,
                 ops: Vec::new(),
                 nodes: Some(vec![Field::Column {
                     column: "id".into(),
@@ -3979,11 +4069,13 @@ mod tests {
         use crate::ast::{AggOp, AggSelect, RootBody};
         for body in [
             RootBody::Aggregate {
+                nodes_limit: None,
                 ops: Vec::new(),
                 nodes: None,
                 typenames: vec!["__typename".into()],
             },
             RootBody::Aggregate {
+                nodes_limit: None,
                 ops: vec![AggSelect {
                     alias: "__typename".into(),
                     op: AggOp::Typename,
@@ -4012,6 +4104,7 @@ mod tests {
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                nodes_limit: None,
                 ops: vec![
                     AggSelect {
                         alias: "__typename".into(),
@@ -4041,6 +4134,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
                 typenames: Vec::new(),
+                nodes_limit: None,
                 ops: vec![AggSelect {
                     alias: "count".into(),
                     op: AggOp::count(),
