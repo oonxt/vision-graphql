@@ -31,6 +31,12 @@ pub enum Error {
     #[error("scope: {0}")]
     Scope(String),
 
+    /// The document was rejected before parsing, by [`crate::limits::ParseLimits`].
+    /// Distinct from [`Error::Parse`] so an endpoint can answer "too large /
+    /// too deep" differently from "syntactically invalid".
+    #[error("query rejected: {message}")]
+    Limit { message: String },
+
     /// The query cannot be lowered without its variable values, so it cannot be
     /// compiled once and reused. See [`crate::Engine::compile`].
     #[error("not compilable at {path}: {message}")]

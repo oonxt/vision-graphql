@@ -5,6 +5,7 @@ use crate::ast::{
     Val,
 };
 use crate::error::{Error, Result};
+use crate::limits::ParseLimits;
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
@@ -16,7 +17,9 @@ use async_graphql_value::{Name, Value as GqlValue};
 use serde_json::Value;
 use std::collections::HashMap;
 
-type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
+/// Fragment definitions by name, as gathered from the document. Public so the
+/// introspection resolver can spread the same fragments the data path does.
+pub type Fragments<'a> = HashMap<String, &'a FragmentDefinition>;
 
 #[tracing::instrument(level = "trace", skip_all)]
 pub fn parse_and_lower(
@@ -29,9 +32,21 @@ pub fn parse_and_lower(
     lower(&doc, variables, operation_name, schema)
 }
 
-/// Parse GraphQL text into a document. Depends on nothing but the text, which
-/// is what makes it cacheable — see [`crate::parse_cache`].
+/// Parse GraphQL text into a document, under [`ParseLimits::default`].
+/// Depends on nothing but the text, which is what makes it cacheable — see
+/// [`crate::parse_cache`].
+///
+/// Every path into the parser goes through here, which is what makes this the
+/// place the pre-parse guard lives: an over-deep document must be rejected
+/// before `parse_query` sees it, because the overflow it causes aborts the
+/// process rather than unwinding. See [`crate::limits`].
 pub fn parse_document(source: &str) -> Result<ExecutableDocument> {
+    parse_document_with(source, &ParseLimits::default())
+}
+
+/// [`parse_document`] under explicit limits.
+pub fn parse_document_with(source: &str, limits: &ParseLimits) -> Result<ExecutableDocument> {
+    limits.check(source)?;
     parse_query(source).map_err(|e| Error::Parse(e.to_string()))
 }
 
@@ -63,7 +78,24 @@ pub fn lower_with(
     for (name, def) in &doc.fragments {
         fragments.insert(name.as_str().to_string(), &def.node);
     }
+    validate_fragments(&fragments)?;
     let op = pick_operation(doc, operation_name)?;
+    reject_directives(op, &fragments)?;
+
+    // `query($n: Int = 10)` means the request may leave `$n` out. Filling the
+    // defaults in here, once, is what keeps every variable position below from
+    // having to know about them — and an explicitly passed null still wins,
+    // since only *missing* names are filled.
+    let defaults = collect_defaults(op.variable_definitions)?;
+    let merged;
+    let variables = match (&variables, defaults.is_empty()) {
+        (Bindings::Eager(vars), false) => {
+            merged = with_defaults(vars, &defaults);
+            Bindings::Eager(&merged)
+        }
+        _ => variables,
+    };
+
     match op.ty {
         OperationType::Query => lower_query(op.selection_set, schema, variables, &fragments),
         OperationType::Mutation => lower_mutation(op.selection_set, schema, variables, &fragments),
@@ -71,9 +103,58 @@ pub fn lower_with(
     }
 }
 
+/// Default values declared by an operation's variable definitions.
+///
+/// Public because the compiled path cannot apply them while lowering — it does
+/// not have the request's variables yet — so [`crate::CompiledQuery`] carries
+/// them and applies them at execute time. See [`crate::types::Inputs`].
+pub fn variable_defaults(
+    doc: &ExecutableDocument,
+    operation_name: Option<&str>,
+) -> Result<serde_json::Map<String, Value>> {
+    collect_defaults(pick_operation(doc, operation_name)?.variable_definitions)
+}
+
+fn collect_defaults(
+    defs: &[Positioned<async_graphql_parser::types::VariableDefinition>],
+) -> Result<serde_json::Map<String, Value>> {
+    let mut out = serde_json::Map::new();
+    for def in defs {
+        let Some(default) = def.node.default_value.as_ref() else {
+            continue;
+        };
+        let name = def.node.name.node.as_str();
+        let json = default
+            .node
+            .clone()
+            .into_json()
+            .map_err(|e| Error::Variable {
+                name: name.to_string(),
+                message: format!("default value is not representable as JSON: {e}"),
+            })?;
+        out.insert(name.to_string(), json);
+    }
+    Ok(out)
+}
+
+/// `vars` with any name it does not carry taken from `defaults`.
+fn with_defaults(vars: &Value, defaults: &serde_json::Map<String, Value>) -> Value {
+    let mut out = match vars {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (name, value) in defaults {
+        out.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    Value::Object(out)
+}
+
+#[derive(Clone, Copy)]
 struct OpInfo<'a> {
     ty: OperationType,
     selection_set: &'a SelectionSet,
+    variable_definitions: &'a [Positioned<async_graphql_parser::types::VariableDefinition>],
+    directives: &'a [Positioned<async_graphql_parser::types::Directive>],
 }
 
 fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result<OpInfo<'a>> {
@@ -81,6 +162,8 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
         (DocumentOperations::Single(op), _) => Ok(OpInfo {
             ty: op.node.ty,
             selection_set: &op.node.selection_set.node,
+            variable_definitions: &op.node.variable_definitions,
+            directives: &op.node.directives,
         }),
         (DocumentOperations::Multiple(ops), Some(n)) => {
             let key = Name::new(n);
@@ -90,6 +173,8 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
             Ok(OpInfo {
                 ty: op.node.ty,
                 selection_set: &op.node.selection_set.node,
+                variable_definitions: &op.node.variable_definitions,
+                directives: &op.node.directives,
             })
         }
         (DocumentOperations::Multiple(ops), None) => {
@@ -98,6 +183,8 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
                 Ok(OpInfo {
                     ty: op.node.ty,
                     selection_set: &op.node.selection_set.node,
+                    variable_definitions: &op.node.variable_definitions,
+                    directives: &op.node.directives,
                 })
             } else {
                 Err(Error::Parse(
@@ -106,6 +193,355 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
             }
         }
     }
+}
+
+/// Every argument on a `_by_pk` field must name a primary key column.
+///
+/// The loop that reads the PK looks up the columns it wants and never sees the
+/// rest, so without this an argument that is not part of the key — a typo, or a
+/// `where` the caller believed was filtering — is accepted and silently
+/// dropped. Every other argument position in this file rejects what it does not
+/// know; this one has to as well.
+fn reject_non_pk_arguments(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    path: &str,
+) -> Result<()> {
+    for (name_p, _) in args {
+        let name = name_p.node.as_str();
+        if !table.primary_key.iter().any(|pk| pk == name) {
+            return Err(Error::Validate {
+                path: format!("{path}.{name}"),
+                message: format!(
+                    "unknown argument '{name}'; '{}' takes only its primary key ({})",
+                    table.exposed_name,
+                    table.primary_key.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The introspection field every GraphQL client may add to any selection set.
+/// Apollo and urql add it to *all* of them by default, which is why it has to be
+/// accepted everywhere a selection set is lowered rather than only at the top.
+pub(crate) const TYPENAME: &str = "__typename";
+
+/// `__typename` takes no arguments. Rejecting them keeps it consistent with
+/// every other field position rather than quietly ignoring what was written.
+fn reject_typename_arguments(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    alias: &str,
+    parent_path: &str,
+) -> Result<()> {
+    if let Some((first, _)) = args.first() {
+        return Err(Error::Validate {
+            path: format!("{parent_path}.{alias}.{}", first.node.as_str()),
+            message: "'__typename' takes no arguments".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Collapse fields that answer to the same response key.
+///
+/// Two fields with one key is not an error by itself — spreading a fragment
+/// that repeats a column is ordinary, and the GraphQL spec says such fields
+/// merge. What is an error is two fields that answer to one key and ask for
+/// *different* things: only one of them can survive into `json_build_object`,
+/// and until this existed the loser vanished with no word to the caller.
+///
+/// Identical scalar reads collapse to one. Relations collapse only when neither
+/// carries arguments, since `posts(limit: 1)` and `posts` under one key have no
+/// single answer — that is a conflict, and the fix is an alias.
+fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
+    fn key_of(f: &Field) -> &str {
+        match f {
+            Field::Column { alias, .. }
+            | Field::JsonPath { alias, .. }
+            | Field::Typename { alias }
+            | Field::Relation { alias, .. } => alias,
+        }
+    }
+
+    fn conflict(alias: &str, parent_path: &str) -> Error {
+        Error::Validate {
+            path: format!("{parent_path}.{alias}"),
+            message: format!(
+                "two fields both answer to '{alias}' but ask for different things; \
+                 give one of them an alias"
+            ),
+        }
+    }
+
+    let mut out: Vec<Field> = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(pos) = out.iter().position(|e| key_of(e) == key_of(&field)) else {
+            out.push(field);
+            continue;
+        };
+        let alias = key_of(&field).to_string();
+        match (&mut out[pos], field) {
+            (Field::Typename { .. }, Field::Typename { .. }) => {}
+            (
+                Field::Column { physical: a, .. },
+                Field::Column {
+                    physical: ref b, ..
+                },
+            ) if a == b => {}
+            (
+                Field::JsonPath {
+                    physical: a,
+                    path: pa,
+                    ..
+                },
+                Field::JsonPath {
+                    physical: ref b,
+                    path: ref pb,
+                    ..
+                },
+            ) if a == b && pa == pb => {}
+            (
+                Field::Relation {
+                    name: a,
+                    args: aargs,
+                    selection: asel,
+                    ..
+                },
+                Field::Relation {
+                    name: ref b,
+                    args: bargs,
+                    selection: bsel,
+                    ..
+                },
+            ) if a == b && aargs.is_empty() && bargs.is_empty() => {
+                asel.extend(bsel);
+                let merged = std::mem::take(asel);
+                *asel = merge_fields(merged, &format!("{parent_path}.{alias}"))?;
+            }
+            _ => return Err(conflict(&alias, parent_path)),
+        }
+    }
+    Ok(out)
+}
+
+/// Every response key in one operation must be distinct.
+///
+/// Root fields are not merged the way selection-set fields are: two roots under
+/// one key differ in what they select, what they filter and often in kind
+/// (`users` vs `users_aggregate` aliased alike), and there is no defensible way
+/// to fold that into one. Rendering both is what used to happen, and the second
+/// silently overwrote the first in the result object.
+fn ensure_unique_root_aliases<'a>(aliases: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for alias in aliases {
+        if seen.contains(&alias) {
+            return Err(Error::Validate {
+                path: alias.to_string(),
+                message: format!(
+                    "two root fields both answer to '{alias}'; give one of them an alias"
+                ),
+            });
+        }
+        seen.push(alias);
+    }
+    Ok(())
+}
+
+/// Answer `__schema` / `__type` now, from the schema's type system.
+///
+/// It happens here, in lowering, because this is where the document's fragments
+/// and variables are — and because the answer then travels as an ordinary value
+/// in the IR, which every path downstream already knows how to carry.
+fn lower_introspection(
+    name: &str,
+    field: &async_graphql_parser::types::Field,
+    schema: &Schema,
+    vars: Bindings<'_>,
+    fragments: &Fragments<'_>,
+) -> Result<Value> {
+    if !schema.introspection_enabled() {
+        return Err(Error::Validate {
+            path: name.to_string(),
+            message: "introspection is disabled; enable it with \
+                      Schema::builder().enable_introspection()"
+                .into(),
+        });
+    }
+    let ts = schema.type_system();
+    if name == "__schema" {
+        return crate::introspection::resolve_schema(&field.selection_set.node, ts, fragments);
+    }
+
+    let mut wanted: Option<String> = None;
+    for (arg_name, value) in &field.arguments {
+        match arg_name.node.as_str() {
+            "name" => {
+                let json = gql_to_json(&value.node, vars, "__type.name")?;
+                wanted = Some(
+                    json.as_str()
+                        .ok_or_else(|| Error::Validate {
+                            path: "__type.name".into(),
+                            message: format!("expected a string, got {json}"),
+                        })?
+                        .to_string(),
+                );
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("__type.{other}"),
+                    message: format!("unknown argument '{other}' on '__type'"),
+                })
+            }
+        }
+    }
+    let wanted = wanted.ok_or_else(|| Error::Validate {
+        path: "__type".into(),
+        message: "missing required argument 'name'".into(),
+    })?;
+    crate::introspection::resolve_type_by_name(&wanted, &field.selection_set.node, ts, fragments)
+}
+
+/// Refuse a document carrying directives.
+///
+/// This engine implements none — not `@include`, not `@skip` — and until this
+/// check existed they were simply not looked at, so `field @include(if: false)`
+/// came back included. A directive that silently does not happen is the worst of
+/// the three options; erroring is the honest one, and it is why the introspection
+/// answer publishes an empty directive list.
+///
+/// Every position the grammar allows one is checked: the operation, its variable
+/// definitions, the fragment definitions, and every selection. Checking only
+/// selections would leave `query Q @skip(if: true)` accepted and inert, which is
+/// the same failure one level up.
+fn reject_directives(op: OpInfo<'_>, fragments: &Fragments<'_>) -> Result<()> {
+    fn refuse(
+        directives: &[Positioned<async_graphql_parser::types::Directive>],
+        where_: &str,
+    ) -> Result<()> {
+        if let Some(d) = directives.first() {
+            let name = d.node.name.node.as_str();
+            return Err(Error::Validate {
+                path: format!("@{name}"),
+                message: format!(
+                    "directives are not supported; '@{name}' on {where_} would have no effect"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn walk(set: &SelectionSet) -> Result<()> {
+        for sel in &set.items {
+            match &sel.node {
+                Selection::Field(f) => {
+                    refuse(&f.node.directives, "a field")?;
+                    walk(&f.node.selection_set.node)?;
+                }
+                Selection::InlineFragment(f) => {
+                    refuse(&f.node.directives, "an inline fragment")?;
+                    walk(&f.node.selection_set.node)?;
+                }
+                Selection::FragmentSpread(f) => refuse(&f.node.directives, "a fragment spread")?,
+            }
+        }
+        Ok(())
+    }
+
+    refuse(op.directives, "an operation")?;
+    for def in op.variable_definitions {
+        refuse(&def.node.directives, "a variable definition")?;
+    }
+    // Fragment bodies are walked here rather than followed from the spreads, so
+    // a fragment the operation does not use is still rejected — and the walk
+    // needs no cycle guard, since it never follows a spread.
+    for frag in fragments.values() {
+        refuse(&frag.directives, "a fragment definition")?;
+        walk(&frag.selection_set.node)?;
+    }
+    walk(op.selection_set)
+}
+
+/// Drop repeats anywhere in the list, not just adjacent ones.
+///
+/// `Vec::dedup` only collapses neighbours, so `__typename t: __typename
+/// __typename` kept two entries under one key and wrote it twice into the same
+/// `json_build_object`.
+fn dedup_keys(keys: &mut Vec<String>) {
+    let mut seen: Vec<String> = Vec::new();
+    keys.retain(|k| {
+        if seen.contains(k) {
+            false
+        } else {
+            seen.push(k.clone());
+            true
+        }
+    });
+}
+
+fn validate_fragments(fragments: &Fragments<'_>) -> Result<()> {
+    /// Longest chain allowed. Tied to the text-nesting limit because it bounds
+    /// the same thing — how deep the walkers below can recurse — just reached by
+    /// a different route.
+    const MAX_CHAIN: usize = crate::limits::DEFAULT_MAX_DEPTH;
+
+    fn spreads_of<'a>(set: &'a SelectionSet, out: &mut Vec<&'a str>) {
+        for sel in &set.items {
+            match &sel.node {
+                Selection::FragmentSpread(f) => out.push(f.node.fragment_name.node.as_str()),
+                Selection::Field(f) => spreads_of(&f.node.selection_set.node, out),
+                Selection::InlineFragment(f) => spreads_of(&f.node.selection_set.node, out),
+            }
+        }
+    }
+
+    /// Depth of the longest chain starting at `name`, or an error if `name` is
+    /// reachable from itself. `path` is the chain currently being walked, which
+    /// is what distinguishes a cycle from a fragment merely spread twice.
+    fn depth<'a>(
+        name: &'a str,
+        fragments: &'a Fragments<'a>,
+        path: &mut Vec<&'a str>,
+        done: &mut std::collections::HashMap<&'a str, usize>,
+    ) -> Result<usize> {
+        if let Some(d) = done.get(name) {
+            return Ok(*d);
+        }
+        if path.contains(&name) {
+            path.push(name);
+            return Err(Error::Validate {
+                path: format!("fragment {name}"),
+                message: format!("fragment cycle: {}", path.join(" -> ")),
+            });
+        }
+        // An unknown spread is reported where it is used, with the field path.
+        let Some((key, frag)) = fragments.get_key_value(name) else {
+            return Ok(0);
+        };
+        path.push(key.as_str());
+        let mut spreads = Vec::new();
+        spreads_of(&frag.selection_set.node, &mut spreads);
+        let mut deepest = 0;
+        for next in spreads {
+            deepest = deepest.max(1 + depth(next, fragments, path, done)?);
+        }
+        path.pop();
+        if deepest > MAX_CHAIN {
+            return Err(Error::Validate {
+                path: format!("fragment {name}"),
+                message: format!("fragment chain is deeper than the limit of {MAX_CHAIN}"),
+            });
+        }
+        done.insert(key.as_str(), deepest);
+        Ok(deepest)
+    }
+
+    let mut done = std::collections::HashMap::new();
+    for name in fragments.keys() {
+        depth(name.as_str(), fragments, &mut Vec::new(), &mut done)?;
+    }
+    Ok(())
 }
 
 fn lower_query(
@@ -151,7 +587,11 @@ fn lower_query(
                 if let Some(base_name) = name.strip_suffix("_aggregate") {
                     if let Some(table) = schema.table(base_name) {
                         let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
-                        let (ops, nodes) = lower_aggregate_selection(
+                        let AggregateSelection {
+                            ops,
+                            nodes,
+                            typenames,
+                        } = lower_aggregate_selection(
                             &field.selection_set.node,
                             table,
                             vars,
@@ -161,7 +601,11 @@ fn lower_query(
                             table: base_name.to_string(),
                             alias,
                             args,
-                            body: crate::ast::RootBody::Aggregate { ops, nodes },
+                            body: crate::ast::RootBody::Aggregate {
+                                ops,
+                                nodes,
+                                typenames,
+                            },
                         });
                         continue;
                     }
@@ -179,6 +623,7 @@ fn lower_query(
                                 ),
                             });
                         }
+                        reject_non_pk_arguments(&field.arguments, table, &alias)?;
                         let mut pk: Vec<(String, Val)> = Vec::new();
                         for pk_col in &table.primary_key {
                             let found = field
@@ -213,9 +658,31 @@ fn lower_query(
                     }
                 }
 
-                let table = schema.table(name).ok_or_else(|| Error::Validate {
-                    path: alias.clone(),
-                    message: format!("unknown root field '{name}'"),
+                if name == "__schema" || name == "__type" {
+                    roots.push(RootField {
+                        table: String::new(),
+                        alias,
+                        args: QueryArgs::default(),
+                        body: crate::ast::RootBody::Introspection(lower_introspection(
+                            name, field, schema, vars, fragments,
+                        )?),
+                    });
+                    continue;
+                }
+
+                let table = schema.table(name).ok_or_else(|| {
+                    if name == TYPENAME {
+                        return Error::Validate {
+                            path: alias.clone(),
+                            message: "'__typename' is supported inside a field's selection set, \
+                                      but not as a root field"
+                                .into(),
+                        };
+                    }
+                    Error::Validate {
+                        path: alias.clone(),
+                        message: format!("unknown root field '{name}'"),
+                    }
                 })?;
                 let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
                 let selection = lower_selection_set(
@@ -236,6 +703,7 @@ fn lower_query(
             }
         }
     }
+    ensure_unique_root_aliases(roots.iter().map(|r| r.alias.as_str()))?;
     Ok(Operation::Query(roots))
 }
 
@@ -281,6 +749,7 @@ fn lower_mutation(
         let mf = lower_mutation_field(name, &alias, field, schema, vars, fragments)?;
         fields.push(mf);
     }
+    ensure_unique_root_aliases(fields.iter().map(crate::ast::MutationField::alias))?;
     Ok(Operation::Mutation(fields))
 }
 
@@ -338,6 +807,11 @@ fn lower_mutation_field(
                     objects,
                     on_conflict,
                     returning,
+                    // `insert_one` answers with the row, not the
+                    // `{affected_rows, returning}` wrapper, so a `__typename`
+                    // in its selection set is a row typename and rides along in
+                    // `returning`.
+                    response_typenames: Vec::new(),
                     one: true,
                     scope_check: None,
                 });
@@ -359,12 +833,14 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Insert {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 objects,
                 on_conflict,
                 returning,
+                response_typenames,
                 one: false,
                 scope_check: None,
             });
@@ -419,12 +895,14 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Update {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 where_,
                 set,
                 returning,
+                response_typenames,
                 scope_check: None,
             });
         }
@@ -444,6 +922,7 @@ fn lower_mutation_field(
                         ),
                     });
                 }
+                reject_non_pk_arguments(&field.arguments, table, alias)?;
                 let mut pk: Vec<(String, Val)> = Vec::new();
                 for pk_col in &table.primary_key {
                     let found = field
@@ -511,15 +990,25 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Delete {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 where_,
                 returning,
+                response_typenames,
             });
         }
     }
 
+    if name == TYPENAME {
+        return Err(Error::Validate {
+            path: alias.into(),
+            message: "'__typename' is supported inside a field's selection set, but not as a \
+                      root field"
+                .into(),
+        });
+    }
     Err(Error::Validate {
         path: alias.into(),
         message: format!("mutation field '{name}' not yet supported"),
@@ -1062,6 +1551,19 @@ fn parse_update_by_pk_args(
                 };
                 let mut map = std::collections::BTreeMap::new();
                 for (k, val) in kv {
+                    // Same reason as `reject_non_pk_arguments`: only the primary
+                    // key columns are read back out below, so anything else here
+                    // would vanish without a word.
+                    if !table.primary_key.iter().any(|pk| pk == k.as_str()) {
+                        return Err(Error::Validate {
+                            path: format!("{path}.{k}"),
+                            message: format!(
+                                "'{k}' is not a primary key column of '{}' ({})",
+                                table.exposed_name,
+                                table.primary_key.join(", ")
+                            ),
+                        });
+                    }
                     map.insert(
                         k.to_string(),
                         gql_to_val(val, vars, &format!("{path}.{k}"))?,
@@ -1108,8 +1610,11 @@ fn parse_returning(
     vars: Bindings<'_>,
     fragments: &Fragments<'_>,
     parent_path: &str,
-) -> Result<Vec<Field>> {
+) -> Result<(Vec<Field>, Vec<String>)> {
     let mut returning: Vec<Field> = Vec::new();
+    // `__typename` here names the mutation-response type, not the row type, so
+    // it cannot ride along inside `returning`.
+    let mut typenames: Vec<String> = Vec::new();
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
             return Err(Error::Parse(
@@ -1119,6 +1624,15 @@ fn parse_returning(
         let field = &f.node;
         let fname = field.name.node.as_str();
         match fname {
+            TYPENAME => {
+                let alias = field
+                    .alias
+                    .as_ref()
+                    .map(|a| a.node.as_str().to_string())
+                    .unwrap_or_else(|| fname.to_string());
+                reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                typenames.push(alias);
+            }
             "affected_rows" => {}
             "returning" => {
                 returning = lower_selection_set(
@@ -1138,7 +1652,8 @@ fn parse_returning(
             }
         }
     }
-    Ok(returning)
+    dedup_keys(&mut typenames);
+    Ok((returning, typenames))
 }
 
 fn lower_selection_set(
@@ -1190,6 +1705,12 @@ fn lower_selection_set(
                     .map(|a| a.node.as_str().to_string())
                     .unwrap_or_else(|| name.to_string());
 
+                if name == TYPENAME {
+                    reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                    out.push(Field::Typename { alias });
+                    continue;
+                }
+
                 if let Some(rel) = table.find_relation(name) {
                     let target =
                         schema
@@ -1239,7 +1760,7 @@ fn lower_selection_set(
             }
         }
     }
-    Ok(out)
+    merge_fields(out, parent_path)
 }
 
 /// Lower a scalar column selection into either a plain [`Field::Column`] or a
@@ -1828,19 +2349,30 @@ pub(crate) fn json_to_gql(v: &Value) -> GqlValue {
     }
 }
 
+/// What an `_aggregate` field selected: the functions, the optional `nodes`
+/// row selection, and any `__typename` at the `<table>_aggregate` level.
+struct AggregateSelection {
+    ops: Vec<crate::ast::AggSelect>,
+    nodes: Option<Vec<Field>>,
+    typenames: Vec<String>,
+}
+
 fn lower_aggregate_selection(
     set: &SelectionSet,
     table: &Table,
     vars: Bindings<'_>,
     parent_path: &str,
-) -> Result<(Vec<crate::ast::AggOp>, Option<Vec<Field>>)> {
-    let mut ops: Vec<crate::ast::AggOp> = Vec::new();
+) -> Result<AggregateSelection> {
+    use crate::ast::{AggCol, AggField, AggOp, AggSelect};
+
+    let mut ops: Vec<AggSelect> = Vec::new();
     let mut nodes: Option<Vec<Field>> = None;
+    let mut typenames: Vec<String> = Vec::new();
 
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
             return Err(Error::Parse(
-                "fragments are not supported in Phase 3".into(),
+                "fragments are not supported inside an _aggregate field".into(),
             ));
         };
         let field = &f.node;
@@ -1850,42 +2382,90 @@ fn lower_aggregate_selection(
                 for s in &field.selection_set.node.items {
                     let Selection::Field(sf) = &s.node else {
                         return Err(Error::Parse(
-                            "fragments not supported inside aggregate".into(),
+                            "fragments are not supported inside aggregate".into(),
                         ));
                     };
                     let sf = &sf.node;
                     let op_name = sf.name.node.as_str();
-                    match op_name {
-                        "count" => {
-                            ops.push(crate::ast::AggOp::Count);
+                    let alias = sf
+                        .alias
+                        .as_ref()
+                        .map(|a| a.node.as_str().to_string())
+                        .unwrap_or_else(|| op_name.to_string());
+                    let path = format!("{parent_path}.aggregate.{alias}");
+                    let op = match op_name {
+                        TYPENAME => {
+                            reject_typename_arguments(
+                                &sf.arguments,
+                                &alias,
+                                &format!("{parent_path}.aggregate"),
+                            )?;
+                            AggOp::Typename
                         }
+                        "count" => parse_count_args(&sf.arguments, table, vars, &path)?,
                         "sum" | "avg" | "max" | "min" => {
-                            let mut columns = Vec::new();
+                            if let Some((first, _)) = sf.arguments.first() {
+                                return Err(Error::Validate {
+                                    path: format!("{path}.{}", first.node.as_str()),
+                                    message: format!(
+                                        "'{op_name}' takes no arguments; name the columns in its \
+                                         selection set instead"
+                                    ),
+                                });
+                            }
+                            let mut fields = Vec::new();
+                            let mut column_count = 0usize;
                             for cs in &sf.selection_set.node.items {
                                 let Selection::Field(cf) = &cs.node else {
                                     return Err(Error::Parse(
-                                        "fragments not supported inside aggregate".into(),
+                                        "fragments are not supported inside aggregate".into(),
                                     ));
                                 };
-                                let cname = cf.node.name.node.as_str();
+                                let cf = &cf.node;
+                                let cname = cf.name.node.as_str();
+                                let calias = cf
+                                    .alias
+                                    .as_ref()
+                                    .map(|a| a.node.as_str().to_string())
+                                    .unwrap_or_else(|| cname.to_string());
+                                if let Some((first, _)) = cf.arguments.first() {
+                                    return Err(Error::Validate {
+                                        path: format!("{path}.{calias}.{}", first.node.as_str()),
+                                        message: "a column inside an aggregate takes no arguments"
+                                            .into(),
+                                    });
+                                }
+                                if cname == TYPENAME {
+                                    fields.push(AggField::Typename { alias: calias });
+                                    continue;
+                                }
                                 let col =
                                     table.find_column(cname).ok_or_else(|| Error::Validate {
-                                        path: format!("{parent_path}.aggregate.{op_name}.{cname}"),
+                                        path: format!("{path}.{calias}"),
                                         message: format!(
                                             "unknown column '{cname}' on '{}'",
                                             table.exposed_name
                                         ),
                                     })?;
-                                columns.push(col.exposed_name.clone());
+                                column_count += 1;
+                                fields.push(AggField::Column(AggCol {
+                                    alias: calias,
+                                    column: col.exposed_name.clone(),
+                                }));
                             }
-                            let op = match op_name {
-                                "sum" => crate::ast::AggOp::Sum { columns },
-                                "avg" => crate::ast::AggOp::Avg { columns },
-                                "max" => crate::ast::AggOp::Max { columns },
-                                "min" => crate::ast::AggOp::Min { columns },
+                            if column_count == 0 {
+                                return Err(Error::Validate {
+                                    path: path.clone(),
+                                    message: format!("'{op_name}' needs at least one column"),
+                                });
+                            }
+                            match op_name {
+                                "sum" => AggOp::Sum { fields },
+                                "avg" => AggOp::Avg { fields },
+                                "max" => AggOp::Max { fields },
+                                "min" => AggOp::Min { fields },
                                 _ => unreachable!(),
-                            };
-                            ops.push(op);
+                            }
                         }
                         other => {
                             return Err(Error::Validate {
@@ -1893,7 +2473,8 @@ fn lower_aggregate_selection(
                                 message: format!("unsupported aggregate '{other}'"),
                             });
                         }
-                    }
+                    };
+                    ops.push(AggSelect { alias, op });
                 }
             }
             "nodes" => {
@@ -1905,6 +2486,15 @@ fn lower_aggregate_selection(
                 )?;
                 nodes = Some(fields);
             }
+            TYPENAME => {
+                let alias = field
+                    .alias
+                    .as_ref()
+                    .map(|a| a.node.as_str().to_string())
+                    .unwrap_or_else(|| key.to_string());
+                reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                typenames.push(alias);
+            }
             other => {
                 return Err(Error::Validate {
                     path: format!("{parent_path}.{other}"),
@@ -1913,7 +2503,73 @@ fn lower_aggregate_selection(
             }
         }
     }
-    Ok((ops, nodes))
+    dedup_keys(&mut typenames);
+    Ok(AggregateSelection {
+        ops,
+        nodes,
+        typenames,
+    })
+}
+
+/// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
+///
+/// Arguments here used to be read by nobody: `count(distinct: true, columns:
+/// [name])` rendered `count(*)` and returned a number that answered a different
+/// question than the one asked, without an error. Whatever is not understood is
+/// now rejected.
+fn parse_count_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    vars: Bindings<'_>,
+    path: &str,
+) -> Result<crate::ast::AggOp> {
+    let mut columns: Vec<String> = Vec::new();
+    let mut distinct = false;
+    for (name_p, value_p) in args {
+        let name = name_p.node.as_str();
+        match name {
+            "columns" => {
+                let json = gql_to_json(&value_p.node, vars, &format!("{path}.columns"))?;
+                let items = match &json {
+                    Value::Array(xs) => xs.clone(),
+                    single => vec![single.clone()],
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let cname = item.as_str().ok_or_else(|| Error::Validate {
+                        path: format!("{path}.columns[{i}]"),
+                        message: "expected column name (enum or string)".into(),
+                    })?;
+                    let col = table.find_column(cname).ok_or_else(|| Error::Validate {
+                        path: format!("{path}.columns[{i}]"),
+                        message: format!("unknown column '{cname}' on '{}'", table.exposed_name),
+                    })?;
+                    columns.push(col.exposed_name.clone());
+                }
+            }
+            "distinct" => {
+                let json = gql_to_json(&value_p.node, vars, &format!("{path}.distinct"))?;
+                distinct = json.as_bool().ok_or_else(|| Error::Validate {
+                    path: format!("{path}.distinct"),
+                    message: format!("expected a boolean, got {json}"),
+                })?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{path}.{other}"),
+                    message: format!(
+                        "unknown argument '{other}' on 'count'; it takes 'columns' and 'distinct'"
+                    ),
+                })
+            }
+        }
+    }
+    if distinct && columns.is_empty() {
+        return Err(Error::Validate {
+            path: format!("{path}.distinct"),
+            message: "'distinct' needs 'columns' to be distinct on".into(),
+        });
+    }
+    Ok(crate::ast::AggOp::Count { columns, distinct })
 }
 
 fn lower_selection_columns_only(
@@ -1936,6 +2592,11 @@ fn lower_selection_columns_only(
             .as_ref()
             .map(|a| a.node.as_str().to_string())
             .unwrap_or_else(|| name.to_string());
+        if name == TYPENAME {
+            reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+            out.push(Field::Typename { alias });
+            continue;
+        }
         let col = table.find_column(name).ok_or_else(|| Error::Validate {
             path: format!("{parent_path}.{alias}"),
             message: format!("unknown column '{name}' on '{}'", table.exposed_name),
@@ -1948,7 +2609,7 @@ fn lower_selection_columns_only(
             parent_path,
         )?);
     }
-    Ok(out)
+    merge_fields(out, parent_path)
 }
 
 #[cfg(test)]
@@ -2285,12 +2946,27 @@ mod tests {
         };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
-            crate::ast::RootBody::Aggregate { ops, nodes } => {
+            crate::ast::RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 2);
-                assert!(matches!(ops[0], crate::ast::AggOp::Count));
-                match &ops[1] {
-                    crate::ast::AggOp::Sum { columns } => {
-                        assert_eq!(columns, &vec!["id".to_string()])
+                assert_eq!(ops[0].alias, "count");
+                assert!(matches!(
+                    ops[0].op,
+                    crate::ast::AggOp::Count {
+                        distinct: false,
+                        ..
+                    }
+                ));
+                assert_eq!(ops[1].alias, "sum");
+                match &ops[1].op {
+                    crate::ast::AggOp::Sum { fields } => {
+                        assert_eq!(fields.len(), 1);
+                        match &fields[0] {
+                            crate::ast::AggField::Column(c) => {
+                                assert_eq!(c.column, "id");
+                                assert_eq!(c.alias, "id");
+                            }
+                            other => panic!("expected a column, got {other:?}"),
+                        }
                     }
                     _ => panic!("expected Sum"),
                 }
@@ -2574,13 +3250,382 @@ mod tests {
             panic!("expected Query");
         };
         match &roots[0].body {
-            crate::ast::RootBody::Aggregate { ops, nodes } => {
+            crate::ast::RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 1);
                 assert!(nodes.is_none());
             }
             _ => panic!("expected Aggregate"),
         }
         assert!(roots[0].args.where_.is_some());
+    }
+
+    fn agg(q: &str) -> Result<Vec<crate::ast::AggSelect>> {
+        let op = parse_and_lower(q, &json!({}), None, &schema())?;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate { ops, .. } => Ok(ops.clone()),
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn count_takes_columns_and_distinct() {
+        let ops =
+            agg("{ users_aggregate { aggregate { count(columns: [name], distinct: true) } } }")
+                .unwrap();
+        match &ops[0].op {
+            crate::ast::AggOp::Count { columns, distinct } => {
+                assert_eq!(columns, &vec!["name".to_string()]);
+                assert!(distinct);
+            }
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_rejects_what_it_does_not_understand() {
+        // Silently ignoring these is what made `count` answer a different
+        // question than the one asked.
+        let err = agg("{ users_aggregate { aggregate { count(sneaky: 1) } } }").unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown argument 'sneaky'"),
+            "{err}"
+        );
+
+        let err = agg("{ users_aggregate { aggregate { count(columns: [nope]) } } }").unwrap_err();
+        assert!(format!("{err}").contains("unknown column 'nope'"), "{err}");
+
+        let err = agg("{ users_aggregate { aggregate { count(distinct: true) } } }").unwrap_err();
+        assert!(format!("{err}").contains("needs 'columns'"), "{err}");
+
+        let err =
+            agg("{ users_aggregate { aggregate { sum(columns: [id]) { id } } } }").unwrap_err();
+        assert!(format!("{err}").contains("takes no arguments"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_fields_keep_their_aliases() {
+        let ops =
+            agg("{ users_aggregate { aggregate { total: count highest: max { newest: id } } } }")
+                .unwrap();
+        assert_eq!(ops[0].alias, "total");
+        assert_eq!(ops[1].alias, "highest");
+        match &ops[1].op {
+            crate::ast::AggOp::Max { fields } => match &fields[0] {
+                crate::ast::AggField::Column(c) => {
+                    assert_eq!(c.alias, "newest");
+                    assert_eq!(c.column, "id");
+                }
+                other => panic!("expected a column, got {other:?}"),
+            },
+            other => panic!("expected Max, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_identical_fields_collapse() {
+        // The shape a fragment spread produces: `id` asked for twice.
+        let op = parse_and_lower(
+            "fragment F on users { id } query { users { id ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => assert_eq!(selection.len(), 1),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn conflicting_fields_under_one_key_are_rejected() {
+        // Rendering both put two "name" keys in one json_build_object and the
+        // second silently won.
+        let err = parse_and_lower(
+            r#"{ users { name: id name } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'name'"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_root_alias_is_rejected() {
+        let err = parse_and_lower(
+            "{ users { id } users { name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("two root fields both answer to 'users'"),
+            "{err}"
+        );
+        // An alias on one of them is the fix, and it works.
+        parse_and_lower(
+            "{ users { id } others: users { name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identical_argument_free_relations_merge_but_differing_ones_do_not() {
+        let s = schema_with_relations();
+        let op = parse_and_lower(
+            "{ users { posts { id } posts { title } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => {
+                assert_eq!(selection.len(), 1);
+                match &selection[0] {
+                    Field::Relation { selection, .. } => assert_eq!(selection.len(), 2),
+                    _ => panic!("expected Relation"),
+                }
+            }
+            _ => panic!("expected List"),
+        }
+
+        let err = parse_and_lower(
+            "{ users { posts { id } posts(limit: 1) { id } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'posts'"), "{err}");
+    }
+
+    #[test]
+    fn declared_variable_defaults_are_applied() {
+        let op = parse_and_lower(
+            "query($n: Int = 7) { users(limit: $n) { id } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            roots[0].args.limit,
+            Some(crate::ast::Count::Lit(7))
+        ));
+
+        // A supplied value beats the default.
+        let op = parse_and_lower(
+            "query($n: Int = 7) { users(limit: $n) { id } }",
+            &json!({"n": 3}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            roots[0].args.limit,
+            Some(crate::ast::Count::Lit(3))
+        ));
+    }
+
+    #[test]
+    fn typename_lowers_in_a_row_selection() {
+        let op =
+            parse_and_lower("{ users { __typename id } }", &json!({}), None, &schema()).unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => {
+                assert!(
+                    matches!(&selection[0], Field::Typename { alias } if alias == "__typename")
+                );
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn repeated_typename_collapses() {
+        // Apollo injects `__typename` into every selection set, so a fragment
+        // spread routinely asks for it twice.
+        let op = parse_and_lower(
+            "fragment F on users { __typename id } { users { __typename ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => assert_eq!(selection.len(), 2),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn typename_takes_no_arguments_and_is_not_a_root_field() {
+        let err = parse_and_lower(
+            "{ users { __typename(x: 1) } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("takes no arguments"), "{err}");
+
+        let err = parse_and_lower("{ __typename }", &json!({}), None, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("not as a root field"), "{err}");
+    }
+
+    #[test]
+    fn typename_is_accepted_at_every_aggregate_level() {
+        let op = parse_and_lower(
+            "{ users_aggregate { __typename aggregate { __typename max { __typename id } } \
+              nodes { __typename } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate {
+                ops,
+                nodes,
+                typenames,
+            } => {
+                assert_eq!(typenames, &vec!["__typename".to_string()]);
+                assert!(matches!(ops[0].op, crate::ast::AggOp::Typename));
+                match &ops[1].op {
+                    crate::ast::AggOp::Max { fields } => {
+                        assert!(matches!(fields[0], crate::ast::AggField::Typename { .. }));
+                    }
+                    other => panic!("expected Max, got {other:?}"),
+                }
+                assert!(matches!(nodes.as_ref().unwrap()[0], Field::Typename { .. }));
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    /// A fragment that spreads itself. Before this was rejected, lowering
+    /// recursed until the stack ran out and the process aborted — reaching the
+    /// assertion at all is most of the test.
+    #[test]
+    fn a_fragment_cycle_is_rejected() {
+        let err = parse_and_lower(
+            "fragment F on users { id ...F } { users { ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("fragment cycle"), "{err}");
+
+        // Indirect, and through a field rather than at the top level.
+        let err = parse_and_lower(
+            "fragment A on users { id ...B } fragment B on users { ...A } { users { ...A } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("fragment cycle"), "{err}");
+    }
+
+    /// The same hazard by another route: no cycle, just a long chain. Each
+    /// fragment nests one bracket deep, so the pre-parse text guard sees
+    /// nothing.
+    #[test]
+    fn an_over_deep_fragment_chain_is_rejected() {
+        let mut q = String::from("{ users { ...F0 } }");
+        for i in 0..500 {
+            q.push_str(&format!(" fragment F{i} on users {{ ...F{} }}", i + 1));
+        }
+        q.push_str(" fragment F500 on users { id }");
+        let err = parse_and_lower(&q, &json!({}), None, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("deeper than the limit"), "{err}");
+    }
+
+    #[test]
+    fn a_fragment_spread_twice_is_not_a_cycle() {
+        parse_and_lower(
+            "fragment F on users { id } { users { ...F } others: users { ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn directives_are_rejected_in_every_position() {
+        for q in [
+            "query Q @skip(if: true) { users { id } }",
+            "query Q($n: Int @foo) { users(limit: $n) { id } }",
+            "fragment F on users @foo { id } { users { ...F } }",
+            "{ users { id @include(if: true) } }",
+            "{ users { ... on users @foo { id } } }",
+            "fragment F on users { id } { users { ...F @foo } }",
+        ] {
+            let err = parse_and_lower(q, &json!({}), None, &schema()).unwrap_err();
+            assert!(
+                format!("{err}").contains("directives are not supported"),
+                "{q} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_typename_answers_under_one_key() {
+        let op = parse_and_lower(
+            r#"mutation { insert_users(objects: [{name: "a"}]) {
+                 __typename affected_rows t: __typename __typename } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Mutation(fields) = op else {
+            panic!("expected Mutation");
+        };
+        match &fields[0] {
+            crate::ast::MutationField::Insert {
+                response_typenames, ..
+            } => {
+                // Non-adjacent repeats too: `Vec::dedup` would have kept both.
+                assert_eq!(
+                    response_typenames,
+                    &vec!["__typename".to_string(), "t".to_string()]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
     }
 
     #[test]

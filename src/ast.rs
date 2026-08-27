@@ -183,23 +183,114 @@ pub enum RootBody {
         selection: Vec<Field>,
     },
     Aggregate {
-        ops: Vec<AggOp>,
+        ops: Vec<AggSelect>,
         nodes: Option<Vec<Field>>,
+        /// Response keys asking for the `<table>_aggregate` type name — the
+        /// level that holds `aggregate` and `nodes`, one above both of them.
+        typenames: Vec<String>,
     },
     ByPk {
         /// `(exposed_column, value)` pairs. All PK columns must be present.
         pk: Vec<(String, Val)>,
         selection: Vec<Field>,
     },
+    /// `__schema` / `__type`, answered from the schema rather than from
+    /// Postgres and carried into the statement as a bound `json` parameter.
+    ///
+    /// Resolving at lowering time rather than around the SQL is what lets a
+    /// document that mixes introspection with data stay one request, and what
+    /// lets an introspection query be compiled like any other.
+    Introspection(Value),
+}
+
+/// One entry under `aggregate { … }`: the response key it answers to, and the
+/// function it computes.
+///
+/// The key is carried rather than derived from the function name because
+/// `total: count` is a field alias like any other — deriving it would answer
+/// under `count` and hand the caller a response shaped differently from the
+/// document they sent.
+#[derive(Debug, Clone)]
+pub struct AggSelect {
+    pub alias: String,
+    pub op: AggOp,
+}
+
+/// A column inside `sum { … }` / `avg` / `max` / `min`, with the response key
+/// it answers to. Same reason as [`AggSelect::alias`].
+#[derive(Debug, Clone)]
+pub struct AggCol {
+    pub alias: String,
+    pub column: String,
+}
+
+/// An entry inside a `sum` / `avg` / `max` / `min` group.
+///
+/// A client that injects `__typename` into every selection set — which is what
+/// Apollo does — injects it here too, so the group cannot be a list of columns
+/// alone.
+#[derive(Debug, Clone)]
+pub enum AggField {
+    Column(AggCol),
+    Typename { alias: String },
+}
+
+impl AggField {
+    /// A column answering under its own name.
+    pub fn column(column: impl Into<String>) -> Self {
+        AggField::Column(AggCol::new(column))
+    }
+}
+
+impl AggCol {
+    /// A column answering under its own name.
+    pub fn new(column: impl Into<String>) -> Self {
+        let column = column.into();
+        AggCol {
+            alias: column.clone(),
+            column,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum AggOp {
-    Count,
-    Sum { columns: Vec<String> },
-    Avg { columns: Vec<String> },
-    Max { columns: Vec<String> },
-    Min { columns: Vec<String> },
+    /// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
+    ///
+    /// Empty `columns` is `count(*)`. One column counts rows where it is not
+    /// null. Several columns render as a row constructor, which is SQL NULL only
+    /// when every field is — so without `distinct` that is `count(*)` again, and
+    /// `distinct` is what makes naming several columns useful: distinct
+    /// combinations.
+    Count {
+        columns: Vec<String>,
+        distinct: bool,
+    },
+    Sum {
+        fields: Vec<AggField>,
+    },
+    Avg {
+        fields: Vec<AggField>,
+    },
+    Max {
+        fields: Vec<AggField>,
+    },
+    Min {
+        fields: Vec<AggField>,
+    },
+    /// `__typename` beside the aggregate functions; names the
+    /// `<table>_aggregate_fields` type.
+    Typename,
+}
+
+impl AggOp {
+    /// `count(*)`.
+    pub fn count() -> Self {
+        AggOp::Count {
+            columns: Vec::new(),
+            distinct: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +300,21 @@ pub struct QueryArgs {
     pub limit: Option<Count>,
     pub offset: Option<Count>,
     pub distinct_on: Vec<String>,
+}
+
+impl QueryArgs {
+    /// Whether the field was written with no arguments at all.
+    ///
+    /// Used to decide whether two relation fields under one response key can be
+    /// merged: with no arguments on either side they ask the same question, and
+    /// only their selections differ.
+    pub fn is_empty(&self) -> bool {
+        self.where_.is_none()
+            && self.order_by.is_empty()
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && self.distinct_on.is_empty()
+    }
 }
 
 /// One object-relation hop on the way to an `order_by` column.
@@ -303,6 +409,12 @@ pub enum Field {
         /// Non-empty list of key/index components. Rendered as a `text[]` bind.
         path: Vec<String>,
     },
+    /// `__typename`. Renders as a string literal: the type name comes from the
+    /// table the selection set belongs to, which only the renderer knows, so the
+    /// IR carries the request and not the answer.
+    Typename {
+        alias: String,
+    },
     Relation {
         /// Name of the relation on the parent table (resolved via schema at render).
         name: String,
@@ -367,6 +479,9 @@ pub enum MutationField {
         objects: Vec<InsertObject>,
         on_conflict: Option<OnConflict>,
         returning: Vec<Field>,
+        /// Response keys asking for the mutation-response type name. Not part
+        /// of `returning`, which selects from the row type.
+        response_typenames: Vec<String>,
         /// true for `insert_users_one` (single object result); false for `insert_users`
         /// (array result wrapped in `{affected_rows, returning}`).
         one: bool,
@@ -382,6 +497,8 @@ pub enum MutationField {
         /// `{ exposed_column -> new_value }`
         set: std::collections::BTreeMap<String, Val>,
         returning: Vec<Field>,
+        /// See [`MutationField::Insert::response_typenames`].
+        response_typenames: Vec<String>,
         /// Post-update scope check under deny-by-default scoped execution: every
         /// row left by the UPDATE must still satisfy this predicate or the whole
         /// statement aborts. The same predicate is also AND-ed into `where_` as a
@@ -409,6 +526,8 @@ pub enum MutationField {
         table: String,
         where_: BoolExpr,
         returning: Vec<Field>,
+        /// See [`MutationField::Insert::response_typenames`].
+        response_typenames: Vec<String>,
     },
     DeleteByPk {
         alias: String,
@@ -567,10 +686,17 @@ mod tests {
     #[test]
     fn build_aggregate_root() {
         let body = RootBody::Aggregate {
+            typenames: Vec::new(),
             ops: vec![
-                AggOp::Count,
-                AggOp::Sum {
-                    columns: vec!["age".into()],
+                AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                },
+                AggSelect {
+                    alias: "sum".into(),
+                    op: AggOp::Sum {
+                        fields: vec![AggField::column("age")],
+                    },
                 },
             ],
             nodes: Some(vec![Field::Column {
@@ -579,7 +705,7 @@ mod tests {
             }]),
         };
         match body {
-            RootBody::Aggregate { ops, nodes } => {
+            RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 2);
                 assert!(nodes.is_some());
             }
@@ -605,6 +731,7 @@ mod tests {
                 physical: "id".into(),
                 alias: "id".into(),
             }],
+            response_typenames: Vec::new(),
             one: false,
             scope_check: None,
         };

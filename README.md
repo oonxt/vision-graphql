@@ -62,6 +62,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Area | Status |
 |---|---|
 | Select, `_by_pk`, `_aggregate` | ✓ |
+| Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, with field aliases | ✓ |
 | Object + Array relations | ✓ |
 | `EXISTS` relation filters in `where` | ✓ |
 | Mutations: `insert` / `insert_one` / `update` / `update_by_pk` / `delete` / `delete_by_pk` | ✓ |
@@ -72,8 +73,11 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
 | Field aliases (`abundance: data`) | ✓ |
+| `__typename` in every selection set | ✓ |
+| Schema introspection (`__schema` / `__type`), off by default | ✓ |
+| SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
-| GraphQL variables, named + inline fragments | ✓ |
+| GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | Schema introspection | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |
@@ -83,6 +87,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
 | Computed fields | Not implemented |
+| Pre-parse limits on document size and nesting (`ParseLimits`) | ✓ |
 | Subscriptions | Not implemented |
 
 ## JSON/JSONB path reads
@@ -534,6 +539,178 @@ nested children render to a single atomic statement, a violation anywhere rolls
 back every level. An upsert (`on_conflict` with `update_columns`) additionally
 applies the predicate to the `DO UPDATE … WHERE`, so a conflicting row outside
 scope is skipped rather than overwritten.
+
+## `__typename`
+
+Supported in every selection set: rows, nested relations, `_by_pk`, aggregate
+`nodes`, the `aggregate` object and each function group inside it, mutation
+`returning`, and the `{ affected_rows, returning }` wrapper itself. That breadth
+is the point — Apollo and urql inject `__typename` into *every* selection set by
+default, so anything less means a client that works until it touches the one
+position that was missed.
+
+```graphql
+{ users { __typename id posts { __typename title } } }
+```
+```json
+{ "users": [ { "__typename": "users", "id": 1,
+               "posts": [ { "__typename": "posts", "title": "hello" } ] } ] }
+```
+
+Type names follow Hasura's scheme, so tooling generated against a Hasura
+endpoint reads them unchanged: a row is the exposed table name, and the derived
+types are `<table>_aggregate`, `<table>_aggregate_fields`, `<table>_sum_fields`
+(and `avg` / `max` / `min`), and `<table>_mutation_response`. They render as SQL
+literals — no bind, no round trip.
+
+`__typename` is not accepted as a *root* field (`{ __typename }`), which would
+name the operation root type; put it inside a field's selection set.
+
+## Schema introspection and SDL
+
+The GraphQL type system this engine exposes is derived from the schema —
+Hasura's shape, so a client or codegen setup written against a Hasura endpoint
+reads it unchanged:
+
+```
+users                         users_bool_exp        Int_comparison_exp
+users_aggregate               users_order_by        order_by
+users_aggregate_fields        users_insert_input    users_select_column
+users_sum_fields (avg/max/min) users_set_input      users_constraint
+users_mutation_response       users_on_conflict     users_pk_columns_input
+```
+
+Everything published is something the engine implements. `String_comparison_exp`
+carries the operators the lowering actually lowers and not one more — no
+`_regex`, no `_similar` — because a client generates code against what it is
+told. A read-only table gets read types and no mutation fields. `on_conflict`
+appears only where a unique constraint exists to name in it. `path` appears only
+on `json`/`jsonb` columns. The directive list is empty, and a document carrying
+`@include`/`@skip` is rejected rather than having it silently not happen.
+
+### `__schema` / `__type` — off by default
+
+```rust
+# use vision_graphql::Schema;
+# async fn f(pool: sqlx::PgPool) -> vision_graphql::error::Result<()> {
+let schema = Schema::introspect(&pool).await?.enable_introspection().build();
+# let _ = schema; Ok(()) }
+```
+
+Introspection hands the caller the whole data model — every table, column, type
+and relation. That is a wider disclosure than answering data queries, so
+upgrading does not turn it on. Enable it where the endpoint is internal or the
+model is public anyway; leave it off where clients ship pre-generated documents.
+
+It is answered from the schema in memory, and the JSON rides into the statement
+as a bound parameter — so a document mixing introspection with data is still one
+request, and a compiled introspection query works like any other.
+
+A Postgres enum column is published as a custom scalar named after the type
+rather than a GraphQL enum: introspection reads the type's name but not its
+variants.
+
+### SDL export
+
+```bash
+vision-gql sdl --url $DATABASE_URL --config schema.toml -o schema.graphql --force
+vision-gql sdl --url $DATABASE_URL --config schema.toml -o schema.graphql --check
+```
+
+The exposed surface is otherwise implicit — what introspection found, minus
+`hide_columns`, renamed by `expose_as`, plus what the overlay declared.
+Committing the SDL turns "did that migration expose a new column" into a line in
+a diff. `--check` is the CI half: exit 0 when the file matches the database, 1
+when it does not, with a summary that leads with the types that appeared or went
+away. Output is byte-stable for a given schema.
+
+Unlike runtime introspection, this needs no flag: it is a build-time artifact,
+not something a request can ask for. In code it is
+`vision_graphql::sdl::render(schema.type_system())`.
+
+## Aggregates
+
+```graphql
+query {
+  users_aggregate(where: {active: {_eq: true}}) {
+    aggregate {
+      total: count                                  # count(*)
+      cities: count(columns: [city], distinct: true) # count(DISTINCT city)
+      oldest: max { born: birth_date }
+      avg { age }
+    }
+    nodes { id name }
+  }
+}
+```
+
+`count` takes `columns` and `distinct`; the other functions take their columns
+as a selection set. Field aliases work here like anywhere else — `total: count`
+answers under `total`. Anything else in an argument position is an error rather
+than something quietly dropped: `count(distinct: true)` with no `columns` says
+so, and a misspelled argument names itself.
+
+## Strictness
+
+Two rules worth knowing before pointing a client at this, both of which used to
+be silent:
+
+**Unknown arguments are rejected, everywhere.** Including on `_by_pk` roots,
+which read the arguments they want by name and used to leave the rest alone —
+`users_by_pk(id: 1, where: {…})` now says the `where` does not belong instead of
+returning the row and discarding the filter.
+
+**Two fields cannot answer to one response key unless they ask the same
+question.** Identical scalar reads collapse, which is what makes spreading a
+fragment that repeats a column work. Relations merge when neither carries
+arguments. Anything else — `posts` beside `posts(limit: 1)`, two root fields
+both called `users` — is an error naming the key, because only one of them can
+survive into the response object and the other used to vanish without a word.
+
+## Request limits
+
+Every document is checked against [`ParseLimits`] *before* it is parsed —
+a single pass over the raw bytes, bounding total length and nesting depth.
+
+This one guard cannot live anywhere else. Nesting an input value deeply enough
+overflows the stack inside the parser, and a stack overflow in Rust aborts the
+process: it is not a panic, so no `catch_unwind` at the request boundary
+contains it. A ~16 KiB document takes the server down along with every request
+in flight:
+
+```graphql
+{ users(where: {_not: {_not: … × 2000 … }}) { id } }
+```
+
+2000 is the depth that does it on a 2 MiB stack, which is what a tokio worker
+thread gets by default; an 8 MiB main thread only moves the cliff to ~8000.
+Selection-set nesting is already bounded by the parser's own recursion limit —
+it is input values (`where`, `_set`, `objects`) that had no guard, which is why
+the depth counted here spans `{`, `[` and `(` alike.
+
+Defaults are 64 levels and 128 KiB, far above any hand-written or generated
+query. Brackets inside string literals and `#` comments do not count. A rejected
+document returns `Error::Limit`, kept separate from `Error::Parse` so an
+endpoint can answer "too large" differently from "invalid syntax".
+
+```rust
+# use std::sync::Arc;
+# use vision_graphql::{Engine, ParseCache, ParseLimits, Schema};
+# fn example(pool: sqlx::PgPool, schema: Schema) {
+let cache = ParseCache::with_limits(256, ParseLimits { max_depth: 32, max_bytes: 32 * 1024 });
+let engine = Engine::with_parse_cache(pool, schema, Arc::new(cache));
+# let _ = engine; }
+```
+
+`Engine::with_parse_cache` also lets several engines share one cache. Parsing
+is schema-independent, so an application running an engine per role — the way
+per-role column visibility is expressed today — would otherwise parse the same
+document once per role.
+
+These limits bound the *document*. They are not a complexity budget: a flat
+query with two hundred aliased relation fields passes, and renders two hundred
+correlated subqueries. If you forward untrusted client documents, pair this
+with a row limit and a statement timeout of your own.
 
 ## Transactions
 

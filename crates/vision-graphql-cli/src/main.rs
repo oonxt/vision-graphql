@@ -1,6 +1,7 @@
 mod analyze;
 mod cmd_diff;
 mod cmd_generate;
+mod cmd_sdl;
 mod cmd_validate;
 mod filter;
 mod log_init;
@@ -36,6 +37,8 @@ enum Cmd {
     Diff(DiffArgs),
     /// Validate a schema.toml's structure without connecting to a database.
     Validate(ValidateArgs),
+    /// Write the GraphQL schema (SDL) a database plus overlay exposes.
+    Sdl(SdlArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -84,6 +87,30 @@ struct DiffArgs {
     /// Output format.
     #[arg(long, default_value = "text", value_parser = ["text", "json"])]
     format: String,
+}
+
+#[derive(ClapArgs, Debug)]
+struct SdlArgs {
+    #[command(flatten)]
+    db: CommonDb,
+
+    /// Overlay TOML to apply before rendering. Without it the SDL is what
+    /// introspection alone exposes.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Output path; "-" for stdout (default).
+    #[arg(short = 'o', long = "output", default_value = "-")]
+    output: String,
+
+    /// Overwrite an existing output file.
+    #[arg(short = 'f', long = "force")]
+    force: bool,
+
+    /// Compare --output against the database instead of writing it.
+    /// Exit 0 when they match, 1 when they do not — for CI.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -150,6 +177,20 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .await
             }
             Cmd::Validate(a) => cmd_validate::run(&a.path),
+            Cmd::Sdl(a) => {
+                let url = resolve_url(a.db.url)?;
+                cmd_sdl::run(cmd_sdl::Args {
+                    url,
+                    output: a.output,
+                    force: a.force,
+                    check: a.check,
+                    config: a.config,
+                    schemas: a.db.schemas,
+                    include: a.db.include_tables,
+                    ignore: a.db.ignore_tables,
+                })
+                .await
+            }
         }
     })
 }

@@ -72,6 +72,21 @@ impl Engine {
         }
     }
 
+    /// Same as [`Engine::new`] on a caller-owned [`ParseCache`].
+    ///
+    /// Two reasons to reach for this: to set [`ParseLimits`](crate::ParseLimits)
+    /// other than the defaults, and to share one cache across several engines.
+    /// Parsing is schema-independent, so an application running a separate
+    /// engine per role — the way per-role column visibility is expressed — would
+    /// otherwise parse the same document once per role.
+    pub fn with_parse_cache(pool: PgPool, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
+        Self {
+            pool,
+            schema: Arc::new(schema),
+            parse_cache,
+        }
+    }
+
     /// The shared document cache. Exposed for `clear()` and for size
     /// inspection; every handle spawned from this engine uses the same one.
     pub fn parse_cache(&self) -> &Arc<ParseCache> {
@@ -191,6 +206,7 @@ impl Engine {
             sql,
             specs,
             root_alias,
+            defaults: crate::parser::variable_defaults(&doc, operation_name)?,
             scoped: policy.is_some(),
         })
     }
@@ -213,7 +229,8 @@ impl Engine {
             ));
         }
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let binds = crate::types::resolve_binds(&compiled.specs, &Inputs::variables(&vars))?;
+        let inputs = Inputs::variables(&vars).with_defaults(&compiled.defaults);
+        let binds = crate::types::resolve_binds(&compiled.specs, &inputs)?;
         tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled");
         crate::executor::execute(&self.pool, &compiled.sql, &binds).await
     }
@@ -238,7 +255,9 @@ impl Engine {
             ));
         }
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let inputs = Inputs::variables(&vars).with_principal(principal);
+        let inputs = Inputs::variables(&vars)
+            .with_defaults(&compiled.defaults)
+            .with_principal(principal);
         let binds = crate::types::resolve_binds(&compiled.specs, &inputs)?;
         tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled scoped");
         crate::executor::execute(&self.pool, &compiled.sql, &binds).await
