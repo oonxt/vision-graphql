@@ -35,7 +35,7 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::predicate::{Principal, ScopeExpr};
 use crate::schema::{Schema, Table};
-use crate::scope::ScopeSet;
+use crate::scope::{ColumnScope, ScopeSet};
 
 /// Per-table rule in a [`ScopePolicy`], the templated counterpart of
 /// [`crate::TableScope`].
@@ -55,6 +55,7 @@ pub enum ScopeRule {
 #[derive(Debug, Clone, Default)]
 pub struct ScopePolicy {
     tables: HashMap<String, ScopeRule>,
+    columns: HashMap<String, ColumnScope>,
 }
 
 /// Builder for [`ScopePolicy`]. Mirrors [`crate::ScopeSet`]'s surface but takes
@@ -62,6 +63,7 @@ pub struct ScopePolicy {
 #[derive(Debug, Clone, Default)]
 pub struct ScopePolicyBuilder {
     tables: HashMap<String, ScopeRule>,
+    columns: HashMap<String, ColumnScope>,
 }
 
 impl ScopePolicy {
@@ -81,7 +83,21 @@ impl ScopePolicy {
                 ScopeRule::Deny => set.deny(table.clone()),
             };
         }
+        // Column rules carry no parameters — which columns a role may touch is
+        // part of the shape, not of the principal — so they are copied across
+        // rather than resolved.
+        set = self.apply_columns(set);
         Ok(set)
+    }
+
+    fn apply_columns(&self, mut set: ScopeSet) -> ScopeSet {
+        for (table, rule) in &self.columns {
+            set = match rule {
+                ColumnScope::Only(cols) => set.columns(table.clone(), cols.iter().cloned()),
+                ColumnScope::Except(cols) => set.hide_columns(table.clone(), cols.iter().cloned()),
+            };
+        }
+        set
     }
 
     /// A [`ScopeSet`] with every rule lowered but no principal substituted:
@@ -101,7 +117,10 @@ impl ScopePolicy {
                 ScopeRule::Deny => set.deny(table.clone()),
             };
         }
-        set
+        // Carried here too, or a query compiled against this policy would be
+        // checked for rows and not for columns — which is the path a scoped
+        // endpoint is most likely to be using.
+        self.apply_columns(set)
     }
 
     /// Convenience for single-key scopes: binds the `principal` parameter to
@@ -126,6 +145,36 @@ impl ScopePolicyBuilder {
     /// Allow `table` with no predicate.
     pub fn unrestricted(mut self, table: impl Into<String>) -> Self {
         self.tables.insert(table.into(), ScopeRule::Unrestricted);
+        self
+    }
+
+    /// Restrict `table` to these columns and no others. See [`ColumnScope`].
+    ///
+    /// Replaces any previous rule for the same table — the two forms are
+    /// alternative spellings of one rule, not layers.
+    pub fn columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns.insert(
+            table.into(),
+            ColumnScope::Only(columns.into_iter().map(Into::into).collect()),
+        );
+        self
+    }
+
+    /// Withhold these columns of `table`, admitting the rest. Replaces any
+    /// previous rule for the same table; see [`ScopePolicyBuilder::columns`].
+    pub fn hide_columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns.insert(
+            table.into(),
+            ColumnScope::Except(columns.into_iter().map(Into::into).collect()),
+        );
         self
     }
 
@@ -156,8 +205,30 @@ impl ScopePolicyBuilder {
                 validate_expr(expr, table, schema, &format!("scope.{table_name}"))?;
             }
         }
+        // Column names are validated too: a typo in an allowlist is the
+        // dangerous direction — `columns(["naem"])` would withhold `name` and
+        // look like it was doing its job — and in a denylist it is worse, since
+        // `hide_columns(["passwrod_hash"])` hides nothing at all.
+        for (table_name, rule) in &self.columns {
+            let table = schema.table(table_name).ok_or_else(|| Error::Validate {
+                path: format!("scope.{table_name}"),
+                message: format!("unknown table '{table_name}'"),
+            })?;
+            let named = match rule {
+                ColumnScope::Only(cols) | ColumnScope::Except(cols) => cols,
+            };
+            for column in named {
+                if table.find_column(column).is_none() {
+                    return Err(Error::Validate {
+                        path: format!("scope.{table_name}.columns"),
+                        message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+                    });
+                }
+            }
+        }
         Ok(ScopePolicy {
             tables: self.tables,
+            columns: self.columns,
         })
     }
 }

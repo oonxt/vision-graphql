@@ -87,7 +87,7 @@ impl QueryBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -97,7 +97,7 @@ impl QueryBuilder {
     pub fn column(mut self, col: impl Into<String>) -> Self {
         let c: String = col.into();
         self.selection.push(Field::Column {
-            physical: c.clone(),
+            column: c.clone(),
             alias: c,
         });
         self
@@ -114,7 +114,7 @@ impl QueryBuilder {
         path: &[&str],
     ) -> Self {
         self.selection.push(Field::JsonPath {
-            physical: col.into(),
+            column: col.into(),
             alias: alias.into(),
             path: path.iter().map(|c| (*c).to_string()).collect(),
         });
@@ -385,7 +385,7 @@ impl AggregateBuilder {
         self.nodes = Some(
             cols.iter()
                 .map(|c| Field::Column {
-                    physical: (*c).to_string(),
+                    column: (*c).to_string(),
                     alias: (*c).to_string(),
                 })
                 .collect(),
@@ -432,7 +432,7 @@ impl ByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -600,7 +600,7 @@ impl InsertBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -665,7 +665,7 @@ impl UpdateBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -709,7 +709,7 @@ impl UpdateByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -761,7 +761,7 @@ impl DeleteBuilder {
         self.returning = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -797,7 +797,7 @@ impl DeleteByPkBuilder {
         self.selection = cols
             .iter()
             .map(|c| Field::Column {
-                physical: (*c).to_string(),
+                column: (*c).to_string(),
                 alias: (*c).to_string(),
             })
             .collect();
@@ -902,11 +902,11 @@ mod tests {
         };
         match &selection[1] {
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                assert_eq!(physical, "data");
+                assert_eq!(column, "data");
                 assert_eq!(alias, "abundance");
                 assert_eq!(path, &vec!["a".to_string(), "b".to_string()]);
             }

@@ -284,20 +284,15 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
         let alias = key_of(&field).to_string();
         match (&mut out[pos], field) {
             (Field::Typename { .. }, Field::Typename { .. }) => {}
-            (
-                Field::Column { physical: a, .. },
-                Field::Column {
-                    physical: ref b, ..
-                },
-            ) if a == b => {}
+            (Field::Column { column: a, .. }, Field::Column { column: ref b, .. }) if a == b => {}
             (
                 Field::JsonPath {
-                    physical: a,
+                    column: a,
                     path: pa,
                     ..
                 },
                 Field::JsonPath {
-                    physical: ref b,
+                    column: ref b,
                     path: ref pb,
                     ..
                 },
@@ -1834,7 +1829,7 @@ fn lower_scalar_field(
 
     let Some(v) = path_value else {
         return Ok(Field::Column {
-            physical: col.physical_name.clone(),
+            column: col.exposed_name.clone(),
             alias,
         });
     };
@@ -1868,7 +1863,7 @@ fn lower_scalar_field(
     }
 
     Ok(Field::JsonPath {
-        physical: col.physical_name.clone(),
+        column: col.exposed_name.clone(),
         alias,
         path,
     })
@@ -2688,11 +2683,11 @@ mod tests {
         };
         match &selection[0] {
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                assert_eq!(physical, "data");
+                assert_eq!(column, "data");
                 assert_eq!(alias, "abundance");
                 assert_eq!(path, &vec!["a".to_string(), "b".to_string()]);
             }
@@ -2771,8 +2766,8 @@ mod tests {
             };
             assert_eq!(selection.len(), 2);
             match &selection[0] {
-                Field::Column { physical, alias } => {
-                    assert_eq!(physical, "id");
+                Field::Column { column, alias } => {
+                    assert_eq!(column, "id");
                     assert_eq!(alias, "id");
                 }
                 _ => panic!("expected Column"),
@@ -2791,8 +2786,8 @@ mod tests {
             panic!("expected List");
         };
         match &selection[0] {
-            Field::Column { physical, alias } => {
-                assert_eq!(physical, "id");
+            Field::Column { column, alias } => {
+                assert_eq!(column, "id");
                 assert_eq!(alias, "uid");
             }
             _ => panic!("expected Column"),

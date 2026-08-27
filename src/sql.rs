@@ -192,10 +192,10 @@ fn render_inner_select(
         }
         match field {
             Field::Typename { alias } => render_typename_select(table, alias, ctx),
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", root.table),
+                    message: format!("unknown column '{column}' on '{}'", root.table),
                 })?;
                 write!(
                     ctx.sql,
@@ -206,13 +206,13 @@ fn render_inner_select(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", root.table),
+                    message: format!("unknown column '{column}' on '{}'", root.table),
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
@@ -476,19 +476,11 @@ fn render_relation_subquery(
         }
         match field {
             Field::Typename { alias: fa } => render_typename_select(target, fa, ctx),
-            Field::Column {
-                physical,
-                alias: fa,
-            } => {
-                let col = target
-                    .find_column(physical)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("{parent_path}.{alias}.{fa}"),
-                        message: format!(
-                            "unknown column '{physical}' on '{}'",
-                            target.exposed_name
-                        ),
-                    })?;
+            Field::Column { column, alias: fa } => {
+                let col = target.find_column(column).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.{alias}.{fa}"),
+                    message: format!("unknown column '{column}' on '{}'", target.exposed_name),
+                })?;
                 write!(
                     ctx.sql,
                     r#"{remote_alias}.{} AS "{}""#,
@@ -498,19 +490,14 @@ fn render_relation_subquery(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias: fa,
                 path,
             } => {
-                let col = target
-                    .find_column(physical)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("{parent_path}.{alias}.{fa}"),
-                        message: format!(
-                            "unknown column '{physical}' on '{}'",
-                            target.exposed_name
-                        ),
-                    })?;
+                let col = target.find_column(column).ok_or_else(|| Error::Validate {
+                    path: format!("{parent_path}.{alias}.{fa}"),
+                    message: format!("unknown column '{column}' on '{}'", target.exposed_name),
+                })?;
                 let err_path = format!("{parent_path}.{alias}.{fa}");
                 let expr = render_json_path_expr(&remote_alias, col, path, &err_path, ctx)?;
                 write!(ctx.sql, r#"{expr} AS "{fa}""#).unwrap();
@@ -1026,10 +1013,10 @@ fn render_by_pk(
         }
         match field {
             Field::Typename { alias } => render_typename_select(table, alias, ctx),
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 write!(
                     ctx.sql,
@@ -1040,13 +1027,13 @@ fn render_by_pk(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(&inner_alias, col, path, &err_path, ctx)?;
@@ -2370,10 +2357,10 @@ fn render_json_build_object_for_nodes(
                 )
                 .unwrap();
             }
-            Field::Column { physical, alias } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            Field::Column { column, alias } => {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.nodes.{alias}"),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 write!(
                     ctx.sql,
@@ -2383,13 +2370,13 @@ fn render_json_build_object_for_nodes(
                 .unwrap();
             }
             Field::JsonPath {
-                physical,
+                column,
                 alias,
                 path,
             } => {
-                let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+                let col = table.find_column(column).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.nodes.{alias}"),
-                    message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
                 let err_path = format!("{parent_path}.nodes.{alias}");
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
@@ -2459,13 +2446,13 @@ fn render_aggregate_source(
     }
     if let Some(fields) = nodes {
         for f in fields {
-            let physical = match f {
-                Field::Column { physical, .. } | Field::JsonPath { physical, .. } => physical,
+            let column = match f {
+                Field::Column { column, .. } | Field::JsonPath { column, .. } => column,
                 Field::Typename { .. } | Field::Relation { .. } => continue,
             };
-            let col = table.find_column(physical).ok_or_else(|| Error::Validate {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("{}.nodes", root.alias),
-                message: format!("unknown column '{physical}' on '{}'", table.exposed_name),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             cols_needed.insert(col.physical_name.clone());
         }
@@ -2715,11 +2702,11 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                     Field::Column {
-                        physical: "name".into(),
+                        column: "name".into(),
                         alias: "name".into(),
                     },
                 ],
@@ -2750,7 +2737,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "data".into(),
+                    column: "data".into(),
                     alias: "abundance".into(),
                     path: vec!["a".into(), "b".into()],
                 }],
@@ -2776,7 +2763,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "meta".into(),
+                    column: "meta".into(),
                     alias: "tags".into(),
                     path: vec!["tags".into()],
                 }],
@@ -2796,7 +2783,7 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::List {
                 selection: vec![Field::JsonPath {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "oops".into(),
                     path: vec!["x".into()],
                 }],
@@ -2827,7 +2814,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2875,7 +2862,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2904,7 +2891,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2933,7 +2920,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2969,7 +2956,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -2997,7 +2984,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3250,7 +3237,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: false,
@@ -3279,7 +3266,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: true,
@@ -3307,7 +3294,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             one: false,
@@ -3482,7 +3469,7 @@ mod tests {
             pk: vec![("id".into(), serde_json::json!(1).into())],
             set,
             selection: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             scope: Some(BoolExpr::Compare {
@@ -3524,7 +3511,7 @@ mod tests {
             table: "users".into(),
             pk: vec![("id".into(), serde_json::json!(1).into())],
             selection: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             scope: None,
@@ -3552,7 +3539,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3573,7 +3560,7 @@ mod tests {
             body: RootBody::ByPk {
                 pk: vec![("id".into(), json!(7).into())],
                 selection: vec![Field::Column {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "name".into(),
                 }],
             },
@@ -3606,7 +3593,7 @@ mod tests {
                     },
                 ],
                 nodes: Some(vec![Field::Column {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "name".into(),
                 }]),
             },
@@ -3687,7 +3674,7 @@ mod tests {
                         alias: "__typename".into(),
                     },
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                 ],
@@ -3709,7 +3696,7 @@ mod tests {
             body: RootBody::Aggregate {
                 ops: Vec::new(),
                 nodes: Some(vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }]),
                 typenames: Vec::new(),
@@ -3822,7 +3809,7 @@ mod tests {
             },
             body: RootBody::List {
                 selection: vec![Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 }],
             },
@@ -3841,7 +3828,7 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     },
                     Field::Relation {
@@ -3849,7 +3836,7 @@ mod tests {
                         alias: "user".into(),
                         args: QueryArgs::default(),
                         selection: vec![Field::Column {
-                            physical: "name".into(),
+                            column: "name".into(),
                             alias: "name".into(),
                         }],
                     },
@@ -3869,7 +3856,7 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                     Field::Relation {
@@ -3877,7 +3864,7 @@ mod tests {
                         alias: "posts".into(),
                         args: QueryArgs::default(),
                         selection: vec![Field::Column {
-                            physical: "title".into(),
+                            column: "title".into(),
                             alias: "title".into(),
                         }],
                     },
@@ -3926,7 +3913,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 },
                 Field::Relation {
@@ -3934,7 +3921,7 @@ mod tests {
                     alias: "posts".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     }],
                 },
@@ -4003,7 +3990,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 },
                 Field::Relation {
@@ -4011,7 +3998,7 @@ mod tests {
                     alias: "posts".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     }],
                 },
@@ -4080,7 +4067,7 @@ mod tests {
             on_conflict: None,
             returning: vec![
                 Field::Column {
-                    physical: "title".into(),
+                    column: "title".into(),
                     alias: "title".into(),
                 },
                 Field::Relation {
@@ -4088,7 +4075,7 @@ mod tests {
                     alias: "user".into(),
                     args: QueryArgs::default(),
                     selection: vec![Field::Column {
-                        physical: "name".into(),
+                        column: "name".into(),
                         alias: "name".into(),
                     }],
                 },
@@ -4160,7 +4147,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "title".into(),
+                column: "title".into(),
                 alias: "title".into(),
             }],
             one: false,

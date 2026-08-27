@@ -42,11 +42,11 @@ fn moderately_complex_query() -> Operation {
         body: RootBody::List {
             selection: vec![
                 Field::Column {
-                    physical: "id".into(),
+                    column: "id".into(),
                     alias: "id".into(),
                 },
                 Field::Column {
-                    physical: "name".into(),
+                    column: "name".into(),
                     alias: "name".into(),
                 },
                 Field::Relation {
@@ -57,7 +57,7 @@ fn moderately_complex_query() -> Operation {
                         ..Default::default()
                     },
                     selection: vec![Field::Column {
-                        physical: "title".into(),
+                        column: "title".into(),
                         alias: "title".into(),
                     }],
                 },
