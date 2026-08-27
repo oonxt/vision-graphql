@@ -199,10 +199,7 @@ fn agg_columns(op: &crate::ast::AggOp) -> Vec<&str> {
     use crate::ast::{AggField, AggOp};
     match op {
         AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-        AggOp::Sum { fields }
-        | AggOp::Avg { fields }
-        | AggOp::Max { fields }
-        | AggOp::Min { fields } => fields
+        AggOp::Func { fields, .. } => fields
             .iter()
             .filter_map(|f| match f {
                 AggField::Column(c) => Some(c.column.as_str()),

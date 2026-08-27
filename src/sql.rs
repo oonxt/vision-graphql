@@ -2531,10 +2531,9 @@ fn render_agg_op(
             ctx.sql.push(')');
             Ok(())
         }
-        AggOp::Sum { fields } => render_agg_func(&key, "sum", fields, table_alias, table, ctx),
-        AggOp::Avg { fields } => render_agg_func(&key, "avg", fields, table_alias, table, ctx),
-        AggOp::Max { fields } => render_agg_func(&key, "max", fields, table_alias, table, ctx),
-        AggOp::Min { fields } => render_agg_func(&key, "min", fields, table_alias, table, ctx),
+        AggOp::Func { func, fields } => {
+            render_agg_func(&key, func.name(), fields, table_alias, table, ctx)
+        }
         AggOp::Typename => {
             write!(
                 ctx.sql,
@@ -2713,10 +2712,7 @@ fn render_aggregate_source(
         // project them just like sum/avg/max/min do.
         let names: Vec<&str> = match &sel.op {
             AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-            AggOp::Sum { fields }
-            | AggOp::Avg { fields }
-            | AggOp::Max { fields }
-            | AggOp::Min { fields } => fields
+            AggOp::Func { fields, .. } => fields
                 .iter()
                 .filter_map(|f| match f {
                     crate::ast::AggField::Column(c) => Some(c.column.as_str()),
@@ -3939,7 +3935,8 @@ mod tests {
                     },
                     AggSelect {
                         alias: "sum".into(),
-                        op: AggOp::Sum {
+                        op: AggOp::Func {
+                            func: crate::ast::AggFunc::Sum,
                             fields: vec![crate::ast::AggField::column("id")],
                         },
                     },
@@ -3986,7 +3983,8 @@ mod tests {
                     },
                     AggSelect {
                         alias: "highest".into(),
-                        op: AggOp::Max {
+                        op: AggOp::Func {
+                            func: crate::ast::AggFunc::Max,
                             fields: vec![crate::ast::AggField::Column(crate::ast::AggCol {
                                 alias: "newest".into(),
                                 column: "id".into(),

@@ -406,3 +406,110 @@ async fn a_relation_aggregate_in_returning_sees_the_rows_just_inserted() {
         "the count must see what `posts` sees: {a}"
     );
 }
+
+/// Every per-column aggregate, run for real — and the type each one is
+/// published as, checked against what PostgreSQL actually answers with.
+#[tokio::test]
+async fn every_aggregate_function_runs_and_is_published_as_its_result_type() {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"CREATE TABLE m (
+               id SERIAL PRIMARY KEY,
+               small SMALLINT NOT NULL,
+               whole INT NOT NULL,
+               big BIGINT NOT NULL,
+               approx DOUBLE PRECISION NOT NULL,
+               exact NUMERIC(12,2) NOT NULL,
+               label TEXT NOT NULL
+           );
+           INSERT INTO m (small, whole, big, approx, exact, label) VALUES
+             (1, 10, 100, 1.5, 1.25, 'a'),
+             (2, 20, 200, 2.5, 2.25, 'b'),
+             (3, 30, 300, 3.5, 3.25, 'c');"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect(&pool).await.unwrap().build();
+    let engine = Engine::new(
+        pool.clone(),
+        Schema::introspect(&pool).await.unwrap().build(),
+    );
+
+    let v = engine
+        .query(
+            r#"{ m_aggregate { aggregate {
+                   sum { whole } avg { whole }
+                   max { whole label } min { whole label }
+                   stddev { whole } stddev_pop { whole } stddev_samp { whole }
+                   variance { whole } var_pop { whole } var_samp { whole }
+                 } } }"#,
+            None,
+        )
+        .await
+        .expect("every function must be valid SQL");
+    let a = &v["m_aggregate"]["aggregate"];
+    assert_eq!(a["sum"]["whole"], 60);
+    assert_eq!(a["avg"]["whole"], 20.0);
+    assert_eq!(a["max"]["label"], "c");
+    assert_eq!(a["min"]["whole"], 10);
+    assert_eq!(a["stddev"]["whole"], 10.0);
+    // A float comparison, so a tolerance rather than a literal.
+    let var_pop = a["var_pop"]["whole"].as_f64().unwrap();
+    assert!((var_pop - 200.0 / 3.0).abs() < 1e-9, "{var_pop}");
+    let stddev_pop = a["stddev_pop"]["whole"].as_f64().unwrap();
+    assert!((stddev_pop - var_pop.sqrt()).abs() < 1e-9, "{stddev_pop}");
+
+    // `max`/`min` order anything; the rest are arithmetic and are not offered
+    // on a text column.
+    let err = engine
+        .query("{ m_aggregate { aggregate { sum { label } } } }", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("label"), "{err}");
+
+    // What the type system publishes has to be what PostgreSQL answers with.
+    let ts = schema.type_system();
+    let published = |group: &str, column: &str| -> String {
+        let vision_graphql::type_system::TypeDef::Object { fields, .. } =
+            ts.get(&format!("m_{group}_fields")).expect(group)
+        else {
+            panic!("{group} should be an object")
+        };
+        let f = fields.iter().find(|f| f.name == column).expect(column);
+        f.ty.base_name().to_string()
+    };
+    for (group, column, expected) in [
+        ("sum", "small", "bigint"),
+        ("sum", "whole", "bigint"),
+        ("sum", "big", "numeric"),
+        ("sum", "approx", "Float"),
+        ("sum", "exact", "numeric"),
+        ("avg", "whole", "numeric"),
+        ("avg", "approx", "Float"),
+        ("stddev", "whole", "numeric"),
+        ("var_samp", "approx", "Float"),
+        ("max", "whole", "Int"),
+        ("max", "label", "String"),
+    ] {
+        assert_eq!(published(group, column), expected, "{group} of {column}");
+    }
+
+    // …and PostgreSQL agrees.
+    for (func, column, pg_type) in [
+        ("sum", "whole", "bigint"),
+        ("sum", "big", "numeric"),
+        ("avg", "whole", "numeric"),
+        ("stddev", "whole", "numeric"),
+        ("var_samp", "approx", "double precision"),
+    ] {
+        let actual: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT pg_typeof({func}({column}))::text FROM m"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actual, pg_type, "{func}({column})");
+    }
+}

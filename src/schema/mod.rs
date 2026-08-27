@@ -37,6 +37,29 @@ pub enum PgType {
     },
 }
 
+impl PgType {
+    /// Whether arithmetic applies: `sum`, `avg`, `stddev` and the rest are
+    /// only defined over numbers, and PostgreSQL has no `sum(text)` to call.
+    pub fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Numeric
+        )
+    }
+
+    /// Whether values of this type have an order — which is what `max`, `min`
+    /// and `_gt`-family comparisons need. Everything but `json`/`jsonb`, which
+    /// PostgreSQL orders in a way nobody should depend on.
+    pub fn is_orderable(&self) -> bool {
+        !matches!(self, PgType::Json | PgType::Jsonb)
+    }
+}
+
 #[derive(Debug)]
 pub struct Column {
     pub exposed_name: String,

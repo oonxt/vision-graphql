@@ -27,6 +27,7 @@
 //! but not its variants. A client sees a named scalar and passes strings, which
 //! is what the engine binds anyway.
 
+use crate::ast::AggFunc;
 use crate::schema::{PgType, RelKind, Schema, Table};
 use crate::type_names;
 use std::collections::{BTreeMap, BTreeSet};
@@ -240,28 +241,59 @@ pub fn scalar_name(pg: &PgType) -> String {
     }
 }
 
+/// Every per-column aggregate, in the order they are published.
+const ALL_AGG_FUNCS: [AggFunc; 10] = [
+    AggFunc::Sum,
+    AggFunc::Avg,
+    AggFunc::Max,
+    AggFunc::Min,
+    AggFunc::Stddev,
+    AggFunc::StddevPop,
+    AggFunc::StddevSamp,
+    AggFunc::Variance,
+    AggFunc::VarPop,
+    AggFunc::VarSamp,
+];
+
+/// Whether `func` means anything for a column of this type.
+pub fn applies(func: AggFunc, pg: &PgType) -> bool {
+    if func.numeric_only() {
+        pg.is_numeric()
+    } else {
+        pg.is_orderable()
+    }
+}
+
+/// What PostgreSQL answers with.
+///
+/// Not the column's own type, which is what this used to publish: `avg` of an
+/// `integer` is a `numeric`, and a client generating code against `Int` would
+/// have been generating the wrong thing. The mapping is PostgreSQL's, from its
+/// aggregate function table.
+fn result_type(func: AggFunc, pg: &PgType) -> PgType {
+    use AggFunc::*;
+    match func {
+        // Ordering answers with what it was given.
+        Max | Min => pg.clone(),
+        // Summing widens, so that a total of many `int4` cannot overflow one.
+        Sum => match pg {
+            PgType::Int2 | PgType::Int4 => PgType::Int8,
+            PgType::Int8 => PgType::Numeric,
+            other => other.clone(),
+        },
+        // Everything arithmetic answers exactly for exact input and in floating
+        // point for floating input.
+        Avg | Stddev | StddevPop | StddevSamp | Variance | VarPop | VarSamp => match pg {
+            PgType::Float4 | PgType::Float8 => PgType::Float8,
+            _ => PgType::Numeric,
+        },
+    }
+}
+
 /// Whether `LIKE`-family operators apply, which is what decides whether the
 /// comparison input for this scalar carries them.
 fn is_stringish(pg: &PgType) -> bool {
     matches!(pg, PgType::Text | PgType::Varchar)
-}
-
-/// Ordered scalars — everything except `json`/`jsonb`, which Postgres has no
-/// total order for that anyone should rely on.
-fn is_comparable(pg: &PgType) -> bool {
-    !matches!(pg, PgType::Json | PgType::Jsonb)
-}
-
-fn is_numeric(pg: &PgType) -> bool {
-    matches!(
-        pg,
-        PgType::Int2
-            | PgType::Int4
-            | PgType::Int8
-            | PgType::Float4
-            | PgType::Float8
-            | PgType::Numeric
-    )
 }
 
 const BUILT_IN_SCALARS: [&str; 5] = ["Int", "Float", "String", "Boolean", "ID"];
@@ -287,6 +319,11 @@ struct Builder<'a> {
     /// Scalars reached from a column, so only the comparison inputs that can be
     /// used get published.
     scalars: BTreeMap<String, PgType>,
+    /// Scalars that appear only as an aggregate's *result* — `bigint` for the
+    /// sum of an `integer`, say. They need a type of their own, but no
+    /// comparison input: nothing can be filtered on them, since no column has
+    /// one.
+    result_scalars: BTreeSet<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -294,6 +331,7 @@ impl<'a> Builder<'a> {
         Builder {
             schema,
             published: BTreeSet::new(),
+            result_scalars: BTreeSet::new(),
             types: BTreeMap::new(),
             scalars: BTreeMap::new(),
         }
@@ -392,6 +430,15 @@ impl<'a> Builder<'a> {
         // exactly the ones something refers to — `Int` and `Boolean` are reached
         // through `limit` and `_is_null` even when no column has those types —
         // keeps the list complete without publishing scalars nothing uses.
+        // Result-only scalars first: they are referenced but reach no column, so
+        // nothing else would define them.
+        let result_scalars = std::mem::take(&mut self.result_scalars);
+        for name in result_scalars {
+            ts.types.entry(name.clone()).or_insert(TypeDef::Scalar {
+                name,
+                description: None,
+            });
+        }
         for name in dangling_references(&ts) {
             debug_assert!(
                 BUILT_IN_SCALARS.contains(&name.as_str()),
@@ -520,20 +567,20 @@ impl<'a> Builder<'a> {
         // sum/avg over numeric columns; max/min over anything ordered. A group
         // with no columns to put in it is not published at all, rather than
         // published empty.
-        for (op, keep) in [
-            ("sum", is_numeric as fn(&PgType) -> bool),
-            ("avg", is_numeric),
-            ("max", is_comparable),
-            ("min", is_comparable),
-        ] {
+        for func in ALL_AGG_FUNCS {
             let cols: Vec<Field> = t
                 .columns()
-                .filter(|c| keep(&c.pg_type))
-                .map(|c| Field::new(&c.exposed_name, TypeRef::named(scalar_name(&c.pg_type))))
+                .filter(|c| applies(func, &c.pg_type))
+                .map(|c| {
+                    let name = scalar_name(&result_type(func, &c.pg_type));
+                    self.result_scalars.insert(name.clone());
+                    Field::new(&c.exposed_name, TypeRef::named(name))
+                })
                 .collect();
             if cols.is_empty() {
                 continue;
             }
+            let op = func.name();
             let name = type_names::agg_op_fields(t, op);
             let mut cols = cols;
             cols.sort_by(|a, b| a.name.cmp(&b.name));
@@ -749,7 +796,7 @@ impl<'a> Builder<'a> {
             InputValue::new("_nin", named().non_null().list()),
             InputValue::new("_is_null", TypeRef::named("Boolean")),
         ];
-        if is_comparable(pg) {
+        if pg.is_orderable() {
             for op in ["_gt", "_gte", "_lt", "_lte"] {
                 fields.push(InputValue::new(op, named()));
             }

@@ -5,7 +5,23 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ## Unreleased
 
+### Added
+
+- **`stddev`, `stddev_pop`, `stddev_samp`, `variance`, `var_pop`, `var_samp`**,
+  beside the aggregates that were already there — PostgreSQL's set under
+  PostgreSQL's names.
+
 ### Fixed
+
+- **An aggregate published one type and answered with another.** `avg` of an
+  `integer` was published as `Int`, where PostgreSQL answers `numeric`; `sum` of
+  an `integer` as `Int`, where it answers `bigint`. A client generating code
+  from the schema was generating the wrong type. The published type is now the
+  one PostgreSQL returns.
+- **A function that cannot apply to a column was accepted.** `sum` over a `text`
+  column reached the database and came back "function sum(text) does not exist",
+  while the type system had never published it — the engine accepting what the
+  schema says cannot exist. Refused at lowering, with the reason.
 
 - **Two test-suite failures that looked like flaky tests and were not.** Every
   integration test started a PostgreSQL container of its own — a hundred or so
