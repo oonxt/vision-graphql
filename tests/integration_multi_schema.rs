@@ -6,28 +6,15 @@
 //! both contain a table called `orders`.
 
 use serde_json::Value;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::config::{ConfigOverlay, TableOverlay};
 use vision_graphql::schema::Schema;
 use vision_graphql::Engine;
 
-async fn setup_pool() -> (
-    sqlx::PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+mod common;
+
+async fn setup_pool() -> (sqlx::PgPool, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -66,12 +53,12 @@ async fn setup_pool() -> (
     .execute(&pool)
     .await
     .expect("seed");
-    (pool, container)
+    (pool, db)
 }
 
 #[tokio::test]
 async fn first_schema_owns_bare_names_the_rest_are_prefixed() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect_schemas(&pool, &["app", "audit"])
         .await
         .expect("introspect")
@@ -95,7 +82,7 @@ async fn first_schema_owns_bare_names_the_rest_are_prefixed() {
 /// single SQL statement.
 #[tokio::test]
 async fn cross_schema_relation_queries_end_to_end() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect_schemas(&pool, &["app", "audit"])
         .await
         .expect("introspect")
@@ -139,7 +126,7 @@ async fn cross_schema_relation_queries_end_to_end() {
 /// against the other schema's table.
 #[tokio::test]
 async fn cross_schema_relation_filter_works() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect_schemas(&pool, &["app", "audit"])
         .await
         .expect("introspect")
@@ -163,7 +150,7 @@ async fn cross_schema_relation_filter_works() {
 /// schema for it to name.
 #[tokio::test]
 async fn unlisted_schemas_are_not_introspected() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect_schemas(&pool, &["app"])
         .await
         .expect("introspect")
@@ -186,7 +173,7 @@ async fn unlisted_schemas_are_not_introspected() {
 /// nothing from the other schemas leaks in.
 #[tokio::test]
 async fn default_introspect_still_sees_only_public() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
 
     assert!(schema.table("orders").is_none());
@@ -198,7 +185,7 @@ async fn default_introspect_still_sees_only_public() {
 /// without changing its columns or its name.
 #[tokio::test]
 async fn overlay_schema_repoints_reads_to_another_schema() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
 
     let mut cfg = ConfigOverlay::default();
     cfg.tables.insert(

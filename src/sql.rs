@@ -2531,10 +2531,9 @@ fn render_agg_op(
             ctx.sql.push(')');
             Ok(())
         }
-        AggOp::Sum { fields } => render_agg_func(&key, "sum", fields, table_alias, table, ctx),
-        AggOp::Avg { fields } => render_agg_func(&key, "avg", fields, table_alias, table, ctx),
-        AggOp::Max { fields } => render_agg_func(&key, "max", fields, table_alias, table, ctx),
-        AggOp::Min { fields } => render_agg_func(&key, "min", fields, table_alias, table, ctx),
+        AggOp::Func { func, fields } => {
+            render_agg_func(&key, *func, fields, table_alias, table, ctx)
+        }
         AggOp::Typename => {
             write!(
                 ctx.sql,
@@ -2549,13 +2548,14 @@ fn render_agg_op(
 
 fn render_agg_func(
     key: &str,
-    pg_func: &str,
+    func: crate::ast::AggFunc,
     fields: &[crate::ast::AggField],
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::AggField;
+    let pg_func = func.name();
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -2581,6 +2581,21 @@ fn render_agg_func(
                             c.column, table.exposed_name
                         ),
                     })?;
+                // The parser refuses this earlier with a document path, but the
+                // typed builder never goes near the parser — this is the one
+                // point both entry points pass through, so the check that keeps
+                // "function sum(text) does not exist" from being PostgreSQL's
+                // answer has to live here too.
+                if !crate::type_system::applies(func, &col.pg_type) {
+                    return Err(Error::Validate {
+                        path: format!("aggregate.{key}.{}", c.alias),
+                        message: format!(
+                            "'{pg_func}' does not apply to '{}': {}",
+                            col.exposed_name,
+                            crate::type_system::why_inapplicable(func, &col.pg_type)
+                        ),
+                    });
+                }
                 write!(
                     ctx.sql,
                     "'{}', {pg_func}({table_alias}.{})",
@@ -2713,10 +2728,7 @@ fn render_aggregate_source(
         // project them just like sum/avg/max/min do.
         let names: Vec<&str> = match &sel.op {
             AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-            AggOp::Sum { fields }
-            | AggOp::Avg { fields }
-            | AggOp::Max { fields }
-            | AggOp::Min { fields } => fields
+            AggOp::Func { fields, .. } => fields
                 .iter()
                 .filter_map(|f| match f {
                     crate::ast::AggField::Column(c) => Some(c.column.as_str()),
@@ -3939,7 +3951,8 @@ mod tests {
                     },
                     AggSelect {
                         alias: "sum".into(),
-                        op: AggOp::Sum {
+                        op: AggOp::Func {
+                            func: crate::ast::AggFunc::Sum,
                             fields: vec![crate::ast::AggField::column("id")],
                         },
                     },
@@ -3986,7 +3999,8 @@ mod tests {
                     },
                     AggSelect {
                         alias: "highest".into(),
-                        op: AggOp::Max {
+                        op: AggOp::Func {
+                            func: crate::ast::AggFunc::Max,
                             fields: vec![crate::ast::AggField::Column(crate::ast::AggCol {
                                 alias: "newest".into(),
                                 column: "id".into(),

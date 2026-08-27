@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -16,23 +16,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -52,12 +38,12 @@ async fn setup() -> (
     .expect("seed");
 
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn aggregate_count_returns_row_count() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query("query { users_aggregate { aggregate { count } } }", None)
         .await
@@ -67,7 +53,7 @@ async fn aggregate_count_returns_row_count() {
 
 #[tokio::test]
 async fn aggregate_sum_and_avg() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate { aggregate { sum { score } avg { score } } } }",
@@ -84,7 +70,7 @@ async fn aggregate_sum_and_avg() {
 
 #[tokio::test]
 async fn aggregate_with_nodes() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate(where: {score: {_gte: 20}}) { aggregate { count } nodes { name } } }",
@@ -99,7 +85,7 @@ async fn aggregate_with_nodes() {
 
 #[tokio::test]
 async fn aggregate_max_min() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate { aggregate { max { score } min { score } } } }",
@@ -117,7 +103,7 @@ async fn aggregate_max_min() {
 /// documents.
 #[tokio::test]
 async fn count_over_columns_and_distinct() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v = engine
         .query(
             r#"{ users_aggregate { aggregate {
@@ -149,7 +135,7 @@ async fn count_over_columns_and_distinct() {
 /// scalar subquery over an unaggregated source, which errors at two rows.
 #[tokio::test]
 async fn typename_only_aggregate_runs() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v = engine
         .query(
             "{ users_aggregate { __typename aggregate { __typename } } }",
@@ -168,18 +154,8 @@ async fn typename_only_aggregate_runs() {
 /// per parent row rather than per table.
 #[tokio::test]
 async fn a_relation_can_be_aggregated() {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (
@@ -261,18 +237,8 @@ async fn a_relation_aggregate_obeys_the_scope() {
     use vision_graphql::predicate::{col, principal};
     use vision_graphql::ScopePolicy;
 
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (
@@ -347,18 +313,8 @@ async fn a_relation_aggregate_obeys_the_scope() {
 async fn a_default_limit_bounds_nodes_and_leaves_the_count_true() {
     use vision_graphql::limits::ExecutionLimits;
 
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY);
            CREATE TABLE posts (id SERIAL PRIMARY KEY, author_id INT NOT NULL REFERENCES authors(id));
@@ -412,18 +368,8 @@ async fn a_default_limit_bounds_nodes_and_leaves_the_count_true() {
 /// reports a row and counts none.
 #[tokio::test]
 async fn a_relation_aggregate_in_returning_sees_the_rows_just_inserted() {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (
@@ -459,4 +405,183 @@ async fn a_relation_aggregate_in_returning_sees_the_rows_just_inserted() {
         a["posts_aggregate"]["aggregate"]["count"], 2,
         "the count must see what `posts` sees: {a}"
     );
+}
+
+/// Every per-column aggregate, run for real — and the type each one is
+/// published as, checked against what PostgreSQL actually answers with.
+#[tokio::test]
+async fn every_aggregate_function_runs_and_is_published_as_its_result_type() {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"CREATE TABLE m (
+               id SERIAL PRIMARY KEY,
+               small SMALLINT NOT NULL,
+               whole INT NOT NULL,
+               big BIGINT NOT NULL,
+               approx DOUBLE PRECISION NOT NULL,
+               exact NUMERIC(12,2) NOT NULL,
+               label TEXT NOT NULL
+           );
+           INSERT INTO m (small, whole, big, approx, exact, label) VALUES
+             (1, 10, 100, 1.5, 1.25, 'a'),
+             (2, 20, 200, 2.5, 2.25, 'b'),
+             (3, 30, 300, 3.5, 3.25, 'c');"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect(&pool).await.unwrap().build();
+    let engine = Engine::new(
+        pool.clone(),
+        Schema::introspect(&pool).await.unwrap().build(),
+    );
+
+    let v = engine
+        .query(
+            r#"{ m_aggregate { aggregate {
+                   sum { whole } avg { whole }
+                   max { whole label } min { whole label }
+                   stddev { whole } stddev_pop { whole } stddev_samp { whole }
+                   variance { whole } var_pop { whole } var_samp { whole }
+                 } } }"#,
+            None,
+        )
+        .await
+        .expect("every function must be valid SQL");
+    let a = &v["m_aggregate"]["aggregate"];
+    assert_eq!(a["sum"]["whole"], 60);
+    assert_eq!(a["avg"]["whole"], 20.0);
+    assert_eq!(a["max"]["label"], "c");
+    assert_eq!(a["min"]["whole"], 10);
+    assert_eq!(a["stddev"]["whole"], 10.0);
+    // A float comparison, so a tolerance rather than a literal.
+    let var_pop = a["var_pop"]["whole"].as_f64().unwrap();
+    assert!((var_pop - 200.0 / 3.0).abs() < 1e-9, "{var_pop}");
+    let stddev_pop = a["stddev_pop"]["whole"].as_f64().unwrap();
+    assert!((stddev_pop - var_pop.sqrt()).abs() < 1e-9, "{stddev_pop}");
+
+    // `max`/`min` order anything; the rest are arithmetic and are not offered
+    // on a text column.
+    let err = engine
+        .query("{ m_aggregate { aggregate { sum { label } } } }", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("label"), "{err}");
+
+    // What the type system publishes has to be what PostgreSQL answers with.
+    let ts = schema.type_system();
+    let published = |group: &str, column: &str| -> String {
+        let vision_graphql::type_system::TypeDef::Object { fields, .. } =
+            ts.get(&format!("m_{group}_fields")).expect(group)
+        else {
+            panic!("{group} should be an object")
+        };
+        let f = fields.iter().find(|f| f.name == column).expect(column);
+        f.ty.base_name().to_string()
+    };
+    for (group, column, expected) in [
+        ("sum", "small", "bigint"),
+        ("sum", "whole", "bigint"),
+        ("sum", "big", "numeric"),
+        ("sum", "approx", "Float"),
+        ("sum", "exact", "numeric"),
+        ("avg", "whole", "numeric"),
+        ("avg", "approx", "Float"),
+        ("stddev", "whole", "numeric"),
+        ("var_samp", "approx", "Float"),
+        ("max", "whole", "Int"),
+        ("max", "label", "String"),
+    ] {
+        assert_eq!(published(group, column), expected, "{group} of {column}");
+    }
+
+    // …and PostgreSQL agrees.
+    for (func, column, pg_type) in [
+        ("sum", "whole", "bigint"),
+        ("sum", "big", "numeric"),
+        ("avg", "whole", "numeric"),
+        ("stddev", "whole", "numeric"),
+        ("var_samp", "approx", "double precision"),
+    ] {
+        let actual: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT pg_typeof({func}({column}))::text FROM m"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actual, pg_type, "{func}({column})");
+    }
+}
+
+/// `boolean`, `uuid` and enums order — `_gt` works on every one — but
+/// PostgreSQL defines no `max`/`min` aggregate over them: publishing those
+/// fields published a query whose only possible answer was "function
+/// max(boolean) does not exist", from the database, at request time.
+#[tokio::test]
+async fn max_min_are_not_offered_where_postgres_has_none() {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+           CREATE TABLE t (
+               id SERIAL PRIMARY KEY,
+               label TEXT NOT NULL,
+               day DATE NOT NULL,
+               flag BOOLEAN NOT NULL,
+               token UUID NOT NULL DEFAULT gen_random_uuid(),
+               state mood NOT NULL
+           );
+           INSERT INTO t (label, day, flag, state) VALUES
+             ('a', '2024-01-01', true, 'sad'),
+             ('b', '2024-06-01', false, 'happy');"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect(&pool).await.unwrap().build();
+    let engine = Engine::new(
+        pool.clone(),
+        Schema::introspect(&pool).await.unwrap().build(),
+    );
+
+    // What stays: max over text and dates, run for real.
+    let v = engine
+        .query("{ t_aggregate { aggregate { max { label day } } } }", None)
+        .await
+        .expect("max over text and date is PostgreSQL's own");
+    assert_eq!(v["t_aggregate"]["aggregate"]["max"]["label"], "b");
+    assert_eq!(v["t_aggregate"]["aggregate"]["max"]["day"], "2024-06-01");
+
+    // What goes: the schema stops publishing them…
+    let ts = schema.type_system();
+    let vision_graphql::type_system::TypeDef::Object { fields, .. } = ts
+        .get("t_max_fields")
+        .expect("max group exists for label/day")
+    else {
+        panic!("t_max_fields should be an object");
+    };
+    for absent in ["flag", "token", "state"] {
+        assert!(
+            !fields.iter().any(|f| f.name == absent),
+            "PostgreSQL has no max over '{absent}'"
+        );
+    }
+
+    // …and lowering refuses what it never published, with the reason, rather
+    // than letting the database answer with an opaque error.
+    for column in ["flag", "token", "state"] {
+        let err = engine
+            .query(
+                &format!("{{ t_aggregate {{ aggregate {{ max {{ {column} }} }} }} }}"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not apply") && msg.contains(column),
+            "{msg}"
+        );
+    }
 }

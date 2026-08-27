@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -47,22 +47,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"
                 CREATE TABLE organizations (
@@ -91,12 +78,12 @@ async fn setup() -> (
     .await
     .expect("seed");
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn nested_object_on_conflict_do_nothing_links_to_existing() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded: Value = engine
         .query(
@@ -137,7 +124,7 @@ async fn nested_object_on_conflict_do_nothing_links_to_existing() {
 
 #[tokio::test]
 async fn nested_wrapper_unknown_key_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let err = engine
         .query(
             r#"mutation {
@@ -159,7 +146,7 @@ async fn nested_wrapper_unknown_key_is_error() {
 
 #[tokio::test]
 async fn nested_on_conflict_missing_constraint_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let err = engine
         .query(
             r#"mutation {
@@ -184,7 +171,7 @@ async fn nested_on_conflict_missing_constraint_is_error() {
 
 #[tokio::test]
 async fn nested_object_on_conflict_do_update_updates_existing() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded: Value = engine
         .query(
@@ -222,7 +209,7 @@ async fn nested_object_on_conflict_do_update_updates_existing() {
 
 #[tokio::test]
 async fn nested_array_on_conflict_do_update_updates_existing() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded_bob: Value = engine
         .query(
@@ -286,7 +273,7 @@ async fn nested_array_on_conflict_do_update_updates_existing() {
 
 #[tokio::test]
 async fn nested_array_on_conflict_do_nothing_preserves_existing() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded: Value = engine
         .query(
@@ -370,7 +357,7 @@ async fn nested_array_on_conflict_do_nothing_preserves_existing() {
 
 #[tokio::test]
 async fn top_level_on_conflict_do_nothing_unchanged() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let _: Value = engine
         .query(
@@ -401,7 +388,7 @@ async fn top_level_on_conflict_do_nothing_unchanged() {
 
 #[tokio::test]
 async fn two_level_nested_on_conflict_on_innermost() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded: Value = engine
         .query(
@@ -445,7 +432,7 @@ async fn two_level_nested_on_conflict_on_innermost() {
 
 #[tokio::test]
 async fn sibling_object_and_array_with_on_conflict() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let seeded: Value = engine
         .query(
@@ -494,7 +481,7 @@ async fn sibling_object_and_array_with_on_conflict() {
 
 #[tokio::test]
 async fn nested_on_conflict_divergent_across_batch_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let err = engine
         .query(
             r#"mutation {

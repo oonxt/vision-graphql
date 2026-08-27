@@ -312,21 +312,89 @@ pub enum AggOp {
         columns: Vec<String>,
         distinct: bool,
     },
-    Sum {
-        fields: Vec<AggField>,
-    },
-    Avg {
-        fields: Vec<AggField>,
-    },
-    Max {
-        fields: Vec<AggField>,
-    },
-    Min {
+    /// A function applied to named columns: `sum { a b }`, `stddev { a }`.
+    ///
+    /// One variant rather than one per function, because they differ only in
+    /// which SQL function is called and which columns they accept — and a
+    /// variant each meant every walker in the crate grew an arm each time one
+    /// was added.
+    Func {
+        func: AggFunc,
         fields: Vec<AggField>,
     },
     /// `__typename` beside the aggregate functions; names the
     /// `<table>_aggregate_fields` type.
     Typename,
+}
+
+/// The per-column aggregate functions this engine offers.
+///
+/// Exactly PostgreSQL's, under PostgreSQL's names — `stddev` is `stddev_samp`
+/// and `variance` is `var_samp` there too, so a reader who knows one knows the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Sum,
+    Avg,
+    Max,
+    Min,
+    Stddev,
+    StddevPop,
+    StddevSamp,
+    Variance,
+    VarPop,
+    VarSamp,
+}
+
+impl AggFunc {
+    /// Every function, in the order they are published.
+    ///
+    /// The one hand-maintained list. `from_name` and the type system both walk
+    /// it, so a variant missing here is missing from parsing and publishing
+    /// alike — one place to notice, instead of one copy per file that each
+    /// fails on its own.
+    pub const ALL: [AggFunc; 10] = [
+        AggFunc::Sum,
+        AggFunc::Avg,
+        AggFunc::Max,
+        AggFunc::Min,
+        AggFunc::Stddev,
+        AggFunc::StddevPop,
+        AggFunc::StddevSamp,
+        AggFunc::Variance,
+        AggFunc::VarPop,
+        AggFunc::VarSamp,
+    ];
+
+    /// The name in a document, which is also the SQL function's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Max => "max",
+            AggFunc::Min => "min",
+            AggFunc::Stddev => "stddev",
+            AggFunc::StddevPop => "stddev_pop",
+            AggFunc::StddevSamp => "stddev_samp",
+            AggFunc::Variance => "variance",
+            AggFunc::VarPop => "var_pop",
+            AggFunc::VarSamp => "var_samp",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// Whether the function only means something for a number.
+    ///
+    /// `max` and `min` reach further — text, dates, times — though not to
+    /// everything with an ordering (see `PgType::has_max_min`); the rest are
+    /// arithmetic, and offering `stddev` over a `text` column would be offering
+    /// a query that cannot run.
+    pub fn numeric_only(self) -> bool {
+        !matches!(self, AggFunc::Max | AggFunc::Min)
+    }
 }
 
 impl AggOp {
@@ -765,7 +833,8 @@ mod tests {
                 },
                 AggSelect {
                     alias: "sum".into(),
-                    op: AggOp::Sum {
+                    op: AggOp::Func {
+                        func: AggFunc::Sum,
                         fields: vec![AggField::column("age")],
                     },
                 },

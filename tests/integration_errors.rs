@@ -1,26 +1,13 @@
 //! What a failed request looks like on the wire, and what it does not say.
 
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::error::ErrorCode;
 use vision_graphql::{Engine, Schema};
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+mod common;
+
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE users (
                id SERIAL PRIMARY KEY,
@@ -36,7 +23,7 @@ async fn setup() -> (
         pool.clone(),
         Schema::introspect(&pool).await.unwrap().build(),
     );
-    (engine, c)
+    (engine, db)
 }
 
 /// PostgreSQL's own message names the constraint, the table, and sometimes a
@@ -44,7 +31,7 @@ async fn setup() -> (
 /// standard and safe, so that is the part that travels.
 #[tokio::test]
 async fn a_database_error_travels_as_its_sqlstate_and_nothing_else() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let err = engine
         .query(
             r#"mutation { insert_users(objects: [{email: "taken@example.com"}]) {
@@ -78,7 +65,7 @@ async fn a_database_error_travels_as_its_sqlstate_and_nothing_else() {
 /// makes it fixable.
 #[tokio::test]
 async fn request_errors_carry_a_code_and_a_position() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let cases: Vec<(&str, ErrorCode)> = vec![
         ("{ users { nonexistent } }", ErrorCode::ValidationFailed),
@@ -115,18 +102,8 @@ async fn request_errors_carry_a_code_and_a_position() {
 /// the column exists, which is most of what hiding it was for.
 #[tokio::test]
 async fn a_hidden_column_is_reported_as_unknown_not_as_hidden() {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql("CREATE TABLE users (id SERIAL PRIMARY KEY, secret_ssn TEXT);")
         .execute(&pool)
         .await

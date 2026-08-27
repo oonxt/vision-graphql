@@ -1,25 +1,12 @@
 use serde_json::Value;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::Schema;
 use vision_graphql::Engine;
 
-async fn setup_pool() -> (
-    sqlx::PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+mod common;
+
+async fn setup_pool() -> (sqlx::PgPool, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -40,12 +27,12 @@ async fn setup_pool() -> (
     .execute(&pool)
     .await
     .expect("seed");
-    (pool, container)
+    (pool, db)
 }
 
 #[tokio::test]
 async fn introspect_auto_derives_relations() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     assert!(schema.table("users").is_some());
     assert!(schema.table("posts").is_some());
@@ -69,7 +56,7 @@ async fn introspect_auto_derives_relations() {
 
 #[tokio::test]
 async fn introspect_runs_queries_end_to_end() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let engine = Engine::new(pool, schema);
     let v: Value = engine
@@ -83,7 +70,7 @@ async fn introspect_runs_queries_end_to_end() {
 
 #[tokio::test]
 async fn load_config_renames_and_hides() {
-    let (pool, _c) = setup_pool().await;
+    let (pool, _db) = setup_pool().await;
     let schema = Schema::introspect(&pool)
         .await
         .expect("introspect")

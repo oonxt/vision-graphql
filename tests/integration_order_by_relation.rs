@@ -4,10 +4,10 @@
 //! assert the database accepts that SQL and sorts rows the way the query asked.
 
 use serde_json::Value;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 /// posts → user → team: two object-relation hops, so the multi-hop JOIN branch
 /// of `render_order_by_expr` is exercised, not just the single correlated hop.
@@ -38,23 +38,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -87,7 +73,7 @@ async fn setup() -> (
     .expect("seed");
 
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 fn titles(v: &Value) -> Vec<String> {
@@ -102,7 +88,7 @@ fn titles(v: &Value) -> Vec<String> {
 /// One hop: sort posts by their author's name.
 #[tokio::test]
 async fn order_by_object_relation_one_hop() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { posts(where: {user_id: {_is_null: false}}, \
@@ -120,7 +106,7 @@ async fn order_by_object_relation_one_hop() {
 /// only the first hop correlates to the outer row, the rest are joins.
 #[tokio::test]
 async fn order_by_object_relation_two_hops() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { posts(where: {user_id: {_is_null: false}}, \
@@ -139,7 +125,7 @@ async fn order_by_object_relation_two_hops() {
 /// untouched and the missing side sorts as NULL.
 #[tokio::test]
 async fn order_by_object_relation_keeps_rows_with_no_related_row() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { posts(order_by: [{user: {name: asc}}, {id: asc}]) { title } }",

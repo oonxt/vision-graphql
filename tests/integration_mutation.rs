@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -26,22 +26,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"
                 CREATE TABLE users (
@@ -66,12 +53,12 @@ async fn setup() -> (
     .await
     .expect("seed");
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn insert_array_returns_affected_rows_and_returning() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation { insert_users(objects: [{name: "alice", age: 30}, {name: "bob"}]) { affected_rows returning { id name } } }"#,
@@ -87,7 +74,7 @@ async fn insert_array_returns_affected_rows_and_returning() {
 
 #[tokio::test]
 async fn insert_one_returns_single_object() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation { insert_users_one(object: {name: "cara"}) { id name } }"#,
@@ -102,7 +89,7 @@ async fn insert_one_returns_single_object() {
 
 #[tokio::test]
 async fn insert_with_on_conflict_do_update() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let _ = engine
         .query(
             r#"mutation { insert_users_one(object: {name: "dup", age: 1}) { id } }"#,
@@ -127,7 +114,7 @@ async fn insert_with_on_conflict_do_update() {
 
 #[tokio::test]
 async fn update_by_where_affected_rows_and_returning() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let _ = engine
         .query(
             r#"mutation { insert_users(objects: [{name: "u1"}, {name: "u2"}]) { affected_rows } }"#,
@@ -148,7 +135,7 @@ async fn update_by_where_affected_rows_and_returning() {
 
 #[tokio::test]
 async fn update_by_pk_returns_object() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let seed: Value = engine
         .query(
             r#"mutation { insert_users_one(object: {name: "pk_user"}) { id } }"#,
@@ -171,7 +158,7 @@ async fn update_by_pk_returns_object() {
 
 #[tokio::test]
 async fn update_by_pk_missing_row_returns_null() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation { update_users_by_pk(pk_columns: {id: 99999}, _set: {age: 1}) { id } }"#,
@@ -184,7 +171,7 @@ async fn update_by_pk_missing_row_returns_null() {
 
 #[tokio::test]
 async fn delete_by_where() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let _ = engine
         .query(
             r#"mutation { insert_users(objects: [{name: "d1"}, {name: "d2"}]) { affected_rows } }"#,
@@ -205,7 +192,7 @@ async fn delete_by_where() {
 
 #[tokio::test]
 async fn delete_by_pk_missing_returns_null() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(r#"mutation { delete_users_by_pk(id: 99999) { id } }"#, None)
         .await
@@ -215,7 +202,7 @@ async fn delete_by_pk_missing_returns_null() {
 
 #[tokio::test]
 async fn insert_array_returning_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -242,7 +229,7 @@ async fn insert_array_returning_with_nested_relation() {
 
 #[tokio::test]
 async fn insert_one_returning_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -263,7 +250,7 @@ async fn insert_one_returning_with_nested_relation() {
 
 #[tokio::test]
 async fn update_returning_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -297,7 +284,7 @@ async fn update_returning_with_nested_relation() {
 
 #[tokio::test]
 async fn update_by_pk_selection_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     let v0: Value = engine
         .query(
@@ -328,7 +315,7 @@ async fn update_by_pk_selection_with_nested_relation() {
 
 #[tokio::test]
 async fn delete_returning_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     engine
         .query(
             r#"mutation { insert_users_one(object: {name: "tmp"}) { id } }"#,
@@ -360,7 +347,7 @@ async fn delete_returning_with_nested_relation() {
 
 #[tokio::test]
 async fn delete_by_pk_selection_with_nested_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let seeded: Value = engine
         .query(
             r#"mutation { insert_users_one(object: {name: "tmp2"}) { id } }"#,

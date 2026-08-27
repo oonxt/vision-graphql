@@ -8,27 +8,14 @@
 //! it wrote a row into `users`. These tests pin that shut.
 
 use serde_json::Value;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::Schema;
 use vision_graphql::Engine;
 
-async fn pool_with_views() -> (
-    sqlx::PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+mod common;
+
+async fn pool_with_views() -> (sqlx::PgPool, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -58,7 +45,7 @@ async fn pool_with_views() -> (
     .execute(&pool)
     .await
     .expect("seed");
-    (pool, container)
+    (pool, db)
 }
 
 async fn user_names(pool: &sqlx::PgPool) -> Vec<String> {
@@ -72,7 +59,7 @@ async fn user_names(pool: &sqlx::PgPool) -> Vec<String> {
 /// rejected, and the base table behind it must be untouched.
 #[tokio::test]
 async fn introspected_view_rejects_every_write() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let view = schema.table("active_users").expect("view is introspected");
     assert!(view.read_only, "a VIEW must be introspected as read-only");
@@ -108,7 +95,7 @@ async fn introspected_view_rejects_every_write() {
 /// is reported before "no primary key", because it is the more fundamental fact.
 #[tokio::test]
 async fn view_by_pk_writes_are_rejected_as_read_only() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let engine = Engine::new(pool.clone(), schema);
 
@@ -129,7 +116,7 @@ async fn view_by_pk_writes_are_rejected_as_read_only() {
 /// Read-only is about writes only — the view stays fully queryable.
 #[tokio::test]
 async fn read_only_view_is_still_fully_queryable() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let engine = Engine::new(pool, schema);
 
@@ -160,7 +147,7 @@ async fn read_only_view_is_still_fully_queryable() {
 /// Base tables are untouched by all this: they stay writable.
 #[tokio::test]
 async fn base_table_stays_writable() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     assert!(
         !schema.table("users").expect("users").read_only,
@@ -183,7 +170,7 @@ async fn base_table_stays_writable() {
 /// by INSTEAD OF triggers is genuinely writable, and a base table can be frozen.
 #[tokio::test]
 async fn config_overrides_read_only_in_both_directions() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool)
         .await
         .expect("introspect")
@@ -235,7 +222,7 @@ async fn config_overrides_read_only_in_both_directions() {
 /// `orders` block writes into a table the schema says is frozen.
 #[tokio::test]
 async fn nested_insert_into_read_only_target_is_rejected() {
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool)
         .await
         .expect("introspect")
@@ -280,7 +267,7 @@ async fn nested_insert_into_read_only_target_is_rejected() {
 async fn builder_path_cannot_write_to_a_read_only_table() {
     use vision_graphql::Mutation;
 
-    let (pool, _c) = pool_with_views().await;
+    let (pool, _db) = pool_with_views().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let engine = Engine::new(pool.clone(), schema);
 

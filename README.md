@@ -63,7 +63,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 |---|---|
 | Select, `_by_pk`, `_aggregate` | ✓ |
 | Aggregates on a relation (`user { posts_aggregate { … } }`) | ✓ |
-| Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, with field aliases | ✓ |
+| Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, `stddev`(`_pop`/`_samp`), `variance`/`var_pop`/`var_samp`, with field aliases | ✓ |
 | Object + Array relations | ✓ |
 | `EXISTS` relation filters in `where` | ✓ |
 | Mutations: `insert` / `insert_one` / `update` / `update_by_pk` / `delete` / `delete_by_pk` | ✓ |
@@ -104,7 +104,6 @@ and left, not forgotten.
 |---|---|
 | `distinct_on` on an `_aggregate` | The aggregate's source does not render it, so it is refused rather than dropped, and not published. `count(columns: […], distinct: true)` counts distinct values. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
-| `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
 | `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
 | Array, `bytea`, `interval`, `inet` columns | No type mapping: the column is left out of the schema, and `vision-gql diff` reports it. |
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
@@ -753,7 +752,18 @@ and a withheld column cannot be summed or maxed. A number that answered the
 question the rows were refused would be a hole with extra steps.
 
 `count` takes `columns` and `distinct`; the other functions take their columns
-as a selection set. Field aliases work here like anywhere else — `total: count`
+as a selection set. The set is PostgreSQL's, under PostgreSQL's names — so
+`stddev` is `stddev_samp` and `variance` is `var_samp` here as there.
+
+A function is offered only where it means something: the arithmetic ones over
+numbers, `max` and `min` over anything with an order. Asking for `sum` of a
+`text` column is an error rather than a `function sum(text) does not exist` from
+the server.
+
+The published type is what PostgreSQL answers with, not the column's own: the
+`sum` of an `integer` is a `bigint`, its `avg` a `numeric`, and the `var_samp`
+of a `double precision` a `Float`. A client generating code from the schema gets
+the type it will actually receive. Field aliases work here like anywhere else — `total: count`
 answers under `total`. Anything else in an argument position is an error rather
 than something quietly dropped: `count(distinct: true)` with no `columns` says
 so, and a misspelled argument names itself.
@@ -1040,6 +1050,21 @@ let post: Value = engine.transaction(async |tx| {
 A single GraphQL mutation request is already atomic (one SQL statement per
 request). `transaction` exists for workflows that need atomicity *across*
 multiple requests — most commonly id-chaining between mutations.
+
+## Running the tests
+
+Integration tests need a PostgreSQL. Point them at one and the suite takes about
+twelve seconds:
+
+```bash
+docker run --rm -d --name vg-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17.4-alpine
+export TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
+cargo test --workspace
+```
+
+Each test still gets a database of its own on that server, so nothing is shared
+but the process. Without the variable every test starts its own container
+instead, which works and costs a minute.
 
 ## License
 

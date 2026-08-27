@@ -88,15 +88,29 @@ its place when a reader would otherwise "fix" the thing it protects.
 
 ## Testing environment
 
-Integration tests need Docker: each boots its own Postgres through
-testcontainers.
+Integration tests need a PostgreSQL. `tests/common/mod.rs` gives each test a
+fresh **database** on one server, rather than a container each — a hundred
+containers per run is how Docker ends up answering one of them with a timeout,
+which reads as a flaky test and is not one.
 
-Use **`cargo nextest run --test-threads 4`**, not `cargo test`. Cargo runs test
-*binaries* in parallel with no shared budget, and ~25 of them each starting
-containers makes Docker return `PortNotExposed` roughly one run in three — a
-failure that looks like a flaky test and is not one. nextest schedules
-everything through one pool, so the cap is on containers. `cargo test` remains
-the way to run doctests, which nextest does not.
+The fastest and steadiest way to run them is against a server that already
+exists:
+
+```
+docker run --rm -d --name vg-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17.4-alpine
+export TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
+cargo test --workspace          # ~13s
+```
+
+Without `TEST_DATABASE_URL` each test starts a container of its own through
+testcontainers, which works — the start is retried now — but costs a minute for
+the suite. CI sets the variable against a service container and starts none.
+
+A test calls `common::fresh_db()` and **holds the `TestDb` it gets back** for as
+long as it needs the database: it owns the container, and dropping it removes
+one. A `static` would never drop, and a hundred containers nobody removes make
+the next run slower than the one that leaked them — which is how this was
+learned.
 
 ## MSRV
 

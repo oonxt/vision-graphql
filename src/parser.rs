@@ -2595,7 +2595,8 @@ fn lower_aggregate_selection(
                             AggOp::Typename
                         }
                         "count" => parse_count_args(&sf.arguments, table, vars, &path)?,
-                        "sum" | "avg" | "max" | "min" => {
+                        _ if crate::ast::AggFunc::from_name(op_name).is_some() => {
+                            let func = crate::ast::AggFunc::from_name(op_name).unwrap();
                             if let Some((first, _)) = sf.arguments.first() {
                                 return Err(Error::Validate {
                                     path: format!("{path}.{}", first.node.as_str()),
@@ -2639,6 +2640,25 @@ fn lower_aggregate_selection(
                                             table.exposed_name
                                         ),
                                     })?;
+                                // The type system publishes `sum` only over
+                                // numbers; accepting it over a `text` column
+                                // here would accept a query the schema says
+                                // cannot exist, and PostgreSQL would answer
+                                // "function sum(text) does not exist" at request
+                                // time.
+                                if !crate::type_system::applies(func, &col.pg_type) {
+                                    return Err(Error::Validate {
+                                        path: format!("{path}.{calias}"),
+                                        message: format!(
+                                            "'{op_name}' does not apply to '{}': {}",
+                                            col.exposed_name,
+                                            crate::type_system::why_inapplicable(
+                                                func,
+                                                &col.pg_type
+                                            )
+                                        ),
+                                    });
+                                }
                                 column_count += 1;
                                 fields.push(AggField::Column(AggCol {
                                     alias: calias,
@@ -2651,13 +2671,7 @@ fn lower_aggregate_selection(
                                     message: format!("'{op_name}' needs at least one column"),
                                 });
                             }
-                            match op_name {
-                                "sum" => AggOp::Sum { fields },
-                                "avg" => AggOp::Avg { fields },
-                                "max" => AggOp::Max { fields },
-                                "min" => AggOp::Min { fields },
-                                _ => unreachable!(),
-                            }
+                            AggOp::Func { func, fields }
                         }
                         other => {
                             return Err(Error::Validate {
@@ -3150,7 +3164,7 @@ mod tests {
                 ));
                 assert_eq!(ops[1].alias, "sum");
                 match &ops[1].op {
-                    crate::ast::AggOp::Sum { fields } => {
+                    crate::ast::AggOp::Func { fields, .. } => {
                         assert_eq!(fields.len(), 1);
                         match &fields[0] {
                             crate::ast::AggField::Column(c) => {
@@ -3505,7 +3519,7 @@ mod tests {
         assert_eq!(ops[0].alias, "total");
         assert_eq!(ops[1].alias, "highest");
         match &ops[1].op {
-            crate::ast::AggOp::Max { fields } => match &fields[0] {
+            crate::ast::AggOp::Func { fields, .. } => match &fields[0] {
                 crate::ast::AggField::Column(c) => {
                     assert_eq!(c.alias, "newest");
                     assert_eq!(c.column, "id");
@@ -3715,7 +3729,7 @@ mod tests {
                 assert_eq!(typenames, &vec!["__typename".to_string()]);
                 assert!(matches!(ops[0].op, crate::ast::AggOp::Typename));
                 match &ops[1].op {
-                    crate::ast::AggOp::Max { fields } => {
+                    crate::ast::AggOp::Func { fields, .. } => {
                         assert!(matches!(fields[0], crate::ast::AggField::Typename { .. }));
                     }
                     other => panic!("expected Max, got {other:?}"),

@@ -3,6 +3,61 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **`stddev`, `stddev_pop`, `stddev_samp`, `variance`, `var_pop`, `var_samp`**,
+  beside the aggregates that were already there — PostgreSQL's set under
+  PostgreSQL's names.
+
+### Fixed
+
+- **An aggregate published one type and answered with another.** `avg` of an
+  `integer` was published as `Int`, where PostgreSQL answers `numeric`; `sum` of
+  an `integer` as `Int`, where it answers `bigint`. A client generating code
+  from the schema was generating the wrong type. The published type is now the
+  one PostgreSQL returns. The value itself still travels as a JSON number, the
+  way a `numeric` column always has — digits beyond double precision are
+  rounded on the way out; an exact, opt-in stringified transport is a recorded
+  follow-up, not a thing this release does.
+- **A function that cannot apply to a column was accepted.** `sum` over a `text`
+  column reached the database and came back "function sum(text) does not exist",
+  while the type system had never published it — the engine accepting what the
+  schema says cannot exist. Refused at lowering, with the reason.
+- **`max`/`min` were published over `boolean`, `uuid` and enum columns.** Those
+  types order — `_gt` works on every one — but PostgreSQL defines no `max` or
+  `min` aggregate for them, so the schema was publishing a field whose only
+  possible answer was "function max(boolean) does not exist", from the
+  database, at request time. No longer published, and refused with the reason.
+- **The aggregate refusal guarded only documents.** The typed builder
+  (`Engine::run`) never goes near the parser, so `stddev` over a `text` column
+  built by hand still reached the database and came back as an opaque SQL
+  error. The check now also runs where both entry points meet — rendering — so
+  the builder gets the same `Validate` error, with the path and the reason.
+
+- **Two test-suite failures that looked like flaky tests and were not.** Every
+  integration test started a PostgreSQL container of its own — a hundred or so
+  per run — and Docker answered one of them with `PortNotExposed` about one run
+  in three. And one CLI test removed a temp directory that every other CLI test
+  wrote into, deleting files the tests beside it were about to read. Tests now
+  take a database rather than a container: point `TEST_DATABASE_URL` at a
+  PostgreSQL and the suite runs in about twelve seconds instead of a minute,
+  with each test still getting a database of its own. Without it a container is
+  still started per test, retried, and removed when the test ends. No library
+  code changed.
+- **The shared-server test path leaked what it created and mangled one URL
+  shape.** Databases taken on a `TEST_DATABASE_URL` server were never dropped —
+  a hundred per run, and a reused pid recomputing a leaked name made `CREATE
+  DATABASE` fail hard — so a `TestDb` now drops its database when it drops, and
+  the name carries a per-run timestamp. A `TEST_DATABASE_URL` without a
+  database segment (valid; sqlx defaults it) had its authority overwritten by
+  the database name; the path is now looked for after the authority. And two
+  places dropped the `TestDb` guard while still using the database it owned,
+  which on the container path removed the server mid-test. The CLI crate's copy
+  of the harness is gone — it shares the library's by path, so the next fix
+  lands once.
+
 ## 0.14.0 — 2026-08-27
 
 ### Added

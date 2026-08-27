@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn users_schema() -> Schema {
     Schema::builder()
@@ -16,23 +16,9 @@ fn users_schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -52,12 +38,12 @@ async fn setup() -> (
     .expect("seed");
 
     let engine = Engine::new(pool, users_schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn plain_list_returns_all_rows() {
-    let (engine, _container) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query("query { users { id name } }", None)
         .await
@@ -69,7 +55,7 @@ async fn plain_list_returns_all_rows() {
 
 #[tokio::test]
 async fn where_eq_with_variable() {
-    let (engine, _container) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query Q($n: String!) { users(where: {name: {_eq: $n}}) { id name } }",
@@ -84,7 +70,7 @@ async fn where_eq_with_variable() {
 
 #[tokio::test]
 async fn order_by_limit_offset() {
-    let (engine, _container) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users(order_by: [{name: desc}], limit: 2, offset: 1) { name } }",
@@ -100,7 +86,7 @@ async fn order_by_limit_offset() {
 
 #[tokio::test]
 async fn sql_injection_attempt_is_bound_safely() {
-    let (engine, _container) = setup().await;
+    let (engine, _db) = setup().await;
     let nasty = "'); DROP TABLE users; --";
     let v: Value = engine
         .query(
@@ -123,7 +109,7 @@ async fn sql_injection_attempt_is_bound_safely() {
 /// this the document could only be run through `compile_with`.
 #[tokio::test]
 async fn an_operation_can_be_named() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     const DOC: &str = r#"
         query Everyone { users { id } }
         query OnlyActive { users(where: {active: {_eq: true}}) { id name } }

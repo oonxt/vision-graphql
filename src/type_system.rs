@@ -27,6 +27,7 @@
 //! but not its variants. A client sees a named scalar and passes strings, which
 //! is what the engine binds anyway.
 
+use crate::ast::AggFunc;
 use crate::schema::{PgType, RelKind, Schema, Table};
 use crate::type_names;
 use std::collections::{BTreeMap, BTreeSet};
@@ -240,28 +241,65 @@ pub fn scalar_name(pg: &PgType) -> String {
     }
 }
 
+/// Whether `func` means anything for a column of this type.
+pub fn applies(func: AggFunc, pg: &PgType) -> bool {
+    if func.numeric_only() {
+        pg.is_numeric()
+    } else {
+        pg.has_max_min()
+    }
+}
+
+/// Why [`applies`] said no, for the error the caller raises.
+///
+/// One sentence per way of failing, shared by both entry points — the parser
+/// and the renderer — so the document path and the builder get the same reason.
+pub fn why_inapplicable(func: AggFunc, pg: &PgType) -> &'static str {
+    if func.numeric_only() {
+        "it is not a number"
+    } else if !pg.is_orderable() {
+        "it has no ordering"
+    } else {
+        "PostgreSQL defines no max/min for its type"
+    }
+}
+
+/// What PostgreSQL answers with.
+///
+/// Not the column's own type, which is what this used to publish: `avg` of an
+/// `integer` is a `numeric`, and a client generating code against `Int` would
+/// have been generating the wrong thing. The mapping is PostgreSQL's, from its
+/// aggregate function table.
+///
+/// The *value* still travels as a JSON number, like a `numeric` column does
+/// (see `numeric_accepts_the_json_numbers_it_returns`): digits beyond double
+/// precision are rounded by the JSON round-trip on the way out. That is the
+/// deliberate trade — a string would make one scalar serialize two ways — and
+/// an opt-in exact (stringified) transport is the recorded follow-up.
+fn result_type(func: AggFunc, pg: &PgType) -> PgType {
+    use AggFunc::*;
+    match func {
+        // Ordering answers with what it was given.
+        Max | Min => pg.clone(),
+        // Summing widens, so that a total of many `int4` cannot overflow one.
+        Sum => match pg {
+            PgType::Int2 | PgType::Int4 => PgType::Int8,
+            PgType::Int8 => PgType::Numeric,
+            other => other.clone(),
+        },
+        // Everything arithmetic answers exactly for exact input and in floating
+        // point for floating input.
+        Avg | Stddev | StddevPop | StddevSamp | Variance | VarPop | VarSamp => match pg {
+            PgType::Float4 | PgType::Float8 => PgType::Float8,
+            _ => PgType::Numeric,
+        },
+    }
+}
+
 /// Whether `LIKE`-family operators apply, which is what decides whether the
 /// comparison input for this scalar carries them.
 fn is_stringish(pg: &PgType) -> bool {
     matches!(pg, PgType::Text | PgType::Varchar)
-}
-
-/// Ordered scalars — everything except `json`/`jsonb`, which Postgres has no
-/// total order for that anyone should rely on.
-fn is_comparable(pg: &PgType) -> bool {
-    !matches!(pg, PgType::Json | PgType::Jsonb)
-}
-
-fn is_numeric(pg: &PgType) -> bool {
-    matches!(
-        pg,
-        PgType::Int2
-            | PgType::Int4
-            | PgType::Int8
-            | PgType::Float4
-            | PgType::Float8
-            | PgType::Numeric
-    )
 }
 
 const BUILT_IN_SCALARS: [&str; 5] = ["Int", "Float", "String", "Boolean", "ID"];
@@ -287,6 +325,11 @@ struct Builder<'a> {
     /// Scalars reached from a column, so only the comparison inputs that can be
     /// used get published.
     scalars: BTreeMap<String, PgType>,
+    /// Scalars that appear only as an aggregate's *result* — `bigint` for the
+    /// sum of an `integer`, say. They need a type of their own, but no
+    /// comparison input: nothing can be filtered on them, since no column has
+    /// one.
+    result_scalars: BTreeSet<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -294,6 +337,7 @@ impl<'a> Builder<'a> {
         Builder {
             schema,
             published: BTreeSet::new(),
+            result_scalars: BTreeSet::new(),
             types: BTreeMap::new(),
             scalars: BTreeMap::new(),
         }
@@ -392,6 +436,15 @@ impl<'a> Builder<'a> {
         // exactly the ones something refers to — `Int` and `Boolean` are reached
         // through `limit` and `_is_null` even when no column has those types —
         // keeps the list complete without publishing scalars nothing uses.
+        // Result-only scalars first: they are referenced but reach no column, so
+        // nothing else would define them.
+        let result_scalars = std::mem::take(&mut self.result_scalars);
+        for name in result_scalars {
+            ts.types.entry(name.clone()).or_insert(TypeDef::Scalar {
+                name,
+                description: None,
+            });
+        }
         for name in dangling_references(&ts) {
             debug_assert!(
                 BUILT_IN_SCALARS.contains(&name.as_str()),
@@ -517,23 +570,23 @@ impl<'a> Builder<'a> {
             ]),
         ];
 
-        // sum/avg over numeric columns; max/min over anything ordered. A group
-        // with no columns to put in it is not published at all, rather than
-        // published empty.
-        for (op, keep) in [
-            ("sum", is_numeric as fn(&PgType) -> bool),
-            ("avg", is_numeric),
-            ("max", is_comparable),
-            ("min", is_comparable),
-        ] {
+        // sum/avg over numeric columns; max/min where PostgreSQL defines them.
+        // A group with no columns to put in it is not published at all, rather
+        // than published empty.
+        for func in AggFunc::ALL {
             let cols: Vec<Field> = t
                 .columns()
-                .filter(|c| keep(&c.pg_type))
-                .map(|c| Field::new(&c.exposed_name, TypeRef::named(scalar_name(&c.pg_type))))
+                .filter(|c| applies(func, &c.pg_type))
+                .map(|c| {
+                    let name = scalar_name(&result_type(func, &c.pg_type));
+                    self.result_scalars.insert(name.clone());
+                    Field::new(&c.exposed_name, TypeRef::named(name))
+                })
                 .collect();
             if cols.is_empty() {
                 continue;
             }
+            let op = func.name();
             let name = type_names::agg_op_fields(t, op);
             let mut cols = cols;
             cols.sort_by(|a, b| a.name.cmp(&b.name));
@@ -749,7 +802,7 @@ impl<'a> Builder<'a> {
             InputValue::new("_nin", named().non_null().list()),
             InputValue::new("_is_null", TypeRef::named("Boolean")),
         ];
-        if is_comparable(pg) {
+        if pg.is_orderable() {
             for op in ["_gt", "_gte", "_lt", "_lte"] {
                 fields.push(InputValue::new(op, named()));
             }
@@ -1175,6 +1228,51 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"name"));
         assert!(!names.contains(&"data"), "jsonb has no max worth offering");
+    }
+
+    /// `boolean`, `uuid` and enums order — `_gt` works on every one — but
+    /// PostgreSQL defines no `max`/`min` over them, so publishing those fields
+    /// published a query whose only possible answer was a database error.
+    #[test]
+    fn max_min_skip_types_postgres_cannot_max() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("things", "public", "things")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("label", "label", PgType::Text, true)
+                    .column("day", "day", PgType::Date, true)
+                    .column("flag", "flag", PgType::Bool, true)
+                    .column("token", "token", PgType::Uuid, true)
+                    .column(
+                        "mood",
+                        "mood",
+                        PgType::Enum {
+                            schema: "public".into(),
+                            name: "mood".into(),
+                        },
+                        true,
+                    )
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let ts = TypeSystem::build(&schema);
+        let TypeDef::Object { fields, .. } = ts.get("things_max_fields").unwrap() else {
+            panic!("expected object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"label"), "{names:?}");
+        assert!(names.contains(&"day"), "{names:?}");
+        for absent in ["flag", "token", "mood"] {
+            assert!(
+                !names.contains(&absent),
+                "PostgreSQL has no max over '{absent}': {names:?}"
+            );
+        }
+        // The ordering comparisons stay: the types order fine.
+        let TypeDef::InputObject { fields, .. } = ts.get("uuid_comparison_exp").unwrap() else {
+            panic!("expected input object");
+        };
+        assert!(fields.iter().any(|f| f.name == "_gt"), "{fields:?}");
     }
 
     #[test]
