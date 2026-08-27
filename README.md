@@ -89,6 +89,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Computed fields | Not implemented |
 | Pre-parse limits on document size and nesting (`ParseLimits`) | ✓ |
 | Execution limits: relation depth, table reads, default/max row limit (`ExecutionLimits`) | ✓ |
+| Persisted queries: compile a set at startup, run by key (`QueryRegistry`) | ✓ |
 | Subscriptions | Not implemented |
 
 ## JSON/JSONB path reads
@@ -760,6 +761,18 @@ make; a client that needs to know whether more rows exist should ask
 `max_limit` refuses rather than clamps. A truncated answer that looks complete
 is the failure worth avoiding.
 
+### Prepared statements and page size
+
+A literal `limit` renders inline, which keeps the statement readable and
+`EXPLAIN`-able — the point of compiling. When the number comes from a client
+that is the wrong trade: `limit: 1`, `limit: 2`, `limit: 3` are three
+statements, and a driver caches prepared statements per connection keyed on
+their text (sqlx keeps 100), so a client paging through results evicts
+everything else and leaves prepared statements accumulating server-side.
+`.bind_row_counts(true)` renders `limit` and `offset` as binds instead: one
+statement whatever the page size, at the cost of the number no longer showing
+in `CompiledQuery::sql()`.
+
 ### Statement timeout
 
 Set it on the connection, not per request. The engine sends one statement per
@@ -776,6 +789,42 @@ let pool = PgPoolOptions::new()
     .await?;
 # let _ = pool; Ok(()) }
 ```
+
+## Persisted queries
+
+The posture to prefer where clients can ship their documents: compile a set at
+startup, run them by key, never parse a new document at request time.
+
+```rust
+# use vision_graphql::{Engine, QueryRegistry};
+# async fn f(engine: Engine) -> vision_graphql::error::Result<()> {
+// once, at startup — a failure names the key that failed
+let registry = QueryRegistry::compile_all(&engine, [
+    ("user-list",  "query($n: Int!) { users(limit: $n) { id name } }"),
+    ("user-by-id", "query($id: Int!) { users_by_pk(id: $id) { id name } }"),
+])?;
+
+// per request
+let data = engine
+    .execute(registry.require("user-list")?, Some(serde_json::json!({"n": 20})))
+    .await?;
+# let _ = data; Ok(()) }
+```
+
+Most of what the sections above defend against stops being reachable: no new
+document is parsed, so document size and nesting are moot, and the cost of each
+query was fixed when it compiled. It also moves failure to startup — an unknown
+column, a table outside the scope policy, a literal of the wrong type all
+surface when the registry is built rather than on the request that happens to
+hit that query.
+
+`compile_all_scoped` compiles the set against a `ScopePolicy`; one statement
+then serves every principal, with `execute_scoped` supplying who is asking.
+
+The key is whatever suits the application — a name, a file path, the SHA-256 of
+the document if you are implementing the persisted-query protocol clients speak.
+The crate does not choose one. An unknown key is an error that names the key and
+deliberately does not list the ones that do exist.
 
 ## Transactions
 

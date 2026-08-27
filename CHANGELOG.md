@@ -84,6 +84,17 @@ used to be silent, so read **Breaking** before upgrading.
   (`users`, `users_aggregate_fields`, `users_mutation_response`, …), exposed as
   `type_names`. Not accepted as a root field; `__schema` / `__type`
   introspection is still unimplemented.
+- **`persisted::QueryRegistry`** — compile a set of queries at startup and run
+  them by key, the shape an endpoint should prefer where clients can ship their
+  documents: no new document is parsed at request time, and compile failures
+  surface at startup naming the key that failed rather than on the request that
+  happens to hit that query. `compile_all_scoped` compiles against a
+  `ScopePolicy`, so one statement serves every principal.
+- **`ExecutionLimits::bind_row_counts`** — render literal `limit`/`offset` as
+  bound parameters. Off by default, since rendering inline is what keeps a
+  compiled statement readable and `EXPLAIN`-able. On, every page size shares one
+  statement, which is what a driver's prepared-statement cache needs when the
+  number comes from a client.
 - **Schema introspection**: `__schema` and `__type`, answered in memory from a
   type system derived from the schema — the full Hasura-shaped surface, input
   types included (`<t>_bool_exp`, `<t>_order_by`, `<t>_insert_input`,
@@ -120,7 +131,8 @@ used to be silent, so read **Breaking** before upgrading.
 - `AggregateBuilder::count_columns`, `count_distinct`, and `key` (response key
   for the aggregate added last).
 - `CompiledQuery::defaults`.
-- `Count::var`; `Count::Var` is now a struct variant carrying an optional `max`.
+- `Count::var`; `Count::Var` is now a struct variant carrying an optional `max`,
+  and `Count::Bound` is a new variant: a literal that renders as a bind.
 - `QueryArgs::is_empty`, `AggOp::count()`, `AggCol::new`, `AggField::column`.
 
 ### Breaking

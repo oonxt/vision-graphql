@@ -138,6 +138,17 @@ impl PartialEq<Value> for Val {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Count {
     Lit(u64),
+    /// A count known from the query text that renders as a bound parameter
+    /// rather than inline.
+    ///
+    /// Only [`crate::limits::ExecutionLimits::bind_row_counts`] produces this.
+    /// It exists because the two things one might want from a literal `limit`
+    /// pull in opposite directions: rendered inline it keeps the statement
+    /// readable and `EXPLAIN`-able, and rendered as a bind it keeps every page
+    /// size on *one* statement — which is what a driver's prepared-statement
+    /// cache, and Postgres' plan cache behind it, care about when the value
+    /// comes from a client.
+    Bound(u64),
     Var {
         name: String,
         /// Ceiling from [`crate::limits::ExecutionLimits`], checked when the
@@ -164,7 +175,7 @@ impl Count {
     /// Resolve a variable count to a non-negative integer.
     pub fn resolve(&self, inputs: &Inputs<'_>, path: &str) -> Result<u64> {
         match self {
-            Count::Lit(n) => Ok(*n),
+            Count::Lit(n) | Count::Bound(n) => Ok(*n),
             Count::Var { name, max } => {
                 let v = inputs.variable(name)?;
                 let n = v.as_u64().ok_or_else(|| Error::Validate {

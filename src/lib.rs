@@ -64,6 +64,7 @@ pub mod introspection;
 pub mod limits;
 pub mod parse_cache;
 pub mod parser;
+pub mod persisted;
 pub mod policy;
 pub mod predicate;
 pub mod schema;
@@ -84,6 +85,7 @@ pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient}
 pub use error::Error;
 pub use limits::ParseLimits;
 pub use parse_cache::ParseCache;
+pub use persisted::QueryRegistry;
 pub use policy::{ScopePolicy, ScopePolicyBuilder, ScopeRule};
 pub use predicate::{and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr};
 pub use schema::Schema;

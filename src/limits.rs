@@ -313,6 +313,72 @@ mod exec_tests {
     }
 
     #[test]
+    fn bind_row_counts_moves_literals_out_of_the_sql() {
+        let schema = schema();
+        let render = |limits: ExecutionLimits| {
+            let mut op = lower("{ users(limit: 10, offset: 5) { id } }");
+            limits.apply(&mut op).unwrap();
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap()
+        };
+
+        // Default: inline, and the statement reads the way the query does.
+        let (sql, binds) = render(ExecutionLimits::new());
+        assert!(sql.contains("LIMIT 10"), "{sql}");
+        assert!(sql.contains("OFFSET 5"), "{sql}");
+        assert!(binds.is_empty(), "{binds:?}");
+
+        // Bound: one statement whatever the numbers, and they travel as binds.
+        let (sql, binds) = render(ExecutionLimits::new().bind_row_counts(true));
+        assert!(!sql.contains("LIMIT 10"), "{sql}");
+        assert!(sql.contains("LIMIT $"), "{sql}");
+        assert!(sql.contains("OFFSET $"), "{sql}");
+        assert_eq!(
+            binds,
+            vec![crate::types::Bind::Int8(10), crate::types::Bind::Int8(5)]
+        );
+    }
+
+    /// The point of the option: two page sizes, one statement.
+    #[test]
+    fn bound_row_counts_give_every_page_size_the_same_sql() {
+        let schema = schema();
+        let limits = ExecutionLimits::new().bind_row_counts(true);
+        let sql_for = |n: u64| {
+            let mut op = lower(&format!("{{ users(limit: {n}) {{ id }} }}"));
+            limits.apply(&mut op).unwrap();
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
+                .unwrap()
+                .0
+        };
+        assert_eq!(sql_for(1), sql_for(1000));
+    }
+
+    #[test]
+    fn a_default_limit_is_bound_too_when_asked() {
+        let schema = schema();
+        let mut op = lower("{ users { id } }");
+        ExecutionLimits::new()
+            .default_limit(25)
+            .bind_row_counts(true)
+            .apply(&mut op)
+            .unwrap();
+        let (sql, binds) =
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap();
+        assert!(sql.contains("LIMIT $"), "{sql}");
+        assert_eq!(binds, vec![crate::types::Bind::Int8(25)]);
+    }
+
+    #[test]
+    fn a_bound_count_is_still_subject_to_the_ceiling() {
+        let err = apply(
+            "{ users(limit: 500) { id } }",
+            ExecutionLimits::new().max_limit(100).bind_row_counts(true),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
+    }
+
+    #[test]
     fn max_relation_depth_counts_relation_hops() {
         let limits = ExecutionLimits::new().max_relation_depth(2);
         apply("{ users { posts { user { id } } } }", limits).unwrap();
@@ -541,6 +607,7 @@ pub struct ExecutionLimits {
     max_table_reads: Option<usize>,
     default_limit: Option<u64>,
     max_limit: Option<u64>,
+    bind_row_counts: bool,
 }
 
 impl ExecutionLimits {
@@ -596,6 +663,27 @@ impl ExecutionLimits {
     /// was compiled under.
     pub fn max_limit(mut self, n: u64) -> Self {
         self.max_limit = Some(n);
+        self
+    }
+
+    /// Render `limit` and `offset` as bound parameters even when the query text
+    /// spells them out.
+    ///
+    /// Off by default, and the default is the right one for an application whose
+    /// queries it wrote itself: a literal renders inline so the statement reads
+    /// the way the query does and can be `EXPLAIN`ed as-is, which is most of the
+    /// point of [`Engine::compile`](crate::Engine::compile).
+    ///
+    /// It is the wrong default when the numbers come from a client. `limit: 1`,
+    /// `limit: 2`, `limit: 3` are three statements, and a driver caches prepared
+    /// statements per connection keyed on their text — sqlx keeps 100 by default
+    /// — so a caller paging through results, or simply varying the number,
+    /// evicts everything else and leaves prepared statements accumulating
+    /// server-side. Bound, they are one statement whatever the page size.
+    ///
+    /// The cost is that `CompiledQuery::sql()` no longer shows the number.
+    pub fn bind_row_counts(mut self, yes: bool) -> Self {
+        self.bind_row_counts = yes;
         self
     }
 
@@ -728,8 +816,9 @@ impl ExecutionLimits {
             }
         }
         if list {
+            use crate::ast::Count;
             match args.limit.as_mut() {
-                Some(crate::ast::Count::Lit(n)) => {
+                Some(Count::Lit(n) | Count::Bound(n)) => {
                     if let Some(max) = self.max_limit {
                         if *n > max {
                             return Err(Error::Limit {
@@ -738,7 +827,7 @@ impl ExecutionLimits {
                         }
                     }
                 }
-                Some(crate::ast::Count::Var { max, .. }) => {
+                Some(Count::Var { max, .. }) => {
                     // Tightest of what was already there and what applies here.
                     *max = match (*max, self.max_limit) {
                         (Some(a), Some(b)) => Some(a.min(b)),
@@ -747,8 +836,21 @@ impl ExecutionLimits {
                 }
                 None => {
                     if let Some(default) = self.default_limit {
-                        args.limit = Some(crate::ast::Count::Lit(default));
+                        args.limit = Some(Count::Lit(default));
                     }
+                }
+            }
+        }
+        if self.bind_row_counts {
+            // Both, and after the default was filled in: a default limit is the
+            // same text on every request, but an offset the caller varies
+            // fragments the statement cache exactly as a limit does.
+            for slot in [args.limit.as_mut(), args.offset.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                if let crate::ast::Count::Lit(n) = slot {
+                    *slot = crate::ast::Count::Bound(*n);
                 }
             }
         }

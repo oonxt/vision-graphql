@@ -870,10 +870,16 @@ fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
 
 /// A literal count renders inline — it is part of the query text, so it is as
 /// fixed as the rest of the SQL. A variable becomes a bind, which is what keeps
-/// `limit: $n` from producing a different statement per page size.
+/// `limit: $n` from producing a different statement per page size. A literal the
+/// caller asked to be bound ([`Count::Bound`]) does the same for the same
+/// reason, at the cost of no longer showing in the rendered SQL.
 fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
     match count {
         Count::Lit(n) => write!(ctx.sql, " {keyword} {n}").unwrap(),
+        Count::Bound(n) => {
+            let i = ctx.push_fixed(crate::types::Bind::Int8(*n as i64));
+            write!(ctx.sql, " {keyword} ${i}::int8").unwrap();
+        }
         Count::Var { .. } => {
             let n = ctx.push_count(count, || path.to_string());
             write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
