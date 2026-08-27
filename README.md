@@ -102,6 +102,7 @@ and left, not forgotten.
 
 | Gap | Notes |
 |---|---|
+| `distinct_on` on an `_aggregate` | The aggregate's source does not render it, so it is refused rather than dropped, and not published. `count(columns: […], distinct: true)` counts distinct values. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
 | `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
 | `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
