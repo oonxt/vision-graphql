@@ -11,6 +11,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy)]
 pub struct Inputs<'a> {
     variables: Option<&'a Value>,
+    defaults: Option<&'a serde_json::Map<String, Value>>,
     principal: Option<&'a Principal>,
 }
 
@@ -23,6 +24,7 @@ impl<'a> Inputs<'a> {
     pub fn none() -> Self {
         Inputs {
             variables: None,
+            defaults: None,
             principal: None,
         }
     }
@@ -31,8 +33,21 @@ impl<'a> Inputs<'a> {
     pub fn variables(variables: &'a Value) -> Self {
         Inputs {
             variables: Some(variables),
+            defaults: None,
             principal: None,
         }
+    }
+
+    /// Attach the defaults an operation declared for its variables
+    /// (`query($n: Int = 10)`).
+    ///
+    /// The eager path applies these while lowering, but a compiled statement is
+    /// lowered before any request exists, so it carries them and they land
+    /// here. A variable the request actually supplied always wins, including
+    /// when it supplied null.
+    pub fn with_defaults(mut self, defaults: &'a serde_json::Map<String, Value>) -> Self {
+        self.defaults = Some(defaults);
+        self
     }
 
     /// Attach the principal whose parameters back [`Val::ScopeParam`].
@@ -49,10 +64,13 @@ impl<'a> Inputs<'a> {
     /// silently treating a missing variable as null turns a client mistake into
     /// a query that runs and returns the wrong rows.
     pub fn variable(&self, name: &str) -> Result<&'a Value> {
-        self.vars().get(name).ok_or_else(|| Error::Variable {
-            name: name.to_string(),
-            message: "not bound".into(),
-        })
+        self.vars()
+            .get(name)
+            .or_else(|| self.defaults.and_then(|d| d.get(name)))
+            .ok_or_else(|| Error::Variable {
+                name: name.to_string(),
+                message: "not bound".into(),
+            })
     }
 
     /// Value of scope parameter `name`, from the principal.

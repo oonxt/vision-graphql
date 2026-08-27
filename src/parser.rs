@@ -5,6 +5,7 @@ use crate::ast::{
     Val,
 };
 use crate::error::{Error, Result};
+use crate::limits::ParseLimits;
 use crate::schema::{Schema, Table};
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
@@ -29,9 +30,21 @@ pub fn parse_and_lower(
     lower(&doc, variables, operation_name, schema)
 }
 
-/// Parse GraphQL text into a document. Depends on nothing but the text, which
-/// is what makes it cacheable — see [`crate::parse_cache`].
+/// Parse GraphQL text into a document, under [`ParseLimits::default`].
+/// Depends on nothing but the text, which is what makes it cacheable — see
+/// [`crate::parse_cache`].
+///
+/// Every path into the parser goes through here, which is what makes this the
+/// place the pre-parse guard lives: an over-deep document must be rejected
+/// before `parse_query` sees it, because the overflow it causes aborts the
+/// process rather than unwinding. See [`crate::limits`].
 pub fn parse_document(source: &str) -> Result<ExecutableDocument> {
+    parse_document_with(source, &ParseLimits::default())
+}
+
+/// [`parse_document`] under explicit limits.
+pub fn parse_document_with(source: &str, limits: &ParseLimits) -> Result<ExecutableDocument> {
+    limits.check(source)?;
     parse_query(source).map_err(|e| Error::Parse(e.to_string()))
 }
 
@@ -64,6 +77,21 @@ pub fn lower_with(
         fragments.insert(name.as_str().to_string(), &def.node);
     }
     let op = pick_operation(doc, operation_name)?;
+
+    // `query($n: Int = 10)` means the request may leave `$n` out. Filling the
+    // defaults in here, once, is what keeps every variable position below from
+    // having to know about them — and an explicitly passed null still wins,
+    // since only *missing* names are filled.
+    let defaults = collect_defaults(op.variable_definitions)?;
+    let merged;
+    let variables = match (&variables, defaults.is_empty()) {
+        (Bindings::Eager(vars), false) => {
+            merged = with_defaults(vars, &defaults);
+            Bindings::Eager(&merged)
+        }
+        _ => variables,
+    };
+
     match op.ty {
         OperationType::Query => lower_query(op.selection_set, schema, variables, &fragments),
         OperationType::Mutation => lower_mutation(op.selection_set, schema, variables, &fragments),
@@ -71,9 +99,56 @@ pub fn lower_with(
     }
 }
 
+/// Default values declared by an operation's variable definitions.
+///
+/// Public because the compiled path cannot apply them while lowering — it does
+/// not have the request's variables yet — so [`crate::CompiledQuery`] carries
+/// them and applies them at execute time. See [`crate::types::Inputs`].
+pub fn variable_defaults(
+    doc: &ExecutableDocument,
+    operation_name: Option<&str>,
+) -> Result<serde_json::Map<String, Value>> {
+    collect_defaults(pick_operation(doc, operation_name)?.variable_definitions)
+}
+
+fn collect_defaults(
+    defs: &[Positioned<async_graphql_parser::types::VariableDefinition>],
+) -> Result<serde_json::Map<String, Value>> {
+    let mut out = serde_json::Map::new();
+    for def in defs {
+        let Some(default) = def.node.default_value.as_ref() else {
+            continue;
+        };
+        let name = def.node.name.node.as_str();
+        let json = default
+            .node
+            .clone()
+            .into_json()
+            .map_err(|e| Error::Variable {
+                name: name.to_string(),
+                message: format!("default value is not representable as JSON: {e}"),
+            })?;
+        out.insert(name.to_string(), json);
+    }
+    Ok(out)
+}
+
+/// `vars` with any name it does not carry taken from `defaults`.
+fn with_defaults(vars: &Value, defaults: &serde_json::Map<String, Value>) -> Value {
+    let mut out = match vars {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (name, value) in defaults {
+        out.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    Value::Object(out)
+}
+
 struct OpInfo<'a> {
     ty: OperationType,
     selection_set: &'a SelectionSet,
+    variable_definitions: &'a [Positioned<async_graphql_parser::types::VariableDefinition>],
 }
 
 fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result<OpInfo<'a>> {
@@ -81,6 +156,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
         (DocumentOperations::Single(op), _) => Ok(OpInfo {
             ty: op.node.ty,
             selection_set: &op.node.selection_set.node,
+            variable_definitions: &op.node.variable_definitions,
         }),
         (DocumentOperations::Multiple(ops), Some(n)) => {
             let key = Name::new(n);
@@ -90,6 +166,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
             Ok(OpInfo {
                 ty: op.node.ty,
                 selection_set: &op.node.selection_set.node,
+                variable_definitions: &op.node.variable_definitions,
             })
         }
         (DocumentOperations::Multiple(ops), None) => {
@@ -98,6 +175,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
                 Ok(OpInfo {
                     ty: op.node.ty,
                     selection_set: &op.node.selection_set.node,
+                    variable_definitions: &op.node.variable_definitions,
                 })
             } else {
                 Err(Error::Parse(
@@ -106,6 +184,137 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
             }
         }
     }
+}
+
+/// Every argument on a `_by_pk` field must name a primary key column.
+///
+/// The loop that reads the PK looks up the columns it wants and never sees the
+/// rest, so without this an argument that is not part of the key — a typo, or a
+/// `where` the caller believed was filtering — is accepted and silently
+/// dropped. Every other argument position in this file rejects what it does not
+/// know; this one has to as well.
+fn reject_non_pk_arguments(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    path: &str,
+) -> Result<()> {
+    for (name_p, _) in args {
+        let name = name_p.node.as_str();
+        if !table.primary_key.iter().any(|pk| pk == name) {
+            return Err(Error::Validate {
+                path: format!("{path}.{name}"),
+                message: format!(
+                    "unknown argument '{name}'; '{}' takes only its primary key ({})",
+                    table.exposed_name,
+                    table.primary_key.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Collapse fields that answer to the same response key.
+///
+/// Two fields with one key is not an error by itself — spreading a fragment
+/// that repeats a column is ordinary, and the GraphQL spec says such fields
+/// merge. What is an error is two fields that answer to one key and ask for
+/// *different* things: only one of them can survive into `json_build_object`,
+/// and until this existed the loser vanished with no word to the caller.
+///
+/// Identical scalar reads collapse to one. Relations collapse only when neither
+/// carries arguments, since `posts(limit: 1)` and `posts` under one key have no
+/// single answer — that is a conflict, and the fix is an alias.
+fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
+    fn key_of(f: &Field) -> &str {
+        match f {
+            Field::Column { alias, .. }
+            | Field::JsonPath { alias, .. }
+            | Field::Relation { alias, .. } => alias,
+        }
+    }
+
+    fn conflict(alias: &str, parent_path: &str) -> Error {
+        Error::Validate {
+            path: format!("{parent_path}.{alias}"),
+            message: format!(
+                "two fields both answer to '{alias}' but ask for different things; \
+                 give one of them an alias"
+            ),
+        }
+    }
+
+    let mut out: Vec<Field> = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(pos) = out.iter().position(|e| key_of(e) == key_of(&field)) else {
+            out.push(field);
+            continue;
+        };
+        let alias = key_of(&field).to_string();
+        match (&mut out[pos], field) {
+            (
+                Field::Column { physical: a, .. },
+                Field::Column {
+                    physical: ref b, ..
+                },
+            ) if a == b => {}
+            (
+                Field::JsonPath {
+                    physical: a,
+                    path: pa,
+                    ..
+                },
+                Field::JsonPath {
+                    physical: ref b,
+                    path: ref pb,
+                    ..
+                },
+            ) if a == b && pa == pb => {}
+            (
+                Field::Relation {
+                    name: a,
+                    args: aargs,
+                    selection: asel,
+                    ..
+                },
+                Field::Relation {
+                    name: ref b,
+                    args: bargs,
+                    selection: bsel,
+                    ..
+                },
+            ) if a == b && aargs.is_empty() && bargs.is_empty() => {
+                asel.extend(bsel);
+                let merged = std::mem::take(asel);
+                *asel = merge_fields(merged, &format!("{parent_path}.{alias}"))?;
+            }
+            _ => return Err(conflict(&alias, parent_path)),
+        }
+    }
+    Ok(out)
+}
+
+/// Every response key in one operation must be distinct.
+///
+/// Root fields are not merged the way selection-set fields are: two roots under
+/// one key differ in what they select, what they filter and often in kind
+/// (`users` vs `users_aggregate` aliased alike), and there is no defensible way
+/// to fold that into one. Rendering both is what used to happen, and the second
+/// silently overwrote the first in the result object.
+fn ensure_unique_root_aliases<'a>(aliases: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for alias in aliases {
+        if seen.contains(&alias) {
+            return Err(Error::Validate {
+                path: alias.to_string(),
+                message: format!(
+                    "two root fields both answer to '{alias}'; give one of them an alias"
+                ),
+            });
+        }
+        seen.push(alias);
+    }
+    Ok(())
 }
 
 fn lower_query(
@@ -179,6 +388,7 @@ fn lower_query(
                                 ),
                             });
                         }
+                        reject_non_pk_arguments(&field.arguments, table, &alias)?;
                         let mut pk: Vec<(String, Val)> = Vec::new();
                         for pk_col in &table.primary_key {
                             let found = field
@@ -236,6 +446,7 @@ fn lower_query(
             }
         }
     }
+    ensure_unique_root_aliases(roots.iter().map(|r| r.alias.as_str()))?;
     Ok(Operation::Query(roots))
 }
 
@@ -281,6 +492,7 @@ fn lower_mutation(
         let mf = lower_mutation_field(name, &alias, field, schema, vars, fragments)?;
         fields.push(mf);
     }
+    ensure_unique_root_aliases(fields.iter().map(crate::ast::MutationField::alias))?;
     Ok(Operation::Mutation(fields))
 }
 
@@ -444,6 +656,7 @@ fn lower_mutation_field(
                         ),
                     });
                 }
+                reject_non_pk_arguments(&field.arguments, table, alias)?;
                 let mut pk: Vec<(String, Val)> = Vec::new();
                 for pk_col in &table.primary_key {
                     let found = field
@@ -1062,6 +1275,19 @@ fn parse_update_by_pk_args(
                 };
                 let mut map = std::collections::BTreeMap::new();
                 for (k, val) in kv {
+                    // Same reason as `reject_non_pk_arguments`: only the primary
+                    // key columns are read back out below, so anything else here
+                    // would vanish without a word.
+                    if !table.primary_key.iter().any(|pk| pk == k.as_str()) {
+                        return Err(Error::Validate {
+                            path: format!("{path}.{k}"),
+                            message: format!(
+                                "'{k}' is not a primary key column of '{}' ({})",
+                                table.exposed_name,
+                                table.primary_key.join(", ")
+                            ),
+                        });
+                    }
                     map.insert(
                         k.to_string(),
                         gql_to_val(val, vars, &format!("{path}.{k}"))?,
@@ -1239,7 +1465,7 @@ fn lower_selection_set(
             }
         }
     }
-    Ok(out)
+    merge_fields(out, parent_path)
 }
 
 /// Lower a scalar column selection into either a plain [`Field::Column`] or a
@@ -1833,14 +2059,16 @@ fn lower_aggregate_selection(
     table: &Table,
     vars: Bindings<'_>,
     parent_path: &str,
-) -> Result<(Vec<crate::ast::AggOp>, Option<Vec<Field>>)> {
-    let mut ops: Vec<crate::ast::AggOp> = Vec::new();
+) -> Result<(Vec<crate::ast::AggSelect>, Option<Vec<Field>>)> {
+    use crate::ast::{AggCol, AggOp, AggSelect};
+
+    let mut ops: Vec<AggSelect> = Vec::new();
     let mut nodes: Option<Vec<Field>> = None;
 
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
             return Err(Error::Parse(
-                "fragments are not supported in Phase 3".into(),
+                "fragments are not supported inside an _aggregate field".into(),
             ));
         };
         let field = &f.node;
@@ -1850,42 +2078,76 @@ fn lower_aggregate_selection(
                 for s in &field.selection_set.node.items {
                     let Selection::Field(sf) = &s.node else {
                         return Err(Error::Parse(
-                            "fragments not supported inside aggregate".into(),
+                            "fragments are not supported inside aggregate".into(),
                         ));
                     };
                     let sf = &sf.node;
                     let op_name = sf.name.node.as_str();
-                    match op_name {
-                        "count" => {
-                            ops.push(crate::ast::AggOp::Count);
-                        }
+                    let alias = sf
+                        .alias
+                        .as_ref()
+                        .map(|a| a.node.as_str().to_string())
+                        .unwrap_or_else(|| op_name.to_string());
+                    let path = format!("{parent_path}.aggregate.{alias}");
+                    let op = match op_name {
+                        "count" => parse_count_args(&sf.arguments, table, vars, &path)?,
                         "sum" | "avg" | "max" | "min" => {
+                            if let Some((first, _)) = sf.arguments.first() {
+                                return Err(Error::Validate {
+                                    path: format!("{path}.{}", first.node.as_str()),
+                                    message: format!(
+                                        "'{op_name}' takes no arguments; name the columns in its \
+                                         selection set instead"
+                                    ),
+                                });
+                            }
                             let mut columns = Vec::new();
                             for cs in &sf.selection_set.node.items {
                                 let Selection::Field(cf) = &cs.node else {
                                     return Err(Error::Parse(
-                                        "fragments not supported inside aggregate".into(),
+                                        "fragments are not supported inside aggregate".into(),
                                     ));
                                 };
-                                let cname = cf.node.name.node.as_str();
+                                let cf = &cf.node;
+                                let cname = cf.name.node.as_str();
+                                let calias = cf
+                                    .alias
+                                    .as_ref()
+                                    .map(|a| a.node.as_str().to_string())
+                                    .unwrap_or_else(|| cname.to_string());
+                                if let Some((first, _)) = cf.arguments.first() {
+                                    return Err(Error::Validate {
+                                        path: format!("{path}.{calias}.{}", first.node.as_str()),
+                                        message: "a column inside an aggregate takes no arguments"
+                                            .into(),
+                                    });
+                                }
                                 let col =
                                     table.find_column(cname).ok_or_else(|| Error::Validate {
-                                        path: format!("{parent_path}.aggregate.{op_name}.{cname}"),
+                                        path: format!("{path}.{calias}"),
                                         message: format!(
                                             "unknown column '{cname}' on '{}'",
                                             table.exposed_name
                                         ),
                                     })?;
-                                columns.push(col.exposed_name.clone());
+                                columns.push(AggCol {
+                                    alias: calias,
+                                    column: col.exposed_name.clone(),
+                                });
                             }
-                            let op = match op_name {
-                                "sum" => crate::ast::AggOp::Sum { columns },
-                                "avg" => crate::ast::AggOp::Avg { columns },
-                                "max" => crate::ast::AggOp::Max { columns },
-                                "min" => crate::ast::AggOp::Min { columns },
+                            if columns.is_empty() {
+                                return Err(Error::Validate {
+                                    path: path.clone(),
+                                    message: format!("'{op_name}' needs at least one column"),
+                                });
+                            }
+                            match op_name {
+                                "sum" => AggOp::Sum { columns },
+                                "avg" => AggOp::Avg { columns },
+                                "max" => AggOp::Max { columns },
+                                "min" => AggOp::Min { columns },
                                 _ => unreachable!(),
-                            };
-                            ops.push(op);
+                            }
                         }
                         other => {
                             return Err(Error::Validate {
@@ -1893,7 +2155,8 @@ fn lower_aggregate_selection(
                                 message: format!("unsupported aggregate '{other}'"),
                             });
                         }
-                    }
+                    };
+                    ops.push(AggSelect { alias, op });
                 }
             }
             "nodes" => {
@@ -1914,6 +2177,67 @@ fn lower_aggregate_selection(
         }
     }
     Ok((ops, nodes))
+}
+
+/// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
+///
+/// Arguments here used to be read by nobody: `count(distinct: true, columns:
+/// [name])` rendered `count(*)` and returned a number that answered a different
+/// question than the one asked, without an error. Whatever is not understood is
+/// now rejected.
+fn parse_count_args(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    table: &Table,
+    vars: Bindings<'_>,
+    path: &str,
+) -> Result<crate::ast::AggOp> {
+    let mut columns: Vec<String> = Vec::new();
+    let mut distinct = false;
+    for (name_p, value_p) in args {
+        let name = name_p.node.as_str();
+        match name {
+            "columns" => {
+                let json = gql_to_json(&value_p.node, vars, &format!("{path}.columns"))?;
+                let items = match &json {
+                    Value::Array(xs) => xs.clone(),
+                    single => vec![single.clone()],
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let cname = item.as_str().ok_or_else(|| Error::Validate {
+                        path: format!("{path}.columns[{i}]"),
+                        message: "expected column name (enum or string)".into(),
+                    })?;
+                    let col = table.find_column(cname).ok_or_else(|| Error::Validate {
+                        path: format!("{path}.columns[{i}]"),
+                        message: format!("unknown column '{cname}' on '{}'", table.exposed_name),
+                    })?;
+                    columns.push(col.exposed_name.clone());
+                }
+            }
+            "distinct" => {
+                let json = gql_to_json(&value_p.node, vars, &format!("{path}.distinct"))?;
+                distinct = json.as_bool().ok_or_else(|| Error::Validate {
+                    path: format!("{path}.distinct"),
+                    message: format!("expected a boolean, got {json}"),
+                })?;
+            }
+            other => {
+                return Err(Error::Validate {
+                    path: format!("{path}.{other}"),
+                    message: format!(
+                        "unknown argument '{other}' on 'count'; it takes 'columns' and 'distinct'"
+                    ),
+                })
+            }
+        }
+    }
+    if distinct && columns.is_empty() {
+        return Err(Error::Validate {
+            path: format!("{path}.distinct"),
+            message: "'distinct' needs 'columns' to be distinct on".into(),
+        });
+    }
+    Ok(crate::ast::AggOp::Count { columns, distinct })
 }
 
 fn lower_selection_columns_only(
@@ -1948,7 +2272,7 @@ fn lower_selection_columns_only(
             parent_path,
         )?);
     }
-    Ok(out)
+    merge_fields(out, parent_path)
 }
 
 #[cfg(test)]
@@ -2287,10 +2611,20 @@ mod tests {
         match &roots[0].body {
             crate::ast::RootBody::Aggregate { ops, nodes } => {
                 assert_eq!(ops.len(), 2);
-                assert!(matches!(ops[0], crate::ast::AggOp::Count));
-                match &ops[1] {
+                assert_eq!(ops[0].alias, "count");
+                assert!(matches!(
+                    ops[0].op,
+                    crate::ast::AggOp::Count {
+                        distinct: false,
+                        ..
+                    }
+                ));
+                assert_eq!(ops[1].alias, "sum");
+                match &ops[1].op {
                     crate::ast::AggOp::Sum { columns } => {
-                        assert_eq!(columns, &vec!["id".to_string()])
+                        assert_eq!(columns.len(), 1);
+                        assert_eq!(columns[0].column, "id");
+                        assert_eq!(columns[0].alias, "id");
                     }
                     _ => panic!("expected Sum"),
                 }
@@ -2581,6 +2915,192 @@ mod tests {
             _ => panic!("expected Aggregate"),
         }
         assert!(roots[0].args.where_.is_some());
+    }
+
+    fn agg(q: &str) -> Result<Vec<crate::ast::AggSelect>> {
+        let op = parse_and_lower(q, &json!({}), None, &schema())?;
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate { ops, .. } => Ok(ops.clone()),
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn count_takes_columns_and_distinct() {
+        let ops =
+            agg("{ users_aggregate { aggregate { count(columns: [name], distinct: true) } } }")
+                .unwrap();
+        match &ops[0].op {
+            crate::ast::AggOp::Count { columns, distinct } => {
+                assert_eq!(columns, &vec!["name".to_string()]);
+                assert!(distinct);
+            }
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_rejects_what_it_does_not_understand() {
+        // Silently ignoring these is what made `count` answer a different
+        // question than the one asked.
+        let err = agg("{ users_aggregate { aggregate { count(sneaky: 1) } } }").unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown argument 'sneaky'"),
+            "{err}"
+        );
+
+        let err = agg("{ users_aggregate { aggregate { count(columns: [nope]) } } }").unwrap_err();
+        assert!(format!("{err}").contains("unknown column 'nope'"), "{err}");
+
+        let err = agg("{ users_aggregate { aggregate { count(distinct: true) } } }").unwrap_err();
+        assert!(format!("{err}").contains("needs 'columns'"), "{err}");
+
+        let err =
+            agg("{ users_aggregate { aggregate { sum(columns: [id]) { id } } } }").unwrap_err();
+        assert!(format!("{err}").contains("takes no arguments"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_fields_keep_their_aliases() {
+        let ops =
+            agg("{ users_aggregate { aggregate { total: count highest: max { newest: id } } } }")
+                .unwrap();
+        assert_eq!(ops[0].alias, "total");
+        assert_eq!(ops[1].alias, "highest");
+        match &ops[1].op {
+            crate::ast::AggOp::Max { columns } => {
+                assert_eq!(columns[0].alias, "newest");
+                assert_eq!(columns[0].column, "id");
+            }
+            other => panic!("expected Max, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_identical_fields_collapse() {
+        // The shape a fragment spread produces: `id` asked for twice.
+        let op = parse_and_lower(
+            "fragment F on users { id } query { users { id ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => assert_eq!(selection.len(), 1),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn conflicting_fields_under_one_key_are_rejected() {
+        // Rendering both put two "name" keys in one json_build_object and the
+        // second silently won.
+        let err = parse_and_lower(
+            r#"{ users { name: id name } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'name'"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_root_alias_is_rejected() {
+        let err = parse_and_lower(
+            "{ users { id } users { name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("two root fields both answer to 'users'"),
+            "{err}"
+        );
+        // An alias on one of them is the fix, and it works.
+        parse_and_lower(
+            "{ users { id } others: users { name } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identical_argument_free_relations_merge_but_differing_ones_do_not() {
+        let s = schema_with_relations();
+        let op = parse_and_lower(
+            "{ users { posts { id } posts { title } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => {
+                assert_eq!(selection.len(), 1);
+                match &selection[0] {
+                    Field::Relation { selection, .. } => assert_eq!(selection.len(), 2),
+                    _ => panic!("expected Relation"),
+                }
+            }
+            _ => panic!("expected List"),
+        }
+
+        let err = parse_and_lower(
+            "{ users { posts { id } posts(limit: 1) { id } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'posts'"), "{err}");
+    }
+
+    #[test]
+    fn declared_variable_defaults_are_applied() {
+        let op = parse_and_lower(
+            "query($n: Int = 7) { users(limit: $n) { id } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            roots[0].args.limit,
+            Some(crate::ast::Count::Lit(7))
+        ));
+
+        // A supplied value beats the default.
+        let op = parse_and_lower(
+            "query($n: Int = 7) { users(limit: $n) { id } }",
+            &json!({"n": 3}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            roots[0].args.limit,
+            Some(crate::ast::Count::Lit(3))
+        ));
     }
 
     #[test]

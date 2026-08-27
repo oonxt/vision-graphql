@@ -16,7 +16,8 @@
 //! documents are retained.
 
 use crate::error::Result;
-use crate::parser::parse_document;
+use crate::limits::ParseLimits;
+use crate::parser::parse_document_with;
 use async_graphql_parser::types::ExecutableDocument;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,7 @@ const MAX_CACHED_SOURCE: usize = 16 * 1024;
 #[derive(Debug)]
 pub struct ParseCache {
     capacity: usize,
+    limits: ParseLimits,
     inner: Mutex<Generations>,
 }
 
@@ -56,10 +58,25 @@ impl ParseCache {
     /// A cache holding up to `capacity` documents in its hot generation.
     /// `capacity == 0` disables caching: every call parses.
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, ParseLimits::default())
+    }
+
+    /// A cache that also carries the [`ParseLimits`] every document going
+    /// through it is checked against.
+    ///
+    /// The limits live here rather than on [`Engine`](crate::Engine) because
+    /// this is what sits in front of the parser on every path, cached or not.
+    pub fn with_limits(capacity: usize, limits: ParseLimits) -> Self {
         Self {
             capacity,
+            limits,
             inner: Mutex::new(Generations::default()),
         }
+    }
+
+    /// The limits documents are checked against.
+    pub fn limits(&self) -> &ParseLimits {
+        &self.limits
     }
 
     /// Parsed form of `source`, parsing only on a miss.
@@ -69,12 +86,12 @@ impl ParseCache {
     /// wrong answer — instead of serialising every caller behind one parse.
     pub fn get(&self, source: &str) -> Result<Arc<ExecutableDocument>> {
         if self.capacity == 0 || source.len() > MAX_CACHED_SOURCE {
-            return parse_document(source).map(Arc::new);
+            return parse_document_with(source, &self.limits).map(Arc::new);
         }
         if let Some(doc) = self.lookup(source) {
             return Ok(doc);
         }
-        let doc = Arc::new(parse_document(source)?);
+        let doc = Arc::new(parse_document_with(source, &self.limits)?);
         self.insert(source, doc.clone());
         Ok(doc)
     }
@@ -125,6 +142,47 @@ mod tests {
     use super::*;
 
     const Q: &str = "{ users { id } }";
+
+    /// The document that aborted the process before the pre-parse guard existed
+    /// — a stack overflow inside the parser, on a stack the size tokio gives a
+    /// worker thread. Reaching the assertion at all is most of the test.
+    fn over_deep() -> String {
+        format!(
+            "{{ users(where: {}{}{}) {{ id }} }}",
+            "{_not: ".repeat(2000),
+            "{id: {_eq: 1}}",
+            "}".repeat(2000)
+        )
+    }
+
+    #[test]
+    fn over_deep_document_is_rejected_and_not_cached() {
+        let cache = ParseCache::new(8);
+        let err = cache.get(&over_deep()).unwrap_err();
+        assert!(matches!(err, crate::Error::Limit { .. }), "{err}");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn limits_apply_on_the_uncached_path_too() {
+        // capacity 0 skips the cache entirely; the guard must still run.
+        let err = ParseCache::new(0).get(&over_deep()).unwrap_err();
+        assert!(matches!(err, crate::Error::Limit { .. }), "{err}");
+    }
+
+    #[test]
+    fn custom_limits_are_honoured() {
+        let cache = ParseCache::with_limits(
+            8,
+            crate::ParseLimits {
+                max_depth: 2,
+                ..Default::default()
+            },
+        );
+        assert!(cache.get("{ users { id } }").is_ok());
+        let err = cache.get("{ users { posts { id } } }").unwrap_err();
+        assert!(matches!(err, crate::Error::Limit { .. }), "{err}");
+    }
 
     #[test]
     fn second_get_returns_the_same_document() {

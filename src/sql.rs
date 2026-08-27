@@ -2109,7 +2109,7 @@ fn render_mutation_output_for_inner(
 
 fn render_aggregate(
     root: &RootField,
-    ops: &[crate::ast::AggOp],
+    ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     table: &Table,
     schema: &Schema,
@@ -2149,46 +2149,75 @@ fn render_aggregate(
 }
 
 fn render_agg_op(
-    op: &crate::ast::AggOp,
+    sel: &crate::ast::AggSelect,
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::AggOp;
-    match op {
-        AggOp::Count => {
-            ctx.sql.push_str("'count', count(*)");
+    let key = escape_string_literal(&sel.alias);
+    match &sel.op {
+        AggOp::Count { columns, distinct } => {
+            write!(ctx.sql, "'{key}', count(").unwrap();
+            if columns.is_empty() {
+                ctx.sql.push('*');
+            } else {
+                if *distinct {
+                    ctx.sql.push_str("DISTINCT ");
+                }
+                // More than one column counts the tuple: a row constructor is
+                // NULL only when every field is, which is the reading that makes
+                // `count(DISTINCT (a, b))` mean distinct pairs.
+                if columns.len() > 1 {
+                    ctx.sql.push('(');
+                }
+                for (i, exposed) in columns.iter().enumerate() {
+                    if i > 0 {
+                        ctx.sql.push_str(", ");
+                    }
+                    let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+                        path: format!("aggregate.{}", sel.alias),
+                        message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
+                    })?;
+                    write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+                }
+                if columns.len() > 1 {
+                    ctx.sql.push(')');
+                }
+            }
+            ctx.sql.push(')');
             Ok(())
         }
-        AggOp::Sum { columns } => render_agg_func("sum", "sum", columns, table_alias, table, ctx),
-        AggOp::Avg { columns } => render_agg_func("avg", "avg", columns, table_alias, table, ctx),
-        AggOp::Max { columns } => render_agg_func("max", "max", columns, table_alias, table, ctx),
-        AggOp::Min { columns } => render_agg_func("min", "min", columns, table_alias, table, ctx),
+        AggOp::Sum { columns } => render_agg_func(&key, "sum", columns, table_alias, table, ctx),
+        AggOp::Avg { columns } => render_agg_func(&key, "avg", columns, table_alias, table, ctx),
+        AggOp::Max { columns } => render_agg_func(&key, "max", columns, table_alias, table, ctx),
+        AggOp::Min { columns } => render_agg_func(&key, "min", columns, table_alias, table, ctx),
     }
 }
 
 fn render_agg_func(
     key: &str,
     pg_func: &str,
-    columns: &[String],
+    columns: &[crate::ast::AggCol],
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
-    for (i, col_exposed) in columns.iter().enumerate() {
+    for (i, c) in columns.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
         let col = table
-            .find_column(col_exposed)
+            .find_column(&c.column)
             .ok_or_else(|| Error::Validate {
-                path: format!("aggregate.{key}.{col_exposed}"),
-                message: format!("unknown column '{col_exposed}' on '{}'", table.exposed_name),
+                path: format!("aggregate.{key}.{}", c.alias),
+                message: format!("unknown column '{}' on '{}'", c.column, table.exposed_name),
             })?;
         write!(
             ctx.sql,
-            "'{col_exposed}', {pg_func}({table_alias}.{})",
+            "'{}', {pg_func}({table_alias}.{})",
+            escape_string_literal(&c.alias),
             quote_ident(&col.physical_name)
         )
         .unwrap();
@@ -2263,7 +2292,7 @@ fn render_json_build_object_for_nodes(
 
 fn render_aggregate_source(
     root: &RootField,
-    ops: &[crate::ast::AggOp],
+    ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
     table: &Table,
     schema: &Schema,
@@ -2273,15 +2302,17 @@ fn render_aggregate_source(
     use std::collections::BTreeSet;
 
     let mut cols_needed: BTreeSet<String> = BTreeSet::new();
-    for op in ops {
-        let columns = match op {
-            AggOp::Count => continue,
+    for sel in ops {
+        // `count(columns: …)` reads columns too, so the inner select has to
+        // project them just like sum/avg/max/min do.
+        let names: Vec<&str> = match &sel.op {
+            AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
             AggOp::Sum { columns }
             | AggOp::Avg { columns }
             | AggOp::Max { columns }
-            | AggOp::Min { columns } => columns,
+            | AggOp::Min { columns } => columns.iter().map(|c| c.column.as_str()).collect(),
         };
-        for c in columns {
+        for c in names {
             let col = table.find_column(c).ok_or_else(|| Error::Validate {
                 path: format!("{}.aggregate", root.alias),
                 message: format!("unknown column '{c}' on '{}'", table.exposed_name),
@@ -3410,7 +3441,7 @@ mod tests {
 
     #[test]
     fn render_aggregate_count_and_sum() {
-        use crate::ast::{AggOp, RootBody};
+        use crate::ast::{AggCol, AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
@@ -3418,9 +3449,15 @@ mod tests {
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
                 ops: vec![
-                    AggOp::Count,
-                    AggOp::Sum {
-                        columns: vec!["id".into()],
+                    AggSelect {
+                        alias: "count".into(),
+                        op: AggOp::count(),
+                    },
+                    AggSelect {
+                        alias: "sum".into(),
+                        op: AggOp::Sum {
+                            columns: vec![AggCol::new("id")],
+                        },
                     },
                 ],
                 nodes: Some(vec![Field::Column {
@@ -3434,15 +3471,77 @@ mod tests {
     }
 
     #[test]
-    fn render_aggregate_no_nodes() {
-        use crate::ast::{AggOp, RootBody};
+    fn render_count_distinct_and_aliases() {
+        use crate::ast::{AggCol, AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
-                ops: vec![AggOp::Count],
+                ops: vec![
+                    AggSelect {
+                        alias: "total".into(),
+                        op: AggOp::count(),
+                    },
+                    AggSelect {
+                        alias: "names".into(),
+                        op: AggOp::Count {
+                            columns: vec!["name".into()],
+                            distinct: true,
+                        },
+                    },
+                    AggSelect {
+                        alias: "pairs".into(),
+                        op: AggOp::Count {
+                            columns: vec!["id".into(), "name".into()],
+                            distinct: true,
+                        },
+                    },
+                    AggSelect {
+                        alias: "highest".into(),
+                        op: AggOp::Max {
+                            columns: vec![AggCol {
+                                alias: "newest".into(),
+                                column: "id".into(),
+                            }],
+                        },
+                    },
+                ],
+                nodes: None,
+            },
+        }]);
+        let (sql, _binds) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains("'total', count(*)"), "{sql}");
+        assert!(
+            sql.contains(r#"'names', count(DISTINCT t0."name")"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"'pairs', count(DISTINCT (t0."id", t0."name"))"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"'highest', json_build_object('newest', max(t0."id"))"#),
+            "{sql}"
+        );
+        // The columns count() reads must be projected by the inner select.
+        assert!(sql.contains(r#"SELECT "id", "name" FROM"#), "{sql}");
+    }
+
+    #[test]
+    fn render_aggregate_no_nodes() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
                 nodes: None,
             },
         }]);

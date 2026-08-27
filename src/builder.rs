@@ -258,7 +258,7 @@ pub struct AggregateBuilder {
     table: String,
     alias: String,
     args: QueryArgs,
-    ops: Vec<AggOp>,
+    ops: Vec<crate::ast::AggSelect>,
     nodes: Option<Vec<Field>>,
 }
 
@@ -283,36 +283,89 @@ impl AggregateBuilder {
         self
     }
 
+    /// `count(*)`.
     pub fn count(mut self) -> Self {
-        self.ops.push(AggOp::Count);
+        self.push("count", AggOp::count());
         self
     }
 
-    pub fn sum(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Sum {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
+    /// `count(<cols>)` — rows where the named columns are not null.
+    pub fn count_columns(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "count",
+            AggOp::Count {
+                columns: cols.iter().map(|s| (*s).to_string()).collect(),
+                distinct: false,
+            },
+        );
+        self
+    }
+
+    /// `count(DISTINCT <cols>)`.
+    pub fn count_distinct(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "count",
+            AggOp::Count {
+                columns: cols.iter().map(|s| (*s).to_string()).collect(),
+                distinct: true,
+            },
+        );
+        self
+    }
+
+    /// Response key for the aggregate added last, so two counts can coexist:
+    /// `.count().key("total").count_distinct(&["city"]).key("cities")`.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        if let Some(last) = self.ops.last_mut() {
+            last.alias = key.into();
+        }
+        self
+    }
+
+    fn push(&mut self, alias: &str, op: AggOp) {
+        self.ops.push(crate::ast::AggSelect {
+            alias: alias.to_string(),
+            op,
         });
+    }
+
+    pub fn sum(mut self, cols: &[&str]) -> Self {
+        self.push(
+            "sum",
+            AggOp::Sum {
+                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+            },
+        );
         self
     }
 
     pub fn avg(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Avg {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "avg",
+            AggOp::Avg {
+                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+            },
+        );
         self
     }
 
     pub fn max(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Max {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "max",
+            AggOp::Max {
+                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+            },
+        );
         self
     }
 
     pub fn min(mut self, cols: &[&str]) -> Self {
-        self.ops.push(AggOp::Min {
-            columns: cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        self.push(
+            "min",
+            AggOp::Min {
+                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+            },
+        );
         self
     }
 

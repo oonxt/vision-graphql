@@ -183,7 +183,7 @@ pub enum RootBody {
         selection: Vec<Field>,
     },
     Aggregate {
-        ops: Vec<AggOp>,
+        ops: Vec<AggSelect>,
         nodes: Option<Vec<Field>>,
     },
     ByPk {
@@ -193,13 +193,70 @@ pub enum RootBody {
     },
 }
 
+/// One entry under `aggregate { … }`: the response key it answers to, and the
+/// function it computes.
+///
+/// The key is carried rather than derived from the function name because
+/// `total: count` is a field alias like any other — deriving it would answer
+/// under `count` and hand the caller a response shaped differently from the
+/// document they sent.
+#[derive(Debug, Clone)]
+pub struct AggSelect {
+    pub alias: String,
+    pub op: AggOp,
+}
+
+/// A column inside `sum { … }` / `avg` / `max` / `min`, with the response key
+/// it answers to. Same reason as [`AggSelect::alias`].
+#[derive(Debug, Clone)]
+pub struct AggCol {
+    pub alias: String,
+    pub column: String,
+}
+
+impl AggCol {
+    /// A column answering under its own name.
+    pub fn new(column: impl Into<String>) -> Self {
+        let column = column.into();
+        AggCol {
+            alias: column.clone(),
+            column,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AggOp {
-    Count,
-    Sum { columns: Vec<String> },
-    Avg { columns: Vec<String> },
-    Max { columns: Vec<String> },
-    Min { columns: Vec<String> },
+    /// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
+    ///
+    /// Empty `columns` is `count(*)`. With columns it counts rows where they
+    /// are not null, and `distinct` counts distinct values of them.
+    Count {
+        columns: Vec<String>,
+        distinct: bool,
+    },
+    Sum {
+        columns: Vec<AggCol>,
+    },
+    Avg {
+        columns: Vec<AggCol>,
+    },
+    Max {
+        columns: Vec<AggCol>,
+    },
+    Min {
+        columns: Vec<AggCol>,
+    },
+}
+
+impl AggOp {
+    /// `count(*)`.
+    pub fn count() -> Self {
+        AggOp::Count {
+            columns: Vec::new(),
+            distinct: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +266,21 @@ pub struct QueryArgs {
     pub limit: Option<Count>,
     pub offset: Option<Count>,
     pub distinct_on: Vec<String>,
+}
+
+impl QueryArgs {
+    /// Whether the field was written with no arguments at all.
+    ///
+    /// Used to decide whether two relation fields under one response key can be
+    /// merged: with no arguments on either side they ask the same question, and
+    /// only their selections differ.
+    pub fn is_empty(&self) -> bool {
+        self.where_.is_none()
+            && self.order_by.is_empty()
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && self.distinct_on.is_empty()
+    }
 }
 
 /// One object-relation hop on the way to an `order_by` column.
@@ -568,9 +640,15 @@ mod tests {
     fn build_aggregate_root() {
         let body = RootBody::Aggregate {
             ops: vec![
-                AggOp::Count,
-                AggOp::Sum {
-                    columns: vec!["age".into()],
+                AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                },
+                AggSelect {
+                    alias: "sum".into(),
+                    op: AggOp::Sum {
+                        columns: vec![AggCol::new("age")],
+                    },
                 },
             ],
             nodes: Some(vec![Field::Column {
