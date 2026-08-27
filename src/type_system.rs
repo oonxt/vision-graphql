@@ -219,7 +219,9 @@ impl TypeSystem {
 /// client would already have a serializer for.
 pub fn scalar_name(pg: &PgType) -> String {
     match pg {
-        PgType::Int4 => "Int".into(),
+        // Both are GraphQL `Int`: the spec's Int is 32-bit signed, which holds
+        // every int2 and int4 value.
+        PgType::Int2 | PgType::Int4 => "Int".into(),
         PgType::Int8 => "bigint".into(),
         PgType::Float4 | PgType::Float8 => "Float".into(),
         PgType::Bool => "Boolean".into(),
@@ -253,7 +255,12 @@ fn is_comparable(pg: &PgType) -> bool {
 fn is_numeric(pg: &PgType) -> bool {
     matches!(
         pg,
-        PgType::Int4 | PgType::Int8 | PgType::Float4 | PgType::Float8 | PgType::Numeric
+        PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float4
+            | PgType::Float8
+            | PgType::Numeric
     )
 }
 
@@ -600,6 +607,16 @@ impl<'a> Builder<'a> {
     }
 
     fn mutation_inputs(&mut self, t: &Table) {
+        // Constraints whose every column is exposed — see the note where the
+        // enum is added. Computed up front because the nested insert wrappers
+        // below are built before the `on_conflict` type exists to look up.
+        let publishable: Vec<String> = t
+            .unique_constraints
+            .iter()
+            .filter(|(_, cols)| cols.iter().all(|c| t.find_column(c).is_some()))
+            .map(|(name, _)| name.clone())
+            .collect();
+
         let row_cols: Vec<InputValue> = t
             .columns()
             .map(|c| {
@@ -639,7 +656,7 @@ impl<'a> Builder<'a> {
         // `on_conflict` exists only where the table has a constraint to name —
         // publishing it unconditionally would point at a type that is never
         // defined.
-        let nested_on_conflict = (!t.unique_constraints.is_empty())
+        let nested_on_conflict = (!publishable.is_empty())
             .then(|| InputValue::new("on_conflict", TypeRef::named(on_conflict_name(t))));
 
         let mut arr_fields = vec![InputValue::new(
@@ -664,15 +681,19 @@ impl<'a> Builder<'a> {
             fields: obj_fields,
         });
 
-        // `on_conflict` is only meaningful where there is a constraint to name.
-        if !t.unique_constraints.is_empty() {
+        // `on_conflict` is only meaningful where there is a constraint to name,
+        // and only constraints whose columns are all exposed are published: a
+        // constraint name usually contains its column names, so publishing one
+        // over a hidden column hands back what hiding it withheld. The engine
+        // still accepts it — see `Table::unique_constraints`.
+        if !publishable.is_empty() {
             self.add(TypeDef::Enum {
                 name: constraint_enum_name(t),
                 description: Some(format!(
                     "Unique constraints on `{}`, nameable in `on_conflict`.",
                     t.exposed_name
                 )),
-                values: t.unique_constraints.keys().cloned().collect(),
+                values: publishable,
             });
             self.add(TypeDef::Enum {
                 name: update_column_enum_name(t),
@@ -778,7 +799,9 @@ impl<'a> Builder<'a> {
             }
             let row = type_names::row(t).to_string();
             let response = TypeRef::named(type_names::mutation_response(t));
-            let on_conflict = (!t.unique_constraints.is_empty())
+            let on_conflict = self
+                .types
+                .contains_key(&on_conflict_name(t))
                 .then(|| InputValue::new("on_conflict", TypeRef::named(on_conflict_name(t))));
 
             let mut insert_args = vec![InputValue::new(
@@ -1094,6 +1117,23 @@ mod tests {
         assert!(!insert_posts.args.iter().any(|a| a.name == "on_conflict"));
         let insert_users = fields.iter().find(|f| f.name == "insert_users").unwrap();
         assert!(insert_users.args.iter().any(|a| a.name == "on_conflict"));
+
+        // The nested wrappers hang off the same condition, and are built before
+        // the `on_conflict` type exists — so they cannot be decided by looking
+        // it up.
+        let TypeDef::InputObject { fields, .. } = ts.get("users_arr_rel_insert_input").unwrap()
+        else {
+            panic!("expected input object");
+        };
+        assert!(fields.iter().any(|f| f.name == "on_conflict"), "{fields:?}");
+        let TypeDef::InputObject { fields, .. } = ts.get("posts_arr_rel_insert_input").unwrap()
+        else {
+            panic!("expected input object");
+        };
+        assert!(
+            !fields.iter().any(|f| f.name == "on_conflict"),
+            "{fields:?}"
+        );
     }
 
     #[test]

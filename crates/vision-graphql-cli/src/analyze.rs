@@ -18,6 +18,23 @@ pub struct DiffReport {
     /// so nothing here could be checked either way. Reported so the hole is
     /// visible, but not counted as drift — "I could not look" is not a finding.
     pub unverified_repoints: Vec<UnverifiedRepoint>,
+    /// Columns the engine has no type mapping for, and so left out of the
+    /// schema entirely.
+    ///
+    /// Not drift either — the overlay is not wrong, the engine simply cannot
+    /// carry the type — but it is the one thing about a schema that is
+    /// impossible to notice from the outside: the column is absent, so a query
+    /// naming it is told it does not exist. If the dropped column is part of a
+    /// key or a foreign key, a `_by_pk` field or a whole relation goes with it.
+    pub skipped_columns: Vec<SkippedColumn>,
+}
+
+/// See [`DiffReport::skipped_columns`].
+#[derive(Debug, Serialize)]
+pub struct SkippedColumn {
+    pub table: String,
+    pub column: String,
+    pub data_type: String,
 }
 
 /// An overlay `schema = "..."` that points somewhere it cannot work.
@@ -83,8 +100,9 @@ impl DiffReport {
         self.issue_count() == 0
     }
 
-    /// `unverified_repoints` is deliberately excluded: it records what could not
-    /// be checked, not drift that was found, and must not fail `diff`.
+    /// `unverified_repoints` and `skipped_columns` are deliberately excluded:
+    /// they record what could not be checked and what the engine cannot carry,
+    /// not drift that was found, and must not fail `diff`.
     pub fn issue_count(&self) -> usize {
         self.missing_tables.len()
             + self.missing_columns.len()
@@ -95,12 +113,32 @@ impl DiffReport {
 }
 
 pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter) -> DiffReport {
-    let mut report = DiffReport::default();
-
     // Index tables under the names the schema actually exposes them as — which
     // is what an overlay key refers to. With one schema that is just the table
     // name; with several, later schemas are prefixed.
     let exposed = vision_graphql::schema::merge::exposed_name_map(db);
+
+    // What introspection could not map is a property of the database and the
+    // engine, not of the overlay, so it is reported rather than judged. Filtered
+    // and labelled by the *exposed* name like everything else in this report:
+    // `--ignore-tables` is written against exposed names, and a second schema's
+    // tables are prefixed, so filtering on the physical name would drop notices
+    // for exactly the tables a `--schema app,audit` run cares about.
+    let mut report = DiffReport {
+        skipped_columns: db
+            .skipped_columns
+            .iter()
+            .filter_map(|c| {
+                let name = exposed.get(&(c.schema.clone(), c.table.clone()))?;
+                filter.keep(name).then(|| SkippedColumn {
+                    table: name.clone(),
+                    column: c.column.clone(),
+                    data_type: c.data_type.clone(),
+                })
+            })
+            .collect(),
+        ..Default::default()
+    };
     let by_name: BTreeMap<String, &IntrospectedTable> = db
         .tables
         .iter()

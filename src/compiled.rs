@@ -207,7 +207,11 @@ mod tests {
         let (_, specs) =
             compile("query($id: Int!) { users(where: {id: {_eq: $id}}) { name } }").unwrap();
         let err = binds(&specs, json!({"id": "nope"})).unwrap_err();
-        assert!(format!("{err}").contains("Int4"), "{err}");
+        assert!(format!("{err}").contains("expected an integer"), "{err}");
+        assert!(
+            format!("{err}").contains("where.id"),
+            "the position is named: {err}"
+        );
     }
 
     #[test]

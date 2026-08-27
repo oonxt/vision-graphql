@@ -86,6 +86,7 @@ fn write_header(out: &mut String, meta: &HeaderMeta) {
 
 fn pg_type_short(t: &PgType) -> std::borrow::Cow<'static, str> {
     std::borrow::Cow::Borrowed(match t {
+        PgType::Int2 => "int2",
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
         PgType::Text => "text",

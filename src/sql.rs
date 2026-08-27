@@ -938,6 +938,7 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
     use crate::schema::PgType;
     std::borrow::Cow::Borrowed(match pg {
         PgType::Bool => "bool",
+        PgType::Int2 => "int2",
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
         PgType::Float4 => "float4",

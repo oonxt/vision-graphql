@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PgType {
+    Int2,
     Int4,
     Int8,
     Text,
@@ -116,10 +117,14 @@ pub struct Table {
     /// for reasons that have nothing to do with the schema.
     column_order: Vec<String>,
     pub primary_key: Vec<String>,
-    /// Unique (and primary key) constraints, as `constraint name -> exposed
-    /// columns`. Introspection has always read these; carrying them here is
-    /// what lets `on_conflict`'s constraint name be checked against something,
-    /// and what the `<table>_constraint` enum is built from.
+    /// Unique (and primary key) constraints, as `constraint name -> columns`.
+    ///
+    /// Every constraint introspection found, including any covering a column
+    /// `hide_columns` removed: Postgres resolves an `ON CONFLICT` target by
+    /// name, so such a constraint is still a usable target. Deciding which of
+    /// them to *publish* is a separate question, answered in
+    /// [`crate::type_system`] — a constraint name tends to contain its column
+    /// names, which is exactly what hiding a column meant to withhold.
     pub unique_constraints: std::collections::BTreeMap<String, Vec<String>>,
     relations_by_name: HashMap<String, Relation>,
     /// Relation names in the order they were added. Same reason as
