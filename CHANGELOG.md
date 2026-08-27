@@ -7,6 +7,14 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Added
 
+- **GraphQL-shaped errors**: `Error::to_graphql_response` and
+  `Error::to_graphql_error` produce the wire form, `Error::code` the stable
+  classification that goes in `extensions.code` and that an HTTP layer maps to a
+  status. `Error` stays a Rust enum — a library handing back only JSON would be
+  worse to program against. A database error now travels as its SQLSTATE rather
+  than PostgreSQL's message text, which carries table names, constraint names
+  and sometimes a source position from inside the server; the full text remains
+  in `Display`, for the log. An internal error says only that it is one.
 - **`operationName`**: `query_with` and `query_as_with` on `Engine`, `TxClient`,
   `ScopedEngine` and `ScopedTxClient`. It is the third field of a GraphQL
   request body, and a client that ships one document holding every operation it

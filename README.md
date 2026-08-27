@@ -80,6 +80,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | `operationName` (`query_with` / `query_as_with`, on every handle) | ✓ |
+| GraphQL-shaped errors (`Error::to_graphql_response`, `Error::code`) | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
 | Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
@@ -100,7 +101,6 @@ and left, not forgotten.
 
 | Gap | Notes |
 |---|---|
-| GraphQL-shaped errors | [`Error`] is a Rust enum; there is no `errors: [{message, path, extensions}]` envelope, and `Error::Database` carries PostgreSQL's own message. A host serving HTTP maps them itself, and should decide what to pass on. |
 | Aggregates on a relation (`user { posts_aggregate { … } }`) | Only root `<table>_aggregate` exists. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
 | `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
@@ -923,6 +923,56 @@ The key is whatever suits the application — a name, a file path, the SHA-256 o
 the document if you are implementing the persisted-query protocol clients speak.
 The crate does not choose one. An unknown key is an error that names the key and
 deliberately does not list the ones that do exist.
+
+## Errors
+
+`Error` is a Rust enum, and stays one — a library that could only hand back JSON
+would be worse to program against. `to_graphql_response` produces the wire form
+when you need it:
+
+```rust
+# use vision_graphql::{Engine, Error};
+# async fn f(engine: Engine, source: &str) -> serde_json::Value {
+match engine.query(source, None).await {
+    Ok(data) => serde_json::json!({ "data": data }),
+    Err(e) => {
+        tracing::warn!(error = %e, "request failed");   // the whole of it
+        e.to_graphql_response()                          // what the client sees
+    }
+}
+# }
+```
+
+```json
+{"errors": [{
+  "message": "validation error at where.id: type mapping: expected Int4",
+  "extensions": {"code": "VALIDATION_FAILED", "path": "where.id"}
+}]}
+```
+
+**One error, and no `data` key.** Both are consequences of the architecture
+rather than simplifications: the engine renders one statement per request and
+runs it whole, so there is no partial success to report alongside, and the first
+thing that goes wrong is the only thing that happens.
+
+**`extensions.code`** is the stable classification — `VALIDATION_FAILED`,
+`VARIABLE_MISSING`, `SCOPE_DENIED`, `DOCUMENT_REJECTED`, `LIMIT_EXCEEDED`,
+`PARSE_FAILED`, `NOT_COMPILABLE`, `DATABASE_ERROR`, `INTERNAL_ERROR` — and what
+an HTTP layer maps to a status. The string is the contract, not the enum
+variant.
+
+**What the message says depends on who caused it.** A validation error goes
+back whole: it names a column the document already named, and withholding it
+would only make the client guess. A *database* error does not. PostgreSQL's
+message text carries table names, constraint names and sometimes a source file
+and line from inside the server; the reply carries the SQLSTATE
+(`23505`, `23503`, `57014`) and the full text stays in `Display` for your log.
+An internal error says only that it is one.
+
+There is no `path` in the GraphQL sense: `path` names a position in the
+*response*, and every error here is raised before any data exists. The position
+this crate does know — `where.id`, `m0.objects[0].price` — travels in
+`extensions.path` instead.
 
 ## Transactions
 
