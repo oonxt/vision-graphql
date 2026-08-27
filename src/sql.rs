@@ -874,7 +874,7 @@ fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
 fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
     match count {
         Count::Lit(n) => write!(ctx.sql, " {keyword} {n}").unwrap(),
-        Count::Var(_) => {
+        Count::Var { .. } => {
             let n = ctx.push_count(count, || path.to_string());
             write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
         }

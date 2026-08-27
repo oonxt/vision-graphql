@@ -3,6 +3,7 @@
 use crate::ast::Operation;
 use crate::compiled::CompiledQuery;
 use crate::error::{Error, Result};
+use crate::limits::ExecutionLimits;
 use crate::parse_cache::ParseCache;
 use crate::policy::ScopePolicy;
 use crate::predicate::Principal;
@@ -47,10 +48,23 @@ fn unwrap_and_deserialize<T: DeserializeOwned>(mut data: Value, alias: Option<&s
     serde_json::from_value(payload).map_err(|e| Error::Decode(e.to_string()))
 }
 
+/// Apply the limits, then render. Paired in one function because every entry
+/// point needs both and in this order: a new one that called `render_now`
+/// directly would run unbounded, with nothing to notice it.
+fn prepare(
+    op: &mut Operation,
+    schema: &Schema,
+    limits: &ExecutionLimits,
+) -> Result<(String, Vec<crate::types::Bind>)> {
+    limits.apply(op)?;
+    render_now(op, schema, &Inputs::none())
+}
+
 pub struct Engine {
     pool: PgPool,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
+    limits: ExecutionLimits,
 }
 
 impl Engine {
@@ -59,6 +73,7 @@ impl Engine {
             pool,
             schema: Arc::new(schema),
             parse_cache: Arc::new(ParseCache::default()),
+            limits: ExecutionLimits::default(),
         }
     }
 
@@ -69,6 +84,7 @@ impl Engine {
             pool,
             schema: Arc::new(schema),
             parse_cache: Arc::new(ParseCache::new(capacity)),
+            limits: ExecutionLimits::default(),
         }
     }
 
@@ -84,7 +100,24 @@ impl Engine {
             pool,
             schema: Arc::new(schema),
             parse_cache,
+            limits: ExecutionLimits::default(),
         }
+    }
+
+    /// Bound what one request may cost. Unbounded by default — see
+    /// [`ExecutionLimits`].
+    ///
+    /// Applies to every path: GraphQL strings, the typed builder, compiled
+    /// statements, scoped handles and transactions alike, since all of them go
+    /// through the IR these are checked on.
+    pub fn with_limits(mut self, limits: ExecutionLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The limits this engine applies.
+    pub fn limits(&self) -> &ExecutionLimits {
+        &self.limits
     }
 
     /// The shared document cache. Exposed for `clear()` and for size
@@ -104,8 +137,8 @@ impl Engine {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = self.lower(source, &vars)?;
-        let (sql, binds) = render_now(&op, &self.schema, &Inputs::none())?;
+        let mut op = self.lower(source, &vars)?;
+        let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
     }
@@ -113,8 +146,8 @@ impl Engine {
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let operation = op.into_operation();
-        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
+        let mut operation = op.into_operation();
+        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
     }
@@ -142,9 +175,9 @@ impl Engine {
         &self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        let operation = op.into_operation();
+        let mut operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
+        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         let data = crate::executor::execute(&self.pool, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
@@ -200,6 +233,7 @@ impl Engine {
         if let Some(policy) = policy {
             apply_scope(&mut op, &policy.symbolic(), &self.schema)?;
         }
+        self.limits.apply(&mut op)?;
         let root_alias = single_root_alias(&op).map(String::from);
         let (sql, specs) = render(&op, &self.schema)?;
         Ok(CompiledQuery {
@@ -311,6 +345,7 @@ impl Engine {
             tx,
             schema: self.schema.clone(),
             parse_cache: self.parse_cache.clone(),
+            limits: self.limits,
         };
         match f(&mut tc).await {
             Ok(v) => {
@@ -333,6 +368,7 @@ pub struct TxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
+    limits: ExecutionLimits,
 }
 
 impl TxClient {
@@ -341,8 +377,8 @@ impl TxClient {
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let doc = self.parse_cache.get(source)?;
-        let op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
-        let (sql, binds) = render_now(&op, &self.schema, &Inputs::none())?;
+        let mut op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
+        let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
@@ -350,8 +386,8 @@ impl TxClient {
     /// Same as [`Engine::run`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let operation = op.into_operation();
-        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
+        let mut operation = op.into_operation();
+        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
     }
@@ -371,9 +407,9 @@ impl TxClient {
         &mut self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        let operation = op.into_operation();
+        let mut operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = render_now(&operation, &self.schema, &Inputs::none())?;
+        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
@@ -393,7 +429,7 @@ pub struct ScopedEngine<'e> {
 impl ScopedEngine<'_> {
     fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
         apply_scope(&mut op, &self.scope, &self.engine.schema)?;
-        render_now(&op, &self.engine.schema, &Inputs::none())
+        prepare(&mut op, &self.engine.schema, &self.engine.limits)
     }
 
     /// Same as [`Engine::query`], with the scope rewrite applied.
@@ -451,6 +487,7 @@ impl ScopedEngine<'_> {
             schema: self.engine.schema.clone(),
             parse_cache: self.engine.parse_cache.clone(),
             scope: self.scope.clone(),
+            limits: self.engine.limits,
         };
         match f(&mut tc).await {
             Ok(v) => {
@@ -472,12 +509,13 @@ pub struct ScopedTxClient {
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
     scope: ScopeSet,
+    limits: ExecutionLimits,
 }
 
 impl ScopedTxClient {
     fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        render_now(&op, &self.schema, &Inputs::none())
+        prepare(&mut op, &self.schema, &self.limits)
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.

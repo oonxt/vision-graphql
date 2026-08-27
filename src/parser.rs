@@ -2197,7 +2197,7 @@ fn lower_order_by_entry(
 /// bound parameter, not part of the statement's shape.
 fn gql_count(v: &GqlValue, vars: Bindings<'_>, path: &str) -> Result<Count> {
     if let (GqlValue::Variable(name), Bindings::Symbolic) = (v, vars) {
-        return Ok(Count::Var(name.as_str().to_string()));
+        return Ok(Count::var(name.as_str()));
     }
     let json = gql_to_json(v, vars, path)?;
     json.as_u64()

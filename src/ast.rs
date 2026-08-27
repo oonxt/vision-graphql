@@ -138,20 +138,46 @@ impl PartialEq<Value> for Val {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Count {
     Lit(u64),
-    Var(String),
+    Var {
+        name: String,
+        /// Ceiling from [`crate::limits::ExecutionLimits`], checked when the
+        /// variable resolves.
+        ///
+        /// A literal `limit` is capped where the limits are applied, but
+        /// `limit: $n` has no value until the request arrives — and capping is
+        /// pointless if `$n` can name any number. So the ceiling travels with
+        /// the count, which is also what keeps a compiled statement carrying
+        /// the cap it was compiled under.
+        max: Option<u64>,
+    },
 }
 
 impl Count {
+    /// A variable count with no ceiling.
+    pub fn var(name: impl Into<String>) -> Self {
+        Count::Var {
+            name: name.into(),
+            max: None,
+        }
+    }
+
     /// Resolve a variable count to a non-negative integer.
     pub fn resolve(&self, inputs: &Inputs<'_>, path: &str) -> Result<u64> {
         match self {
             Count::Lit(n) => Ok(*n),
-            Count::Var(name) => {
+            Count::Var { name, max } => {
                 let v = inputs.variable(name)?;
-                v.as_u64().ok_or_else(|| Error::Validate {
+                let n = v.as_u64().ok_or_else(|| Error::Validate {
                     path: path.to_string(),
                     message: format!("expected a non-negative integer, got {v}"),
-                })
+                })?;
+                match max {
+                    Some(max) if n > *max => Err(Error::Validate {
+                        path: path.to_string(),
+                        message: format!("{n} is over the limit of {max}"),
+                    }),
+                    _ => Ok(n),
+                }
             }
         }
     }

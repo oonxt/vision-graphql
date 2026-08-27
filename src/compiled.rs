@@ -113,7 +113,7 @@ impl CompiledQuery {
                     val.collect_vars(&mut found)
                 }
                 BindSpec::Count {
-                    val: crate::ast::Count::Var(name),
+                    val: crate::ast::Count::Var { name, .. },
                     ..
                 } => found.push(name.clone()),
                 _ => {}

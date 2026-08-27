@@ -120,6 +120,7 @@ used to be silent, so read **Breaking** before upgrading.
 - `AggregateBuilder::count_columns`, `count_distinct`, and `key` (response key
   for the aggregate added last).
 - `CompiledQuery::defaults`.
+- `Count::var`; `Count::Var` is now a struct variant carrying an optional `max`.
 - `QueryArgs::is_empty`, `AggOp::count()`, `AggCol::new`, `AggField::column`.
 
 ### Breaking

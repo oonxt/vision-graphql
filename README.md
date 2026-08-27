@@ -88,6 +88,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
 | Computed fields | Not implemented |
 | Pre-parse limits on document size and nesting (`ParseLimits`) | ✓ |
+| Execution limits: relation depth, table reads, default/max row limit (`ExecutionLimits`) | ✓ |
 | Subscriptions | Not implemented |
 
 ## JSON/JSONB path reads
@@ -707,10 +708,74 @@ is schema-independent, so an application running an engine per role — the way
 per-role column visibility is expressed today — would otherwise parse the same
 document once per role.
 
-These limits bound the *document*. They are not a complexity budget: a flat
-query with two hundred aliased relation fields passes, and renders two hundred
-correlated subqueries. If you forward untrusted client documents, pair this
-with a row limit and a statement timeout of your own.
+These limits bound the *document*. What the document then costs is bounded
+separately, below.
+
+## Execution limits
+
+`ParseLimits` bounds the text; `ExecutionLimits` bounds the statement it turns
+into. Neither implies the other: a flat document nesting nothing still renders
+one correlated subquery per aliased relation field, and `{ users { id } }` is
+four words that reads a whole table, builds the entire result as one JSON value
+in Postgres, and hands it over in one piece.
+
+```rust
+# use vision_graphql::{Engine, Schema, limits::ExecutionLimits};
+# fn example(pool: sqlx::PgPool, schema: Schema) {
+let engine = Engine::new(pool, schema).with_limits(
+    ExecutionLimits::new()
+        .max_relation_depth(6)   // { users { posts { comments { … } } } }
+        .max_table_reads(40)     // every subquery, EXISTS filter and order_by hop
+        .default_limit(100)      // for a row list that asked for none
+        .max_limit(1000),        // ceiling on one that did
+);
+# let _ = engine; }
+```
+
+Everything is unset by default. A library that silently capped results would be
+worse than one that did not, since the caller cannot tell a capped answer from a
+complete one — so the defaults do nothing, and you set what applies where
+requests come from clients.
+
+The checks run on the lowered IR, which is the one thing both entry points
+share: the typed builder never goes near the parser, so a check living there
+would leave `Engine::run` unbounded. They apply to compiled statements and
+scoped handles alike, and a `limit: $n` carries its ceiling to where the
+variable resolves — so a statement compiled once keeps the cap it was compiled
+under.
+
+`max_table_reads` counts every position that reads a table: each root field,
+each relation at any depth, each `EXISTS` filter inside a `where`, each
+`order_by` hop, each nested insert. That is the number of subqueries the
+statement will carry, and the thing a hundred aliases of one relation inflates
+while leaving depth at 1.
+
+`default_limit` reaches root lists and array relations. Not `_by_pk` or object
+relations, which are one row by construction, and **not aggregates** — capping
+one would change what `count` counts rather than what it costs. It is the one
+limit here that silently changes an answer, which is the trade it exists to
+make; a client that needs to know whether more rows exist should ask
+`_aggregate { count }`.
+
+`max_limit` refuses rather than clamps. A truncated answer that looks complete
+is the failure worth avoiding.
+
+### Statement timeout
+
+Set it on the connection, not per request. The engine sends one statement per
+request, so a `statement_timeout` established at connection time governs every
+query it makes, with no extra round trip and nothing for the engine to
+implement:
+
+```rust
+# use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+# async fn example(url: &str) -> Result<(), sqlx::Error> {
+let opts: PgConnectOptions = url.parse()?;
+let pool = PgPoolOptions::new()
+    .connect_with(opts.options([("statement_timeout", "5s")]))
+    .await?;
+# let _ = pool; Ok(()) }
+```
 
 ## Transactions
 
