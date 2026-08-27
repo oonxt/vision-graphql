@@ -44,6 +44,18 @@ used to be silent, so read **Breaking** before upgrading.
 
 ### Added
 
+- **`__typename`**, in every selection set: rows, relations, `_by_pk`, aggregate
+  `nodes`, the `aggregate` object and each function group inside it, mutation
+  `returning`, and the mutation-response wrapper. Apollo and urql add it to
+  every selection set by default, so it previously failed with "unknown column
+  '__typename'" against any of them. Type names follow Hasura's scheme
+  (`users`, `users_aggregate_fields`, `users_mutation_response`, …), exposed as
+  `type_names`. Not accepted as a root field; `__schema` / `__type`
+  introspection is still unimplemented.
+- `Schema::tables`, `Schema::len`, `Schema::is_empty`, `Table::columns`,
+  `Table::relations` — the schema an overlay actually produced can now be walked
+  from outside the crate, which is what any SDL export, admin tooling, or test
+  that asserts on exposure needs.
 - `limits::ParseLimits` (`max_depth`, `max_bytes`), `ParseLimits::unbounded()`,
   and `parser::parse_document_with`.
 - `ParseCache::with_limits`, `ParseCache::limits`.
@@ -53,15 +65,22 @@ used to be silent, so read **Breaking** before upgrading.
 - `AggregateBuilder::count_columns`, `count_distinct`, and `key` (response key
   for the aggregate added last).
 - `CompiledQuery::defaults`.
-- `QueryArgs::is_empty`, `AggOp::count()`, `AggCol::new`.
+- `QueryArgs::is_empty`, `AggOp::count()`, `AggCol::new`, `AggField::column`.
 
 ### Breaking
 
 - `Error::Limit` is a new variant.
-- `RootBody::Aggregate.ops` is now `Vec<AggSelect>` (alias plus op) rather than
-  `Vec<AggOp>`; `AggOp::Count` is a struct variant carrying `columns` and
-  `distinct`; `AggOp::Sum` / `Avg` / `Max` / `Min` carry `Vec<AggCol>` rather
-  than `Vec<String>`. Builder method signatures are unchanged.
+- The aggregate IR changed shape: `RootBody::Aggregate.ops` is
+  `Vec<AggSelect>` (a response key plus an op) rather than `Vec<AggOp>`;
+  `AggOp::Count` is a struct variant carrying `columns` and `distinct`;
+  `AggOp::Sum` / `Avg` / `Max` / `Min` carry `fields: Vec<AggField>` rather than
+  `columns: Vec<String>`; `AggOp::Typename` is new. Builder method signatures
+  are unchanged.
+- `Field::Typename` is a new IR variant, and `RootBody::Aggregate` and the
+  `Insert` / `Update` / `Delete` mutation fields carry the response keys asking
+  for a type name.
+- An `_aggregate` field selecting only `nodes` no longer returns an empty
+  `aggregate` key the document did not ask for.
 - Queries that previously ran now fail: unknown arguments on `_by_pk` and on
   aggregate functions, and conflicting fields under one response key. Each was
   producing a wrong answer or a truncated response before.

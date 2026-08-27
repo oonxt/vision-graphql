@@ -333,7 +333,10 @@ impl AggregateBuilder {
         self.push(
             "sum",
             AggOp::Sum {
-                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
             },
         );
         self
@@ -343,7 +346,10 @@ impl AggregateBuilder {
         self.push(
             "avg",
             AggOp::Avg {
-                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
             },
         );
         self
@@ -353,7 +359,10 @@ impl AggregateBuilder {
         self.push(
             "max",
             AggOp::Max {
-                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
             },
         );
         self
@@ -363,7 +372,10 @@ impl AggregateBuilder {
         self.push(
             "min",
             AggOp::Min {
-                columns: cols.iter().map(|s| crate::ast::AggCol::new(*s)).collect(),
+                fields: cols
+                    .iter()
+                    .map(|s| crate::ast::AggField::column(*s))
+                    .collect(),
             },
         );
         self
@@ -387,6 +399,7 @@ impl AggregateBuilder {
             alias: self.alias,
             args: self.args,
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: self.ops,
                 nodes: self.nodes,
             },
@@ -601,6 +614,7 @@ impl InsertBuilder {
             objects: self.objects,
             on_conflict: self.on_conflict,
             returning: self.returning,
+            response_typenames: Vec::new(),
             one: self.one,
             scope_check: None,
         }
@@ -660,6 +674,7 @@ impl UpdateBuilder {
 
     pub fn build(self) -> MutationField {
         MutationField::Update {
+            response_typenames: Vec::new(),
             alias: self.alias,
             table: self.table,
             where_: self.where_.expect("update builder: where clause required"),
@@ -755,6 +770,7 @@ impl DeleteBuilder {
 
     pub fn build(self) -> MutationField {
         MutationField::Delete {
+            response_typenames: Vec::new(),
             alias: self.alias,
             table: self.table,
             where_: self.where_.expect("delete builder: where clause required"),
@@ -868,7 +884,7 @@ mod tests {
     fn aggregate_builder_count_sum() {
         let rf = Query::aggregate("users").count().sum(&["age"]).build();
         assert_eq!(rf.alias, "users_aggregate");
-        let RootBody::Aggregate { ops, nodes } = &rf.body else {
+        let RootBody::Aggregate { ops, nodes, .. } = &rf.body else {
             panic!("expected Aggregate");
         };
         assert_eq!(ops.len(), 2);

@@ -249,6 +249,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             table,
             where_,
             returning,
+            ..
         } => {
             let t = lookup_table(schema, table, alias)?;
             scope_bool_expr(where_, t, scope, schema)?;
@@ -565,6 +566,7 @@ mod tests {
 
     fn insert(table: &str, objects: Vec<crate::ast::InsertObject>) -> MutationField {
         MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: format!("insert_{table}"),
             table: table.into(),
             objects,
@@ -670,6 +672,7 @@ mod tests {
     #[test]
     fn update_where_gets_scope_anded_in() {
         let mut op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_posts".into(),
             table: "posts".into(),
             where_: owner("id", 1),
@@ -703,6 +706,7 @@ mod tests {
     #[test]
     fn unrestricted_update_has_no_check() {
         let mut op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_posts".into(),
             table: "posts".into(),
             where_: owner("id", 1),
@@ -727,6 +731,7 @@ mod tests {
     #[test]
     fn delete_on_denied_table_errors() {
         let mut op = Operation::Mutation(vec![MutationField::Delete {
+            response_typenames: Vec::new(),
             alias: "delete_posts".into(),
             table: "posts".into(),
             where_: owner("id", 1),

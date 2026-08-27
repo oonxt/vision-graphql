@@ -73,6 +73,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
 | Field aliases (`abundance: data`) | ✓ |
+| `__typename` in every selection set | ✓ |
+| Schema introspection (`__schema` / `__type`), SDL export | Not implemented |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | Schema introspection | ✓ |
@@ -536,6 +538,34 @@ nested children render to a single atomic statement, a violation anywhere rolls
 back every level. An upsert (`on_conflict` with `update_columns`) additionally
 applies the predicate to the `DO UPDATE … WHERE`, so a conflicting row outside
 scope is skipped rather than overwritten.
+
+## `__typename`
+
+Supported in every selection set: rows, nested relations, `_by_pk`, aggregate
+`nodes`, the `aggregate` object and each function group inside it, mutation
+`returning`, and the `{ affected_rows, returning }` wrapper itself. That breadth
+is the point — Apollo and urql inject `__typename` into *every* selection set by
+default, so anything less means a client that works until it touches the one
+position that was missed.
+
+```graphql
+{ users { __typename id posts { __typename title } } }
+```
+```json
+{ "users": [ { "__typename": "users", "id": 1,
+               "posts": [ { "__typename": "posts", "title": "hello" } ] } ] }
+```
+
+Type names follow Hasura's scheme, so tooling generated against a Hasura
+endpoint reads them unchanged: a row is the exposed table name, and the derived
+types are `<table>_aggregate`, `<table>_aggregate_fields`, `<table>_sum_fields`
+(and `avg` / `max` / `min`), and `<table>_mutation_response`. They render as SQL
+literals — no bind, no round trip.
+
+`__typename` is not accepted as a *root* field (`{ __typename }`), which would
+name the operation root type; put it inside a field's selection set. Full schema
+introspection — `__schema` and `__type`, what GraphiQL and codegen ask for — is
+not implemented.
 
 ## Aggregates
 

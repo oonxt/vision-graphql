@@ -69,6 +69,7 @@ pub mod schema;
 pub mod scope;
 pub mod scope_config;
 pub mod sql;
+pub mod type_names;
 pub mod types;
 
 pub use builder::{

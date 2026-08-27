@@ -180,6 +180,20 @@ impl Table {
         self.relations_by_name.get(name)
     }
 
+    /// Every exposed column, in no particular order.
+    ///
+    /// Public so an application can see what its schema actually exposes —
+    /// which is the only way to check that an overlay's `hide_columns` did what
+    /// was intended, and what any SDL export or admin tooling has to walk.
+    pub fn columns(&self) -> impl Iterator<Item = &Column> {
+        self.columns_by_exposed.values()
+    }
+
+    /// Every relation, as `(exposed name, relation)`.
+    pub fn relations(&self) -> impl Iterator<Item = (&String, &Relation)> {
+        self.relations_by_name.iter()
+    }
+
     pub(crate) fn columns_iter(&self) -> impl Iterator<Item = &Column> {
         self.columns_by_exposed.values()
     }
@@ -199,6 +213,21 @@ impl Schema {
         SchemaBuilder {
             tables: HashMap::new(),
         }
+    }
+
+    /// Every exposed table, as `(exposed name, table)`, in no particular order.
+    pub fn tables(&self) -> impl Iterator<Item = (&String, &Arc<Table>)> {
+        self.tables_by_exposed.iter()
+    }
+
+    /// How many tables are exposed.
+    pub fn len(&self) -> usize {
+        self.tables_by_exposed.len()
+    }
+
+    /// Whether the schema exposes nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.tables_by_exposed.is_empty()
     }
 
     pub fn table(&self, exposed: &str) -> Option<&Arc<Table>> {

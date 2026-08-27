@@ -185,6 +185,9 @@ pub enum RootBody {
     Aggregate {
         ops: Vec<AggSelect>,
         nodes: Option<Vec<Field>>,
+        /// Response keys asking for the `<table>_aggregate` type name — the
+        /// level that holds `aggregate` and `nodes`, one above both of them.
+        typenames: Vec<String>,
     },
     ByPk {
         /// `(exposed_column, value)` pairs. All PK columns must be present.
@@ -214,6 +217,24 @@ pub struct AggCol {
     pub column: String,
 }
 
+/// An entry inside a `sum` / `avg` / `max` / `min` group.
+///
+/// A client that injects `__typename` into every selection set — which is what
+/// Apollo does — injects it here too, so the group cannot be a list of columns
+/// alone.
+#[derive(Debug, Clone)]
+pub enum AggField {
+    Column(AggCol),
+    Typename { alias: String },
+}
+
+impl AggField {
+    /// A column answering under its own name.
+    pub fn column(column: impl Into<String>) -> Self {
+        AggField::Column(AggCol::new(column))
+    }
+}
+
 impl AggCol {
     /// A column answering under its own name.
     pub fn new(column: impl Into<String>) -> Self {
@@ -236,17 +257,20 @@ pub enum AggOp {
         distinct: bool,
     },
     Sum {
-        columns: Vec<AggCol>,
+        fields: Vec<AggField>,
     },
     Avg {
-        columns: Vec<AggCol>,
+        fields: Vec<AggField>,
     },
     Max {
-        columns: Vec<AggCol>,
+        fields: Vec<AggField>,
     },
     Min {
-        columns: Vec<AggCol>,
+        fields: Vec<AggField>,
     },
+    /// `__typename` beside the aggregate functions; names the
+    /// `<table>_aggregate_fields` type.
+    Typename,
 }
 
 impl AggOp {
@@ -375,6 +399,12 @@ pub enum Field {
         /// Non-empty list of key/index components. Rendered as a `text[]` bind.
         path: Vec<String>,
     },
+    /// `__typename`. Renders as a string literal: the type name comes from the
+    /// table the selection set belongs to, which only the renderer knows, so the
+    /// IR carries the request and not the answer.
+    Typename {
+        alias: String,
+    },
     Relation {
         /// Name of the relation on the parent table (resolved via schema at render).
         name: String,
@@ -439,6 +469,9 @@ pub enum MutationField {
         objects: Vec<InsertObject>,
         on_conflict: Option<OnConflict>,
         returning: Vec<Field>,
+        /// Response keys asking for the mutation-response type name. Not part
+        /// of `returning`, which selects from the row type.
+        response_typenames: Vec<String>,
         /// true for `insert_users_one` (single object result); false for `insert_users`
         /// (array result wrapped in `{affected_rows, returning}`).
         one: bool,
@@ -454,6 +487,8 @@ pub enum MutationField {
         /// `{ exposed_column -> new_value }`
         set: std::collections::BTreeMap<String, Val>,
         returning: Vec<Field>,
+        /// See [`MutationField::Insert::response_typenames`].
+        response_typenames: Vec<String>,
         /// Post-update scope check under deny-by-default scoped execution: every
         /// row left by the UPDATE must still satisfy this predicate or the whole
         /// statement aborts. The same predicate is also AND-ed into `where_` as a
@@ -481,6 +516,8 @@ pub enum MutationField {
         table: String,
         where_: BoolExpr,
         returning: Vec<Field>,
+        /// See [`MutationField::Insert::response_typenames`].
+        response_typenames: Vec<String>,
     },
     DeleteByPk {
         alias: String,
@@ -639,6 +676,7 @@ mod tests {
     #[test]
     fn build_aggregate_root() {
         let body = RootBody::Aggregate {
+            typenames: Vec::new(),
             ops: vec![
                 AggSelect {
                     alias: "count".into(),
@@ -647,7 +685,7 @@ mod tests {
                 AggSelect {
                     alias: "sum".into(),
                     op: AggOp::Sum {
-                        columns: vec![AggCol::new("age")],
+                        fields: vec![AggField::column("age")],
                     },
                 },
             ],
@@ -657,7 +695,7 @@ mod tests {
             }]),
         };
         match body {
-            RootBody::Aggregate { ops, nodes } => {
+            RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 2);
                 assert!(nodes.is_some());
             }
@@ -683,6 +721,7 @@ mod tests {
                 physical: "id".into(),
                 alias: "id".into(),
             }],
+            response_typenames: Vec::new(),
             one: false,
             scope_check: None,
         };

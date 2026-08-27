@@ -214,6 +214,27 @@ fn reject_non_pk_arguments(
     Ok(())
 }
 
+/// The introspection field every GraphQL client may add to any selection set.
+/// Apollo and urql add it to *all* of them by default, which is why it has to be
+/// accepted everywhere a selection set is lowered rather than only at the top.
+pub(crate) const TYPENAME: &str = "__typename";
+
+/// `__typename` takes no arguments. Rejecting them keeps it consistent with
+/// every other field position rather than quietly ignoring what was written.
+fn reject_typename_arguments(
+    args: &[(Positioned<Name>, Positioned<GqlValue>)],
+    alias: &str,
+    parent_path: &str,
+) -> Result<()> {
+    if let Some((first, _)) = args.first() {
+        return Err(Error::Validate {
+            path: format!("{parent_path}.{alias}.{}", first.node.as_str()),
+            message: "'__typename' takes no arguments".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Collapse fields that answer to the same response key.
 ///
 /// Two fields with one key is not an error by itself — spreading a fragment
@@ -230,6 +251,7 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
         match f {
             Field::Column { alias, .. }
             | Field::JsonPath { alias, .. }
+            | Field::Typename { alias }
             | Field::Relation { alias, .. } => alias,
         }
     }
@@ -252,6 +274,7 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
         };
         let alias = key_of(&field).to_string();
         match (&mut out[pos], field) {
+            (Field::Typename { .. }, Field::Typename { .. }) => {}
             (
                 Field::Column { physical: a, .. },
                 Field::Column {
@@ -360,7 +383,11 @@ fn lower_query(
                 if let Some(base_name) = name.strip_suffix("_aggregate") {
                     if let Some(table) = schema.table(base_name) {
                         let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
-                        let (ops, nodes) = lower_aggregate_selection(
+                        let AggregateSelection {
+                            ops,
+                            nodes,
+                            typenames,
+                        } = lower_aggregate_selection(
                             &field.selection_set.node,
                             table,
                             vars,
@@ -370,7 +397,11 @@ fn lower_query(
                             table: base_name.to_string(),
                             alias,
                             args,
-                            body: crate::ast::RootBody::Aggregate { ops, nodes },
+                            body: crate::ast::RootBody::Aggregate {
+                                ops,
+                                nodes,
+                                typenames,
+                            },
                         });
                         continue;
                     }
@@ -423,9 +454,19 @@ fn lower_query(
                     }
                 }
 
-                let table = schema.table(name).ok_or_else(|| Error::Validate {
-                    path: alias.clone(),
-                    message: format!("unknown root field '{name}'"),
+                let table = schema.table(name).ok_or_else(|| {
+                    if name == TYPENAME {
+                        return Error::Validate {
+                            path: alias.clone(),
+                            message: "'__typename' is supported inside a field's selection set, \
+                                      but not as a root field"
+                                .into(),
+                        };
+                    }
+                    Error::Validate {
+                        path: alias.clone(),
+                        message: format!("unknown root field '{name}'"),
+                    }
                 })?;
                 let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
                 let selection = lower_selection_set(
@@ -550,6 +591,11 @@ fn lower_mutation_field(
                     objects,
                     on_conflict,
                     returning,
+                    // `insert_one` answers with the row, not the
+                    // `{affected_rows, returning}` wrapper, so a `__typename`
+                    // in its selection set is a row typename and rides along in
+                    // `returning`.
+                    response_typenames: Vec::new(),
                     one: true,
                     scope_check: None,
                 });
@@ -571,12 +617,14 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Insert {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 objects,
                 on_conflict,
                 returning,
+                response_typenames,
                 one: false,
                 scope_check: None,
             });
@@ -631,12 +679,14 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Update {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 where_,
                 set,
                 returning,
+                response_typenames,
                 scope_check: None,
             });
         }
@@ -724,15 +774,25 @@ fn lower_mutation_field(
                 fragments,
                 alias,
             )?;
+            let (returning, response_typenames) = returning;
             return Ok(MutationField::Delete {
                 alias: alias.to_string(),
                 table: base_name.to_string(),
                 where_,
                 returning,
+                response_typenames,
             });
         }
     }
 
+    if name == TYPENAME {
+        return Err(Error::Validate {
+            path: alias.into(),
+            message: "'__typename' is supported inside a field's selection set, but not as a \
+                      root field"
+                .into(),
+        });
+    }
     Err(Error::Validate {
         path: alias.into(),
         message: format!("mutation field '{name}' not yet supported"),
@@ -1334,8 +1394,11 @@ fn parse_returning(
     vars: Bindings<'_>,
     fragments: &Fragments<'_>,
     parent_path: &str,
-) -> Result<Vec<Field>> {
+) -> Result<(Vec<Field>, Vec<String>)> {
     let mut returning: Vec<Field> = Vec::new();
+    // `__typename` here names the mutation-response type, not the row type, so
+    // it cannot ride along inside `returning`.
+    let mut typenames: Vec<String> = Vec::new();
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
             return Err(Error::Parse(
@@ -1345,6 +1408,15 @@ fn parse_returning(
         let field = &f.node;
         let fname = field.name.node.as_str();
         match fname {
+            TYPENAME => {
+                let alias = field
+                    .alias
+                    .as_ref()
+                    .map(|a| a.node.as_str().to_string())
+                    .unwrap_or_else(|| fname.to_string());
+                reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                typenames.push(alias);
+            }
             "affected_rows" => {}
             "returning" => {
                 returning = lower_selection_set(
@@ -1364,7 +1436,8 @@ fn parse_returning(
             }
         }
     }
-    Ok(returning)
+    typenames.dedup();
+    Ok((returning, typenames))
 }
 
 fn lower_selection_set(
@@ -1415,6 +1488,12 @@ fn lower_selection_set(
                     .as_ref()
                     .map(|a| a.node.as_str().to_string())
                     .unwrap_or_else(|| name.to_string());
+
+                if name == TYPENAME {
+                    reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                    out.push(Field::Typename { alias });
+                    continue;
+                }
 
                 if let Some(rel) = table.find_relation(name) {
                     let target =
@@ -2054,16 +2133,25 @@ pub(crate) fn json_to_gql(v: &Value) -> GqlValue {
     }
 }
 
+/// What an `_aggregate` field selected: the functions, the optional `nodes`
+/// row selection, and any `__typename` at the `<table>_aggregate` level.
+struct AggregateSelection {
+    ops: Vec<crate::ast::AggSelect>,
+    nodes: Option<Vec<Field>>,
+    typenames: Vec<String>,
+}
+
 fn lower_aggregate_selection(
     set: &SelectionSet,
     table: &Table,
     vars: Bindings<'_>,
     parent_path: &str,
-) -> Result<(Vec<crate::ast::AggSelect>, Option<Vec<Field>>)> {
-    use crate::ast::{AggCol, AggOp, AggSelect};
+) -> Result<AggregateSelection> {
+    use crate::ast::{AggCol, AggField, AggOp, AggSelect};
 
     let mut ops: Vec<AggSelect> = Vec::new();
     let mut nodes: Option<Vec<Field>> = None;
+    let mut typenames: Vec<String> = Vec::new();
 
     for sel in &set.items {
         let Selection::Field(f) = &sel.node else {
@@ -2090,6 +2178,14 @@ fn lower_aggregate_selection(
                         .unwrap_or_else(|| op_name.to_string());
                     let path = format!("{parent_path}.aggregate.{alias}");
                     let op = match op_name {
+                        TYPENAME => {
+                            reject_typename_arguments(
+                                &sf.arguments,
+                                &alias,
+                                &format!("{parent_path}.aggregate"),
+                            )?;
+                            AggOp::Typename
+                        }
                         "count" => parse_count_args(&sf.arguments, table, vars, &path)?,
                         "sum" | "avg" | "max" | "min" => {
                             if let Some((first, _)) = sf.arguments.first() {
@@ -2101,7 +2197,8 @@ fn lower_aggregate_selection(
                                     ),
                                 });
                             }
-                            let mut columns = Vec::new();
+                            let mut fields = Vec::new();
+                            let mut column_count = 0usize;
                             for cs in &sf.selection_set.node.items {
                                 let Selection::Field(cf) = &cs.node else {
                                     return Err(Error::Parse(
@@ -2122,6 +2219,10 @@ fn lower_aggregate_selection(
                                             .into(),
                                     });
                                 }
+                                if cname == TYPENAME {
+                                    fields.push(AggField::Typename { alias: calias });
+                                    continue;
+                                }
                                 let col =
                                     table.find_column(cname).ok_or_else(|| Error::Validate {
                                         path: format!("{path}.{calias}"),
@@ -2130,22 +2231,23 @@ fn lower_aggregate_selection(
                                             table.exposed_name
                                         ),
                                     })?;
-                                columns.push(AggCol {
+                                column_count += 1;
+                                fields.push(AggField::Column(AggCol {
                                     alias: calias,
                                     column: col.exposed_name.clone(),
-                                });
+                                }));
                             }
-                            if columns.is_empty() {
+                            if column_count == 0 {
                                 return Err(Error::Validate {
                                     path: path.clone(),
                                     message: format!("'{op_name}' needs at least one column"),
                                 });
                             }
                             match op_name {
-                                "sum" => AggOp::Sum { columns },
-                                "avg" => AggOp::Avg { columns },
-                                "max" => AggOp::Max { columns },
-                                "min" => AggOp::Min { columns },
+                                "sum" => AggOp::Sum { fields },
+                                "avg" => AggOp::Avg { fields },
+                                "max" => AggOp::Max { fields },
+                                "min" => AggOp::Min { fields },
                                 _ => unreachable!(),
                             }
                         }
@@ -2168,6 +2270,15 @@ fn lower_aggregate_selection(
                 )?;
                 nodes = Some(fields);
             }
+            TYPENAME => {
+                let alias = field
+                    .alias
+                    .as_ref()
+                    .map(|a| a.node.as_str().to_string())
+                    .unwrap_or_else(|| key.to_string());
+                reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+                typenames.push(alias);
+            }
             other => {
                 return Err(Error::Validate {
                     path: format!("{parent_path}.{other}"),
@@ -2176,7 +2287,12 @@ fn lower_aggregate_selection(
             }
         }
     }
-    Ok((ops, nodes))
+    typenames.dedup();
+    Ok(AggregateSelection {
+        ops,
+        nodes,
+        typenames,
+    })
 }
 
 /// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
@@ -2260,6 +2376,11 @@ fn lower_selection_columns_only(
             .as_ref()
             .map(|a| a.node.as_str().to_string())
             .unwrap_or_else(|| name.to_string());
+        if name == TYPENAME {
+            reject_typename_arguments(&field.arguments, &alias, parent_path)?;
+            out.push(Field::Typename { alias });
+            continue;
+        }
         let col = table.find_column(name).ok_or_else(|| Error::Validate {
             path: format!("{parent_path}.{alias}"),
             message: format!("unknown column '{name}' on '{}'", table.exposed_name),
@@ -2609,7 +2730,7 @@ mod tests {
         };
         assert_eq!(roots[0].table, "users");
         match &roots[0].body {
-            crate::ast::RootBody::Aggregate { ops, nodes } => {
+            crate::ast::RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 2);
                 assert_eq!(ops[0].alias, "count");
                 assert!(matches!(
@@ -2621,10 +2742,15 @@ mod tests {
                 ));
                 assert_eq!(ops[1].alias, "sum");
                 match &ops[1].op {
-                    crate::ast::AggOp::Sum { columns } => {
-                        assert_eq!(columns.len(), 1);
-                        assert_eq!(columns[0].column, "id");
-                        assert_eq!(columns[0].alias, "id");
+                    crate::ast::AggOp::Sum { fields } => {
+                        assert_eq!(fields.len(), 1);
+                        match &fields[0] {
+                            crate::ast::AggField::Column(c) => {
+                                assert_eq!(c.column, "id");
+                                assert_eq!(c.alias, "id");
+                            }
+                            other => panic!("expected a column, got {other:?}"),
+                        }
                     }
                     _ => panic!("expected Sum"),
                 }
@@ -2908,7 +3034,7 @@ mod tests {
             panic!("expected Query");
         };
         match &roots[0].body {
-            crate::ast::RootBody::Aggregate { ops, nodes } => {
+            crate::ast::RootBody::Aggregate { ops, nodes, .. } => {
                 assert_eq!(ops.len(), 1);
                 assert!(nodes.is_none());
             }
@@ -2971,10 +3097,13 @@ mod tests {
         assert_eq!(ops[0].alias, "total");
         assert_eq!(ops[1].alias, "highest");
         match &ops[1].op {
-            crate::ast::AggOp::Max { columns } => {
-                assert_eq!(columns[0].alias, "newest");
-                assert_eq!(columns[0].column, "id");
-            }
+            crate::ast::AggOp::Max { fields } => match &fields[0] {
+                crate::ast::AggField::Column(c) => {
+                    assert_eq!(c.alias, "newest");
+                    assert_eq!(c.column, "id");
+                }
+                other => panic!("expected a column, got {other:?}"),
+            },
             other => panic!("expected Max, got {other:?}"),
         }
     }
@@ -3101,6 +3230,91 @@ mod tests {
             roots[0].args.limit,
             Some(crate::ast::Count::Lit(3))
         ));
+    }
+
+    #[test]
+    fn typename_lowers_in_a_row_selection() {
+        let op =
+            parse_and_lower("{ users { __typename id } }", &json!({}), None, &schema()).unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => {
+                assert!(
+                    matches!(&selection[0], Field::Typename { alias } if alias == "__typename")
+                );
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn repeated_typename_collapses() {
+        // Apollo injects `__typename` into every selection set, so a fragment
+        // spread routinely asks for it twice.
+        let op = parse_and_lower(
+            "fragment F on users { __typename id } { users { __typename ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::List { selection } => assert_eq!(selection.len(), 2),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn typename_takes_no_arguments_and_is_not_a_root_field() {
+        let err = parse_and_lower(
+            "{ users { __typename(x: 1) } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("takes no arguments"), "{err}");
+
+        let err = parse_and_lower("{ __typename }", &json!({}), None, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("not as a root field"), "{err}");
+    }
+
+    #[test]
+    fn typename_is_accepted_at_every_aggregate_level() {
+        let op = parse_and_lower(
+            "{ users_aggregate { __typename aggregate { __typename max { __typename id } } \
+              nodes { __typename } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        match &roots[0].body {
+            crate::ast::RootBody::Aggregate {
+                ops,
+                nodes,
+                typenames,
+            } => {
+                assert_eq!(typenames, &vec!["__typename".to_string()]);
+                assert!(matches!(ops[0].op, crate::ast::AggOp::Typename));
+                match &ops[1].op {
+                    crate::ast::AggOp::Max { fields } => {
+                        assert!(matches!(fields[0], crate::ast::AggField::Typename { .. }));
+                    }
+                    other => panic!("expected Max, got {other:?}"),
+                }
+                assert!(matches!(nodes.as_ref().unwrap()[0], Field::Typename { .. }));
+            }
+            _ => panic!("expected Aggregate"),
+        }
     }
 
     #[test]

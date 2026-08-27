@@ -123,9 +123,11 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
         crate::ast::RootBody::List { selection } => {
             render_list(root, selection, table, schema, ctx)
         }
-        crate::ast::RootBody::Aggregate { ops, nodes } => {
-            render_aggregate(root, ops, nodes.as_deref(), table, schema, ctx)
-        }
+        crate::ast::RootBody::Aggregate {
+            ops,
+            nodes,
+            typenames,
+        } => render_aggregate(root, ops, nodes.as_deref(), typenames, table, schema, ctx),
         crate::ast::RootBody::ByPk { pk, selection } => {
             render_by_pk(root, pk, selection, table, schema, ctx)
         }
@@ -179,6 +181,7 @@ fn render_inner_select(
             ctx.sql.push_str(", ");
         }
         match field {
+            Field::Typename { alias } => render_typename_select(table, alias, ctx),
             Field::Column { physical, alias } => {
                 let col = table.find_column(physical).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
@@ -462,6 +465,7 @@ fn render_relation_subquery(
             ctx.sql.push_str(", ");
         }
         match field {
+            Field::Typename { alias: fa } => render_typename_select(target, fa, ctx),
             Field::Column {
                 physical,
                 alias: fa,
@@ -942,6 +946,33 @@ fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
     })
 }
 
+/// `__typename` in a SELECT list: a literal of the type this selection set
+/// belongs to. Cast to text so `row_to_json` sees a string rather than an
+/// `unknown`-typed constant.
+/// `__typename` beside `affected_rows` / `returning`: the mutation-response
+/// type, which is not the row type the `returning` selection reads.
+fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCtx) {
+    for alias in names {
+        write!(
+            ctx.sql,
+            ", '{}', '{}'::text",
+            escape_string_literal(alias),
+            escape_string_literal(&crate::type_names::mutation_response(table))
+        )
+        .unwrap();
+    }
+}
+
+fn render_typename_select(table: &Table, alias: &str, ctx: &mut RenderCtx) {
+    write!(
+        ctx.sql,
+        r#"'{}'::text AS "{}""#,
+        escape_string_literal(crate::type_names::row(table)),
+        alias
+    )
+    .unwrap();
+}
+
 fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -977,6 +1008,7 @@ fn render_by_pk(
             ctx.sql.push_str(", ");
         }
         match field {
+            Field::Typename { alias } => render_typename_select(table, alias, ctx),
             Field::Column { physical, alias } => {
                 let col = table.find_column(physical).ok_or_else(|| Error::Validate {
                     path: format!("{}.{}", root.alias, alias),
@@ -1958,6 +1990,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             one,
             ..
         } => {
@@ -2010,6 +2043,7 @@ fn render_mutation_output_for_inner(
                 } else {
                     ctx.sql.push_str(", 'returning', '[]'::json");
                 }
+                render_response_typenames(response_typenames, tbl, ctx);
                 ctx.sql.push(')');
             }
         }
@@ -2017,6 +2051,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             ..
         } => {
             let tbl = schema.table(table).ok_or_else(|| Error::Validate {
@@ -2038,6 +2073,7 @@ fn render_mutation_output_for_inner(
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
             }
+            render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
         }
         MutationField::UpdateByPk {
@@ -2062,6 +2098,7 @@ fn render_mutation_output_for_inner(
             alias,
             table,
             returning,
+            response_typenames,
             ..
         } => {
             let tbl = schema.table(table).ok_or_else(|| Error::Validate {
@@ -2083,6 +2120,7 @@ fn render_mutation_output_for_inner(
             } else {
                 ctx.sql.push_str(", 'returning', '[]'::json");
             }
+            render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
         }
         MutationField::DeleteByPk {
@@ -2111,6 +2149,7 @@ fn render_aggregate(
     root: &RootField,
     ops: &[crate::ast::AggSelect],
     nodes: Option<&[Field]>,
+    typenames: &[String],
     table: &Table,
     schema: &Schema,
     ctx: &mut RenderCtx,
@@ -2118,17 +2157,42 @@ fn render_aggregate(
     let inner_alias = ctx.next_alias("t");
 
     ctx.sql.push_str("(SELECT json_build_object(");
-    ctx.sql.push_str("'aggregate', json_build_object(");
-    for (i, op) in ops.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for alias in typenames {
+        if !first {
             ctx.sql.push_str(", ");
         }
-        render_agg_op(op, &inner_alias, table, ctx)?;
+        first = false;
+        write!(
+            ctx.sql,
+            "'{}', '{}'::text",
+            escape_string_literal(alias),
+            escape_string_literal(&crate::type_names::aggregate(table))
+        )
+        .unwrap();
     }
-    ctx.sql.push(')');
+    // Only when the document asked for it: an `aggregate` key in a response to
+    // `{ nodes { … } }` is a field the caller did not select.
+    if !ops.is_empty() {
+        if !first {
+            ctx.sql.push_str(", ");
+        }
+        first = false;
+        ctx.sql.push_str("'aggregate', json_build_object(");
+        for (i, op) in ops.iter().enumerate() {
+            if i > 0 {
+                ctx.sql.push_str(", ");
+            }
+            render_agg_op(op, &inner_alias, table, ctx)?;
+        }
+        ctx.sql.push(')');
+    }
 
     if let Some(node_fields) = nodes {
-        ctx.sql.push_str(", 'nodes', coalesce(json_agg(");
+        if !first {
+            ctx.sql.push_str(", ");
+        }
+        ctx.sql.push_str("'nodes', coalesce(json_agg(");
         render_json_build_object_for_nodes(
             node_fields,
             &inner_alias,
@@ -2188,39 +2252,65 @@ fn render_agg_op(
             ctx.sql.push(')');
             Ok(())
         }
-        AggOp::Sum { columns } => render_agg_func(&key, "sum", columns, table_alias, table, ctx),
-        AggOp::Avg { columns } => render_agg_func(&key, "avg", columns, table_alias, table, ctx),
-        AggOp::Max { columns } => render_agg_func(&key, "max", columns, table_alias, table, ctx),
-        AggOp::Min { columns } => render_agg_func(&key, "min", columns, table_alias, table, ctx),
+        AggOp::Sum { fields } => render_agg_func(&key, "sum", fields, table_alias, table, ctx),
+        AggOp::Avg { fields } => render_agg_func(&key, "avg", fields, table_alias, table, ctx),
+        AggOp::Max { fields } => render_agg_func(&key, "max", fields, table_alias, table, ctx),
+        AggOp::Min { fields } => render_agg_func(&key, "min", fields, table_alias, table, ctx),
+        AggOp::Typename => {
+            write!(
+                ctx.sql,
+                "'{key}', '{}'::text",
+                escape_string_literal(&crate::type_names::aggregate_fields(table))
+            )
+            .unwrap();
+            Ok(())
+        }
     }
 }
 
 fn render_agg_func(
     key: &str,
     pg_func: &str,
-    columns: &[crate::ast::AggCol],
+    fields: &[crate::ast::AggField],
     table_alias: &str,
     table: &Table,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    use crate::ast::AggField;
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
-    for (i, c) in columns.iter().enumerate() {
+    for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        let col = table
-            .find_column(&c.column)
-            .ok_or_else(|| Error::Validate {
-                path: format!("aggregate.{key}.{}", c.alias),
-                message: format!("unknown column '{}' on '{}'", c.column, table.exposed_name),
-            })?;
-        write!(
-            ctx.sql,
-            "'{}', {pg_func}({table_alias}.{})",
-            escape_string_literal(&c.alias),
-            quote_ident(&col.physical_name)
-        )
-        .unwrap();
+        match f {
+            AggField::Typename { alias } => {
+                write!(
+                    ctx.sql,
+                    "'{}', '{}'::text",
+                    escape_string_literal(alias),
+                    escape_string_literal(&crate::type_names::agg_op_fields(table, pg_func))
+                )
+                .unwrap();
+            }
+            AggField::Column(c) => {
+                let col = table
+                    .find_column(&c.column)
+                    .ok_or_else(|| Error::Validate {
+                        path: format!("aggregate.{key}.{}", c.alias),
+                        message: format!(
+                            "unknown column '{}' on '{}'",
+                            c.column, table.exposed_name
+                        ),
+                    })?;
+                write!(
+                    ctx.sql,
+                    "'{}', {pg_func}({table_alias}.{})",
+                    escape_string_literal(&c.alias),
+                    quote_ident(&col.physical_name)
+                )
+                .unwrap();
+            }
+        }
     }
     ctx.sql.push(')');
     Ok(())
@@ -2240,6 +2330,15 @@ fn render_json_build_object_for_nodes(
             ctx.sql.push_str(", ");
         }
         match f {
+            Field::Typename { alias } => {
+                write!(
+                    ctx.sql,
+                    "'{}', '{}'::text",
+                    escape_string_literal(alias),
+                    escape_string_literal(crate::type_names::row(table))
+                )
+                .unwrap();
+            }
             Field::Column { physical, alias } => {
                 let col = table.find_column(physical).ok_or_else(|| Error::Validate {
                     path: format!("{parent_path}.nodes.{alias}"),
@@ -2307,10 +2406,17 @@ fn render_aggregate_source(
         // project them just like sum/avg/max/min do.
         let names: Vec<&str> = match &sel.op {
             AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-            AggOp::Sum { columns }
-            | AggOp::Avg { columns }
-            | AggOp::Max { columns }
-            | AggOp::Min { columns } => columns.iter().map(|c| c.column.as_str()).collect(),
+            AggOp::Sum { fields }
+            | AggOp::Avg { fields }
+            | AggOp::Max { fields }
+            | AggOp::Min { fields } => fields
+                .iter()
+                .filter_map(|f| match f {
+                    crate::ast::AggField::Column(c) => Some(c.column.as_str()),
+                    crate::ast::AggField::Typename { .. } => None,
+                })
+                .collect(),
+            AggOp::Typename => Vec::new(),
         };
         for c in names {
             let col = table.find_column(c).ok_or_else(|| Error::Validate {
@@ -2324,7 +2430,7 @@ fn render_aggregate_source(
         for f in fields {
             let physical = match f {
                 Field::Column { physical, .. } | Field::JsonPath { physical, .. } => physical,
-                Field::Relation { .. } => continue,
+                Field::Typename { .. } | Field::Relation { .. } => continue,
             };
             let col = table.find_column(physical).ok_or_else(|| Error::Validate {
                 path: format!("{}.nodes", root.alias),
@@ -3103,6 +3209,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3131,6 +3238,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users_one".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3158,6 +3266,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3200,6 +3309,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3229,6 +3339,7 @@ mod tests {
             value: serde_json::json!("alice").into(),
         };
         let op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_users".into(),
             table: "users".into(),
             // where already carries the AND-ed scope (as apply_scope leaves it).
@@ -3267,6 +3378,7 @@ mod tests {
         let mut set = BTreeMap::new();
         set.insert("name".to_string(), serde_json::json!("bob").into());
         let op = Operation::Mutation(vec![MutationField::Update {
+            response_typenames: Vec::new(),
             alias: "update_users".into(),
             table: "users".into(),
             where_: BoolExpr::Compare {
@@ -3291,6 +3403,7 @@ mod tests {
         columns.insert("id".to_string(), serde_json::json!(1).into());
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3441,13 +3554,14 @@ mod tests {
 
     #[test]
     fn render_aggregate_count_and_sum() {
-        use crate::ast::{AggCol, AggOp, AggSelect, RootBody};
+        use crate::ast::{AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: vec![
                     AggSelect {
                         alias: "count".into(),
@@ -3456,7 +3570,7 @@ mod tests {
                     AggSelect {
                         alias: "sum".into(),
                         op: AggOp::Sum {
-                            columns: vec![AggCol::new("id")],
+                            fields: vec![crate::ast::AggField::column("id")],
                         },
                     },
                 ],
@@ -3472,13 +3586,14 @@ mod tests {
 
     #[test]
     fn render_count_distinct_and_aliases() {
-        use crate::ast::{AggCol, AggOp, AggSelect, RootBody};
+        use crate::ast::{AggOp, AggSelect, RootBody};
 
         let op = Operation::Query(vec![RootField {
             table: "users".into(),
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: vec![
                     AggSelect {
                         alias: "total".into(),
@@ -3501,10 +3616,10 @@ mod tests {
                     AggSelect {
                         alias: "highest".into(),
                         op: AggOp::Max {
-                            columns: vec![AggCol {
+                            fields: vec![crate::ast::AggField::Column(crate::ast::AggCol {
                                 alias: "newest".into(),
                                 column: "id".into(),
-                            }],
+                            })],
                         },
                     },
                 ],
@@ -3530,6 +3645,51 @@ mod tests {
     }
 
     #[test]
+    fn render_typename_is_a_literal_of_the_type_name() {
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: crate::ast::RootBody::List {
+                selection: vec![
+                    Field::Typename {
+                        alias: "__typename".into(),
+                    },
+                    Field::Column {
+                        physical: "id".into(),
+                        alias: "id".into(),
+                    },
+                ],
+            },
+        }]);
+        let (sql, binds) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains(r#"'users'::text AS "__typename""#), "{sql}");
+        // A literal, not a bind: it comes from the schema, not the request.
+        assert!(binds.is_empty(), "{binds:?}");
+    }
+
+    #[test]
+    fn aggregate_key_is_omitted_when_only_nodes_were_asked_for() {
+        use crate::ast::RootBody;
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: Vec::new(),
+                nodes: Some(vec![Field::Column {
+                    physical: "id".into(),
+                    alias: "id".into(),
+                }]),
+                typenames: Vec::new(),
+            },
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(!sql.contains("'aggregate'"), "{sql}");
+        assert!(sql.contains("'nodes'"), "{sql}");
+    }
+
+    #[test]
     fn render_aggregate_no_nodes() {
         use crate::ast::{AggOp, AggSelect, RootBody};
 
@@ -3538,6 +3698,7 @@ mod tests {
             alias: "users_aggregate".into(),
             args: QueryArgs::default(),
             body: RootBody::Aggregate {
+                typenames: Vec::new(),
                 ops: vec![AggSelect {
                     alias: "count".into(),
                     op: AggOp::count(),
@@ -3663,6 +3824,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("name".to_string(), serde_json::json!("alice").into());
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3739,6 +3901,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_users".into(),
             table: "users".into(),
             objects: vec![InsertObject {
@@ -3815,6 +3978,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_posts".into(),
             table: "posts".into(),
             objects: vec![InsertObject {
@@ -3895,6 +4059,7 @@ mod tests {
         );
 
         let op = Operation::Mutation(vec![MutationField::Insert {
+            response_typenames: Vec::new(),
             alias: "insert_posts".into(),
             table: "posts".into(),
             objects: vec![InsertObject {
