@@ -1,6 +1,7 @@
 //! Format a DiffReport for human or machine consumption.
 
 use crate::analyze::{ColumnOrigin, DiffReport, RepointProblem};
+use std::collections::BTreeSet;
 use std::io::Write;
 
 #[derive(Debug, Clone, Copy)]
@@ -19,7 +20,8 @@ pub fn write<W: Write>(report: &DiffReport, format: Format, out: &mut W) -> std:
 fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if report.is_clean() {
         writeln!(out, "OK: no overlay drift detected")?;
-        return write_unverified(report, out);
+        write_unverified(report, out)?;
+        return write_skipped(report, out);
     }
     if !report.missing_tables.is_empty() {
         writeln!(
@@ -75,12 +77,41 @@ fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()>
     }
     writeln!(out, "{} issues found", report.issue_count())?;
     write_unverified(report, out)?;
+    write_skipped(report, out)?;
     Ok(())
 }
 
 /// Printed on both the clean and dirty paths: it is not drift, but leaving it
 /// silent would let `diff` read as "everything checked out" when part of the
 /// overlay was never looked at.
+/// Columns the engine cannot carry. Not drift, but the only place this becomes
+/// visible: from the outside the column simply is not there.
+fn write_skipped<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
+    if report.skipped_columns.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "not exposed (no type mapping — these columns are absent from the schema):"
+    )?;
+    for c in &report.skipped_columns {
+        writeln!(out, "  - {}.{} ({})", c.table, c.column, c.data_type)?;
+    }
+    let types: BTreeSet<&str> = report
+        .skipped_columns
+        .iter()
+        .map(|c| c.data_type.as_str())
+        .collect();
+    writeln!(
+        out,
+        "    {} column(s) across {} type(s): {}",
+        report.skipped_columns.len(),
+        types.len(),
+        types.into_iter().collect::<Vec<_>>().join(", ")
+    )?;
+    Ok(())
+}
+
 fn write_unverified<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if report.unverified_repoints.is_empty() {
         return Ok(());
@@ -112,6 +143,7 @@ mod tests {
 
     fn dirty_report() -> DiffReport {
         DiffReport {
+            skipped_columns: Vec::new(),
             missing_tables: vec!["ghosts".into()],
             missing_columns: vec![MissingColumn {
                 table: "users".into(),

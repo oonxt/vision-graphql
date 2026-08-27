@@ -226,11 +226,14 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .as_bool()
             .map(Bind::Bool)
             .ok_or_else(|| Error::TypeMap("expected Bool".into())),
-        PgType::Int4 => v
+        // int2 binds as int4 and the cast narrows it server-side: sqlx has no
+        // i16 in `Bind`, and Postgres rejects an out-of-range value at the cast
+        // rather than wrapping it.
+        PgType::Int2 | PgType::Int4 => v
             .as_i64()
             .and_then(|n| i32::try_from(n).ok())
             .map(Bind::Int4)
-            .ok_or_else(|| Error::TypeMap("expected Int4".into())),
+            .ok_or_else(|| Error::TypeMap("expected an integer".into())),
         PgType::Int8 => v
             .as_i64()
             .map(Bind::Int8)
@@ -239,10 +242,22 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .as_f64()
             .map(Bind::Float8)
             .ok_or_else(|| Error::TypeMap("expected floating point".into())),
+        // `numeric` is carried as text so the server does the conversion and
+        // nothing is rounded on the way. That is a reason to *accept* a string,
+        // not a reason to refuse a number: a column that reads back as `12.34`
+        // and then refuses `_gt: 10` makes every caller round-trip through
+        // strings for no benefit. A JSON number is rendered back to its own
+        // text and cast server-side like any other.
+        PgType::Numeric => match v {
+            Value::String(s) => Ok(Bind::Text(s.clone())),
+            Value::Number(n) => Ok(Bind::Text(n.to_string())),
+            other => Err(Error::TypeMap(format!(
+                "expected a number or a string for numeric, got {other}"
+            ))),
+        },
         PgType::Text
         | PgType::Varchar
         | PgType::Uuid
-        | PgType::Numeric
         | PgType::Timestamp
         | PgType::TimestampTz
         | PgType::Date
@@ -278,20 +293,31 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
     }
     match pg {
         PgType::Bool => collect(values, Value::as_bool, "Bool").map(Bind::BoolArray),
-        PgType::Int4 => collect(
+        PgType::Int2 | PgType::Int4 => collect(
             values,
             |v| v.as_i64().and_then(|n| i32::try_from(n).ok()),
-            "Int4",
+            "an integer",
         )
         .map(Bind::Int4Array),
         PgType::Int8 => collect(values, Value::as_i64, "Int8").map(Bind::Int8Array),
         PgType::Float4 | PgType::Float8 => {
             collect(values, Value::as_f64, "floating point").map(Bind::Float8Array)
         }
+        // Same as the scalar case: `_in: [1, 2]` on a numeric column is the
+        // natural way to write it.
+        PgType::Numeric => collect(
+            values,
+            |v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            },
+            "a number or a string",
+        )
+        .map(Bind::TextArray),
         PgType::Text
         | PgType::Varchar
         | PgType::Uuid
-        | PgType::Numeric
         | PgType::Timestamp
         | PgType::TimestampTz
         | PgType::Date
@@ -341,9 +367,41 @@ mod tests {
         assert!(matches!(bind, Bind::Null));
     }
 
+    /// `int2` has no bind of its own: it goes out as int4 and the cast narrows
+    /// it, so an out-of-range value is refused by Postgres rather than wrapped.
+    #[test]
+    fn smallint_binds_through_int4() {
+        assert!(matches!(
+            json_to_bind(&json!(7), &PgType::Int2).unwrap(),
+            Bind::Int4(7)
+        ));
+    }
+
+    #[test]
+    fn numeric_takes_a_number_or_a_string() {
+        // A numeric column reads back as a JSON number, so writing one must
+        // work; the string form stays for values a float cannot hold exactly.
+        for (input, expected) in [
+            (json!(9.5), "9.5"),
+            (json!(10), "10"),
+            (json!("12.340"), "12.340"),
+            (
+                json!("179769313486231570000000000000000000.5"),
+                "179769313486231570000000000000000000.5",
+            ),
+        ] {
+            match json_to_bind(&input, &PgType::Numeric).unwrap() {
+                Bind::Text(s) => assert_eq!(s, expected, "for {input}"),
+                other => panic!("expected text, got {other:?}"),
+            }
+        }
+        let err = json_to_bind(&json!(true), &PgType::Numeric).unwrap_err();
+        assert!(format!("{err}").contains("number or a string"), "{err}");
+    }
+
     #[test]
     fn reject_type_mismatch() {
         let err = json_to_bind(&json!("not a number"), &PgType::Int4).unwrap_err();
-        assert!(format!("{err}").contains("expected Int4"));
+        assert!(format!("{err}").contains("expected an integer"));
     }
 }

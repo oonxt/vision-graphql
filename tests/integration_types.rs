@@ -200,3 +200,167 @@ async fn filter_uuid_in_list() {
         .expect("uuid _in filter should work");
     assert_eq!(res, json!({"events": [{"id": 1}, {"id": 2}]}));
 }
+
+/// `smallint` used to vanish from the schema with only a log line — the column
+/// was simply absent, and a query naming it was told it did not exist. Same for
+/// `character(n)`.
+#[tokio::test]
+async fn smallint_and_char_are_readable_and_writable() {
+    let container = Postgres::default()
+        .with_tag("17.4-alpine")
+        .start()
+        .await
+        .expect("start pg");
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"CREATE TABLE items (
+               id SERIAL PRIMARY KEY,
+               qty SMALLINT NOT NULL,
+               code CHAR(4),
+               weird BYTEA
+           );
+           INSERT INTO items (qty, code) VALUES (3, 'ab  '), (9, 'cd  ');"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let introspected = vision_graphql::Schema::introspect(&pool).await.unwrap();
+    let engine = vision_graphql::Engine::new(
+        pool.clone(),
+        vision_graphql::Schema::introspect(&pool)
+            .await
+            .unwrap()
+            .build(),
+    );
+    let _ = introspected;
+
+    let v = engine
+        .query("{ items(where: {qty: {_gt: 5}}) { id qty code } }", None)
+        .await
+        .unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["items"][0]["qty"], 9);
+    assert_eq!(v["items"][0]["code"], "cd  ");
+
+    // Writing one too, and `_in` over the same type.
+    let v = engine
+        .query(
+            r#"mutation { insert_items(objects: [{qty: 7, code: "ef"}]) {
+                 returning { qty code } } }"#,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["insert_items"]["returning"][0]["qty"], 7);
+
+    let v = engine
+        .query("{ items(where: {qty: {_in: [3, 7]}}) { qty } }", None)
+        .await
+        .unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+}
+
+/// A type with no mapping is still dropped — but it is recorded now, so
+/// `vision-gql diff` can say so instead of leaving the hole invisible.
+#[tokio::test]
+async fn an_unmappable_column_is_recorded_rather_than_only_logged() {
+    let container = Postgres::default()
+        .with_tag("17.4-alpine")
+        .start()
+        .await
+        .expect("start pg");
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE items (id SERIAL PRIMARY KEY, tags TEXT[], blob BYTEA, span INTERVAL);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let db = vision_graphql::schema::introspect::introspect(&pool)
+        .await
+        .unwrap();
+    let mut skipped: Vec<(&str, &str)> = db
+        .skipped_columns
+        .iter()
+        .map(|c| (c.column.as_str(), c.data_type.as_str()))
+        .collect();
+    skipped.sort();
+    assert_eq!(
+        skipped,
+        vec![("blob", "bytea"), ("span", "interval"), ("tags", "ARRAY")]
+    );
+}
+
+/// A `numeric` column reads back as a JSON number, so a filter written with one
+/// has to work: requiring `_gt: "10"` made every caller round-trip through
+/// strings for no benefit.
+#[tokio::test]
+async fn numeric_accepts_the_json_numbers_it_returns() {
+    let container = Postgres::default()
+        .with_tag("17.4-alpine")
+        .start()
+        .await
+        .expect("start pg");
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"CREATE TABLE items (id SERIAL PRIMARY KEY, price NUMERIC(12,2));
+           INSERT INTO items (price) VALUES (12.34), (99.99);"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let engine = vision_graphql::Engine::new(
+        pool.clone(),
+        vision_graphql::Schema::introspect(&pool)
+            .await
+            .unwrap()
+            .build(),
+    );
+
+    let v = engine
+        .query("{ items(where: {price: {_gt: 50}}) { price } }", None)
+        .await
+        .unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["items"][0]["price"], 99.99);
+
+    let v = engine
+        .query(
+            r#"mutation { insert_items(objects: [{price: 5.25}]) { returning { price } } }"#,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["insert_items"]["returning"][0]["price"], 5.25);
+
+    // The string form still works, and is what a value a float cannot hold
+    // exactly must use.
+    let v = engine
+        .query(
+            r#"mutation { insert_items(objects: [{price: "0.10"}]) { returning { price } } }"#,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["insert_items"]["returning"][0]["price"], 0.10);
+}

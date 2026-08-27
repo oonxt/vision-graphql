@@ -80,8 +80,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | Schema introspection | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
-| PG enum / `date` / `time` columns (enum casts are schema-qualified) | ✓ |
-| Enum array columns (`role_type[]`) | Not implemented (skipped at introspection) |
+| PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
+| Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
 | TOML config overlay (`expose_as`, `schema`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
@@ -189,6 +189,34 @@ which is unchanged.
 
 A `CompiledQuery` runs on the pool, not inside `Engine::transaction` —
 mutations needing a transaction still go through `TxClient`.
+
+## Column types
+
+Most of the mapping is unremarkable — `integer` is `Int`, `text` is `String`.
+Three things are worth knowing.
+
+**`numeric` takes a number or a string.** It is carried to the server as text
+and cast there, so nothing is rounded in transit, but that is a reason to accept
+a string, not to refuse a number: a column that reads back as `12.34` and then
+rejects `_gt: 10` makes every caller round-trip through strings for nothing.
+Both work; use the string form for a value a float cannot hold exactly.
+
+**A type with no mapping means the column is not there.** Arrays, `bytea`,
+`interval` and `inet` have none, and introspection leaves those columns out of
+the schema entirely — a query naming one is told it does not exist, and if the
+dropped column belongs to a key or a foreign key, a `_by_pk` field or a whole
+relation goes missing with it. That used to be a log line and nothing else;
+`vision-gql diff` now reports them:
+
+```
+not exposed (no type mapping — these columns are absent from the schema):
+  - public.items.tags (ARRAY)
+  - public.items.blob (bytea)
+    2 column(s) across 2 type(s): ARRAY, bytea
+```
+
+**A Postgres enum column** is exposed as a custom scalar named after the type
+and bound as a string; its casts are schema-qualified.
 
 ## Building the schema
 
@@ -867,4 +895,5 @@ multiple requests — most commonly id-chaining between mutations.
 
 ## License
 
-MIT OR Apache-2.0
+MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)),
+at your option.

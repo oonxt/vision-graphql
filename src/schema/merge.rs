@@ -109,13 +109,8 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
             t = t.primary_key(&refs);
         }
         for (name, cols) in &it.unique_constraints {
-            // Only constraints every column of which is still exposed: one over
-            // a hidden column cannot be named in an `on_conflict` that the
-            // caller could satisfy.
-            if cols.iter().all(|c| column_names.contains(c.as_str())) {
-                let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
-                t = t.unique_constraint(name, &refs);
-            }
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_constraint(name, &refs);
         }
         for (src, name, rel) in &rels {
             if src != exposed {
@@ -233,14 +228,14 @@ pub fn apply_config(
             t = t.primary_key(&refs);
         }
 
-        // Constraints survive the overlay only while every column they cover is
-        // still exposed — `hide_columns` can take one out from under them, and a
-        // constraint the caller cannot satisfy is worse than no constraint.
+        // Constraints survive `hide_columns` intact. Postgres resolves an
+        // `ON CONFLICT` target by constraint name, so one covering a hidden
+        // column is still a usable target — it is only its *name* that should
+        // not be published, and that is decided where publishing happens
+        // (`type_system`), not here where the engine's own knowledge lives.
         for (name, cols) in &old.unique_constraints {
-            if cols.iter().all(|c| t.find_column(c).is_some()) {
-                let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
-                t = t.unique_constraint(name, &refs);
-            }
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_constraint(name, &refs);
         }
 
         let overlay_rel_names: std::collections::BTreeSet<&str> = overlay
@@ -609,6 +604,7 @@ mod tests {
         }
 
         let mut db = IntrospectedDb {
+            skipped_columns: Vec::new(),
             tables: Default::default(),
             schemas: schemas.iter().map(|s| (*s).to_string()).collect(),
         };

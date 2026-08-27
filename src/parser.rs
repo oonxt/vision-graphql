@@ -1443,6 +1443,28 @@ fn parse_on_conflict(
             message: "missing or non-string 'constraint'".into(),
         })?
         .to_string();
+    // Checked here rather than left to Postgres, which answers 42704 at request
+    // time — and so slips past `Engine::compile`, whose whole point is that a
+    // query which cannot work fails at startup.
+    //
+    // Only when the table knows its constraints. A hand-built `Schema` declares
+    // none, and rejecting every `on_conflict` against one would be enforcing a
+    // list that was never claimed to be complete.
+    if !table.unique_constraints.is_empty() && !table.unique_constraints.contains_key(&constraint) {
+        let known: Vec<&str> = table
+            .unique_constraints
+            .keys()
+            .map(String::as_str)
+            .collect();
+        return Err(Error::Validate {
+            path: format!("{path}.constraint"),
+            message: format!(
+                "'{constraint}' is not a unique constraint on '{}' ({})",
+                table.exposed_name,
+                known.join(", ")
+            ),
+        });
+    }
     let mut update_columns: Vec<String> = Vec::new();
     if let Some(cols) = obj.get("update_columns") {
         let arr = cols.as_array().ok_or_else(|| Error::Validate {
@@ -3665,6 +3687,56 @@ mod tests {
             }
             other => panic!("expected Insert, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unknown_on_conflict_constraint_is_caught_before_postgres_sees_it() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("email", "email", PgType::Text, true)
+                    .primary_key(&["id"])
+                    .unique_constraint("users_pkey", &["id"])
+                    .unique_constraint("users_email_key", &["email"]),
+            )
+            .build();
+        let q = |c: &str| {
+            format!(
+                r#"mutation {{ insert_users(objects: [{{id: 1}}], on_conflict: {{
+                     constraint: "{c}", update_columns: ["id"] }}) {{ affected_rows }} }}"#
+            )
+        };
+        let err = parse_and_lower(&q("users_emial_key"), &json!({}), None, &schema).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("is not a unique constraint"), "{msg}");
+        assert!(
+            msg.contains("users_email_key"),
+            "the known ones are listed: {msg}"
+        );
+        parse_and_lower(&q("users_email_key"), &json!({}), None, &schema).unwrap();
+    }
+
+    /// A hand-built schema declares no constraints. Enforcing an empty list
+    /// would be enforcing one that was never claimed to be complete.
+    #[test]
+    fn a_schema_that_declares_no_constraints_accepts_any_name() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        parse_and_lower(
+            r#"mutation { insert_users(objects: [{id: 1}], on_conflict: {
+                 constraint: "whatever_the_database_calls_it", update_columns: ["id"]
+               }) { affected_rows } }"#,
+            &json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -11,6 +11,21 @@ used to be silent, so read **Breaking** before upgrading.
 
 ### Fixed
 
+- **`on_conflict`'s constraint name was checked by nobody**, so a typo reached
+  Postgres as a 42704 at request time — slipping past `Engine::compile`, whose
+  point is that a query which cannot work fails at startup. Checked against the
+  constraints introspection found, and the error lists them. A hand-built
+  `Schema` declares none, and an empty list is not enforced.
+- **A `numeric` column read back as a JSON number but refused one**, so
+  `_gt: 10` was an error and every caller had to round-trip through strings.
+  Numbers and strings are both accepted now.
+- **`smallint` and `character(n)` columns silently vanished** from the schema,
+  as any unmapped type does. Both are mapped now. What still has no mapping —
+  arrays, `bytea`, `interval`, `inet` — is recorded during introspection instead
+  of only logged, and `vision-gql diff` reports it: the column being absent is
+  otherwise impossible to notice from the outside, and takes any key or relation
+  that depended on it along with it.
+
 - **A deeply nested input value crashed the process.** `{_not: {_not: … }}` at
   ~2000 levels — about 16 KiB of text — overflowed the stack inside the parser.
   A stack overflow aborts in Rust rather than unwinding, so no `catch_unwind` at
@@ -134,6 +149,9 @@ used to be silent, so read **Breaking** before upgrading.
 - `AggregateBuilder::count_columns`, `count_distinct`, and `key` (response key
   for the aggregate added last).
 - `CompiledQuery::defaults`.
+- `LICENSE-MIT` and `LICENSE-APACHE`. `Cargo.toml` had declared
+  `MIT OR Apache-2.0` since the beginning with neither text in the repository.
+- `PgType::Int2`; `introspect::SkippedColumn` and `IntrospectedDb::skipped_columns`.
 - `Count::var`; `Count::Var` is now a struct variant carrying an optional `max`,
   and `Count::Bound` is a new variant: a literal that renders as a bind.
 - `QueryArgs::is_empty`, `AggOp::count()`, `AggCol::new`, `AggField::column`.

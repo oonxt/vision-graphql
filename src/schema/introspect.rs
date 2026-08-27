@@ -9,6 +9,15 @@ use std::collections::BTreeMap;
 pub struct IntrospectedDb {
     /// Keyed by `(schema_name, table_name)`.
     pub tables: BTreeMap<(String, String), IntrospectedTable>,
+    /// Columns whose Postgres type this engine has no mapping for, and which
+    /// are therefore absent from every table above.
+    ///
+    /// Recorded rather than only logged, because the consequence is invisible
+    /// from the outside: the column is not in the schema, so a query naming it
+    /// says "unknown column" as if it never existed — and if the dropped column
+    /// is part of a key or a foreign key, `_by_pk` or a whole relation goes
+    /// missing with it. `vision-gql diff` reports these.
+    pub skipped_columns: Vec<SkippedColumn>,
     /// The schemas that were asked for, in the order they were asked for.
     ///
     /// Order is meaningful, not decorative: the first schema owns the bare
@@ -58,12 +67,25 @@ pub struct IntrospectedForeignKey {
     pub to_columns: Vec<String>,
 }
 
+/// A column left out of the schema because its type has no mapping here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedColumn {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    /// The Postgres type as `information_schema` spells it.
+    pub data_type: String,
+}
+
 pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
     match data_type {
+        "smallint" => Some(PgType::Int2),
         "integer" => Some(PgType::Int4),
         "bigint" => Some(PgType::Int8),
         "text" => Some(PgType::Text),
         "character varying" => Some(PgType::Varchar),
+        // `bpchar`. Blank-padded on the server; read and written as text.
+        "character" => Some(PgType::Varchar),
         "boolean" => Some(PgType::Bool),
         "real" => Some(PgType::Float4),
         "double precision" => Some(PgType::Float8),
@@ -121,6 +143,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
     let wanted: Vec<String> = schemas.iter().map(|s| (*s).to_string()).collect();
     let mut db = IntrospectedDb {
         tables: BTreeMap::new(),
+        skipped_columns: Vec::new(),
         schemas: wanted.clone(),
     };
 
@@ -166,6 +189,12 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 data_type = %dtype,
                 "skipping column with unsupported type"
             );
+            db.skipped_columns.push(SkippedColumn {
+                schema: schema.clone(),
+                table: tname.clone(),
+                column: cname.clone(),
+                data_type: dtype.clone(),
+            });
             continue;
         };
         let entry = db
