@@ -27,6 +27,7 @@
 //! workload can raise them, and so an endpoint can lower them.
 
 use crate::error::{Error, Result};
+use crate::schema::Schema;
 
 /// Limits on the raw text of a document.
 ///
@@ -159,420 +160,6 @@ fn skip_string(b: &[u8], i: usize) -> usize {
     b.len()
 }
 
-#[cfg(test)]
-mod exec_tests {
-    use super::*;
-    use crate::ast::{Count, Operation};
-    use crate::schema::{PgType, Relation, Schema, Table};
-    use serde_json::json;
-
-    fn schema() -> Schema {
-        Schema::builder()
-            .table(
-                Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .primary_key(&["id"])
-                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
-            )
-            .table(
-                Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .primary_key(&["id"])
-                    .relation("user", Relation::object("users").on([("user_id", "id")])),
-            )
-            .build()
-    }
-
-    fn lower(q: &str) -> Operation {
-        crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap()
-    }
-
-    fn apply(q: &str, limits: ExecutionLimits) -> Result<Operation> {
-        let mut op = lower(q);
-        limits.apply(&mut op)?;
-        Ok(op)
-    }
-
-    fn limit_of(op: &Operation) -> Option<Count> {
-        let Operation::Query(roots) = op else {
-            panic!("expected Query")
-        };
-        roots[0].args.limit.clone()
-    }
-
-    #[test]
-    fn unbounded_limits_change_nothing() {
-        let op = apply("{ users { id } }", ExecutionLimits::new()).unwrap();
-        assert_eq!(limit_of(&op), None);
-    }
-
-    #[test]
-    fn default_limit_fills_in_a_list_that_asked_for_none() {
-        let op = apply("{ users { id } }", ExecutionLimits::new().default_limit(50)).unwrap();
-        assert_eq!(limit_of(&op), Some(Count::Lit(50)));
-    }
-
-    #[test]
-    fn default_limit_leaves_an_explicit_one_alone() {
-        let op = apply(
-            "{ users(limit: 3) { id } }",
-            ExecutionLimits::new().default_limit(50),
-        )
-        .unwrap();
-        assert_eq!(limit_of(&op), Some(Count::Lit(3)));
-    }
-
-    #[test]
-    fn default_limit_reaches_array_relations_too() {
-        let op = apply(
-            "{ users { posts { id } } }",
-            ExecutionLimits::new().default_limit(50),
-        )
-        .unwrap();
-        let Operation::Query(roots) = &op else {
-            panic!()
-        };
-        let crate::ast::RootBody::List { selection } = &roots[0].body else {
-            panic!()
-        };
-        match &selection[0] {
-            crate::ast::Field::Relation { args, .. } => {
-                assert_eq!(args.limit, Some(Count::Lit(50)))
-            }
-            other => panic!("expected a relation, got {other:?}"),
-        }
-    }
-
-    /// An aggregate answers with one row however many it reads, and capping it
-    /// would quietly change what `count` counts.
-    #[test]
-    fn default_limit_does_not_touch_an_aggregate_or_a_by_pk() {
-        let op = apply(
-            "{ users_aggregate { aggregate { count } } }",
-            ExecutionLimits::new().default_limit(50),
-        )
-        .unwrap();
-        assert_eq!(limit_of(&op), None);
-
-        let op = apply(
-            "{ users_by_pk(id: 1) { id } }",
-            ExecutionLimits::new().default_limit(50),
-        )
-        .unwrap();
-        assert_eq!(limit_of(&op), None);
-    }
-
-    #[test]
-    fn max_limit_rejects_a_literal_over_the_ceiling() {
-        let err = apply(
-            "{ users(limit: 5000) { id } }",
-            ExecutionLimits::new().max_limit(100),
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
-        apply(
-            "{ users(limit: 100) { id } }",
-            ExecutionLimits::new().max_limit(100),
-        )
-        .unwrap();
-    }
-
-    /// `limit: $n` has no value yet, so the ceiling has to travel with it.
-    #[test]
-    fn max_limit_follows_a_variable_to_where_it_resolves() {
-        // Symbolic lowering: eager lowering would substitute the value and leave
-        // no variable for a ceiling to travel with.
-        let doc =
-            crate::parser::parse_document("query($n: Int) { users(limit: $n) { id } }").unwrap();
-        let mut op =
-            crate::parser::lower_with(&doc, crate::parser::Bindings::Symbolic, None, &schema())
-                .unwrap();
-        ExecutionLimits::new()
-            .max_limit(100)
-            .apply(&mut op)
-            .unwrap();
-
-        let Operation::Query(roots) = &op else {
-            panic!()
-        };
-        let count = roots[0].args.limit.clone().unwrap();
-        let over = json!({"n": 5000});
-        let err = count
-            .resolve(&crate::types::Inputs::variables(&over), "users.limit")
-            .unwrap_err();
-        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
-
-        let ok = json!({"n": 5});
-        assert_eq!(
-            count
-                .resolve(&crate::types::Inputs::variables(&ok), "users.limit")
-                .unwrap(),
-            5
-        );
-    }
-
-    #[test]
-    fn bind_row_counts_moves_literals_out_of_the_sql() {
-        let schema = schema();
-        let render = |limits: ExecutionLimits| {
-            let mut op = lower("{ users(limit: 10, offset: 5) { id } }");
-            limits.apply(&mut op).unwrap();
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap()
-        };
-
-        // Default: inline, and the statement reads the way the query does.
-        let (sql, binds) = render(ExecutionLimits::new());
-        assert!(sql.contains("LIMIT 10"), "{sql}");
-        assert!(sql.contains("OFFSET 5"), "{sql}");
-        assert!(binds.is_empty(), "{binds:?}");
-
-        // Bound: one statement whatever the numbers, and they travel as binds.
-        let (sql, binds) = render(ExecutionLimits::new().bind_row_counts(true));
-        assert!(!sql.contains("LIMIT 10"), "{sql}");
-        assert!(sql.contains("LIMIT $"), "{sql}");
-        assert!(sql.contains("OFFSET $"), "{sql}");
-        assert_eq!(
-            binds,
-            vec![crate::types::Bind::Int8(10), crate::types::Bind::Int8(5)]
-        );
-    }
-
-    /// The point of the option: two page sizes, one statement.
-    #[test]
-    fn bound_row_counts_give_every_page_size_the_same_sql() {
-        let schema = schema();
-        let limits = ExecutionLimits::new().bind_row_counts(true);
-        let sql_for = |n: u64| {
-            let mut op = lower(&format!("{{ users(limit: {n}) {{ id }} }}"));
-            limits.apply(&mut op).unwrap();
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
-                .unwrap()
-                .0
-        };
-        assert_eq!(sql_for(1), sql_for(1000));
-    }
-
-    #[test]
-    fn a_default_limit_is_bound_too_when_asked() {
-        let schema = schema();
-        let mut op = lower("{ users { id } }");
-        ExecutionLimits::new()
-            .default_limit(25)
-            .bind_row_counts(true)
-            .apply(&mut op)
-            .unwrap();
-        let (sql, binds) =
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap();
-        assert!(sql.contains("LIMIT $"), "{sql}");
-        assert_eq!(binds, vec![crate::types::Bind::Int8(25)]);
-    }
-
-    #[test]
-    fn a_bound_count_is_still_subject_to_the_ceiling() {
-        let err = apply(
-            "{ users(limit: 500) { id } }",
-            ExecutionLimits::new().max_limit(100).bind_row_counts(true),
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
-    }
-
-    #[test]
-    fn max_relation_depth_counts_relation_hops() {
-        let limits = ExecutionLimits::new().max_relation_depth(2);
-        apply("{ users { posts { user { id } } } }", limits).unwrap();
-        let err = apply("{ users { posts { user { posts { id } } } } }", limits).unwrap_err();
-        assert!(
-            format!("{err}").contains("deeper than the limit of 2"),
-            "{err}"
-        );
-    }
-
-    /// Breadth is the other half: two hundred aliases of one relation nest one
-    /// level and render two hundred correlated subqueries.
-    #[test]
-    fn max_table_reads_counts_breadth_not_just_depth() {
-        let inner: String = (0..20).map(|i| format!("a{i}: posts {{ id }} ")).collect();
-        let q = format!("{{ users {{ {inner} }} }}");
-        let err = apply(&q, ExecutionLimits::new().max_table_reads(10)).unwrap_err();
-        assert!(
-            format!("{err}").contains("more than 10 table positions"),
-            "{err}"
-        );
-        apply(&q, ExecutionLimits::new().max_table_reads(21)).unwrap();
-    }
-
-    #[test]
-    fn an_exists_filter_and_an_order_by_hop_count_as_reads() {
-        // root + EXISTS
-        let err = apply(
-            "{ users(where: {posts: {id: {_gt: 1}}}) { id } }",
-            ExecutionLimits::new().max_table_reads(1),
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("table positions"), "{err}");
-
-        // root + order_by hop
-        let err = apply(
-            "{ posts(order_by: [{user: {id: asc}}]) { id } }",
-            ExecutionLimits::new().max_table_reads(1),
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("table positions"), "{err}");
-    }
-
-    #[test]
-    fn introspection_reads_no_table() {
-        let schema = Schema::builder()
-            .table(
-                Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .primary_key(&["id"]),
-            )
-            .enable_introspection()
-            .build();
-        let mut op = crate::parser::parse_and_lower(
-            "{ __type(name: \"users\") { name } }",
-            &json!({}),
-            None,
-            &schema,
-        )
-        .unwrap();
-        ExecutionLimits::new()
-            .max_table_reads(0)
-            .apply(&mut op)
-            .unwrap();
-    }
-
-    #[test]
-    fn a_nested_insert_counts_every_level() {
-        let op = crate::parser::parse_and_lower(
-            r#"mutation { insert_users(objects: [{id: 1, posts: {data: [{id: 2}]}}]) {
-                 affected_rows } }"#,
-            &json!({}),
-            None,
-            &schema(),
-        );
-        let mut op = op.unwrap();
-        // The parent plus its nested child.
-        let err = ExecutionLimits::new()
-            .max_table_reads(1)
-            .apply(&mut op)
-            .unwrap_err();
-        assert!(format!("{err}").contains("table positions"), "{err}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn depth_of(source: &str) -> Result<()> {
-        ParseLimits::default().check(source)
-    }
-
-    #[test]
-    fn ordinary_queries_pass() {
-        depth_of("{ users { id name } }").unwrap();
-        depth_of(
-            r#"query($id: Int!) {
-                 users(where: {_and: [{id: {_eq: $id}}, {name: {_is_null: false}}]}) {
-                   id
-                   posts(order_by: [{id: asc}], limit: 5) { title comments { body } }
-                 }
-               }"#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn deep_input_value_is_rejected() {
-        let q = format!(
-            "{{ users(where: {}{}{}) {{ id }} }}",
-            "{_not: ".repeat(2000),
-            "{id: {_eq: 1}}",
-            "}".repeat(2000)
-        );
-        let err = depth_of(&q).unwrap_err();
-        assert!(format!("{err}").contains("nests deeper"), "{err}");
-    }
-
-    #[test]
-    fn depth_is_counted_across_bracket_kinds() {
-        let limits = ParseLimits {
-            max_depth: 3,
-            ..Default::default()
-        };
-        limits.check("{ a(b: [1]) }").unwrap(); // { ( [  => 3
-        let err = limits.check("{ a(b: [[1]]) }").unwrap_err(); // => 4
-        assert!(format!("{err}").contains("nests deeper"), "{err}");
-    }
-
-    #[test]
-    fn brackets_inside_strings_do_not_count() {
-        let limits = ParseLimits {
-            max_depth: 2,
-            ..Default::default()
-        };
-        limits
-            .check(r#"{ users(where: "{{{{{{{{") { id } }"#)
-            .unwrap();
-        limits
-            .check(r#"{ users(where: "\"{{{{") { id } }"#)
-            .unwrap();
-        limits
-            .check("{ users(where: \"\"\"{{{{{{\"\"\") { id } }")
-            .unwrap();
-    }
-
-    #[test]
-    fn brackets_inside_comments_do_not_count() {
-        let limits = ParseLimits {
-            max_depth: 2,
-            ..Default::default()
-        };
-        limits.check("{ users { id } } # {{{{{{{{").unwrap();
-        limits.check("# {{{{\n{ users { id } }").unwrap();
-    }
-
-    #[test]
-    fn unterminated_string_is_left_to_the_parser() {
-        // No panic, no false rejection: the parser reports the syntax error.
-        ParseLimits::default()
-            .check(r#"{ users(name: "oops) { id } }"#)
-            .unwrap();
-    }
-
-    #[test]
-    fn oversized_document_is_rejected() {
-        let limits = ParseLimits {
-            max_bytes: 16,
-            ..Default::default()
-        };
-        let err = limits.check("{ users { id name active } }").unwrap_err();
-        assert!(format!("{err}").contains("over the 16-byte limit"), "{err}");
-    }
-
-    #[test]
-    fn unbounded_accepts_what_default_rejects() {
-        let q = format!("{}{}", "{a(b: [".repeat(100), "]) }".repeat(100));
-        assert!(ParseLimits::default().check(&q).is_err());
-        ParseLimits::unbounded().check(&q).unwrap();
-    }
-
-    #[test]
-    fn multibyte_text_does_not_confuse_the_scan() {
-        let limits = ParseLimits {
-            max_depth: 2,
-            ..Default::default()
-        };
-        limits
-            .check(r#"{ users(name: "中文｛括号｝") { id } }"#)
-            .unwrap();
-    }
-}
-
 /// What a single request may cost, checked on the lowered IR.
 ///
 /// [`ParseLimits`] bounds the *document*; these bound the *statement* it turns
@@ -691,10 +278,14 @@ impl ExecutionLimits {
     pub fn is_unbounded(&self) -> bool {
         *self == Self::default()
     }
-
     /// Apply to a lowered operation: rewrite what needs defaults, reject what is
     /// over a ceiling.
-    pub fn apply(&self, op: &mut crate::ast::Operation) -> Result<()> {
+    ///
+    /// Takes the schema because whether a relation returns one row or many is
+    /// not in the IR, and a default `limit` means different things for each: on
+    /// an object relation it would replace the `LIMIT 1` the renderer relies on
+    /// to keep `row_to_json` over a single row.
+    pub fn apply(&self, op: &mut crate::ast::Operation, schema: &Schema) -> Result<()> {
         if self.is_unbounded() {
             return Ok(());
         }
@@ -702,12 +293,12 @@ impl ExecutionLimits {
         match op {
             crate::ast::Operation::Query(roots) => {
                 for root in roots.iter_mut() {
-                    self.root(root, &mut reads)?;
+                    self.root(root, schema, &mut reads)?;
                 }
             }
             crate::ast::Operation::Mutation(fields) => {
                 for f in fields.iter_mut() {
-                    self.mutation(f, &mut reads)?;
+                    self.mutation(f, schema, &mut reads)?;
                 }
             }
         }
@@ -733,22 +324,37 @@ impl ExecutionLimits {
         }
     }
 
-    fn root(&self, root: &mut crate::ast::RootField, reads: &mut usize) -> Result<()> {
+    fn root(
+        &self,
+        root: &mut crate::ast::RootField,
+        schema: &Schema,
+        reads: &mut usize,
+    ) -> Result<()> {
         use crate::ast::RootBody;
         // Introspection answers from memory and reads no table.
         if matches!(root.body, RootBody::Introspection(_)) {
             return Ok(());
         }
         self.count_read(reads)?;
-        let list = matches!(root.body, RootBody::List { .. });
-        self.args(&mut root.args, list, reads, 0)?;
+        // An `_aggregate` root renders `LIMIT` like any list, and its `nodes`
+        // returns those rows — so the ceiling has to reach it, or appending
+        // `_aggregate` is all it takes to walk around one. A *default* is filled
+        // in only where `nodes` was selected: on `aggregate { count }` alone it
+        // would change the answer rather than bound the work.
+        let (cap, fill_default) = match &root.body {
+            RootBody::List { .. } => (true, true),
+            RootBody::Aggregate { nodes, .. } => (true, nodes.is_some()),
+            RootBody::ByPk { .. } | RootBody::Introspection(_) => (false, false),
+        };
+        let table = schema.table(&root.table);
+        self.args(&mut root.args, cap, fill_default, table, schema, reads, 0)?;
         match &mut root.body {
             RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
-                self.fields(selection, reads, 0)?;
+                self.fields(selection, table, schema, reads, 0)?;
             }
             RootBody::Aggregate { nodes, .. } => {
                 if let Some(fields) = nodes.as_mut() {
-                    self.fields(fields, reads, 0)?;
+                    self.fields(fields, table, schema, reads, 0)?;
                 }
             }
             RootBody::Introspection(_) => {}
@@ -756,66 +362,140 @@ impl ExecutionLimits {
         Ok(())
     }
 
-    fn mutation(&self, mf: &mut crate::ast::MutationField, reads: &mut usize) -> Result<()> {
+    fn mutation(
+        &self,
+        mf: &mut crate::ast::MutationField,
+        schema: &Schema,
+        reads: &mut usize,
+    ) -> Result<()> {
         use crate::ast::MutationField;
         self.count_read(reads)?;
         match mf {
             MutationField::Insert {
-                objects, returning, ..
+                table,
+                objects,
+                on_conflict,
+                returning,
+                scope_check,
+                ..
             } => {
-                for o in objects.iter() {
-                    self.insert_object(o, reads)?;
+                let t = schema.table(table);
+                self.insert_batch(objects, reads)?;
+                if let Some(w) = on_conflict.as_mut().and_then(|oc| oc.where_.as_mut()) {
+                    self.bool_expr(w, reads, 0)?;
                 }
-                self.fields(returning, reads, 0)?;
+                self.predicate(scope_check, reads)?;
+                self.fields(returning, t, schema, reads, 0)?;
             }
             MutationField::Update {
-                where_, returning, ..
-            }
-            | MutationField::Delete {
-                where_, returning, ..
+                table,
+                where_,
+                returning,
+                scope_check,
+                ..
             } => {
-                self.bool_expr(where_, reads)?;
-                self.fields(returning, reads, 0)?;
+                let t = schema.table(table);
+                self.bool_expr(where_, reads, 0)?;
+                self.predicate(scope_check, reads)?;
+                self.fields(returning, t, schema, reads, 0)?;
             }
-            MutationField::UpdateByPk { selection, .. }
-            | MutationField::DeleteByPk { selection, .. } => {
-                self.fields(selection, reads, 0)?;
+            MutationField::Delete {
+                table,
+                where_,
+                returning,
+                ..
+            } => {
+                let t = schema.table(table);
+                self.bool_expr(where_, reads, 0)?;
+                self.fields(returning, t, schema, reads, 0)?;
+            }
+            MutationField::UpdateByPk {
+                table,
+                selection,
+                scope,
+                ..
+            }
+            | MutationField::DeleteByPk {
+                table,
+                selection,
+                scope,
+                ..
+            } => {
+                let t = schema.table(table);
+                self.predicate(scope, reads)?;
+                self.fields(selection, t, schema, reads, 0)?;
             }
         }
         Ok(())
     }
 
-    fn insert_object(&self, obj: &crate::ast::InsertObject, reads: &mut usize) -> Result<()> {
-        for nested in obj.nested_arrays.values() {
-            self.count_read(reads)?;
-            for row in &nested.rows {
-                self.insert_object(row, reads)?;
+    /// A predicate injected before this pass runs — a scope check, an
+    /// `on_conflict` filter — can carry a relation chain of its own, which
+    /// renders as `EXISTS` like any other.
+    fn predicate(&self, pred: &mut Option<crate::ast::BoolExpr>, reads: &mut usize) -> Result<()> {
+        match pred.as_mut() {
+            Some(p) => self.bool_expr(p, reads, 0),
+            None => Ok(()),
+        }
+    }
+
+    /// Nested inserts are counted per distinct relation, not per row.
+    ///
+    /// The renderer batches every parent row's children into one CTE per
+    /// relation name, so counting per row made a fifty-row bulk insert look like
+    /// fifty subqueries when it renders two — and rejected it.
+    fn insert_batch(&self, objects: &[crate::ast::InsertObject], reads: &mut usize) -> Result<()> {
+        use std::collections::BTreeMap;
+
+        let mut children: BTreeMap<(&str, bool), Vec<&crate::ast::InsertObject>> = BTreeMap::new();
+        for o in objects {
+            for (name, nested) in &o.nested_arrays {
+                children
+                    .entry((name, true))
+                    .or_default()
+                    .extend(nested.rows.iter());
+            }
+            for (name, nested) in &o.nested_objects {
+                children.entry((name, false)).or_default().push(&nested.row);
             }
         }
-        for nested in obj.nested_objects.values() {
+        for rows in children.into_values() {
             self.count_read(reads)?;
-            self.insert_object(&nested.row, reads)?;
+            let owned: Vec<crate::ast::InsertObject> = rows.into_iter().cloned().collect();
+            self.insert_batch(&owned, reads)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn args(
         &self,
         args: &mut crate::ast::QueryArgs,
-        list: bool,
+        cap: bool,
+        fill_default: bool,
+        table: Option<&std::sync::Arc<crate::schema::Table>>,
+        schema: &Schema,
         reads: &mut usize,
         depth: usize,
     ) -> Result<()> {
         if let Some(w) = args.where_.as_mut() {
-            self.bool_expr(w, reads)?;
+            self.bool_expr(w, reads, depth)?;
         }
-        // An `order_by` that walks a relation reads that relation's table.
-        for ob in &args.order_by {
-            for _ in &ob.path {
+        // An `order_by` that walks relations reads each one's table and nests one
+        // correlated subquery per hop, so the chain answers to the depth limit
+        // exactly as a selection does.
+        for ob in &mut args.order_by {
+            self.check_depth(depth + ob.path.len())?;
+            for hop in &mut ob.path {
                 self.count_read(reads)?;
+                // `apply_scope` fills these in, and a scope predicate can carry
+                // a relation chain of its own.
+                if let Some(filter) = hop.filter.as_mut() {
+                    self.bool_expr(filter, reads, depth)?;
+                }
             }
         }
-        if list {
+        if cap {
             use crate::ast::Count;
             match args.limit.as_mut() {
                 Some(Count::Lit(n) | Count::Bound(n)) => {
@@ -835,8 +515,10 @@ impl ExecutionLimits {
                     };
                 }
                 None => {
-                    if let Some(default) = self.default_limit {
-                        args.limit = Some(Count::Lit(default));
+                    if fill_default {
+                        if let Some(default) = self.default_limit {
+                            args.limit = Some(Count::Lit(default));
+                        }
                     }
                 }
             }
@@ -854,51 +536,625 @@ impl ExecutionLimits {
                 }
             }
         }
-        let _ = depth;
+        let _ = (table, schema);
         Ok(())
     }
 
     fn fields(
         &self,
         fields: &mut [crate::ast::Field],
+        table: Option<&std::sync::Arc<crate::schema::Table>>,
+        schema: &Schema,
         reads: &mut usize,
         depth: usize,
     ) -> Result<()> {
         for f in fields.iter_mut() {
             let crate::ast::Field::Relation {
-                args, selection, ..
+                name,
+                args,
+                selection,
+                ..
             } = f
             else {
                 continue;
             };
             self.count_read(reads)?;
             self.check_depth(depth + 1)?;
-            // Whether this relation returns many rows is not visible in the IR —
-            // the kind lives on the schema — so the default applies to any
-            // relation that carries list arguments at all. An object relation
-            // renders `row_to_json` over one row, where a `LIMIT` is harmless.
-            self.args(args, true, reads, depth + 1)?;
-            self.fields(selection, reads, depth + 1)?;
+            // Only an array relation may return many rows. An object relation
+            // renders `row_to_json` over a subquery the renderer caps at one
+            // row, and a default filled in here would replace that cap — turning
+            // a relation that matches two rows from a quiet single answer into a
+            // failed statement.
+            let rel = table.and_then(|t| t.find_relation(name));
+            let target = rel.and_then(|r| schema.table(&r.target_table));
+            let is_array = matches!(rel.map(|r| r.kind), Some(crate::schema::RelKind::Array));
+            self.args(args, true, is_array, target, schema, reads, depth + 1)?;
+            self.fields(selection, target, schema, reads, depth + 1)?;
         }
         Ok(())
     }
 
-    fn bool_expr(&self, expr: &mut crate::ast::BoolExpr, reads: &mut usize) -> Result<()> {
+    /// A relation inside a `where` renders as `EXISTS` and nests exactly the way
+    /// a selected relation does, so it answers to the same depth limit — which
+    /// is the whole reason that limit exists.
+    fn bool_expr(
+        &self,
+        expr: &mut crate::ast::BoolExpr,
+        reads: &mut usize,
+        depth: usize,
+    ) -> Result<()> {
         use crate::ast::BoolExpr;
         match expr {
             BoolExpr::And(parts) | BoolExpr::Or(parts) => {
                 for p in parts.iter_mut() {
-                    self.bool_expr(p, reads)?;
+                    self.bool_expr(p, reads, depth)?;
                 }
             }
-            BoolExpr::Not(inner) => self.bool_expr(inner, reads)?,
+            BoolExpr::Not(inner) => self.bool_expr(inner, reads, depth)?,
             BoolExpr::Relation { inner, .. } => {
-                // An EXISTS subquery reads a table like any other position.
                 self.count_read(reads)?;
-                self.bool_expr(inner, reads)?;
+                self.check_depth(depth + 1)?;
+                self.bool_expr(inner, reads, depth + 1)?;
             }
             BoolExpr::Compare { .. } | BoolExpr::IsNull { .. } | BoolExpr::InList { .. } => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth_of(source: &str) -> Result<()> {
+        ParseLimits::default().check(source)
+    }
+
+    #[test]
+    fn ordinary_queries_pass() {
+        depth_of("{ users { id name } }").unwrap();
+        depth_of(
+            r#"query($id: Int!) {
+                 users(where: {_and: [{id: {_eq: $id}}, {name: {_is_null: false}}]}) {
+                   id
+                   posts(order_by: [{id: asc}], limit: 5) { title comments { body } }
+                 }
+               }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deep_input_value_is_rejected() {
+        let q = format!(
+            "{{ users(where: {}{}{}) {{ id }} }}",
+            "{_not: ".repeat(2000),
+            "{id: {_eq: 1}}",
+            "}".repeat(2000)
+        );
+        let err = depth_of(&q).unwrap_err();
+        assert!(format!("{err}").contains("nests deeper"), "{err}");
+    }
+
+    #[test]
+    fn depth_is_counted_across_bracket_kinds() {
+        let limits = ParseLimits {
+            max_depth: 3,
+            ..Default::default()
+        };
+        limits.check("{ a(b: [1]) }").unwrap(); // { ( [  => 3
+        let err = limits.check("{ a(b: [[1]]) }").unwrap_err(); // => 4
+        assert!(format!("{err}").contains("nests deeper"), "{err}");
+    }
+
+    #[test]
+    fn brackets_inside_strings_do_not_count() {
+        let limits = ParseLimits {
+            max_depth: 2,
+            ..Default::default()
+        };
+        limits
+            .check(r#"{ users(where: "{{{{{{{{") { id } }"#)
+            .unwrap();
+        limits
+            .check(r#"{ users(where: "\"{{{{") { id } }"#)
+            .unwrap();
+        limits
+            .check("{ users(where: \"\"\"{{{{{{\"\"\") { id } }")
+            .unwrap();
+    }
+
+    #[test]
+    fn brackets_inside_comments_do_not_count() {
+        let limits = ParseLimits {
+            max_depth: 2,
+            ..Default::default()
+        };
+        limits.check("{ users { id } } # {{{{{{{{").unwrap();
+        limits.check("# {{{{\n{ users { id } }").unwrap();
+    }
+
+    #[test]
+    fn unterminated_string_is_left_to_the_parser() {
+        // No panic, no false rejection: the parser reports the syntax error.
+        ParseLimits::default()
+            .check(r#"{ users(name: "oops) { id } }"#)
+            .unwrap();
+    }
+
+    #[test]
+    fn oversized_document_is_rejected() {
+        let limits = ParseLimits {
+            max_bytes: 16,
+            ..Default::default()
+        };
+        let err = limits.check("{ users { id name active } }").unwrap_err();
+        assert!(format!("{err}").contains("over the 16-byte limit"), "{err}");
+    }
+
+    #[test]
+    fn unbounded_accepts_what_default_rejects() {
+        let q = format!("{}{}", "{a(b: [".repeat(100), "]) }".repeat(100));
+        assert!(ParseLimits::default().check(&q).is_err());
+        ParseLimits::unbounded().check(&q).unwrap();
+    }
+
+    #[test]
+    fn multibyte_text_does_not_confuse_the_scan() {
+        let limits = ParseLimits {
+            max_depth: 2,
+            ..Default::default()
+        };
+        limits
+            .check(r#"{ users(name: "中文｛括号｝") { id } }"#)
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+    use crate::ast::{Count, Operation};
+    use crate::schema::{PgType, Relation, Schema, Table};
+    use serde_json::json;
+
+    fn schema() -> Schema {
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build()
+    }
+
+    fn lower(q: &str) -> Operation {
+        crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap()
+    }
+
+    fn apply(q: &str, limits: ExecutionLimits) -> Result<Operation> {
+        let mut op = lower(q);
+        limits.apply(&mut op, &schema())?;
+        Ok(op)
+    }
+
+    fn limit_of(op: &Operation) -> Option<Count> {
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        roots[0].args.limit.clone()
+    }
+
+    #[test]
+    fn unbounded_limits_change_nothing() {
+        let op = apply("{ users { id } }", ExecutionLimits::new()).unwrap();
+        assert_eq!(limit_of(&op), None);
+    }
+
+    #[test]
+    fn default_limit_fills_in_a_list_that_asked_for_none() {
+        let op = apply("{ users { id } }", ExecutionLimits::new().default_limit(50)).unwrap();
+        assert_eq!(limit_of(&op), Some(Count::Lit(50)));
+    }
+
+    #[test]
+    fn default_limit_leaves_an_explicit_one_alone() {
+        let op = apply(
+            "{ users(limit: 3) { id } }",
+            ExecutionLimits::new().default_limit(50),
+        )
+        .unwrap();
+        assert_eq!(limit_of(&op), Some(Count::Lit(3)));
+    }
+
+    #[test]
+    fn default_limit_reaches_array_relations_too() {
+        let op = apply(
+            "{ users { posts { id } } }",
+            ExecutionLimits::new().default_limit(50),
+        )
+        .unwrap();
+        let Operation::Query(roots) = &op else {
+            panic!()
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!()
+        };
+        match &selection[0] {
+            crate::ast::Field::Relation { args, .. } => {
+                assert_eq!(args.limit, Some(Count::Lit(50)))
+            }
+            other => panic!("expected a relation, got {other:?}"),
+        }
+    }
+
+    /// An aggregate answers with one row however many it reads, and capping it
+    /// would quietly change what `count` counts.
+    #[test]
+    fn default_limit_does_not_touch_an_aggregate_or_a_by_pk() {
+        let op = apply(
+            "{ users_aggregate { aggregate { count } } }",
+            ExecutionLimits::new().default_limit(50),
+        )
+        .unwrap();
+        assert_eq!(limit_of(&op), None);
+
+        let op = apply(
+            "{ users_by_pk(id: 1) { id } }",
+            ExecutionLimits::new().default_limit(50),
+        )
+        .unwrap();
+        assert_eq!(limit_of(&op), None);
+    }
+
+    #[test]
+    fn max_limit_rejects_a_literal_over_the_ceiling() {
+        let err = apply(
+            "{ users(limit: 5000) { id } }",
+            ExecutionLimits::new().max_limit(100),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
+        apply(
+            "{ users(limit: 100) { id } }",
+            ExecutionLimits::new().max_limit(100),
+        )
+        .unwrap();
+    }
+
+    /// `limit: $n` has no value yet, so the ceiling has to travel with it.
+    #[test]
+    fn max_limit_follows_a_variable_to_where_it_resolves() {
+        // Symbolic lowering: eager lowering would substitute the value and leave
+        // no variable for a ceiling to travel with.
+        let doc =
+            crate::parser::parse_document("query($n: Int) { users(limit: $n) { id } }").unwrap();
+        let mut op =
+            crate::parser::lower_with(&doc, crate::parser::Bindings::Symbolic, None, &schema())
+                .unwrap();
+        ExecutionLimits::new()
+            .max_limit(100)
+            .apply(&mut op, &schema())
+            .unwrap();
+
+        let Operation::Query(roots) = &op else {
+            panic!()
+        };
+        let count = roots[0].args.limit.clone().unwrap();
+        let over = json!({"n": 5000});
+        let err = count
+            .resolve(&crate::types::Inputs::variables(&over), "users.limit")
+            .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
+
+        let ok = json!({"n": 5});
+        assert_eq!(
+            count
+                .resolve(&crate::types::Inputs::variables(&ok), "users.limit")
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn bind_row_counts_moves_literals_out_of_the_sql() {
+        let schema = schema();
+        let render = |limits: ExecutionLimits| {
+            let mut op = lower("{ users(limit: 10, offset: 5) { id } }");
+            limits.apply(&mut op, &schema).unwrap();
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap()
+        };
+
+        // Default: inline, and the statement reads the way the query does.
+        let (sql, binds) = render(ExecutionLimits::new());
+        assert!(sql.contains("LIMIT 10"), "{sql}");
+        assert!(sql.contains("OFFSET 5"), "{sql}");
+        assert!(binds.is_empty(), "{binds:?}");
+
+        // Bound: one statement whatever the numbers, and they travel as binds.
+        let (sql, binds) = render(ExecutionLimits::new().bind_row_counts(true));
+        assert!(!sql.contains("LIMIT 10"), "{sql}");
+        assert!(sql.contains("LIMIT $"), "{sql}");
+        assert!(sql.contains("OFFSET $"), "{sql}");
+        assert_eq!(
+            binds,
+            vec![crate::types::Bind::Int8(10), crate::types::Bind::Int8(5)]
+        );
+    }
+
+    /// The point of the option: two page sizes, one statement.
+    #[test]
+    fn bound_row_counts_give_every_page_size_the_same_sql() {
+        let schema = schema();
+        let limits = ExecutionLimits::new().bind_row_counts(true);
+        let sql_for = |n: u64| {
+            let mut op = lower(&format!("{{ users(limit: {n}) {{ id }} }}"));
+            limits.apply(&mut op, &schema).unwrap();
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
+                .unwrap()
+                .0
+        };
+        assert_eq!(sql_for(1), sql_for(1000));
+    }
+
+    #[test]
+    fn a_default_limit_is_bound_too_when_asked() {
+        let schema = schema();
+        let mut op = lower("{ users { id } }");
+        ExecutionLimits::new()
+            .default_limit(25)
+            .bind_row_counts(true)
+            .apply(&mut op, &schema)
+            .unwrap();
+        let (sql, binds) =
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap();
+        assert!(sql.contains("LIMIT $"), "{sql}");
+        assert_eq!(binds, vec![crate::types::Bind::Int8(25)]);
+    }
+
+    #[test]
+    fn a_bound_count_is_still_subject_to_the_ceiling() {
+        let err = apply(
+            "{ users(limit: 500) { id } }",
+            ExecutionLimits::new().max_limit(100).bind_row_counts(true),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 100"), "{err}");
+    }
+
+    /// `_aggregate` renders `LIMIT` and its `nodes` returns those rows, so a
+    /// ceiling that stopped at `RootBody::List` was one suffix away from being
+    /// bypassed entirely.
+    #[test]
+    fn an_aggregate_root_answers_to_the_row_ceiling() {
+        let err = apply(
+            "{ users_aggregate(limit: 100000) { nodes { id } } }",
+            ExecutionLimits::new().max_limit(10),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 10"), "{err}");
+
+        // Through a variable too.
+        let doc = crate::parser::parse_document(
+            "query($n: Int) { users_aggregate(limit: $n) { nodes { id } } }",
+        )
+        .unwrap();
+        let mut op =
+            crate::parser::lower_with(&doc, crate::parser::Bindings::Symbolic, None, &schema())
+                .unwrap();
+        ExecutionLimits::new()
+            .max_limit(10)
+            .apply(&mut op, &schema())
+            .unwrap();
+        let Operation::Query(roots) = &op else {
+            panic!()
+        };
+        let over = json!({"n": 999});
+        let err = roots[0]
+            .args
+            .limit
+            .clone()
+            .unwrap()
+            .resolve(&crate::types::Inputs::variables(&over), "limit")
+            .unwrap_err();
+        assert!(format!("{err}").contains("over the limit of 10"), "{err}");
+    }
+
+    #[test]
+    fn a_default_limit_bounds_aggregate_nodes_but_not_a_bare_count() {
+        // `nodes` returns rows, so it is bounded…
+        let op = apply(
+            "{ users_aggregate { nodes { id } } }",
+            ExecutionLimits::new().default_limit(25),
+        )
+        .unwrap();
+        assert_eq!(limit_of(&op), Some(Count::Lit(25)));
+
+        // …while a count alone would have its answer changed, not its cost.
+        let op = apply(
+            "{ users_aggregate { aggregate { count } } }",
+            ExecutionLimits::new().default_limit(25),
+        )
+        .unwrap();
+        assert_eq!(limit_of(&op), None);
+    }
+
+    /// An object relation renders `row_to_json` over a subquery the renderer
+    /// caps at one row. Filling a default in there replaces that cap, and a
+    /// relation matching two rows then fails the whole statement.
+    #[test]
+    fn a_default_limit_leaves_object_relations_alone() {
+        let op = apply(
+            "{ posts { id user { id } } }",
+            ExecutionLimits::new().default_limit(50),
+        )
+        .unwrap();
+        let Operation::Query(roots) = &op else {
+            panic!()
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!()
+        };
+        let rel = selection
+            .iter()
+            .find_map(|f| match f {
+                crate::ast::Field::Relation { name, args, .. } if name == "user" => Some(args),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(rel.limit, None, "the renderer's LIMIT 1 must survive");
+    }
+
+    /// The renderer batches every parent row's children into one CTE per
+    /// relation, so counting per row rejected ordinary bulk inserts.
+    #[test]
+    fn a_bulk_insert_counts_relations_not_rows() {
+        let rows: String = (0..50)
+            .map(|i| format!("{{id: {i}, posts: {{data: [{{id: {i}}}]}}}}, "))
+            .collect();
+        let mut op = crate::parser::parse_and_lower(
+            &format!("mutation {{ insert_users(objects: [{rows}]) {{ affected_rows }} }}"),
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        // One read for the insert, one for the batched `posts` CTE.
+        ExecutionLimits::new()
+            .max_table_reads(2)
+            .apply(&mut op, &schema())
+            .unwrap();
+    }
+
+    #[test]
+    fn relation_depth_is_checked_in_where_chains_and_order_by_paths() {
+        let limits = ExecutionLimits::new().max_relation_depth(2);
+        // EXISTS nests one correlated subquery per hop, same as a selection.
+        let err = apply(
+            "{ users(where: {posts: {user: {posts: {id: {_gt: 1}}}}}) { id } }",
+            limits,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("deeper than the limit of 2"),
+            "{err}"
+        );
+        apply(
+            "{ users(where: {posts: {user: {id: {_gt: 1}}}}) { id } }",
+            limits,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_on_conflict_filter_counts_as_a_read() {
+        let mut op = crate::parser::parse_and_lower(
+            r#"mutation { insert_users(objects: [{id: 1}], on_conflict: {
+                 constraint: "users_pkey", update_columns: ["id"],
+                 where: {posts: {id: {_gt: 1}}}
+               }) { affected_rows } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let err = ExecutionLimits::new()
+            .max_table_reads(1)
+            .apply(&mut op, &schema())
+            .unwrap_err();
+        assert!(format!("{err}").contains("table positions"), "{err}");
+    }
+
+    #[test]
+    fn max_relation_depth_counts_relation_hops() {
+        let limits = ExecutionLimits::new().max_relation_depth(2);
+        apply("{ users { posts { user { id } } } }", limits).unwrap();
+        let err = apply("{ users { posts { user { posts { id } } } } }", limits).unwrap_err();
+        assert!(
+            format!("{err}").contains("deeper than the limit of 2"),
+            "{err}"
+        );
+    }
+
+    /// Breadth is the other half: two hundred aliases of one relation nest one
+    /// level and render two hundred correlated subqueries.
+    #[test]
+    fn max_table_reads_counts_breadth_not_just_depth() {
+        let inner: String = (0..20).map(|i| format!("a{i}: posts {{ id }} ")).collect();
+        let q = format!("{{ users {{ {inner} }} }}");
+        let err = apply(&q, ExecutionLimits::new().max_table_reads(10)).unwrap_err();
+        assert!(
+            format!("{err}").contains("more than 10 table positions"),
+            "{err}"
+        );
+        apply(&q, ExecutionLimits::new().max_table_reads(21)).unwrap();
+    }
+
+    #[test]
+    fn an_exists_filter_and_an_order_by_hop_count_as_reads() {
+        // root + EXISTS
+        let err = apply(
+            "{ users(where: {posts: {id: {_gt: 1}}}) { id } }",
+            ExecutionLimits::new().max_table_reads(1),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("table positions"), "{err}");
+
+        // root + order_by hop
+        let err = apply(
+            "{ posts(order_by: [{user: {id: asc}}]) { id } }",
+            ExecutionLimits::new().max_table_reads(1),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("table positions"), "{err}");
+    }
+
+    #[test]
+    fn introspection_reads_no_table() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .enable_introspection()
+            .build();
+        let mut op = crate::parser::parse_and_lower(
+            "{ __type(name: \"users\") { name } }",
+            &json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
+        ExecutionLimits::new()
+            .max_table_reads(0)
+            .apply(&mut op, &schema)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_nested_insert_counts_every_level() {
+        let op = crate::parser::parse_and_lower(
+            r#"mutation { insert_users(objects: [{id: 1, posts: {data: [{id: 2}]}}]) {
+                 affected_rows } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        );
+        let mut op = op.unwrap();
+        // The parent plus its nested child.
+        let err = ExecutionLimits::new()
+            .max_table_reads(1)
+            .apply(&mut op, &schema())
+            .unwrap_err();
+        assert!(format!("{err}").contains("table positions"), "{err}");
     }
 }

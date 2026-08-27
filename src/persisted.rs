@@ -92,10 +92,26 @@ impl QueryRegistry {
     }
 
     /// Compile `source` and store it under `key`.
+    ///
+    /// A key already taken is an error. A registry assembled from a directory of
+    /// files, or from two lists merged, would otherwise keep whichever document
+    /// came last and serve *that* under the key — the wrong query, silently, in
+    /// the one structure whose entire purpose is to be certain which queries can
+    /// run. Use [`QueryRegistry::replace`] where overwriting is meant.
     pub fn insert(&mut self, engine: &Engine, key: impl Into<String>, source: &str) -> Result<()> {
         let key = key.into();
+        self.vacant(&key)?;
         let compiled = engine.compile(source).map_err(|e| label(&key, e))?;
         self.queries.insert(key, compiled);
+        Ok(())
+    }
+
+    fn vacant(&self, key: &str) -> Result<()> {
+        if self.queries.contains_key(key) {
+            return Err(Error::Schema(format!(
+                "persisted query '{key}': a query is already registered under this key"
+            )));
+        }
         Ok(())
     }
 
@@ -108,6 +124,7 @@ impl QueryRegistry {
         policy: &ScopePolicy,
     ) -> Result<()> {
         let key = key.into();
+        self.vacant(&key)?;
         let compiled = engine
             .compile_scoped(source, policy)
             .map_err(|e| label(&key, e))?;
@@ -115,8 +132,19 @@ impl QueryRegistry {
         Ok(())
     }
 
-    /// Store an already-compiled statement.
-    pub fn add(&mut self, key: impl Into<String>, compiled: CompiledQuery) {
+    /// Store an already-compiled statement. Refuses a key already taken, for the
+    /// reason [`QueryRegistry::insert`] gives.
+    pub fn add(&mut self, key: impl Into<String>, compiled: CompiledQuery) -> Result<()> {
+        let key = key.into();
+        self.vacant(&key)?;
+        self.queries.insert(key, compiled);
+        Ok(())
+    }
+
+    /// Store under `key`, replacing whatever was there. For a caller that means
+    /// to overwrite — a hot reload, a test — rather than one that collided by
+    /// accident.
+    pub fn replace(&mut self, key: impl Into<String>, compiled: CompiledQuery) {
         self.queries.insert(key.into(), compiled);
     }
 
@@ -257,6 +285,24 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err}").contains("shape:"), "{err}");
         assert!(matches!(err, Error::NotCompilable { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_key_is_refused_rather_than_overwritten() {
+        let engine = engine();
+        let err = QueryRegistry::compile_all(
+            &engine,
+            [("list", "{ users { id } }"), ("list", "{ users { name } }")],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("already registered"), "{err}");
+
+        // …unless the caller says so.
+        let mut reg = QueryRegistry::new();
+        reg.insert(&engine, "list", "{ users { id } }").unwrap();
+        let other = engine.compile("{ users { name } }").unwrap();
+        reg.replace("list", other);
+        assert_eq!(reg.len(), 1);
     }
 
     #[tokio::test]

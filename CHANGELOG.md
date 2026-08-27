@@ -52,6 +52,9 @@ used to be silent, so read **Breaking** before upgrading.
   `sdl --check` would keep certifying it. Reached by hiding a primary key
   column. Same for a table whose every column is hidden, which is now skipped
   entirely, along with any relation pointing at it.
+- **`on_conflict`'s `where` was lowered against an empty schema**, so a relation
+  predicate in it failed with "relation target table missing" — the wrong cause,
+  and the shape was unwritable.
 - **Directives were read by nobody.** `field @include(if: false)` came back
   included. No directive is implemented, so a document carrying one is now
   rejected — which is also what makes the empty directive list in the

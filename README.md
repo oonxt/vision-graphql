@@ -751,15 +751,20 @@ each relation at any depth, each `EXISTS` filter inside a `where`, each
 statement will carry, and the thing a hundred aliases of one relation inflates
 while leaving depth at 1.
 
-`default_limit` reaches root lists and array relations. Not `_by_pk` or object
-relations, which are one row by construction, and **not aggregates** — capping
-one would change what `count` counts rather than what it costs. It is the one
-limit here that silently changes an answer, which is the trade it exists to
-make; a client that needs to know whether more rows exist should ask
-`_aggregate { count }`.
+`default_limit` reaches root lists and array relations, and an `_aggregate`
+that selects `nodes` — those rows are rows like any other. Not `_by_pk`, not
+object relations (one row by construction; a limit there would replace the
+`LIMIT 1` the renderer needs), and not an `_aggregate` selecting only
+`aggregate { … }`, where a cap would change what `count` counts rather than
+what it costs. It is the one limit here that silently changes an answer, which
+is the trade it exists to make; a client that needs to know whether more rows
+exist should ask `_aggregate { count }` as its own root field.
 
-`max_limit` refuses rather than clamps. A truncated answer that looks complete
-is the failure worth avoiding.
+`max_limit` reaches every position that renders a `LIMIT`, `_aggregate`
+included — a ceiling one suffix could walk around would not be one.
+
+It refuses rather than clamps. A truncated answer that looks complete is the
+failure worth avoiding.
 
 ### Prepared statements and page size
 

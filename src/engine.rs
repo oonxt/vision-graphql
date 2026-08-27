@@ -56,7 +56,7 @@ fn prepare(
     schema: &Schema,
     limits: &ExecutionLimits,
 ) -> Result<(String, Vec<crate::types::Bind>)> {
-    limits.apply(op)?;
+    limits.apply(op, schema)?;
     render_now(op, schema, &Inputs::none())
 }
 
@@ -233,7 +233,7 @@ impl Engine {
         if let Some(policy) = policy {
             apply_scope(&mut op, &policy.symbolic(), &self.schema)?;
         }
-        self.limits.apply(&mut op)?;
+        self.limits.apply(&mut op, &self.schema)?;
         let root_alias = single_root_alias(&op).map(String::from);
         let (sql, specs) = render(&op, &self.schema)?;
         Ok(CompiledQuery {

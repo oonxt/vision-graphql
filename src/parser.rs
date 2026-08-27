@@ -1061,6 +1061,7 @@ fn parse_insert_args(
                 on_conflict = Some(parse_on_conflict(
                     &json,
                     table,
+                    schema,
                     &format!("{parent_path}.on_conflict"),
                 )?);
             }
@@ -1226,6 +1227,7 @@ fn parse_insert_object(
                         Some(parse_on_conflict(
                             oc_json,
                             target,
+                            schema,
                             &format!("{path}.{k}.on_conflict"),
                         )?)
                     } else {
@@ -1324,6 +1326,7 @@ fn parse_insert_object(
                         Some(parse_on_conflict(
                             oc_json,
                             target,
+                            schema,
                             &format!("{path}.{k}.on_conflict"),
                         )?)
                     } else {
@@ -1422,7 +1425,12 @@ fn gql_object_to_val_map(
     Ok(out)
 }
 
-fn parse_on_conflict(json: &Value, table: &Table, path: &str) -> Result<crate::ast::OnConflict> {
+fn parse_on_conflict(
+    json: &Value,
+    table: &Table,
+    schema: &Schema,
+    path: &str,
+) -> Result<crate::ast::OnConflict> {
     let obj = json.as_object().ok_or_else(|| Error::Validate {
         path: path.into(),
         message: "expected object".into(),
@@ -1461,7 +1469,11 @@ fn parse_on_conflict(json: &Value, table: &Table, path: &str) -> Result<crate::a
             lower_where(
                 &json_to_gql(w),
                 table,
-                &Schema::builder().build(),
+                // The real schema: an empty one made a relation predicate here
+                // fail with "relation target table missing", which named the
+                // wrong cause and made `on_conflict: { where: { rel: … } }`
+                // impossible to write.
+                schema,
                 // `w` came from `gql_to_json`, so every variable in it is
                 // already substituted and the mode cannot matter.
                 Bindings::Eager(&Value::Null),
@@ -3623,6 +3635,33 @@ mod tests {
                     response_typenames,
                     &vec!["__typename".to_string(), "t".to_string()]
                 );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    /// `on_conflict.where` used to be lowered against an empty schema, so a
+    /// relation predicate failed with "relation target table missing" — naming
+    /// the wrong cause, and making the shape unwritable.
+    #[test]
+    fn an_on_conflict_where_may_walk_a_relation() {
+        let op = parse_and_lower(
+            r#"mutation { insert_users(objects: [{id: 1}], on_conflict: {
+                 constraint: "users_pkey", update_columns: ["id"],
+                 where: {posts: {id: {_gt: 1}}}
+               }) { affected_rows } }"#,
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Mutation(fields) = op else {
+            panic!("expected Mutation");
+        };
+        match &fields[0] {
+            crate::ast::MutationField::Insert { on_conflict, .. } => {
+                let w = on_conflict.as_ref().unwrap().where_.as_ref().unwrap();
+                assert!(matches!(w, BoolExpr::Relation { name, .. } if name == "posts"));
             }
             other => panic!("expected Insert, got {other:?}"),
         }
