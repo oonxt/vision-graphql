@@ -1,21 +1,12 @@
 use std::process::Command;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 
-async fn boot_pg() -> (
-    String, // DATABASE_URL
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+mod common;
 
-    // Seed a tiny schema.
-    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+async fn boot_pg() -> String {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    let url = db.url.clone();
+
     sqlx::raw_sql(
         r#"
         CREATE TABLE users (
@@ -38,13 +29,12 @@ async fn boot_pg() -> (
     .await
     .expect("seed");
     pool.close().await;
-
-    (url, container)
+    url
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_to_stdout_includes_all_tables() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let bin = env!("CARGO_BIN_EXE_vision-gql");
     let out = Command::new(bin)
         .args(["generate", "--url", &url])
@@ -63,7 +53,7 @@ async fn generate_to_stdout_includes_all_tables() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_ignore_tables_filters() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let bin = env!("CARGO_BIN_EXE_vision-gql");
     let out = Command::new(bin)
         .args(["generate", "--url", &url, "--ignore-tables", "audit_*"])
@@ -80,7 +70,7 @@ async fn generate_ignore_tables_filters() {
 /// the raw table name would silently match nothing for the prefixed schema.
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_reads_multiple_schemas_and_keys_stanzas_by_exposed_name() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     sqlx::raw_sql(
         r#"
@@ -122,7 +112,7 @@ async fn generate_reads_multiple_schemas_and_keys_stanzas_by_exposed_name() {
 /// Without `--schema`, nothing changes: `public` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_defaults_to_public_only() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     sqlx::raw_sql("CREATE SCHEMA audit; CREATE TABLE audit.ghosts (id SERIAL PRIMARY KEY);")
         .execute(&pool)
@@ -145,7 +135,7 @@ async fn generate_defaults_to_public_only() {
 /// that lacks one is a query-time Postgres error — `diff` has to catch it.
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_catches_repoint_to_table_missing_columns() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     sqlx::raw_sql(
         r#"
@@ -193,7 +183,7 @@ async fn diff_catches_repoint_to_table_missing_columns() {
 /// not check rather than either passing silently or inventing drift.
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_reports_unverifiable_repoint_without_failing() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let p = write_temp_toml(
         "repoint_unverified.toml",
         r#"
@@ -217,17 +207,33 @@ async fn diff_reports_unverifiable_repoint_without_failing() {
     let _ = std::fs::remove_file(&p);
 }
 
-fn write_temp_toml(name: &str, contents: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("vision-gql-e2e-{}", std::process::id()));
+/// A directory nobody else writes into.
+///
+/// It used to be one directory per process, shared by every test — and one of
+/// them removed it when it was done, which deleted the files the tests running
+/// beside it were about to read. That failure looks exactly like a flaky
+/// container and is not one.
+fn temp_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "vision-gql-e2e-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join(name);
+    dir
+}
+
+fn write_temp_toml(name: &str, contents: &str) -> std::path::PathBuf {
+    let p = temp_dir().join(name);
     std::fs::write(&p, contents).unwrap();
     p
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_clean_overlay_exits_zero() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let p = write_temp_toml(
         "clean.toml",
         r#"
@@ -252,7 +258,7 @@ async fn diff_clean_overlay_exits_zero() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_stale_hide_column_exits_one() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let p = write_temp_toml(
         "stale.toml",
         r#"
@@ -273,7 +279,7 @@ async fn diff_stale_hide_column_exits_one() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_json_format_exits_one_with_machine_output() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let p = write_temp_toml(
         "stale_json.toml",
         r#"
@@ -302,7 +308,7 @@ async fn diff_json_format_exits_one_with_machine_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_ignore_tables_filters_findings() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let p = write_temp_toml(
         "ignored.toml",
         r#"
@@ -329,10 +335,9 @@ async fn diff_ignore_tables_filters_findings() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_force_required_to_overwrite() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let bin = env!("CARGO_BIN_EXE_vision-gql");
-    let dir = std::env::temp_dir().join(format!("vision-gql-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir();
     let path = dir.join("schema.toml");
 
     let out = Command::new(bin)
@@ -421,7 +426,7 @@ fn missing_url_and_env_exits_two() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sdl_renders_the_exposed_schema_and_honours_the_overlay() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let bin = env!("CARGO_BIN_EXE_vision-gql");
 
     let out = Command::new(bin)
@@ -468,11 +473,9 @@ async fn sdl_renders_the_exposed_schema_and_honours_the_overlay() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sdl_check_exits_one_when_the_file_is_stale() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let bin = env!("CARGO_BIN_EXE_vision-gql");
-    let dir = std::env::temp_dir().join(format!("vision-gql-sdl-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("schema.graphql");
+    let path = temp_dir().join("schema.graphql");
 
     let out = Command::new(bin)
         .args([
@@ -532,7 +535,7 @@ async fn sdl_check_exits_one_when_the_file_is_stale() {
 /// from the outside — `diff` is where that hole gets said out loud.
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_reports_columns_with_no_type_mapping() {
-    let (url, _c) = boot_pg().await;
+    let url = boot_pg().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect(&url)
         .await

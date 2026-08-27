@@ -3,10 +3,10 @@
 //! explicit casts so the server converts them.
 
 use serde_json::json;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 const UUID_A: &str = "11111111-1111-1111-1111-111111111111";
 const UUID_B: &str = "22222222-2222-2222-2222-222222222222";
@@ -25,23 +25,9 @@ fn events_schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         r#"
@@ -61,12 +47,12 @@ async fn setup() -> (
     .await
     .expect("seed");
 
-    (Engine::new(pool, events_schema()), container)
+    (Engine::new(pool, events_schema()), db)
 }
 
 #[tokio::test]
 async fn filter_by_uuid_eq() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             r#"query { events(where: {ext_id: {_eq: "11111111-1111-1111-1111-111111111111"}}) { id ext_id } }"#,
@@ -79,7 +65,7 @@ async fn filter_by_uuid_eq() {
 
 #[tokio::test]
 async fn filter_by_timestamptz_gt() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             r#"query { events(where: {created_at: {_gt: "2026-02-01T00:00:00Z"}}) { id } }"#,
@@ -92,7 +78,7 @@ async fn filter_by_timestamptz_gt() {
 
 #[tokio::test]
 async fn filter_by_numeric_gt() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             r#"query { events(where: {amount: {_gt: "50"}}) { id } }"#,
@@ -105,7 +91,7 @@ async fn filter_by_numeric_gt() {
 
 #[tokio::test]
 async fn insert_with_stringly_types() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             r#"
@@ -138,7 +124,7 @@ async fn insert_with_stringly_types() {
 
 #[tokio::test]
 async fn read_jsonb_subkey_with_path_and_alias() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             r#"query { events(where: {id: {_eq: 1}}) { id abundance: meta(path: "k") } }"#,
@@ -152,7 +138,7 @@ async fn read_jsonb_subkey_with_path_and_alias() {
 
 #[tokio::test]
 async fn read_jsonb_nested_path_cascades_and_indexes() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     engine
         .query(
             r#"
@@ -190,7 +176,7 @@ async fn read_jsonb_nested_path_cascades_and_indexes() {
 
 #[tokio::test]
 async fn filter_uuid_in_list() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let res = engine
         .query(
             &format!(r#"query {{ events(where: {{ext_id: {{_in: ["{UUID_A}", "{UUID_B}"]}}}}, order_by: {{id: asc}}) {{ id }} }}"#),
@@ -206,18 +192,8 @@ async fn filter_uuid_in_list() {
 /// `character(n)`.
 #[tokio::test]
 async fn smallint_and_char_are_readable_and_writable() {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE items (
                id SERIAL PRIMARY KEY,
@@ -299,18 +275,8 @@ async fn smallint_and_char_are_readable_and_writable() {
 /// `vision-gql diff` can say so instead of leaving the hole invisible.
 #[tokio::test]
 async fn an_unmappable_column_is_recorded_rather_than_only_logged() {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         "CREATE TABLE items (id SERIAL PRIMARY KEY, tags TEXT[], blob BYTEA, span INTERVAL);",
     )
@@ -344,18 +310,8 @@ async fn an_unmappable_column_is_recorded_rather_than_only_logged() {
 /// strings for no benefit.
 #[tokio::test]
 async fn numeric_accepts_the_json_numbers_it_returns() {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE items (id SERIAL PRIMARY KEY, price NUMERIC(12,2));
            INSERT INTO items (price) VALUES (12.34), (99.99);"#,

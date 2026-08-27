@@ -5,12 +5,12 @@
 //! users ←(user_id) orders ←(order_id) samples, plus a public lookup table.
 
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::ast::{BoolExpr, CmpOp};
 use vision_graphql::predicate::{col, principal, rel};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, Mutation, Query, ScopePolicy, ScopeSet};
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -50,23 +50,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -95,7 +81,7 @@ async fn setup() -> (
     .expect("seed");
 
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 fn eq(column: &str, v: i64) -> BoolExpr {
@@ -125,7 +111,7 @@ fn user_scope(user_id: i64) -> ScopeSet {
 
 #[tokio::test]
 async fn root_select_is_filtered_to_owner() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .scoped(user_scope(1))
         .query("query { orders { id title } }", None)
@@ -140,7 +126,7 @@ async fn root_select_is_filtered_to_owner() {
 
 #[tokio::test]
 async fn relation_path_scope_filters_via_exists_chain() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .scoped(user_scope(2))
         .query("query { samples { serial } }", None)
@@ -153,7 +139,7 @@ async fn relation_path_scope_filters_via_exists_chain() {
 
 #[tokio::test]
 async fn nested_relation_selection_is_scoped_per_level() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // users root is scoped to self; nested orders/samples each carry their
     // own predicate too (defense in depth at every access point).
     let v: Value = engine
@@ -178,7 +164,7 @@ async fn nested_relation_selection_is_scoped_per_level() {
 
 #[tokio::test]
 async fn by_pk_outside_scope_returns_null() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scoped = engine.scoped(user_scope(1));
     let own: Value = scoped
         .query("query { orders_by_pk(id: 1) { id } }", None)
@@ -196,7 +182,7 @@ async fn by_pk_outside_scope_returns_null() {
 
 #[tokio::test]
 async fn aggregate_count_respects_scope() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .scoped(user_scope(1))
         .query("query { samples_aggregate { aggregate { count } } }", None)
@@ -211,7 +197,7 @@ async fn aggregate_count_respects_scope() {
 
 #[tokio::test]
 async fn exists_filter_target_is_scoped() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // bob probes "which users have orders" — the EXISTS target (orders) is
     // scoped to bob's rows, so alice (who has orders, but not bob's) is out.
     let v: Value = engine
@@ -229,7 +215,7 @@ async fn exists_filter_target_is_scoped() {
 
 #[tokio::test]
 async fn unlisted_table_is_denied() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scope = ScopeSet::new().unrestricted("adverts");
     let err = engine
         .scoped(scope)
@@ -241,7 +227,7 @@ async fn unlisted_table_is_denied() {
 
 #[tokio::test]
 async fn unrestricted_table_passes_through() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .scoped(user_scope(1))
         .query("query { adverts { id title } }", None)
@@ -252,7 +238,7 @@ async fn unrestricted_table_passes_through() {
 
 #[tokio::test]
 async fn scoped_insert_array_in_scope_succeeds() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // The array insert form (insert_orders) is scoped just like insert_one:
     // an in-scope row passes the post-insert guard.
     let v: Value = engine
@@ -272,7 +258,7 @@ async fn builder_path_and_run_as_are_scoped() {
     struct Order {
         id: i64,
     }
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let orders: Vec<Order> = engine
         .scoped(user_scope(2))
         .run_as(Query::from("orders").select(&["id"]))
@@ -284,7 +270,7 @@ async fn builder_path_and_run_as_are_scoped() {
 
 #[tokio::test]
 async fn transaction_cannot_escape_scope() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scoped = engine.scoped(user_scope(1));
     let (own_count, denied) = scoped
         .transaction(async |tx| {
@@ -320,7 +306,7 @@ async fn transaction_cannot_escape_scope() {
 
 #[tokio::test]
 async fn scoped_update_only_touches_owned_rows() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice (user 1) tries to retitle order 3 (bob's). The scope predicate
     // (user_id = 1) AND-s onto her where, so zero rows match.
     let v: Value = engine
@@ -362,7 +348,7 @@ async fn scoped_update_only_touches_owned_rows() {
 
 #[tokio::test]
 async fn scoped_update_by_pk_returns_null_for_foreign_row() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // by_pk on bob's order: PK matches but scope predicate does not → null.
     let v: Value = engine
         .scoped(user_scope(1))
@@ -390,7 +376,7 @@ async fn scoped_update_by_pk_returns_null_for_foreign_row() {
 
 #[tokio::test]
 async fn scoped_delete_cannot_remove_foreign_rows() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice deletes "all" samples she can reach via a broad predicate. samples'
     // scope is a Relation (reachable via her orders), so this also exercises a
     // Relation predicate inside a DELETE WHERE; only her 2 samples are eligible.
@@ -426,7 +412,7 @@ async fn scoped_delete_cannot_remove_foreign_rows() {
 
 #[tokio::test]
 async fn scoped_delete_by_pk_on_denied_table_fails_closed() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // samples is reachable, but a table absent from the set is denied outright.
     let scope = ScopeSet::new().allow("orders", eq("user_id", 1)); // samples absent
     let err = engine
@@ -439,7 +425,7 @@ async fn scoped_delete_by_pk_on_denied_table_fails_closed() {
 
 #[tokio::test]
 async fn scoped_insert_in_scope_succeeds() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice inserts an order owned by herself — satisfies the scope check.
     let v: Value = engine
         .scoped(user_scope(1))
@@ -455,7 +441,7 @@ async fn scoped_insert_in_scope_succeeds() {
 
 #[tokio::test]
 async fn scoped_insert_outside_scope_aborts() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice tries to insert an order owned by bob (user_id 2). The post-insert
     // check fails → the whole statement aborts and nothing is committed.
     let err = engine
@@ -482,7 +468,7 @@ async fn scoped_insert_outside_scope_aborts() {
 
 #[tokio::test]
 async fn scoped_insert_on_denied_table_fails_closed() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // samples is absent from this set → denied before any SQL runs.
     let scope = ScopeSet::new().allow("orders", eq("user_id", 1));
     let err = engine
@@ -513,7 +499,7 @@ fn nested_insert_scope() -> ScopeSet {
 
 #[tokio::test]
 async fn scoped_nested_insert_in_scope_succeeds() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .scoped(nested_insert_scope())
         .query(
@@ -538,7 +524,7 @@ async fn scoped_nested_insert_in_scope_succeeds() {
 
 #[tokio::test]
 async fn scoped_nested_insert_child_violation_aborts_everything() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // The child order is tagged outside the allowed prefix → the nested guard
     // aborts the whole statement; neither the user nor the order is committed.
     let err = engine
@@ -576,7 +562,7 @@ async fn scoped_nested_insert_child_violation_aborts_everything() {
 
 #[tokio::test]
 async fn scoped_update_cannot_move_row_out_of_scope() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice owns order 1. She tries to reassign it to bob (user_id 2). The
     // pre-image filter (user_id = 1) matches her own row, but the post-update
     // guard sees the new row with user_id = 2 → violation → whole stmt aborts.
@@ -618,7 +604,7 @@ async fn scoped_update_cannot_move_row_out_of_scope() {
 
 #[tokio::test]
 async fn scoped_update_by_pk_cannot_move_row_out_of_scope() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // alice's own order 2, reassigned to bob via _by_pk: PK + pre-image filter
     // match, but the post-update guard rejects the out-of-scope result.
     let err = engine
@@ -648,7 +634,7 @@ async fn scoped_update_by_pk_cannot_move_row_out_of_scope() {
 
 #[tokio::test]
 async fn scoped_upsert_cannot_overwrite_foreign_row() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // bob's order 3 exists. alice upserts on the orders pkey, trying to take it
     // over by setting user_id = 1 and a new title. The DO UPDATE WHERE applies
     // her scope (user_id = 1) to the EXISTING row (still user_id = 2) → the
@@ -683,7 +669,7 @@ async fn scoped_upsert_cannot_overwrite_foreign_row() {
 
 #[tokio::test]
 async fn scoped_nested_insert_denied_target_fails_closed() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // Parent allowed, but the nested target table `orders` is absent from the
     // set → denied at rewrite time, before any SQL runs.
     let scope = ScopeSet::new().unrestricted("users");
@@ -704,7 +690,7 @@ async fn scoped_nested_insert_denied_target_fails_closed() {
 
 #[tokio::test]
 async fn scope_policy_dsl_binds_per_principal() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("users", col("id").eq(principal()))
         .allow("orders", col("user_id").eq(principal()))
@@ -746,7 +732,7 @@ async fn scope_policy_validate_rejects_typo_at_build_time() {
 
 #[tokio::test]
 async fn scope_policy_from_toml_enforces() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let toml = r#"
         [tables.users]
         where = { id = { _eq = "$principal" } }
@@ -791,7 +777,7 @@ async fn scope_policy_from_toml_enforces() {
 /// happens to be spelled `order_by` instead of a selection set.
 #[tokio::test]
 async fn ordering_through_denied_relation_fails_closed() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scope = ScopeSet::new().unrestricted("orders"); // users absent => denied
 
     // Baseline: selecting the relation is denied.
@@ -818,7 +804,7 @@ async fn ordering_through_denied_relation_fails_closed() {
 /// `users`, which is denied, even though the intermediate `orders` is allowed.
 #[tokio::test]
 async fn ordering_through_denied_relation_fails_closed_at_any_hop() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scope = ScopeSet::new()
         .unrestricted("samples")
         .unrestricted("orders"); // users absent => denied at the second hop
@@ -846,7 +832,7 @@ async fn ordering_through_denied_relation_fails_closed_at_any_hop() {
 /// exactly the leak this asserts against.
 #[tokio::test]
 async fn ordering_through_restricted_relation_cannot_see_out_of_scope_rows() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let scope = ScopeSet::new()
         .unrestricted("orders")
         .allow("users", eq("id", 2)); // only bob is readable
@@ -884,18 +870,8 @@ async fn column_scope_holds_on_both_paths() {
     use vision_graphql::predicate::{col, principal, Principal};
     use vision_graphql::ScopePolicy;
 
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE staff (id SERIAL PRIMARY KEY, org INT NOT NULL, name TEXT, salary INT);
            INSERT INTO staff (org, name, salary) VALUES

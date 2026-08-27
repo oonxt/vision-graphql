@@ -3,6 +3,21 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **Two test-suite failures that looked like flaky tests and were not.** Every
+  integration test started a PostgreSQL container of its own — a hundred or so
+  per run — and Docker answered one of them with `PortNotExposed` about one run
+  in three. And one CLI test removed a temp directory that every other CLI test
+  wrote into, deleting files the tests beside it were about to read. Tests now
+  take a database rather than a container: point `TEST_DATABASE_URL` at a
+  PostgreSQL and the suite runs in about twelve seconds instead of a minute,
+  with each test still getting a database of its own. Without it a container is
+  still started per test, retried, and removed when the test ends. No library
+  code changed.
+
 ## 0.14.0 — 2026-08-27
 
 ### Added

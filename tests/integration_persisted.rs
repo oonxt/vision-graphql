@@ -1,26 +1,12 @@
 use serde_json::json;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::predicate::{col, principal, Principal};
 use vision_graphql::{Engine, QueryRegistry, Schema, ScopePolicy};
 
-async fn setup() -> (
-    Engine,
-    Schema,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+mod common;
+
+async fn setup() -> (Engine, Schema) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE users (id SERIAL PRIMARY KEY, owner INT NOT NULL, name TEXT);
            INSERT INTO users (owner, name) VALUES (1, 'a'), (1, 'b'), (2, 'c');"#,
@@ -33,12 +19,12 @@ async fn setup() -> (
         pool.clone(),
         Schema::introspect(&pool).await.unwrap().build(),
     );
-    (engine, schema, c)
+    (engine, schema)
 }
 
 #[tokio::test]
 async fn a_registry_compiled_at_startup_serves_requests_by_key() {
-    let (engine, _schema, _c) = setup().await;
+    let (engine, _schema) = setup().await;
     let registry = QueryRegistry::compile_all(
         &engine,
         [
@@ -67,7 +53,7 @@ async fn a_registry_compiled_at_startup_serves_requests_by_key() {
 
 #[tokio::test]
 async fn a_scoped_registry_serves_every_principal_from_one_statement() {
-    let (engine, schema, _c) = setup().await;
+    let (engine, schema) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("users", col("owner").eq(principal()))
         .validate(&schema)

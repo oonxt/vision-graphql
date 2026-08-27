@@ -11,27 +11,14 @@
 //!   `_by_pk` available.
 
 use serde_json::Value;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::Schema;
 use vision_graphql::Engine;
 
-async fn pool() -> (
-    sqlx::PgPool,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+mod common;
+
+async fn pool() -> (sqlx::PgPool, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -60,7 +47,7 @@ async fn pool() -> (
     .execute(&pool)
     .await
     .expect("seed");
-    (pool, container)
+    (pool, db)
 }
 
 async fn schema_with_config(pool: &sqlx::PgPool) -> Schema {
@@ -77,7 +64,7 @@ async fn schema_with_config(pool: &sqlx::PgPool) -> Schema {
 /// "unknown root field".
 #[tokio::test]
 async fn materialized_view_is_introspected_and_queryable() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
 
     let mv = schema
@@ -107,7 +94,7 @@ async fn materialized_view_is_introspected_and_queryable() {
 /// map and the column is silently dropped from the schema.
 #[tokio::test]
 async fn materialized_view_columns_with_type_modifiers_are_mapped() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let mv = schema.table("mv_user_stats").expect("matview");
 
@@ -137,7 +124,7 @@ async fn materialized_view_columns_with_type_modifiers_are_mapped() {
 /// so it must never be handed mutation roots.
 #[tokio::test]
 async fn materialized_view_rejects_writes() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     let engine = Engine::new(pool, schema);
 
@@ -156,7 +143,7 @@ async fn materialized_view_rejects_writes() {
 /// constraints for introspection to find.
 #[tokio::test]
 async fn by_pk_on_a_view_is_unavailable_until_declared() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = Schema::introspect(&pool).await.expect("introspect").build();
     assert!(
         schema
@@ -180,7 +167,7 @@ async fn by_pk_on_a_view_is_unavailable_until_declared() {
 /// plain view and a materialized one.
 #[tokio::test]
 async fn config_primary_key_enables_by_pk_on_views() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = schema_with_config(&pool).await;
 
     assert_eq!(
@@ -221,7 +208,7 @@ async fn config_primary_key_enables_by_pk_on_views() {
 /// are independent, and `update_<view>_by_pk` stays shut.
 #[tokio::test]
 async fn declaring_a_pk_does_not_make_a_view_writable() {
-    let (pool, _c) = pool().await;
+    let (pool, _db) = pool().await;
     let schema = schema_with_config(&pool).await;
     let engine = Engine::new(pool.clone(), schema);
 

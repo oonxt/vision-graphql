@@ -1,24 +1,13 @@
 use serde_json::json;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::limits::ExecutionLimits;
 use vision_graphql::{Engine, Query, Schema};
 
-async fn boot() -> (
-    String,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&url)
-        .await
-        .unwrap();
+mod common;
+
+async fn boot() -> (String, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    let url = db.url.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (id SERIAL PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id));
@@ -30,7 +19,7 @@ async fn boot() -> (
     .await
     .unwrap();
     pool.close().await;
-    (url, c)
+    (url, db)
 }
 
 async fn engine(url: &str, limits: ExecutionLimits) -> Engine {
@@ -44,7 +33,7 @@ async fn engine(url: &str, limits: ExecutionLimits) -> Engine {
 
 #[tokio::test]
 async fn default_limit_bounds_a_query_that_asked_for_nothing() {
-    let (url, _c) = boot().await;
+    let (url, _db) = boot().await;
     let e = engine(&url, ExecutionLimits::new().default_limit(10)).await;
 
     let v = e.query("{ users { id } }", None).await.unwrap();
@@ -86,7 +75,7 @@ async fn default_limit_bounds_a_query_that_asked_for_nothing() {
 
 #[tokio::test]
 async fn ceilings_are_refused_rather_than_silently_clamped() {
-    let (url, _c) = boot().await;
+    let (url, _db) = boot().await;
     let e = engine(
         &url,
         ExecutionLimits::new()
@@ -136,7 +125,7 @@ async fn ceilings_are_refused_rather_than_silently_clamped() {
 /// and nothing for the engine itself to implement. This is the test that says so.
 #[tokio::test]
 async fn a_connection_level_statement_timeout_governs_engine_queries() {
-    let (url, _c) = boot().await;
+    let (url, _db) = boot().await;
     let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_with(opts.options([("statement_timeout", "300ms")]))

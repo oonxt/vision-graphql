@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -16,23 +16,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -52,12 +38,12 @@ async fn setup() -> (
     .expect("seed");
 
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn aggregate_count_returns_row_count() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query("query { users_aggregate { aggregate { count } } }", None)
         .await
@@ -67,7 +53,7 @@ async fn aggregate_count_returns_row_count() {
 
 #[tokio::test]
 async fn aggregate_sum_and_avg() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate { aggregate { sum { score } avg { score } } } }",
@@ -84,7 +70,7 @@ async fn aggregate_sum_and_avg() {
 
 #[tokio::test]
 async fn aggregate_with_nodes() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate(where: {score: {_gte: 20}}) { aggregate { count } nodes { name } } }",
@@ -99,7 +85,7 @@ async fn aggregate_with_nodes() {
 
 #[tokio::test]
 async fn aggregate_max_min() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             "query { users_aggregate { aggregate { max { score } min { score } } } }",
@@ -117,7 +103,7 @@ async fn aggregate_max_min() {
 /// documents.
 #[tokio::test]
 async fn count_over_columns_and_distinct() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v = engine
         .query(
             r#"{ users_aggregate { aggregate {
@@ -149,7 +135,7 @@ async fn count_over_columns_and_distinct() {
 /// scalar subquery over an unaggregated source, which errors at two rows.
 #[tokio::test]
 async fn typename_only_aggregate_runs() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v = engine
         .query(
             "{ users_aggregate { __typename aggregate { __typename } } }",
@@ -168,18 +154,8 @@ async fn typename_only_aggregate_runs() {
 /// per parent row rather than per table.
 #[tokio::test]
 async fn a_relation_can_be_aggregated() {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (
@@ -261,18 +237,8 @@ async fn a_relation_aggregate_obeys_the_scope() {
     use vision_graphql::predicate::{col, principal};
     use vision_graphql::ScopePolicy;
 
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (
@@ -347,18 +313,8 @@ async fn a_relation_aggregate_obeys_the_scope() {
 async fn a_default_limit_bounds_nodes_and_leaves_the_count_true() {
     use vision_graphql::limits::ExecutionLimits;
 
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY);
            CREATE TABLE posts (id SERIAL PRIMARY KEY, author_id INT NOT NULL REFERENCES authors(id));
@@ -412,18 +368,8 @@ async fn a_default_limit_bounds_nodes_and_leaves_the_count_true() {
 /// reports a row and counts none.
 #[tokio::test]
 async fn a_relation_aggregate_in_returning_sees_the_rows_just_inserted() {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE authors (id SERIAL PRIMARY KEY, name TEXT);
            CREATE TABLE posts (

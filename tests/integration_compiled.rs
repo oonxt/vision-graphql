@@ -5,11 +5,11 @@
 //! around scoped execution hold where it matters.
 
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::predicate::{col, principal, Principal};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, ScopePolicy};
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -31,22 +31,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -65,7 +52,7 @@ async fn setup() -> (
     .await
     .expect("seed");
 
-    (Engine::new(pool, schema()), container)
+    (Engine::new(pool, schema()), db)
 }
 
 fn titles(data: &Value, key: &str) -> Vec<String> {
@@ -79,7 +66,7 @@ fn titles(data: &Value, key: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_statement_serves_every_variable_value() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let q = engine
         .compile("query($id: Int!) { orders(where: {user_id: {_eq: $id}}, order_by: {id: asc}) { title } }")
         .expect("compile");
@@ -97,7 +84,7 @@ async fn one_statement_serves_every_variable_value() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compiled_matches_the_per_request_path() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let source =
         "query($id: Int!) { orders(where: {user_id: {_eq: $id}}, order_by: {id: asc}) { title } }";
     let vars = json!({"id": 1});
@@ -110,7 +97,7 @@ async fn compiled_matches_the_per_request_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn variable_list_and_limit_execute() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let q = engine
         .compile(
             "query($ids: [Int!], $n: Int!) {
@@ -141,7 +128,7 @@ async fn variable_list_and_limit_execute() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_statement_serves_every_principal() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -167,7 +154,7 @@ async fn one_statement_serves_every_principal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scope_still_binds_when_the_query_has_its_own_filter() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -206,7 +193,7 @@ async fn scope_still_binds_when_the_query_has_its_own_filter() {
 /// deferred, or a compiled scoped mutation would write outside its scope.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scoped_compiled_update_still_filters_by_principal() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -256,7 +243,7 @@ async fn a_scoped_compiled_update_still_filters_by_principal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scoped_compiled_delete_still_filters_by_principal() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -297,7 +284,7 @@ async fn a_scoped_compiled_delete_still_filters_by_principal() {
 /// relations included. Compiling must not drop the nested one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scoped_compiled_nested_relation_is_filtered_too() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .unrestricted("users")
         .allow("orders", col("user_id").eq(principal()))
@@ -323,7 +310,7 @@ async fn a_scoped_compiled_nested_relation_is_filtered_too() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scoped_statement_cannot_be_run_unscoped() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -338,7 +325,7 @@ async fn a_scoped_statement_cannot_be_run_unscoped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unscoped_statement_cannot_be_run_with_a_principal() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // Passing a principal to a statement that carries no predicate would look
     // like it restricted the query while returning every row.
     let q = engine.compile("{ orders { title } }").expect("compile");
@@ -351,7 +338,7 @@ async fn an_unscoped_statement_cannot_be_run_with_a_principal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_table_outside_the_policy_fails_at_compile_time() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("orders", col("user_id").eq(principal()))
         .validate(&schema())
@@ -364,7 +351,7 @@ async fn a_table_outside_the_policy_fails_at_compile_time() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_and_delete_compile_and_run() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let update = engine
         .compile(
             "mutation($id: Int!, $t: String!) {
@@ -401,7 +388,7 @@ async fn by_pk_compiles_and_deserializes() {
     struct Order {
         title: String,
     }
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let q = engine
         .compile("query($id: Int!) { orders_by_pk(id: $id) { title } }")
         .expect("compile");
@@ -416,7 +403,7 @@ async fn by_pk_compiles_and_deserializes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_uncompilable_query_says_so_and_still_runs_per_request() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let source = "query($w: orders_bool_exp) { orders(where: $w) { title } }";
     let err = engine.compile(source).unwrap_err();
     assert!(matches!(err, Error::NotCompilable { .. }), "{err:?}");

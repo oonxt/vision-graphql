@@ -69,22 +69,38 @@ jobs:
   test:
     name: tests
     runs-on: ubuntu-latest
+
+    # One PostgreSQL for the whole run. The tests would otherwise start a
+    # container per test binary through testcontainers, and two dozen
+    # `docker create` calls arriving together is how a runner ends up answering
+    # one of them with a timeout. Each test still gets a database of its own on
+    # this server, so nothing is shared but the process.
+    services:
+      postgres:
+        image: postgres:17.4-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
 
-      # Every integration test boots its own Postgres through testcontainers.
-      # Pulling the image once here keeps that out of the tests' own timing, and
-      # off the critical path of the first few that would otherwise race for it.
-      - name: Pre-pull the Postgres image
-        run: docker pull postgres:17.4-alpine
-
       # nextest schedules every binary's tests through one pool, which `cargo
-      # test` cannot: it runs test *binaries* in parallel with no shared budget,
-      # and ~25 of them each starting containers is how a runner ends up with
-      # Docker returning PortNotExposed. The cap is on containers, not on CPU.
+      # test` cannot — it runs test *binaries* in parallel with no shared
+      # budget. With the service container above there are no containers to
+      # race for, so the cap here is only about how much a runner can chew.
       - name: Tests
         run: cargo nextest run --workspace --test-threads 4
 

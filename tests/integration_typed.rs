@@ -3,11 +3,11 @@
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::ast::OrderDir;
 use vision_graphql::schema::{PgType, Schema, Table};
 use vision_graphql::{Engine, Mutation, MutationResult, Query};
+
+mod common;
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct User {
@@ -27,23 +27,9 @@ fn users_schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
 
     sqlx::raw_sql(
         r#"
@@ -61,12 +47,12 @@ async fn setup() -> (
     .await
     .expect("seed");
 
-    (Engine::new(pool, users_schema()), container)
+    (Engine::new(pool, users_schema()), db)
 }
 
 #[tokio::test]
 async fn run_as_list_returns_vec() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let users: Vec<User> = engine
         .run_as(
             Query::from("users")
@@ -92,7 +78,7 @@ async fn run_as_list_returns_vec() {
 
 #[tokio::test]
 async fn run_as_by_pk_returns_option() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let user: Option<User> = engine
         .run_as(Query::by_pk("users", &[("id", json!(1))]).select(&["id", "name"]))
         .await
@@ -114,7 +100,7 @@ async fn run_as_by_pk_returns_option() {
 
 #[tokio::test]
 async fn run_as_insert_returns_mutation_result() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let obj: BTreeMap<String, serde_json::Value> = [
         ("name".to_string(), json!("cara")),
         ("active".to_string(), json!(true)),
@@ -136,7 +122,7 @@ async fn run_as_insert_returns_mutation_result() {
 
 #[tokio::test]
 async fn query_as_deserializes_data_envelope() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     #[derive(Debug, Deserialize)]
     struct Data {
@@ -153,7 +139,7 @@ async fn query_as_deserializes_data_envelope() {
 
 #[tokio::test]
 async fn run_as_inside_transaction() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let users: Vec<User> = engine
         .transaction(async |tx| {
             tx.run_as(

@@ -1041,6 +1041,21 @@ A single GraphQL mutation request is already atomic (one SQL statement per
 request). `transaction` exists for workflows that need atomicity *across*
 multiple requests — most commonly id-chaining between mutations.
 
+## Running the tests
+
+Integration tests need a PostgreSQL. Point them at one and the suite takes about
+twelve seconds:
+
+```bash
+docker run --rm -d --name vg-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:17.4-alpine
+export TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
+cargo test --workspace
+```
+
+Each test still gets a database of its own on that server, so nothing is shared
+but the process. Without the variable every test starts its own container
+instead, which works and costs a minute.
+
 ## License
 
 MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)),

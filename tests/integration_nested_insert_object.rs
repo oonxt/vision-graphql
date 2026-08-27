@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::Engine;
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -46,22 +46,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"
                 CREATE TABLE organizations (
@@ -89,12 +76,12 @@ async fn setup() -> (
     .await
     .expect("seed");
     let engine = Engine::new(pool, schema());
-    (engine, container)
+    (engine, db)
 }
 
 #[tokio::test]
 async fn insert_post_with_nested_user() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -118,7 +105,7 @@ async fn insert_post_with_nested_user() {
 
 #[tokio::test]
 async fn nested_object_missing_data_key_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let err = engine
         .query(
             r#"mutation {
@@ -136,7 +123,7 @@ async fn nested_object_missing_data_key_is_error() {
 
 #[tokio::test]
 async fn nested_object_array_data_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // object-relation 'data' must be an object, not an array.
     let err = engine
         .query(
@@ -158,7 +145,7 @@ async fn nested_object_array_data_is_error() {
 
 #[tokio::test]
 async fn nested_object_fk_and_nested_both_set_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // Can't both set user_id AND provide a nested user.
     let err = engine
         .query(
@@ -180,7 +167,7 @@ async fn nested_object_fk_and_nested_both_set_is_error() {
 
 #[tokio::test]
 async fn nested_object_mixed_batch_is_error() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     // Row 1 uses nested `user`, row 2 uses explicit user_id — rejected.
     // Note: user_id=99 doesn't exist, but the parser should reject BEFORE executing SQL.
     let err = engine
@@ -201,7 +188,7 @@ async fn nested_object_mixed_batch_is_error() {
 
 #[tokio::test]
 async fn insert_batch_with_nested_users() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -230,7 +217,7 @@ async fn insert_batch_with_nested_users() {
 
 #[tokio::test]
 async fn insert_post_with_nested_user_and_comments() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -266,7 +253,7 @@ async fn insert_post_with_nested_user_and_comments() {
 
 #[tokio::test]
 async fn insert_post_with_two_level_object_nesting() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -297,7 +284,7 @@ async fn insert_post_with_two_level_object_nesting() {
 
 #[tokio::test]
 async fn nested_object_correlation_stress() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let mutation = r#"mutation {
         insert_posts(objects: [
           { title: "post-a", user: { data: { name: "user-a" } } },
@@ -338,7 +325,7 @@ async fn nested_object_correlation_stress() {
 
 #[tokio::test]
 async fn insert_post_one_with_nested_user() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .query(
             r#"mutation {
@@ -361,7 +348,7 @@ async fn insert_post_one_with_nested_user() {
 
 #[tokio::test]
 async fn nested_object_rolls_back_on_parent_failure() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
 
     // Violate NOT NULL on users.name (set it null). Whole mutation must fail;
     // neither the post nor any user should persist.

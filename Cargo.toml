@@ -48,7 +48,7 @@ insta = { version = "1", features = ["json"] }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 pretty_assertions = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "sync", "time"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

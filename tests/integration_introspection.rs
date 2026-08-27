@@ -1,6 +1,6 @@
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::{Engine, Schema};
+
+mod common;
 
 /// The query graphql-js `getIntrospectionQuery()` produces, trimmed of the
 /// deprecation flags but keeping the fragments and the seven-deep ofType chain.
@@ -37,24 +37,9 @@ fragment TypeRef on __Type {
 }
 "#;
 
-async fn engine(
-    introspection: bool,
-) -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let c = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .unwrap();
-    let port = c.get_host_port_ipv4(5432).await.unwrap();
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(&format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ))
-        .await
-        .unwrap();
+async fn engine(introspection: bool) -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT UNIQUE, data JSONB);
            CREATE TABLE posts (id SERIAL PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id), score NUMERIC);
@@ -67,12 +52,12 @@ async fn engine(
     } else {
         builder.build()
     };
-    (Engine::new(pool, schema), c)
+    (Engine::new(pool, schema), db)
 }
 
 #[tokio::test]
 async fn graphiql_introspection_query_is_answered() {
-    let (engine, _c) = engine(true).await;
+    let (engine, _db) = engine(true).await;
     let v = engine.query(INTROSPECTION_QUERY, None).await.unwrap();
     let s = &v["__schema"];
     assert_eq!(s["queryType"]["name"], "query_root");
@@ -153,14 +138,14 @@ async fn graphiql_introspection_query_is_answered() {
 
 #[tokio::test]
 async fn introspection_is_off_unless_enabled_and_mixes_with_data() {
-    let (e1, _c) = engine(false).await;
+    let (e1, _db1) = engine(false).await;
     let err = e1
         .query("{ __schema { queryType { name } } }", None)
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("introspection is disabled"));
 
-    let (e2, _c2) = engine(true).await;
+    let (e2, _db2) = engine(true).await;
     // One request, one statement: introspection beside real rows.
     let v = e2
         .query(

@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::{postgres::Postgres, testcontainers::runners::AsyncRunner};
 use vision_graphql::ast::OrderDir;
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::{Engine, Mutation, Query};
+
+mod common;
 
 fn schema() -> Schema {
     Schema::builder()
@@ -26,22 +26,9 @@ fn schema() -> Schema {
         .build()
 }
 
-async fn setup() -> (
-    Engine,
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-) {
-    let container = Postgres::default()
-        .with_tag("17.4-alpine")
-        .start()
-        .await
-        .expect("start pg");
-    let host_port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .expect("pool");
+async fn setup() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
     sqlx::raw_sql(
         r#"
                 CREATE TABLE users (
@@ -61,12 +48,12 @@ async fn setup() -> (
     .execute(&pool)
     .await
     .expect("seed");
-    (Engine::new(pool, schema()), container)
+    (Engine::new(pool, schema()), db)
 }
 
 #[tokio::test]
 async fn builder_query_with_relation() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .run(
             Query::from("users")
@@ -83,7 +70,7 @@ async fn builder_query_with_relation() {
 
 #[tokio::test]
 async fn builder_aggregate() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .run(Query::aggregate("users").count().sum(&["age"]))
         .await
@@ -94,7 +81,7 @@ async fn builder_aggregate() {
 
 #[tokio::test]
 async fn builder_by_pk() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .run(Query::by_pk("users", &[("id", json!(1))]).select(&["name"]))
         .await
@@ -104,7 +91,7 @@ async fn builder_by_pk() {
 
 #[tokio::test]
 async fn builder_insert_and_update() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let v: Value = engine
         .run(Mutation::insert_one("users", [("name", json!("cara"))]).returning(&["id", "name"]))
         .await
@@ -124,7 +111,7 @@ async fn builder_insert_and_update() {
 
 #[tokio::test]
 async fn builder_delete_by_where() {
-    let (engine, _c) = setup().await;
+    let (engine, _db) = setup().await;
     let _ = engine
         .run(Mutation::delete("posts").where_eq("user_id", 1))
         .await
