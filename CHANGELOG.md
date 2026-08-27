@@ -36,10 +36,33 @@ used to be silent, so read **Breaking** before upgrading.
   `users_by_pk(id: 1, where: {…})` ran and dropped the `where`. Applies to the
   query root, `delete_*_by_pk`, and the `pk_columns` object of
   `update_*_by_pk`.
+- **A fragment cycle or a long fragment chain aborted the process.**
+  `fragment F on users { id ...F }` recursed until the stack ran out, and so did
+  a chain of a few hundred fragments — both invisible to `ParseLimits`, which
+  counts brackets in the raw text and sees one level in either case. The
+  fragment graph is now checked for cycles and chain depth before anything walks
+  a selection set.
+- **A `__typename`-only aggregate rendered SQL that fails at runtime.**
+  `{ users_aggregate { __typename } }` selected a literal from an unaggregated
+  source inside a scalar subquery: Postgres errors at two rows and answers null
+  at zero. When nothing in the projection reads a row, the statement no longer
+  reads any.
+- **`<table>_pk_columns_input` could be published with no fields**, which is not
+  a legal GraphQL type, so an SDL file carrying it would not load and
+  `sdl --check` would keep certifying it. Reached by hiding a primary key
+  column. Same for a table whose every column is hidden, which is now skipped
+  entirely, along with any relation pointing at it.
 - **Directives were read by nobody.** `field @include(if: false)` came back
   included. No directive is implemented, so a document carrying one is now
   rejected — which is also what makes the empty directive list in the
-  introspection answer honest.
+  introspection answer honest. Checked in every position the grammar allows
+  one: the operation, its variable definitions, fragment definitions, and every
+  selection.
+- **A repeated `__typename` under one response key was written twice** into the
+  same `json_build_object`: the dedup used `Vec::dedup`, which only collapses
+  adjacent entries. Introspection had the mirror problem — a repeated key kept
+  the first answer and silently dropped a differing one, where the data path
+  errors.
 - **Column and relation order was whatever the hash map felt like.** Anything
   derived from the whole schema differed run to run for reasons unrelated to the
   schema; columns now keep the order introspection read them in

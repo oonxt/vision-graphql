@@ -272,6 +272,10 @@ const ORDER_BY_VALUES: [&str; 6] = [
 
 struct Builder<'a> {
     schema: &'a Schema,
+    /// Tables that get types. A relation pointing at one that does not — a
+    /// table whose columns are all hidden — must be left out too, or it names a
+    /// type nothing defines.
+    published: BTreeSet<String>,
     types: BTreeMap<String, TypeDef>,
     /// Scalars reached from a column, so only the comparison inputs that can be
     /// used get published.
@@ -282,9 +286,18 @@ impl<'a> Builder<'a> {
     fn new(schema: &'a Schema) -> Self {
         Builder {
             schema,
+            published: BTreeSet::new(),
             types: BTreeMap::new(),
             scalars: BTreeMap::new(),
         }
+    }
+
+    /// The table a relation points at, if it is one this type system publishes.
+    fn target(&self, rel: &crate::schema::Relation) -> Option<&'a std::sync::Arc<Table>> {
+        self.published
+            .contains(&rel.target_table)
+            .then(|| self.schema.table(&rel.target_table))
+            .flatten()
     }
 
     fn add(&mut self, def: TypeDef) {
@@ -306,8 +319,31 @@ impl<'a> Builder<'a> {
     }
 
     fn build(mut self) -> TypeSystem {
-        let tables: Vec<&std::sync::Arc<Table>> =
-            self.schema.tables().map(|(_, t)| t).collect::<Vec<_>>();
+        // A table whose every column was hidden would produce `type X { }`, an
+        // empty select-column enum and an empty insert input — none of which is
+        // a legal GraphQL type, so an SDL file carrying them cannot be loaded by
+        // the tooling it exists for. Nothing can be selected from such a table
+        // anyway. Filtered once, here, rather than at each place that walks the
+        // list: a reference to a type that was never defined is exactly the bug
+        // this is trying not to introduce.
+        let tables: Vec<&std::sync::Arc<Table>> = self
+            .schema
+            .tables()
+            .map(|(_, t)| t)
+            .filter(|t| {
+                if t.columns().next().is_none() {
+                    tracing::warn!(
+                        target: "vision_graphql::type_system",
+                        table = %t.exposed_name,
+                        "skipping table with no exposed columns"
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        self.published = tables.iter().map(|t| t.exposed_name.clone()).collect();
 
         for t in &tables {
             self.table_types(t);
@@ -412,7 +448,7 @@ impl<'a> Builder<'a> {
     fn row_object(&mut self, t: &Table) {
         let mut fields = self.column_fields(t);
         for (name, rel) in t.relations() {
-            let Some(target) = self.schema.table(&rel.target_table) else {
+            let Some(target) = self.target(rel) else {
                 continue;
             };
             let target_row = type_names::row(target).to_string();
@@ -514,7 +550,7 @@ impl<'a> Builder<'a> {
         }
         // A relation in a `where` becomes EXISTS, for array and object alike.
         for (rel_name, rel) in t.relations() {
-            let Some(target) = self.schema.table(&rel.target_table) else {
+            let Some(target) = self.target(rel) else {
                 continue;
             };
             fields.push(InputValue::new(
@@ -540,7 +576,7 @@ impl<'a> Builder<'a> {
             if rel.kind != RelKind::Object {
                 continue;
             }
-            let Some(target) = self.schema.table(&rel.target_table) else {
+            let Some(target) = self.target(rel) else {
                 continue;
             };
             fields.push(InputValue::new(
@@ -574,7 +610,7 @@ impl<'a> Builder<'a> {
 
         let mut insert_fields = row_cols.clone();
         for (rel_name, rel) in t.relations() {
-            let Some(target) = self.schema.table(&rel.target_table) else {
+            let Some(target) = self.target(rel) else {
                 continue;
             };
             if target.read_only {
@@ -660,18 +696,10 @@ impl<'a> Builder<'a> {
             });
         }
 
-        if !t.primary_key.is_empty() {
-            let fields: Vec<InputValue> = t
-                .primary_key
-                .iter()
-                .filter_map(|pk| t.find_column(pk))
-                .map(|c| {
-                    InputValue::new(
-                        &c.exposed_name,
-                        TypeRef::named(scalar_name(&c.pg_type)).non_null(),
-                    )
-                })
-                .collect();
+        // Only when every key column is still exposed. `hide_columns` can take
+        // one out from under the key — merge keeps the `primary_key` and warns —
+        // and an input object with no fields is not a legal GraphQL type.
+        if let Some(fields) = pk_args(t) {
             self.add(TypeDef::InputObject {
                 name: pk_columns_input_name(t),
                 description: None,
@@ -788,7 +816,11 @@ impl<'a> Builder<'a> {
                 ]),
             );
 
-            if !t.primary_key.is_empty() {
+            // Both `_by_pk` mutations hang on the same condition the query root
+            // uses: a key every column of which is exposed. Publishing
+            // `update_by_pk` on a weaker test left it pointing at an input type
+            // that was never defined.
+            if pk_args(t).is_some() {
                 fields.push(
                     Field::new(
                         format!("update_{}_by_pk", t.exposed_name),
@@ -1106,6 +1138,88 @@ mod tests {
         };
         assert!(fields.iter().any(|f| f.name == "users_by_pk"));
         assert!(!fields.iter().any(|f| f.name == "summary_by_pk"));
+    }
+
+    /// `hide_columns` can take a column out from under the primary key: merge
+    /// keeps the key and warns. Publishing `<t>_pk_columns_input` on the weaker
+    /// test produced `input X { }`, which no GraphQL parser accepts — so a
+    /// committed SDL file would not load, and `sdl --check` would keep
+    /// certifying it.
+    #[test]
+    fn a_key_whose_column_is_hidden_publishes_no_by_pk_surface() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    // `id` is the declared key but is not exposed.
+                    .column("name", "name", PgType::Text, true)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let ts = TypeSystem::build(&schema);
+        assert!(ts.get("users_pk_columns_input").is_none());
+        assert!(
+            dangling_references(&ts).is_empty(),
+            "{:?}",
+            dangling_references(&ts)
+        );
+
+        let TypeDef::Object { fields, .. } = ts.get(ts.query_root()).unwrap() else {
+            panic!("expected object");
+        };
+        assert!(!fields.iter().any(|f| f.name == "users_by_pk"));
+        let TypeDef::Object { fields, .. } = ts.get(ts.mutation_root().unwrap()).unwrap() else {
+            panic!("expected object");
+        };
+        assert!(
+            !fields.iter().any(|f| f.name.ends_with("_by_pk")),
+            "{fields:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_nothing_exposed_is_skipped_rather_than_emitted_empty() {
+        let schema = Schema::builder()
+            .table(Table::new("hidden", "public", "hidden"))
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let ts = TypeSystem::build(&schema);
+        assert!(ts.get("hidden").is_none());
+        assert!(ts.get("hidden_select_column").is_none());
+        let TypeDef::Object { fields, .. } = ts.get(ts.query_root()).unwrap() else {
+            panic!("expected object");
+        };
+        assert!(
+            !fields.iter().any(|f| f.name.starts_with("hidden")),
+            "{fields:?}"
+        );
+        assert!(dangling_references(&ts).is_empty());
+    }
+
+    #[test]
+    fn a_relation_pointing_at_a_skipped_table_is_left_out() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("ghosts", Relation::array("ghosts").on([("id", "user_id")])),
+            )
+            .table(Table::new("ghosts", "public", "ghosts"))
+            .build();
+        let ts = TypeSystem::build(&schema);
+        assert!(
+            dangling_references(&ts).is_empty(),
+            "{:?}",
+            dangling_references(&ts)
+        );
+        let TypeDef::Object { fields, .. } = ts.get("users").unwrap() else {
+            panic!("expected object");
+        };
+        assert!(!fields.iter().any(|f| f.name == "ghosts"), "{fields:?}");
     }
 
     #[test]

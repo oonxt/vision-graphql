@@ -73,7 +73,7 @@ pub fn resolve_schema(
                 })
             }
         };
-        out.insert(alias, value);
+        insert_field(&mut out, alias, value)?;
     }
     Ok(Value::Object(out))
 }
@@ -175,7 +175,7 @@ fn resolve_type(
                 })
             }
         };
-        out.insert(alias, value);
+        insert_field(&mut out, alias, value)?;
     }
     Ok(Value::Object(out))
 }
@@ -226,7 +226,7 @@ fn resolve_field(
                 })
             }
         };
-        out.insert(alias, value);
+        insert_field(&mut out, alias, value)?;
     }
     Ok(Value::Object(out))
 }
@@ -261,7 +261,7 @@ fn resolve_input_value(
                 })
             }
         };
-        out.insert(alias, value);
+        insert_field(&mut out, alias, value)?;
     }
     Ok(Value::Object(out))
 }
@@ -283,7 +283,7 @@ fn resolve_enum_value(v: &str, set: &SelectionSet, fragments: &Fragments<'_>) ->
                 })
             }
         };
-        out.insert(alias, value);
+        insert_field(&mut out, alias, value)?;
     }
     Ok(Value::Object(out))
 }
@@ -324,18 +324,30 @@ fn flatten<'a>(
             }
         }
     }
-    // A fragment that repeats a field is ordinary; the answer is the same either
-    // way, so keep the first.
-    let mut seen = Vec::new();
-    out.retain(|(alias, _)| {
-        if seen.contains(alias) {
-            false
-        } else {
-            seen.push(alias.clone());
-            true
-        }
-    });
     Ok(out)
+}
+
+/// Add one resolved field to the answer.
+///
+/// A key appearing twice is ordinary — a fragment that repeats `name` — and the
+/// two answers are then identical, so one of them can go. Two *different*
+/// answers under one key is a conflict, and dropping the loser silently is the
+/// failure the data path already refuses (see
+/// [`merge_fields`](crate::parser)); it is refused here for the same reason.
+fn insert_field(out: &mut Map<String, Value>, alias: String, value: Value) -> Result<()> {
+    match out.get(&alias) {
+        Some(existing) if *existing != value => Err(Error::Validate {
+            path: alias.clone(),
+            message: format!(
+                "two fields both answer to '{alias}' but ask for different things; \
+                 give one of them an alias"
+            ),
+        }),
+        _ => {
+            out.insert(alias, value);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +510,42 @@ mod tests {
         let err = resolve_schema(&root.node.selection_set.node, &ts, &fragments).unwrap_err();
         assert!(
             format!("{err}").contains("unknown field 'nonsense'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conflicting_repeats_under_one_key_are_rejected_not_dropped() {
+        // Keeping the first and discarding the rest answered with only `name`,
+        // silently. The data path calls this a conflict; so does this one.
+        let schema = schema();
+        let ts = TypeSystem::build(&schema);
+        let fragments: Fragments<'_> = HashMap::new();
+        let doc = parse_document("{ __type(name: \"users\") { fields { name } fields { name } } }")
+            .unwrap();
+        let DocumentOperations::Single(op) = &doc.operations else {
+            panic!()
+        };
+        let Selection::Field(root) = &op.node.selection_set.node.items[0].node else {
+            panic!()
+        };
+        // Identical repeats are fine — that is what a fragment spread produces.
+        resolve_type_by_name("users", &root.node.selection_set.node, &ts, &fragments).unwrap();
+
+        let doc = parse_document(
+            "{ __type(name: \"users\") { fields { name } fields { type { name } } } }",
+        )
+        .unwrap();
+        let DocumentOperations::Single(op) = &doc.operations else {
+            panic!()
+        };
+        let Selection::Field(root) = &op.node.selection_set.node.items[0].node else {
+            panic!()
+        };
+        let err = resolve_type_by_name("users", &root.node.selection_set.node, &ts, &fragments)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("both answer to 'fields'"),
             "{err}"
         );
     }

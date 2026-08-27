@@ -257,8 +257,11 @@ impl AggCol {
 pub enum AggOp {
     /// `count`, `count(columns: [a, b])`, `count(distinct: true, columns: [a])`.
     ///
-    /// Empty `columns` is `count(*)`. With columns it counts rows where they
-    /// are not null, and `distinct` counts distinct values of them.
+    /// Empty `columns` is `count(*)`. One column counts rows where it is not
+    /// null. Several columns render as a row constructor, which is SQL NULL only
+    /// when every field is — so without `distinct` that is `count(*)` again, and
+    /// `distinct` is what makes naming several columns useful: distinct
+    /// combinations.
     Count {
         columns: Vec<String>,
         distinct: bool,

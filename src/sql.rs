@@ -2166,6 +2166,17 @@ fn render_aggregate(
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
 
+    // Whether anything in the projection actually reads the source rows. Type
+    // names do not, and neither does an empty `aggregate`. Without something
+    // that collapses — an aggregate function, or the `json_agg` over `nodes` —
+    // selecting FROM the source would yield one row per source row inside a
+    // scalar subquery, which Postgres rejects outright at two rows and answers
+    // with null at zero. So when nothing reads the rows, do not read them.
+    let needs_source = nodes.is_some()
+        || ops
+            .iter()
+            .any(|s| !matches!(s.op, crate::ast::AggOp::Typename));
+
     ctx.sql.push_str("(SELECT json_build_object(");
     let mut first = true;
     for alias in typenames {
@@ -2214,10 +2225,13 @@ fn render_aggregate(
         ctx.sql.push_str("), '[]'::json)");
     }
 
-    ctx.sql.push_str(") FROM (");
-    render_aggregate_source(root, ops, nodes, table, schema, ctx)?;
-    ctx.sql.push_str(") ");
-    ctx.sql.push_str(&inner_alias);
+    ctx.sql.push(')');
+    if needs_source {
+        ctx.sql.push_str(" FROM (");
+        render_aggregate_source(root, ops, nodes, table, schema, ctx)?;
+        ctx.sql.push_str(") ");
+        ctx.sql.push_str(&inner_alias);
+    }
     ctx.sql.push(')');
     Ok(())
 }
@@ -3697,6 +3711,66 @@ mod tests {
         let (sql, _) = render(&op, &users_schema()).unwrap();
         assert!(!sql.contains("'aggregate'"), "{sql}");
         assert!(sql.contains("'nodes'"), "{sql}");
+    }
+
+    /// Nothing in the projection reads a row, so the statement must not read
+    /// any: a scalar subquery over an unaggregated source errors at two rows and
+    /// answers null at zero.
+    #[test]
+    fn a_typename_only_aggregate_reads_no_rows() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        for body in [
+            RootBody::Aggregate {
+                ops: Vec::new(),
+                nodes: None,
+                typenames: vec!["__typename".into()],
+            },
+            RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "__typename".into(),
+                    op: AggOp::Typename,
+                }],
+                nodes: None,
+                typenames: Vec::new(),
+            },
+        ] {
+            let op = Operation::Query(vec![RootField {
+                table: "users".into(),
+                alias: "users_aggregate".into(),
+                args: QueryArgs::default(),
+                body,
+            }]);
+            let (sql, _) = render(&op, &users_schema()).unwrap();
+            assert!(!sql.contains("FROM"), "{sql}");
+        }
+    }
+
+    /// …but as soon as something does aggregate, the source comes back.
+    #[test]
+    fn an_aggregate_with_a_function_still_reads_rows() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users_aggregate".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![
+                    AggSelect {
+                        alias: "__typename".into(),
+                        op: AggOp::Typename,
+                    },
+                    AggSelect {
+                        alias: "count".into(),
+                        op: AggOp::count(),
+                    },
+                ],
+                nodes: None,
+                typenames: Vec::new(),
+            },
+        }]);
+        let (sql, _) = render(&op, &users_schema()).unwrap();
+        assert!(sql.contains("count(*)"), "{sql}");
+        assert!(sql.contains(r#"FROM "public"."users""#), "{sql}");
     }
 
     #[test]

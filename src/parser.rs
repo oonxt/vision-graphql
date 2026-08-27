@@ -78,8 +78,9 @@ pub fn lower_with(
     for (name, def) in &doc.fragments {
         fragments.insert(name.as_str().to_string(), &def.node);
     }
+    validate_fragments(&fragments)?;
     let op = pick_operation(doc, operation_name)?;
-    reject_directives(op.selection_set, &fragments)?;
+    reject_directives(op, &fragments)?;
 
     // `query($n: Int = 10)` means the request may leave `$n` out. Filling the
     // defaults in here, once, is what keeps every variable position below from
@@ -148,10 +149,12 @@ fn with_defaults(vars: &Value, defaults: &serde_json::Map<String, Value>) -> Val
     Value::Object(out)
 }
 
+#[derive(Clone, Copy)]
 struct OpInfo<'a> {
     ty: OperationType,
     selection_set: &'a SelectionSet,
     variable_definitions: &'a [Positioned<async_graphql_parser::types::VariableDefinition>],
+    directives: &'a [Positioned<async_graphql_parser::types::Directive>],
 }
 
 fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result<OpInfo<'a>> {
@@ -160,6 +163,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
             ty: op.node.ty,
             selection_set: &op.node.selection_set.node,
             variable_definitions: &op.node.variable_definitions,
+            directives: &op.node.directives,
         }),
         (DocumentOperations::Multiple(ops), Some(n)) => {
             let key = Name::new(n);
@@ -170,6 +174,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
                 ty: op.node.ty,
                 selection_set: &op.node.selection_set.node,
                 variable_definitions: &op.node.variable_definitions,
+                directives: &op.node.directives,
             })
         }
         (DocumentOperations::Multiple(ops), None) => {
@@ -179,6 +184,7 @@ fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result
                     ty: op.node.ty,
                     selection_set: &op.node.selection_set.node,
                     variable_definitions: &op.node.variable_definitions,
+                    directives: &op.node.directives,
                 })
             } else {
                 Err(Error::Parse(
@@ -404,47 +410,138 @@ fn lower_introspection(
 /// came back included. A directive that silently does not happen is the worst of
 /// the three options; erroring is the honest one, and it is why the introspection
 /// answer publishes an empty directive list.
-fn reject_directives(set: &SelectionSet, fragments: &Fragments<'_>) -> Result<()> {
-    fn named(d: &[Positioned<async_graphql_parser::types::Directive>]) -> Option<String> {
-        d.first().map(|d| d.node.name.node.as_str().to_string())
+///
+/// Every position the grammar allows one is checked: the operation, its variable
+/// definitions, the fragment definitions, and every selection. Checking only
+/// selections would leave `query Q @skip(if: true)` accepted and inert, which is
+/// the same failure one level up.
+fn reject_directives(op: OpInfo<'_>, fragments: &Fragments<'_>) -> Result<()> {
+    fn refuse(
+        directives: &[Positioned<async_graphql_parser::types::Directive>],
+        where_: &str,
+    ) -> Result<()> {
+        if let Some(d) = directives.first() {
+            let name = d.node.name.node.as_str();
+            return Err(Error::Validate {
+                path: format!("@{name}"),
+                message: format!(
+                    "directives are not supported; '@{name}' on {where_} would have no effect"
+                ),
+            });
+        }
+        Ok(())
     }
 
-    fn walk(set: &SelectionSet, fragments: &Fragments<'_>, seen: &mut Vec<String>) -> Result<()> {
+    fn walk(set: &SelectionSet) -> Result<()> {
         for sel in &set.items {
-            let (directives, inner) = match &sel.node {
-                Selection::Field(f) => (&f.node.directives, Some(&f.node.selection_set.node)),
+            match &sel.node {
+                Selection::Field(f) => {
+                    refuse(&f.node.directives, "a field")?;
+                    walk(&f.node.selection_set.node)?;
+                }
                 Selection::InlineFragment(f) => {
-                    (&f.node.directives, Some(&f.node.selection_set.node))
+                    refuse(&f.node.directives, "an inline fragment")?;
+                    walk(&f.node.selection_set.node)?;
                 }
-                Selection::FragmentSpread(f) => {
-                    let name = f.node.fragment_name.node.as_str();
-                    // Guard against a fragment cycle: an invalid document, but
-                    // one that would otherwise recurse until the stack ran out.
-                    if !seen.contains(&name.to_string()) {
-                        seen.push(name.to_string());
-                        if let Some(frag) = fragments.get(name) {
-                            walk(&frag.selection_set.node, fragments, seen)?;
-                        }
-                    }
-                    (&f.node.directives, None)
-                }
-            };
-            if let Some(name) = named(directives) {
-                return Err(Error::Validate {
-                    path: format!("@{name}"),
-                    message: format!(
-                        "directives are not supported; '@{name}' would have no effect"
-                    ),
-                });
-            }
-            if let Some(inner) = inner {
-                walk(inner, fragments, seen)?;
+                Selection::FragmentSpread(f) => refuse(&f.node.directives, "a fragment spread")?,
             }
         }
         Ok(())
     }
 
-    walk(set, fragments, &mut Vec::new())
+    refuse(op.directives, "an operation")?;
+    for def in op.variable_definitions {
+        refuse(&def.node.directives, "a variable definition")?;
+    }
+    // Fragment bodies are walked here rather than followed from the spreads, so
+    // a fragment the operation does not use is still rejected — and the walk
+    // needs no cycle guard, since it never follows a spread.
+    for frag in fragments.values() {
+        refuse(&frag.directives, "a fragment definition")?;
+        walk(&frag.selection_set.node)?;
+    }
+    walk(op.selection_set)
+}
+
+/// Drop repeats anywhere in the list, not just adjacent ones.
+///
+/// `Vec::dedup` only collapses neighbours, so `__typename t: __typename
+/// __typename` kept two entries under one key and wrote it twice into the same
+/// `json_build_object`.
+fn dedup_keys(keys: &mut Vec<String>) {
+    let mut seen: Vec<String> = Vec::new();
+    keys.retain(|k| {
+        if seen.contains(k) {
+            false
+        } else {
+            seen.push(k.clone());
+            true
+        }
+    });
+}
+
+fn validate_fragments(fragments: &Fragments<'_>) -> Result<()> {
+    /// Longest chain allowed. Tied to the text-nesting limit because it bounds
+    /// the same thing — how deep the walkers below can recurse — just reached by
+    /// a different route.
+    const MAX_CHAIN: usize = crate::limits::DEFAULT_MAX_DEPTH;
+
+    fn spreads_of<'a>(set: &'a SelectionSet, out: &mut Vec<&'a str>) {
+        for sel in &set.items {
+            match &sel.node {
+                Selection::FragmentSpread(f) => out.push(f.node.fragment_name.node.as_str()),
+                Selection::Field(f) => spreads_of(&f.node.selection_set.node, out),
+                Selection::InlineFragment(f) => spreads_of(&f.node.selection_set.node, out),
+            }
+        }
+    }
+
+    /// Depth of the longest chain starting at `name`, or an error if `name` is
+    /// reachable from itself. `path` is the chain currently being walked, which
+    /// is what distinguishes a cycle from a fragment merely spread twice.
+    fn depth<'a>(
+        name: &'a str,
+        fragments: &'a Fragments<'a>,
+        path: &mut Vec<&'a str>,
+        done: &mut std::collections::HashMap<&'a str, usize>,
+    ) -> Result<usize> {
+        if let Some(d) = done.get(name) {
+            return Ok(*d);
+        }
+        if path.contains(&name) {
+            path.push(name);
+            return Err(Error::Validate {
+                path: format!("fragment {name}"),
+                message: format!("fragment cycle: {}", path.join(" -> ")),
+            });
+        }
+        // An unknown spread is reported where it is used, with the field path.
+        let Some((key, frag)) = fragments.get_key_value(name) else {
+            return Ok(0);
+        };
+        path.push(key.as_str());
+        let mut spreads = Vec::new();
+        spreads_of(&frag.selection_set.node, &mut spreads);
+        let mut deepest = 0;
+        for next in spreads {
+            deepest = deepest.max(1 + depth(next, fragments, path, done)?);
+        }
+        path.pop();
+        if deepest > MAX_CHAIN {
+            return Err(Error::Validate {
+                path: format!("fragment {name}"),
+                message: format!("fragment chain is deeper than the limit of {MAX_CHAIN}"),
+            });
+        }
+        done.insert(key.as_str(), deepest);
+        Ok(deepest)
+    }
+
+    let mut done = std::collections::HashMap::new();
+    for name in fragments.keys() {
+        depth(name.as_str(), fragments, &mut Vec::new(), &mut done)?;
+    }
+    Ok(())
 }
 
 fn lower_query(
@@ -1555,7 +1652,7 @@ fn parse_returning(
             }
         }
     }
-    typenames.dedup();
+    dedup_keys(&mut typenames);
     Ok((returning, typenames))
 }
 
@@ -2406,7 +2503,7 @@ fn lower_aggregate_selection(
             }
         }
     }
-    typenames.dedup();
+    dedup_keys(&mut typenames);
     Ok(AggregateSelection {
         ops,
         nodes,
@@ -3433,6 +3530,101 @@ mod tests {
                 assert!(matches!(nodes.as_ref().unwrap()[0], Field::Typename { .. }));
             }
             _ => panic!("expected Aggregate"),
+        }
+    }
+
+    /// A fragment that spreads itself. Before this was rejected, lowering
+    /// recursed until the stack ran out and the process aborted — reaching the
+    /// assertion at all is most of the test.
+    #[test]
+    fn a_fragment_cycle_is_rejected() {
+        let err = parse_and_lower(
+            "fragment F on users { id ...F } { users { ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("fragment cycle"), "{err}");
+
+        // Indirect, and through a field rather than at the top level.
+        let err = parse_and_lower(
+            "fragment A on users { id ...B } fragment B on users { ...A } { users { ...A } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("fragment cycle"), "{err}");
+    }
+
+    /// The same hazard by another route: no cycle, just a long chain. Each
+    /// fragment nests one bracket deep, so the pre-parse text guard sees
+    /// nothing.
+    #[test]
+    fn an_over_deep_fragment_chain_is_rejected() {
+        let mut q = String::from("{ users { ...F0 } }");
+        for i in 0..500 {
+            q.push_str(&format!(" fragment F{i} on users {{ ...F{} }}", i + 1));
+        }
+        q.push_str(" fragment F500 on users { id }");
+        let err = parse_and_lower(&q, &json!({}), None, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("deeper than the limit"), "{err}");
+    }
+
+    #[test]
+    fn a_fragment_spread_twice_is_not_a_cycle() {
+        parse_and_lower(
+            "fragment F on users { id } { users { ...F } others: users { ...F } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn directives_are_rejected_in_every_position() {
+        for q in [
+            "query Q @skip(if: true) { users { id } }",
+            "query Q($n: Int @foo) { users(limit: $n) { id } }",
+            "fragment F on users @foo { id } { users { ...F } }",
+            "{ users { id @include(if: true) } }",
+            "{ users { ... on users @foo { id } } }",
+            "fragment F on users { id } { users { ...F @foo } }",
+        ] {
+            let err = parse_and_lower(q, &json!({}), None, &schema()).unwrap_err();
+            assert!(
+                format!("{err}").contains("directives are not supported"),
+                "{q} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_typename_answers_under_one_key() {
+        let op = parse_and_lower(
+            r#"mutation { insert_users(objects: [{name: "a"}]) {
+                 __typename affected_rows t: __typename __typename } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Mutation(fields) = op else {
+            panic!("expected Mutation");
+        };
+        match &fields[0] {
+            crate::ast::MutationField::Insert {
+                response_typenames, ..
+            } => {
+                // Non-adjacent repeats too: `Vec::dedup` would have kept both.
+                assert_eq!(
+                    response_typenames,
+                    &vec!["__typename".to_string(), "t".to_string()]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
         }
     }
 
