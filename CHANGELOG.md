@@ -3,6 +3,26 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **`operationName`**: `query_with` and `query_as_with` on `Engine`, `TxClient`,
+  `ScopedEngine` and `ScopedTxClient`. It is the third field of a GraphQL
+  request body, and a client that ships one document holding every operation it
+  might send picks one per request by name — which previously only
+  `Engine::compile_with` could do, so that shape of client could not use the
+  query path at all.
+
+### Fixed
+
+- **A named operation that matched nothing ran anyway** when the document held
+  exactly one operation: the name was not looked at. Answering about the
+  operation that happens to be there when the caller asked about another is the
+  same silent substitution the multi-operation case already refused. Now an
+  error, as the spec has it, including for an anonymous operation that has no
+  name to match.
+
 ## 0.13.0 — 2026-08-27
 
 Hardening for the case where a document reaches the engine from a client rather

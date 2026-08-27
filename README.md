@@ -79,6 +79,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
+| `operationName` (`query_with` / `query_as_with`, on every handle) | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
 | Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
@@ -99,7 +100,6 @@ and left, not forgotten.
 
 | Gap | Notes |
 |---|---|
-| `operationName` on `Engine::query` | A document with several operations can only be run through `Engine::compile`, which does take one. |
 | GraphQL-shaped errors | [`Error`] is a Rust enum; there is no `errors: [{message, path, extensions}]` envelope, and `Error::Database` carries PostgreSQL's own message. A host serving HTTP maps them itself, and should decide what to pass on. |
 | Aggregates on a relation (`user { posts_aggregate { … } }`) | Only root `<table>_aggregate` exists. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |

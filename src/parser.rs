@@ -159,6 +159,19 @@ struct OpInfo<'a> {
 
 fn pick_operation<'a>(doc: &'a ExecutableDocument, name: Option<&str>) -> Result<OpInfo<'a>> {
     match (&doc.operations, name) {
+        // A name that matches nothing is an error even when the document holds
+        // exactly one operation. Running it anyway would answer a question about
+        // the operation that happens to be there when the caller asked about a
+        // different one — the same silent substitution the multi-operation case
+        // already refuses, and the spec says so too.
+        (DocumentOperations::Single(op), Some(wanted))
+            if !doc
+                .operations
+                .iter()
+                .any(|(name, _)| name.map(|n| n.as_str()) == Some(wanted)) =>
+        {
+            Err(Error::Parse(format!("operation '{wanted}' not found")))
+        }
         (DocumentOperations::Single(op), _) => Ok(OpInfo {
             ty: op.node.ty,
             selection_set: &op.node.selection_set.node,
@@ -3789,6 +3802,24 @@ mod tests {
             json!({}),
         )
         .unwrap();
+    }
+
+    /// A name that matches nothing is an error however many operations the
+    /// document holds — running the only one there would answer about that one
+    /// when the caller asked about another.
+    #[test]
+    fn an_operation_name_that_matches_nothing_is_refused() {
+        let s = schema();
+        let doc = parse_document("query Solo { users { id } }").unwrap();
+        assert!(lower(&doc, &json!({}), Some("Solo"), &s).is_ok());
+        let err = lower(&doc, &json!({}), Some("Other"), &s).unwrap_err();
+        assert!(format!("{err}").contains("'Other' not found"), "{err}");
+
+        // An anonymous operation has no name to match.
+        let doc = parse_document("{ users { id } }").unwrap();
+        assert!(lower(&doc, &json!({}), None, &s).is_ok());
+        let err = lower(&doc, &json!({}), Some("Anything"), &s).unwrap_err();
+        assert!(format!("{err}").contains("'Anything' not found"), "{err}");
     }
 
     #[test]

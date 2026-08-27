@@ -127,17 +127,36 @@ impl Engine {
     }
 
     /// Parse (via the cache) and lower `source` against this engine's schema.
-    fn lower(&self, source: &str, vars: &Value) -> Result<Operation> {
+    fn lower(&self, source: &str, vars: &Value, operation_name: Option<&str>) -> Result<Operation> {
         let doc = self.parse_cache.get(source)?;
-        crate::parser::lower(&doc, vars, None, &self.schema)
+        crate::parser::lower(&doc, vars, operation_name, &self.schema)
     }
 
     /// Parse a GraphQL query string, execute against PostgreSQL, return the
     /// Hasura-shaped `data` object as `serde_json::Value`.
+    ///
+    /// A document holding more than one operation needs
+    /// [`Engine::query_with`] to say which.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
+        self.query_with(source, variables, None).await
+    }
+
+    /// [`Engine::query`] naming the operation to run.
+    ///
+    /// This is the third field of a GraphQL request body, beside `query` and
+    /// `variables`: a client that ships one document holding every operation it
+    /// might send picks one per request by name. Without it such a document can
+    /// only be run through [`Engine::compile_with`], which has always taken one.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with(
+        &self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let mut op = self.lower(source, &vars)?;
+        let mut op = self.lower(source, &vars, operation_name)?;
         let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
         crate::executor::execute(&self.pool, &sql, &binds).await
@@ -160,7 +179,17 @@ impl Engine {
         source: &str,
         variables: Option<Value>,
     ) -> Result<T> {
-        let data = self.query(source, variables).await?;
+        self.query_as_with(source, variables, None).await
+    }
+
+    /// [`Engine::query_as`] naming the operation to run.
+    pub async fn query_as_with<T: DeserializeOwned>(
+        &self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self.query_with(source, variables, operation_name).await?;
         unwrap_and_deserialize(data, None)
     }
 
@@ -375,9 +404,20 @@ impl TxClient {
     /// Same as [`Engine::query`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
+        self.query_with(source, variables, None).await
+    }
+
+    /// [`TxClient::query`] naming the operation to run.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with(
+        &mut self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let doc = self.parse_cache.get(source)?;
-        let mut op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
+        let mut op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
         let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
@@ -398,7 +438,17 @@ impl TxClient {
         source: &str,
         variables: Option<Value>,
     ) -> Result<T> {
-        let data = self.query(source, variables).await?;
+        self.query_as_with(source, variables, None).await
+    }
+
+    /// The same, naming the operation to run.
+    pub async fn query_as_with<T: DeserializeOwned>(
+        &mut self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self.query_with(source, variables, operation_name).await?;
         unwrap_and_deserialize(data, None)
     }
 
@@ -435,8 +485,19 @@ impl ScopedEngine<'_> {
     /// Same as [`Engine::query`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
+        self.query_with(source, variables, None).await
+    }
+
+    /// [`ScopedEngine::query`] naming the operation to run.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with(
+        &self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = self.engine.lower(source, &vars)?;
+        let op = self.engine.lower(source, &vars, operation_name)?;
         let (sql, binds) = self.prepare(op)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped");
         crate::executor::execute(&self.engine.pool, &sql, &binds).await
@@ -456,7 +517,17 @@ impl ScopedEngine<'_> {
         source: &str,
         variables: Option<Value>,
     ) -> Result<T> {
-        let data = self.query(source, variables).await?;
+        self.query_as_with(source, variables, None).await
+    }
+
+    /// [`Engine::query_as`] naming the operation to run.
+    pub async fn query_as_with<T: DeserializeOwned>(
+        &self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self.query_with(source, variables, operation_name).await?;
         unwrap_and_deserialize(data, None)
     }
 
@@ -521,9 +592,20 @@ impl ScopedTxClient {
     /// Same as [`TxClient::query`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
+        self.query_with(source, variables, None).await
+    }
+
+    /// [`ScopedTxClient::query`] naming the operation to run.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with(
+        &mut self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let doc = self.parse_cache.get(source)?;
-        let op = crate::parser::lower(&doc, &vars, None, &self.schema)?;
+        let op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
         let (sql, binds) = self.prepare(op)?;
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped in tx");
         crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
@@ -543,7 +625,17 @@ impl ScopedTxClient {
         source: &str,
         variables: Option<Value>,
     ) -> Result<T> {
-        let data = self.query(source, variables).await?;
+        self.query_as_with(source, variables, None).await
+    }
+
+    /// The same, naming the operation to run.
+    pub async fn query_as_with<T: DeserializeOwned>(
+        &mut self,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self.query_with(source, variables, operation_name).await?;
         unwrap_and_deserialize(data, None)
     }
 
