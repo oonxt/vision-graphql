@@ -149,6 +149,9 @@ impl ScopePolicyBuilder {
     }
 
     /// Restrict `table` to these columns and no others. See [`ColumnScope`].
+    ///
+    /// Replaces any previous rule for the same table — the two forms are
+    /// alternative spellings of one rule, not layers.
     pub fn columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -161,7 +164,8 @@ impl ScopePolicyBuilder {
         self
     }
 
-    /// Withhold these columns of `table`, admitting the rest.
+    /// Withhold these columns of `table`, admitting the rest. Replaces any
+    /// previous rule for the same table; see [`ScopePolicyBuilder::columns`].
     pub fn hide_columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,

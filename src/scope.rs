@@ -119,6 +119,11 @@ impl ScopeSet {
     ///
     /// Fail-closed against a growing schema: a column added later is not
     /// admitted until it is named here. See [`ColumnScope`].
+    ///
+    /// Replaces any previous rule for the same table. The two forms are
+    /// alternative spellings of one rule, not layers — `.columns(t, [a, b])`
+    /// followed by `.hide_columns(t, [c])` leaves the *denylist*, admitting
+    /// everything but `c`, which is not what the pair reads like.
     pub fn columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -133,6 +138,8 @@ impl ScopeSet {
 
     /// Withhold these columns of `table`, admitting the rest — including any
     /// added later, which is what makes [`ScopeSet::columns`] the safer form.
+    ///
+    /// Replaces any previous rule for the same table; see [`ScopeSet::columns`].
     pub fn hide_columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -208,8 +215,8 @@ fn check_column(scope: &ScopeSet, table: &Table, column: &str) -> Result<()> {
 fn check_selection(fields: &[Field], table: &Table, scope: &ScopeSet) -> Result<()> {
     for f in fields {
         match f {
-            Field::Column { physical, .. } | Field::JsonPath { physical, .. } => {
-                check_column(scope, table, physical)?;
+            Field::Column { column, .. } | Field::JsonPath { column, .. } => {
+                check_column(scope, table, column)?;
             }
             Field::Typename { .. } | Field::Relation { .. } => {}
         }
@@ -370,14 +377,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             let t = lookup_table(schema, table, alias)?;
             *scope_check = resolve(scope, table)?;
             scope_fields(returning, t, scope, schema)?;
-            if let Some(oc) = on_conflict.as_mut() {
-                for column in &oc.update_columns {
-                    check_column(scope, t, column)?;
-                }
-                if let Some(w) = oc.where_.as_mut() {
-                    scope_bool_expr(w, t, scope, schema)?;
-                }
-            }
+            check_on_conflict(on_conflict.as_mut(), t, scope, schema)?;
             // Recurse through nested inserts, resolving each nested target
             // table's check. An absent/denied nested table fails closed here,
             // before any SQL is built.
@@ -477,7 +477,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
 /// write `posts.title` is not thereby allowed to write `users.role` through a
 /// nested insert.
 fn check_insert_columns(
-    obj: &crate::ast::InsertObject,
+    obj: &mut crate::ast::InsertObject,
     table: &Table,
     scope: &ScopeSet,
     schema: &Schema,
@@ -485,15 +485,43 @@ fn check_insert_columns(
     for column in obj.columns.keys() {
         check_column(scope, table, column)?;
     }
-    for nested in obj.nested_arrays.values() {
+    for nested in obj.nested_arrays.values_mut() {
         let target = lookup_table(schema, &nested.table, &table.exposed_name)?;
-        for row in &nested.rows {
+        check_on_conflict(nested.on_conflict.as_mut(), target, scope, schema)?;
+        for row in nested.rows.iter_mut() {
             check_insert_columns(row, target, scope, schema)?;
         }
     }
-    for nested in obj.nested_objects.values() {
+    for nested in obj.nested_objects.values_mut() {
         let target = lookup_table(schema, &nested.table, &table.exposed_name)?;
-        check_insert_columns(&nested.row, target, scope, schema)?;
+        check_on_conflict(nested.on_conflict.as_mut(), target, scope, schema)?;
+        check_insert_columns(&mut nested.row, target, scope, schema)?;
+    }
+    Ok(())
+}
+
+/// An `on_conflict` block, wherever it appears.
+///
+/// `update_columns` writes them and `where` reads them, so both answer to the
+/// column rules — and the `where` is a user-written predicate like any other,
+/// so its relation targets need the row scope injected. A nested block is the
+/// same block: it was only the top-level one that was being checked, which let
+/// `posts: { data: […], on_conflict: { update_columns: [secret] } }` write a
+/// column the caller could not so much as read.
+fn check_on_conflict(
+    oc: Option<&mut crate::ast::OnConflict>,
+    table: &Table,
+    scope: &ScopeSet,
+    schema: &Schema,
+) -> Result<()> {
+    let Some(oc) = oc else {
+        return Ok(());
+    };
+    for column in &oc.update_columns {
+        check_column(scope, table, column)?;
+    }
+    if let Some(w) = oc.where_.as_mut() {
+        scope_bool_expr(w, table, scope, schema)?;
     }
     Ok(())
 }
@@ -692,7 +720,7 @@ mod tests {
         let mut op = Operation::Query(vec![list_root(
             "posts",
             vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
         )]);
@@ -724,7 +752,7 @@ mod tests {
                 alias: "posts".into(),
                 args: QueryArgs::default(),
                 selection: vec![Field::Column {
-                    physical: "title".into(),
+                    column: "title".into(),
                     alias: "title".into(),
                 }],
             }],
@@ -1166,6 +1194,74 @@ mod column_tests {
             .unrestricted("posts")
             .columns("posts", ["id"]);
         let mut op = lower("{ users { id posts { draft } } }");
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("draft"), "{err}");
+    }
+
+    /// The `physical` field held a physical name while every reader looked it
+    /// up as an exposed one — so a scope rule naming the exposed column
+    /// compared against the wrong string, in both directions.
+    #[test]
+    fn a_column_whose_names_differ_is_matched_by_its_exposed_name() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("salary", "salary_cents", PgType::Int4, true)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let lower = |q: &str| crate::parser::parse_and_lower(q, &json!({}), None, &schema).unwrap();
+
+        // Withheld stays withheld…
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .hide_columns("users", ["salary"]);
+        let mut op = lower("{ users { salary } }");
+        let err = apply_scope(&mut op, &scope, &schema).unwrap_err();
+        assert!(matches!(err, Error::ScopeColumnDenied { .. }), "{err:?}");
+
+        // …and admitted stays admitted.
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .columns("users", ["id", "salary"]);
+        let mut op = lower("{ users { id salary } }");
+        apply_scope(&mut op, &scope, &schema).unwrap();
+    }
+
+    /// A nested block's `on_conflict` is the same block as a top-level one, and
+    /// writes a column just as directly.
+    #[test]
+    fn a_nested_on_conflict_answers_to_the_column_rules() {
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .unrestricted("posts")
+            .columns("posts", ["id", "user_id"]);
+        let mut op = lower(
+            r#"mutation { insert_users(objects: [{name: "a", posts: {
+                 data: [{id: 1}],
+                 on_conflict: {constraint: "posts_pkey", update_columns: ["draft"]}
+               }}]) { affected_rows } }"#,
+        );
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("draft"), "{err}");
+    }
+
+    /// …and its `where` is a user-written predicate: its columns are read, and
+    /// its relation targets need the row scope injected like anywhere else.
+    #[test]
+    fn a_nested_on_conflict_where_is_checked_and_scoped() {
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .unrestricted("posts")
+            .columns("posts", ["id", "user_id"]);
+        let mut op = lower(
+            r#"mutation { insert_users(objects: [{name: "a", posts: {
+                 data: [{id: 1}],
+                 on_conflict: {constraint: "posts_pkey", update_columns: ["id"],
+                               where: {draft: {_eq: true}}}
+               }}]) { affected_rows } }"#,
+        );
         let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
         assert!(format!("{err}").contains("draft"), "{err}");
     }

@@ -433,7 +433,14 @@ pub enum NullsOrder {
 #[derive(Debug, Clone)]
 pub enum Field {
     Column {
-        physical: String,
+        /// Exposed column name — the one the schema is keyed by, and the one
+        /// every consumer looks up with `find_column`.
+        ///
+        /// It used to be called `physical` and be filled with the physical
+        /// name, which no reader expected: a table whose exposed and physical
+        /// names differ could not be selected from at all, and a scope rule
+        /// naming the exposed column compared against the wrong string.
+        column: String,
         alias: String,
     },
     /// Scalar read of a JSON/JSONB column through a `#>` path extraction, e.g.
@@ -441,7 +448,8 @@ pub enum Field {
     /// The result keeps its JSON/JSONB type (structure preserved), and numeric
     /// path components index into JSON arrays per PostgreSQL `#>` semantics.
     JsonPath {
-        physical: String,
+        /// Exposed column name. See [`Field::Column::column`].
+        column: String,
         alias: String,
         /// Non-empty list of key/index components. Rendered as a `text[]` bind.
         path: Vec<String>,
@@ -449,9 +457,7 @@ pub enum Field {
     /// `__typename`. Renders as a string literal: the type name comes from the
     /// table the selection set belongs to, which only the renderer knows, so the
     /// IR carries the request and not the answer.
-    Typename {
-        alias: String,
-    },
+    Typename { alias: String },
     Relation {
         /// Name of the relation on the parent table (resolved via schema at render).
         name: String,
@@ -668,11 +674,11 @@ mod tests {
             body: RootBody::List {
                 selection: vec![
                     Field::Column {
-                        physical: "id".into(),
+                        column: "id".into(),
                         alias: "id".into(),
                     },
                     Field::Column {
-                        physical: "name".into(),
+                        column: "name".into(),
                         alias: "name".into(),
                     },
                 ],
@@ -705,7 +711,7 @@ mod tests {
             alias: "posts".into(),
             args: QueryArgs::default(),
             selection: vec![Field::Column {
-                physical: "title".into(),
+                column: "title".into(),
                 alias: "title".into(),
             }],
         };
@@ -737,7 +743,7 @@ mod tests {
                 },
             ],
             nodes: Some(vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }]),
         };
@@ -765,7 +771,7 @@ mod tests {
             }],
             on_conflict: None,
             returning: vec![Field::Column {
-                physical: "id".into(),
+                column: "id".into(),
                 alias: "id".into(),
             }],
             response_typenames: Vec::new(),

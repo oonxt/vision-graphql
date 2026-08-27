@@ -11,6 +11,12 @@ used to be silent, so read **Breaking** before upgrading.
 
 ### Fixed
 
+- **A column whose exposed name differed from its physical one could not be
+  selected at all.** The IR field was called `physical` and held the physical
+  name, while every reader looked it up with `find_column`, which is keyed by
+  the exposed one — so `Table::column("salary", "salary_cents", …)` rendered
+  "unknown column 'salary_cents'". Renamed to `column` and filled with the
+  exposed name, which is what the name now says and what every consumer wanted.
 - **`on_conflict`'s constraint name was checked by nobody**, so a typo reached
   Postgres as a 42704 at request time — slipping past `Engine::compile`, whose
   point is that a query which cannot work fails at startup. Checked against the
@@ -171,6 +177,8 @@ used to be silent, so read **Breaking** before upgrading.
   `AggOp::Sum` / `Avg` / `Max` / `Min` carry `fields: Vec<AggField>` rather than
   `columns: Vec<String>`; `AggOp::Typename` is new. Builder method signatures
   are unchanged.
+- `Field::Column` and `Field::JsonPath` carry `column` (the exposed name) where
+  they carried `physical`.
 - `Field::Typename` is a new IR variant, and `RootBody::Aggregate` and the
   `Insert` / `Update` / `Delete` mutation fields carry the response keys asking
   for a type name.
