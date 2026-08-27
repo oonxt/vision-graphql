@@ -3,6 +3,59 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **Aggregates on a relation**: `authors { posts_aggregate { aggregate { count } } }`,
+  the same shape the root offers, over one row's children — which is what a
+  paginated list needs, since the page and its total then travel in one request.
+  Array relations only: an object relation is a single row and asking says so.
+  It obeys the scope, because counting a table is reading it — the target's
+  predicate lands in the aggregate's `WHERE`, a denied table is denied here too,
+  and a withheld column cannot be summed. It counts against `ExecutionLimits`
+  as the correlated subquery it is.
+- **GraphQL-shaped errors**: `Error::to_graphql_response` and
+  `Error::to_graphql_error` produce the wire form, `Error::code` the stable
+  classification that goes in `extensions.code` and that an HTTP layer maps to a
+  status. `Error` stays a Rust enum — a library handing back only JSON would be
+  worse to program against. A database error now travels as its SQLSTATE rather
+  than PostgreSQL's message text, which carries table names, constraint names
+  and sometimes a source position from inside the server; the full text remains
+  in `Display`, for the log. An internal error says only that it is one.
+- **`operationName`**: `query_with` and `query_as_with` on `Engine`, `TxClient`,
+  `ScopedEngine` and `ScopedTxClient`. It is the third field of a GraphQL
+  request body, and a client that ships one document holding every operation it
+  might send picks one per request by name — which previously only
+  `Engine::compile_with` could do, so that shape of client could not use the
+  query path at all.
+
+### Fixed
+
+- **An injected `default_limit` capped an aggregate's `count`.** `aggregate` and
+  `nodes` read one source, so the limit decided what was counted rather than how
+  many rows came back — the opposite of what it is for. `nodes` now gets a
+  source of its own when a default applies; a limit the caller writes still
+  applies to both.
+- **A relation aggregate in mutation `returning` read the base table** while the
+  relation beside it read the CTE, so one response reported a row under `posts`
+  and `count: 0` under `posts_aggregate`.
+- **`distinct_on` on an aggregate was parsed and dropped**, leaving `count` to
+  answer a different question with no error. Refused now, and no longer
+  published in the type system.
+- **`ErrorCode::LimitExceeded` was unreachable**: an execution-limit refusal was
+  reported as `DOCUMENT_REJECTED`. `Error::CostLimit` is a new variant and the
+  two now answer differently.
+- **`Error::Scope` was classified as an access denial.** It carries a policy that
+  would not load and a compiled statement run through the wrong entry point —
+  the host's mistakes. Reported as `INTERNAL_ERROR`.
+- **A named operation that matched nothing ran anyway** when the document held
+  exactly one operation: the name was not looked at. Answering about the
+  operation that happens to be there when the caller asked about another is the
+  same silent substitution the multi-operation case already refused. Now an
+  error, as the spec has it, including for an anonymous operation that has no
+  name to match.
+
 ## 0.13.0 — 2026-08-27
 
 Hardening for the case where a document reaches the engine from a client rather

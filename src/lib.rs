@@ -82,7 +82,7 @@ pub use builder::{
 };
 pub use compiled::CompiledQuery;
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
-pub use error::Error;
+pub use error::{Error, ErrorCode};
 pub use limits::ParseLimits;
 pub use parse_cache::ParseCache;
 pub use persisted::QueryRegistry;

@@ -62,6 +62,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Area | Status |
 |---|---|
 | Select, `_by_pk`, `_aggregate` | ✓ |
+| Aggregates on a relation (`user { posts_aggregate { … } }`) | ✓ |
 | Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, with field aliases | ✓ |
 | Object + Array relations | ✓ |
 | `EXISTS` relation filters in `where` | ✓ |
@@ -79,6 +80,8 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
+| `operationName` (`query_with` / `query_as_with`, on every handle) | ✓ |
+| GraphQL-shaped errors (`Error::to_graphql_response`, `Error::code`) | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
 | Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
@@ -99,9 +102,6 @@ and left, not forgotten.
 
 | Gap | Notes |
 |---|---|
-| `operationName` on `Engine::query` | A document with several operations can only be run through `Engine::compile`, which does take one. |
-| GraphQL-shaped errors | [`Error`] is a Rust enum; there is no `errors: [{message, path, extensions}]` envelope, and `Error::Database` carries PostgreSQL's own message. A host serving HTTP maps them itself, and should decide what to pass on. |
-| Aggregates on a relation (`user { posts_aggregate { … } }`) | Only root `<table>_aggregate` exists. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
 | `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
 | `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
@@ -729,6 +729,28 @@ query {
 }
 ```
 
+An array relation carries the same field, over that row's children — which is
+what a paginated list needs, since the page and its total are one request:
+
+```graphql
+{ authors {
+    posts(limit: 10, order_by: [{score: desc}]) { title }
+    posts_aggregate { aggregate { count } }
+    published: posts_aggregate(where: {draft: {_eq: false}}) { aggregate { count } }
+} }
+```
+
+It renders as a correlated subquery like any relation field, takes the same
+arguments (except `distinct_on`, which the aggregate source does not render and
+so does not accept), and answers `count: 0` for a parent with no children rather than
+going missing. Object relations do not have one: a single row has nothing to
+aggregate, and asking says so.
+
+Counting a table is reading it, so a scope applies: the target's row predicate
+lands in the aggregate's `WHERE`, a table the scope denies is denied here too,
+and a withheld column cannot be summed or maxed. A number that answered the
+question the rows were refused would be a hole with extra steps.
+
 `count` takes `columns` and `distinct`; the other functions take their columns
 as a selection set. Field aliases work here like anywhere else — `total: count`
 answers under `total`. Anything else in an argument position is an error rather
@@ -844,12 +866,16 @@ each relation at any depth, each `EXISTS` filter inside a `where`, each
 statement will carry, and the thing a hundred aliases of one relation inflates
 while leaving depth at 1.
 
-`default_limit` reaches root lists and array relations, and an `_aggregate`
-that selects `nodes` — those rows are rows like any other. Not `_by_pk`, not
-object relations (one row by construction; a limit there would replace the
-`LIMIT 1` the renderer needs), and not an `_aggregate` selecting only
-`aggregate { … }`, where a cap would change what `count` counts rather than
-what it costs. It is the one limit here that silently changes an answer, which
+`default_limit` reaches root lists, array relations, and the `nodes` of an
+`_aggregate` — those rows are rows like any other. Not `_by_pk`, and not object
+relations (one row by construction; a limit there would replace the `LIMIT 1`
+the renderer needs).
+
+On an aggregate it reaches `nodes` **and nothing else**: `aggregate` and `nodes`
+otherwise read one source, so a cap on it would decide what `count` counted
+rather than how many rows came back. `nodes` gets a source of its own when a
+default applies. A limit the caller writes still applies to both — they asked
+about that many rows. It is the one limit here that silently changes an answer, which
 is the trade it exists to make; a client that needs to know whether more rows
 exist should ask `_aggregate { count }` as its own root field.
 
@@ -923,6 +949,62 @@ The key is whatever suits the application — a name, a file path, the SHA-256 o
 the document if you are implementing the persisted-query protocol clients speak.
 The crate does not choose one. An unknown key is an error that names the key and
 deliberately does not list the ones that do exist.
+
+## Errors
+
+`Error` is a Rust enum, and stays one — a library that could only hand back JSON
+would be worse to program against. `to_graphql_response` produces the wire form
+when you need it:
+
+```rust
+# use vision_graphql::{Engine, Error};
+# async fn f(engine: Engine, source: &str) -> serde_json::Value {
+match engine.query(source, None).await {
+    Ok(data) => serde_json::json!({ "data": data }),
+    Err(e) => {
+        tracing::warn!(error = %e, "request failed");   // the whole of it
+        e.to_graphql_response()                          // what the client sees
+    }
+}
+# }
+```
+
+```json
+{"errors": [{
+  "message": "validation error at where.id: type mapping: expected Int4",
+  "extensions": {"code": "VALIDATION_FAILED", "path": "where.id"}
+}]}
+```
+
+**One error, and no `data` key.** Both are consequences of the architecture
+rather than simplifications: the engine renders one statement per request and
+runs it whole, so there is no partial success to report alongside, and the first
+thing that goes wrong is the only thing that happens.
+
+**`extensions.code`** is the stable classification — `VALIDATION_FAILED`,
+`VARIABLE_MISSING`, `SCOPE_DENIED`, `DOCUMENT_REJECTED` (the document was too
+large or too deep to look at), `LIMIT_EXCEEDED` (an ordinary document asking for
+too much), `PARSE_FAILED`, `NOT_COMPILABLE`, `DATABASE_ERROR`, `INTERNAL_ERROR`
+— and what an HTTP layer maps to a status. The string is the contract, not the
+enum variant.
+
+`SCOPE_DENIED` means the caller's access, and only that. A policy that would not
+load, or a compiled statement run through the wrong entry point, is the host's
+own mistake and comes back as `INTERNAL_ERROR`: telling a client it lacks
+permission for a bug it had no part in would send it looking in the wrong place.
+
+**What the message says depends on who caused it.** A validation error goes
+back whole: it names a column the document already named, and withholding it
+would only make the client guess. A *database* error does not. PostgreSQL's
+message text carries table names, constraint names and sometimes a source file
+and line from inside the server; the reply carries the SQLSTATE
+(`23505`, `23503`, `57014`) and the full text stays in `Display` for your log.
+An internal error says only that it is one.
+
+There is no `path` in the GraphQL sense: `path` names a position in the
+*response*, and every error here is raised before any data exists. The position
+this crate does know — `where.id`, `m0.objects[0].price` — travels in
+`extensions.path` instead.
 
 ## Transactions
 

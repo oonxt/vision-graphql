@@ -305,10 +305,26 @@ impl ExecutionLimits {
         Ok(())
     }
 
+    /// The cap `nodes` gets when the caller wrote none.
+    ///
+    /// `None` when there is no `nodes`, when the caller wrote a limit of their
+    /// own — which they meant for the whole field, `count` included — or when
+    /// no default is configured.
+    fn nodes_default(
+        &self,
+        nodes: Option<&[crate::ast::Field]>,
+        args: &crate::ast::QueryArgs,
+    ) -> Option<crate::ast::Count> {
+        if nodes.is_none() || args.limit.is_some() {
+            return None;
+        }
+        self.default_limit.map(crate::ast::Count::Lit)
+    }
+
     fn count_read(&self, reads: &mut usize) -> Result<()> {
         *reads += 1;
         match self.max_table_reads {
-            Some(max) if *reads > max => Err(Error::Limit {
+            Some(max) if *reads > max => Err(Error::CostLimit {
                 message: format!("request reads more than {max} table positions"),
             }),
             _ => Ok(()),
@@ -317,7 +333,7 @@ impl ExecutionLimits {
 
     fn check_depth(&self, depth: usize) -> Result<()> {
         match self.max_relation_depth {
-            Some(max) if depth > max => Err(Error::Limit {
+            Some(max) if depth > max => Err(Error::CostLimit {
                 message: format!("relations nest deeper than the limit of {max}"),
             }),
             _ => Ok(()),
@@ -339,15 +355,24 @@ impl ExecutionLimits {
         // An `_aggregate` root renders `LIMIT` like any list, and its `nodes`
         // returns those rows — so the ceiling has to reach it, or appending
         // `_aggregate` is all it takes to walk around one. A *default* is filled
-        // in only where `nodes` was selected: on `aggregate { count }` alone it
-        // would change the answer rather than bound the work.
+        // in only for `nodes`, and on a source of its own: `aggregate` and
+        // `nodes` otherwise read one source, so a cap on it would decide what
+        // `count` counted rather than how many rows came back.
         let (cap, fill_default) = match &root.body {
             RootBody::List { .. } => (true, true),
-            RootBody::Aggregate { nodes, .. } => (true, nodes.is_some()),
+            // Never on the shared source: it decides what `count` counts. A
+            // default meant for `nodes` goes to its own slot, below.
+            RootBody::Aggregate { .. } => (true, false),
             RootBody::ByPk { .. } | RootBody::Introspection(_) => (false, false),
         };
         let table = schema.table(&root.table);
         self.args(&mut root.args, cap, fill_default, table, schema, reads, 0)?;
+        if let RootBody::Aggregate {
+            nodes, nodes_limit, ..
+        } = &mut root.body
+        {
+            *nodes_limit = self.nodes_default(nodes.as_deref(), &root.args);
+        }
         match &mut root.body {
             RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
                 self.fields(selection, table, schema, reads, 0)?;
@@ -501,7 +526,7 @@ impl ExecutionLimits {
                 Some(Count::Lit(n) | Count::Bound(n)) => {
                     if let Some(max) = self.max_limit {
                         if *n > max {
-                            return Err(Error::Limit {
+                            return Err(Error::CostLimit {
                                 message: format!("limit {n} is over the limit of {max}"),
                             });
                         }
@@ -549,6 +574,29 @@ impl ExecutionLimits {
         depth: usize,
     ) -> Result<()> {
         for f in fields.iter_mut() {
+            // A relation aggregate is a correlated subquery over the target
+            // table like any relation field, and nests like one.
+            if let crate::ast::Field::RelationAggregate {
+                name,
+                args,
+                nodes,
+                nodes_limit,
+                ..
+            } = f
+            {
+                self.count_read(reads)?;
+                self.check_depth(depth + 1)?;
+                let rel = table.and_then(|t| t.find_relation(name));
+                let target = rel.and_then(|r| schema.table(&r.target_table));
+                // Never on the shared source, which decides what `count`
+                // counts; a default meant for `nodes` goes to its own slot.
+                self.args(args, true, false, target, schema, reads, depth + 1)?;
+                *nodes_limit = self.nodes_default(nodes.as_deref(), args);
+                if let Some(node_fields) = nodes.as_mut() {
+                    self.fields(node_fields, target, schema, reads, depth + 1)?;
+                }
+                continue;
+            }
             let crate::ast::Field::Relation {
                 name,
                 args,
@@ -968,23 +1016,57 @@ mod exec_tests {
         assert!(format!("{err}").contains("over the limit of 10"), "{err}");
     }
 
+    /// `aggregate` and `nodes` read one source, so a `LIMIT` on it decides what
+    /// `count` counts. An injected default must therefore reach `nodes` alone —
+    /// it exists to bound how many rows come back, not to change the answer.
     #[test]
-    fn a_default_limit_bounds_aggregate_nodes_but_not_a_bare_count() {
-        // `nodes` returns rows, so it is bounded…
-        let op = apply(
+    fn a_default_limit_bounds_aggregate_nodes_without_touching_the_count() {
+        let schema = schema();
+        let render = |q: &str, limits: ExecutionLimits| {
+            let mut op = lower(q);
+            limits.apply(&mut op, &schema).unwrap();
+            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
+                .unwrap()
+                .0
+        };
+
+        // Both selected: the count sees every row, `nodes` sees 25.
+        let sql = render(
+            "{ users_aggregate { aggregate { count } nodes { id } } }",
+            ExecutionLimits::new().default_limit(25),
+        );
+        assert!(sql.contains("count(*)"), "{sql}");
+        assert_eq!(sql.matches("LIMIT 25").count(), 1, "{sql}");
+        // The counted source carries no limit of its own.
+        let counted = sql.split("'nodes'").next().unwrap();
+        assert!(
+            !counted.contains("LIMIT"),
+            "the count must see every row: {sql}"
+        );
+
+        // `nodes` alone is bounded the same way.
+        let sql = render(
             "{ users_aggregate { nodes { id } } }",
             ExecutionLimits::new().default_limit(25),
-        )
-        .unwrap();
-        assert_eq!(limit_of(&op), Some(Count::Lit(25)));
+        );
+        assert!(sql.contains("LIMIT 25"), "{sql}");
 
-        // …while a count alone would have its answer changed, not its cost.
+        // A bare count is untouched.
         let op = apply(
             "{ users_aggregate { aggregate { count } } }",
             ExecutionLimits::new().default_limit(25),
         )
         .unwrap();
         assert_eq!(limit_of(&op), None);
+
+        // A limit the caller wrote applies to the whole field, count included:
+        // they asked about that many rows.
+        let sql = render(
+            "{ users_aggregate(limit: 5) { aggregate { count } nodes { id } } }",
+            ExecutionLimits::new().default_limit(25),
+        );
+        assert!(sql.contains("LIMIT 5"), "{sql}");
+        assert!(!sql.contains("LIMIT 25"), "{sql}");
     }
 
     /// An object relation renders `row_to_json` over a subquery the renderer

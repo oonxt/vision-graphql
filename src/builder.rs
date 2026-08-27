@@ -400,6 +400,7 @@ impl AggregateBuilder {
             args: self.args,
             body: RootBody::Aggregate {
                 typenames: Vec::new(),
+                nodes_limit: None,
                 ops: self.ops,
                 nodes: self.nodes,
             },
