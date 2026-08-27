@@ -38,11 +38,57 @@ pub const PG_IMAGE_TAG: &str = "17.4-alpine";
 /// A database, and whatever has to stay alive for it to answer.
 ///
 /// Hold it for as long as the test needs the database. Dropping it removes the
-/// container, when there is one.
+/// container, when there is one — and on a shared server, the database itself:
+/// a long-lived server otherwise accretes a hundred databases per run, and the
+/// `t{pid}_…` names would eventually collide with a leaked one when the OS
+/// reuses a pid.
 pub struct TestDb {
     pub pool: PgPool,
     pub url: String,
+    /// The name of the database created on a shared server, so `Drop` can
+    /// remove it. `None` on the container path — the container takes the
+    /// database with it.
+    pub db_name: Option<String>,
+    admin_url: Option<String>,
     _container: Option<ContainerAsync<Postgres>>,
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        let (Some(name), Some(admin)) = (self.db_name.take(), self.admin_url.take()) else {
+            return;
+        };
+        // Drop is synchronous and the ambient runtime may be single-threaded
+        // (`#[tokio::test]`'s default), where blocking on it deadlocks — so a
+        // throwaway thread and runtime, joined so the removal has actually
+        // happened when drop returns. WITH (FORCE) severs this TestDb's own
+        // pool, which still holds connections at this point.
+        let outcome = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a runtime to drop the test database");
+            rt.block_on(async {
+                let admin = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&admin)
+                    .await?;
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    r#"DROP DATABASE "{name}" WITH (FORCE)"#
+                )))
+                .execute(&admin)
+                .await?;
+                admin.close().await;
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .join();
+        // Complain but do not panic: a panic here during a failing test's
+        // unwind would abort the process and eat the failure that matters.
+        if let Ok(Err(e)) = outcome {
+            eprintln!("warning: test database was not removed: {e}");
+        }
+    }
 }
 
 /// The shared server's URL, when one was given. Read once; there is nothing to
@@ -105,10 +151,12 @@ pub async fn fresh_db() -> TestDb {
     match shared_admin_url().await {
         // A server that already exists: take a database on it.
         Some(admin_url) => {
-            let (pool, url) = create_database(admin_url).await;
+            let (pool, url, name) = create_database(admin_url).await;
             TestDb {
                 pool,
                 url,
+                db_name: Some(name),
+                admin_url: Some(admin_url.clone()),
                 _container: None,
             }
         }
@@ -125,6 +173,8 @@ pub async fn fresh_db() -> TestDb {
             TestDb {
                 pool,
                 url,
+                db_name: None,
+                admin_url: None,
                 _container: Some(container),
             }
         }
@@ -133,12 +183,23 @@ pub async fn fresh_db() -> TestDb {
 
 /// A new database on `admin_url`, and the URL that reaches it.
 ///
-/// The name is unique per process and per call, so two tests — in one binary or
-/// in twenty running at once — never share one.
-async fn create_database(admin_url: &str) -> (PgPool, String) {
+/// The name is unique per process and per call — a pid and a counter — plus a
+/// per-run timestamp, because a pid alone comes back: the OS reuses them, and
+/// on a server where an interrupted run left its databases behind (`Drop`
+/// removes them, but `kill -9` outruns any Drop) the reused pid recomputes an
+/// existing name and `CREATE DATABASE` panics on it.
+async fn create_database(admin_url: &str) -> (PgPool, String, String) {
+    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_nanos() as u64
+    });
     let name = format!(
-        "t{}_{}",
+        "t{}_{:x}_{}",
         std::process::id(),
+        run,
         NEXT_DB.fetch_add(1, Ordering::Relaxed)
     );
     let admin = PgPoolOptions::new()
@@ -161,22 +222,31 @@ async fn create_database(admin_url: &str) -> (PgPool, String) {
         .connect(&url)
         .await
         .expect("connect to the test database");
-    (pool, url)
+    (pool, url, name)
 }
 
 /// Replace the database in a connection URL, keeping everything else.
 ///
-/// Not unit-tested here on purpose: this module is compiled into every test
-/// binary, so a test in it runs twenty-five times and says nothing new. Every
-/// integration test that connects exercises it.
-fn swap_database(url: &str, database: &str) -> String {
-    match url.rsplit_once('/') {
-        // Keep any query string: `?sslmode=require` belongs to the server, not
-        // to the database.
-        Some((prefix, rest)) => match rest.split_once('?') {
-            Some((_, query)) => format!("{prefix}/{database}?{query}"),
-            None => format!("{prefix}/{database}"),
-        },
-        None => format!("{url}/{database}"),
+/// The path has to be looked for *after* the authority: a URL with no database
+/// segment — `postgres://u:p@host:5432`, valid, sqlx defaults the database —
+/// has its last `/` inside `://`, and splitting there hands the database name
+/// the authority's place. Tested in `integration_harness.rs`, once — this
+/// module is compiled into every test binary, and a test here would run
+/// twenty-five times and say nothing new.
+pub fn swap_database(url: &str, database: &str) -> String {
+    // Keep any query string: `?sslmode=require` belongs to the server, not to
+    // the database — and it can appear with no path at all.
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let server = match base[authority_start..].find('/') {
+        Some(i) => &base[..authority_start + i],
+        None => base,
+    };
+    match query {
+        Some(query) => format!("{server}/{database}?{query}"),
+        None => format!("{server}/{database}"),
     }
 }

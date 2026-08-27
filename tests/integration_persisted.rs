@@ -4,7 +4,9 @@ use vision_graphql::{Engine, QueryRegistry, Schema, ScopePolicy};
 
 mod common;
 
-async fn setup() -> (Engine, Schema) {
+// The TestDb rides along so the caller holds it: dropping it here would remove
+// the container (when there is one) while the Engine's pool still points at it.
+async fn setup() -> (common::TestDb, Engine, Schema) {
     let db = common::fresh_db().await;
     let pool = db.pool.clone();
     sqlx::raw_sql(
@@ -19,12 +21,12 @@ async fn setup() -> (Engine, Schema) {
         pool.clone(),
         Schema::introspect(&pool).await.unwrap().build(),
     );
-    (engine, schema)
+    (db, engine, schema)
 }
 
 #[tokio::test]
 async fn a_registry_compiled_at_startup_serves_requests_by_key() {
-    let (engine, _schema) = setup().await;
+    let (_db, engine, _schema) = setup().await;
     let registry = QueryRegistry::compile_all(
         &engine,
         [
@@ -53,7 +55,7 @@ async fn a_registry_compiled_at_startup_serves_requests_by_key() {
 
 #[tokio::test]
 async fn a_scoped_registry_serves_every_principal_from_one_statement() {
-    let (engine, schema) = setup().await;
+    let (_db, engine, schema) = setup().await;
     let policy = ScopePolicy::builder()
         .allow("users", col("owner").eq(principal()))
         .validate(&schema)
