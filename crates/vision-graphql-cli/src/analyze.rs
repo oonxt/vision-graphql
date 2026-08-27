@@ -113,28 +113,32 @@ impl DiffReport {
 }
 
 pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter) -> DiffReport {
-    // Carried through untouched: what introspection could not map is a property
-    // of the database and the engine, not of the overlay, so it is reported
-    // rather than judged. The filter still applies — a table nobody exposes is
-    // not worth a notice about its columns.
-    let mut report = DiffReport {
-        skipped_columns: db
-            .skipped_columns
-            .iter()
-            .filter(|c| filter.keep(&c.table))
-            .map(|c| SkippedColumn {
-                table: format!("{}.{}", c.schema, c.table),
-                column: c.column.clone(),
-                data_type: c.data_type.clone(),
-            })
-            .collect(),
-        ..Default::default()
-    };
-
     // Index tables under the names the schema actually exposes them as — which
     // is what an overlay key refers to. With one schema that is just the table
     // name; with several, later schemas are prefixed.
     let exposed = vision_graphql::schema::merge::exposed_name_map(db);
+
+    // What introspection could not map is a property of the database and the
+    // engine, not of the overlay, so it is reported rather than judged. Filtered
+    // and labelled by the *exposed* name like everything else in this report:
+    // `--ignore-tables` is written against exposed names, and a second schema's
+    // tables are prefixed, so filtering on the physical name would drop notices
+    // for exactly the tables a `--schema app,audit` run cares about.
+    let mut report = DiffReport {
+        skipped_columns: db
+            .skipped_columns
+            .iter()
+            .filter_map(|c| {
+                let name = exposed.get(&(c.schema.clone(), c.table.clone()))?;
+                filter.keep(name).then(|| SkippedColumn {
+                    table: name.clone(),
+                    column: c.column.clone(),
+                    data_type: c.data_type.clone(),
+                })
+            })
+            .collect(),
+        ..Default::default()
+    };
     let by_name: BTreeMap<String, &IntrospectedTable> = db
         .tables
         .iter()

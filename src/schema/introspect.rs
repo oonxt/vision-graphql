@@ -67,6 +67,21 @@ pub struct IntrospectedForeignKey {
     pub to_columns: Vec<String>,
 }
 
+/// What to record for a type with no mapping.
+///
+/// `information_schema.data_type` collapses every array to `ARRAY` and every
+/// user-defined type to `USER-DEFINED`, which tells a reader nothing about
+/// which type to go and add support for. The `udt_name` beside it does —
+/// `_text`, `citext` — so the record carries both when they differ.
+fn named_type(data_type: &str, udt_name: Option<&str>) -> String {
+    match udt_name {
+        Some(udt) if udt != data_type && matches!(data_type, "ARRAY" | "USER-DEFINED") => {
+            format!("{data_type} ({udt})")
+        }
+        _ => data_type.to_string(),
+    }
+}
+
 /// A column left out of the schema because its type has no mapping here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedColumn {
@@ -175,6 +190,9 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         let udt_schema: Option<String> = row.get(5);
         let udt_name: Option<String> = row.get(6);
         let is_enum: Option<bool> = row.get(7);
+        // Kept for the skipped-column record: `data_type` alone says `ARRAY` or
+        // `USER-DEFINED`, which names nothing anyone could act on.
+        let udt = udt_name.clone();
         let pg_type = match (&*dtype, udt_schema, udt_name, is_enum) {
             ("USER-DEFINED", Some(schema), Some(name), Some(true)) => {
                 Some(PgType::Enum { schema, name })
@@ -193,7 +211,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 schema: schema.clone(),
                 table: tname.clone(),
                 column: cname.clone(),
-                data_type: dtype.clone(),
+                data_type: named_type(&dtype, udt.as_deref()),
             });
             continue;
         };
@@ -280,7 +298,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         let pg_type = if is_enum {
             Some(PgType::Enum {
                 schema: udt_schema,
-                name: udt_name,
+                name: udt_name.clone(),
             })
         } else {
             data_type_to_pg_type(&strip_type_modifier(&dtype))
@@ -293,6 +311,14 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 data_type = %dtype,
                 "skipping materialized-view column with unsupported type"
             );
+            // Recorded like any other, or a matview's hole stays invisible
+            // exactly as every hole did before.
+            db.skipped_columns.push(SkippedColumn {
+                schema: schema.clone(),
+                table: tname.clone(),
+                column: cname.clone(),
+                data_type: named_type(&dtype, Some(&udt_name)),
+            });
             continue;
         };
         let entry = db

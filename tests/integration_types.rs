@@ -265,6 +265,34 @@ async fn smallint_and_char_are_readable_and_writable() {
         .await
         .unwrap();
     assert_eq!(v["items"].as_array().unwrap().len(), 2);
+
+    // A `char(n)` value comes back blank-padded, so the value the API returns
+    // has to be usable as a filter for the row it came from — and so does the
+    // unpadded spelling. Postgres compares a bpchar column against a bound
+    // `::varchar` ignoring the padding on either side; this pins that, since it
+    // is the whole reason `character` can map to `Varchar` at all.
+    for spelling in ["cd  ", "cd"] {
+        let v = engine
+            .query(
+                &format!("{{ items(where: {{code: {{_eq: \"{spelling}\"}}}}) {{ qty }} }}"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            1,
+            "char(4) round-trip failed for {spelling:?}"
+        );
+    }
+
+    // An out-of-range smallint is knowable from the value, so it fails before
+    // the statement is sent rather than as a 22003 from the server.
+    let err = engine
+        .query("{ items(where: {qty: {_eq: 100000}}) { id } }", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("smallint range"), "{err}");
 }
 
 /// A type with no mapping is still dropped — but it is recorded now, so
@@ -299,9 +327,15 @@ async fn an_unmappable_column_is_recorded_rather_than_only_logged() {
         .map(|c| (c.column.as_str(), c.data_type.as_str()))
         .collect();
     skipped.sort();
+    // `information_schema` calls every array `ARRAY`, which names nothing a
+    // reader could act on — the underlying type name is carried beside it.
     assert_eq!(
         skipped,
-        vec![("blob", "bytea"), ("span", "interval"), ("tags", "ARRAY")]
+        vec![
+            ("blob", "bytea"),
+            ("span", "interval"),
+            ("tags", "ARRAY (_text)")
+        ]
     );
 }
 

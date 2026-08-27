@@ -1451,10 +1451,16 @@ fn parse_on_conflict(
     // none, and rejecting every `on_conflict` against one would be enforcing a
     // list that was never claimed to be complete.
     if !table.unique_constraints.is_empty() && !table.unique_constraints.contains_key(&constraint) {
+        // Only the ones a client could have learned about. Listing every
+        // constraint would hand back the names withheld from
+        // `<table>_constraint` — and a constraint name usually contains its
+        // column names, which is what hiding a column meant to withhold. One
+        // typo'd mutation would have been enough to read them out.
         let known: Vec<&str> = table
             .unique_constraints
-            .keys()
-            .map(String::as_str)
+            .iter()
+            .filter(|(_, cols)| cols.iter().all(|c| table.find_column(c).is_some()))
+            .map(|(name, _)| name.as_str())
             .collect();
         return Err(Error::Validate {
             path: format!("{path}.constraint"),

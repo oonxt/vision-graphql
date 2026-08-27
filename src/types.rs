@@ -226,10 +226,19 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .as_bool()
             .map(Bind::Bool)
             .ok_or_else(|| Error::TypeMap("expected Bool".into())),
-        // int2 binds as int4 and the cast narrows it server-side: sqlx has no
-        // i16 in `Bind`, and Postgres rejects an out-of-range value at the cast
-        // rather than wrapping it.
-        PgType::Int2 | PgType::Int4 => v
+        // int2 travels as int4 — sqlx has no i16 in `Bind` — but the range is
+        // checked here rather than left to the cast. Whether 100000 fits a
+        // smallint is knowable from the value, and a literal that cannot fit
+        // should fail where the query is compiled, not on the request that
+        // happens to run it.
+        PgType::Int2 => v
+            .as_i64()
+            .and_then(|n| i16::try_from(n).ok())
+            .map(|n| Bind::Int4(n as i32))
+            .ok_or_else(|| {
+                Error::TypeMap(format!("expected an integer in smallint range, got {v}"))
+            }),
+        PgType::Int4 => v
             .as_i64()
             .and_then(|n| i32::try_from(n).ok())
             .map(Bind::Int4)
@@ -242,12 +251,17 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
             .as_f64()
             .map(Bind::Float8)
             .ok_or_else(|| Error::TypeMap("expected floating point".into())),
-        // `numeric` is carried as text so the server does the conversion and
-        // nothing is rounded on the way. That is a reason to *accept* a string,
-        // not a reason to refuse a number: a column that reads back as `12.34`
-        // and then refuses `_gt: 10` makes every caller round-trip through
-        // strings for no benefit. A JSON number is rendered back to its own
-        // text and cast server-side like any other.
+        // `numeric` is carried as text so the server does the conversion. That is
+        // a reason to *accept* a string, not to refuse a number: a column that
+        // reads back as `12.34` and then refuses `_gt: 10` makes every caller
+        // round-trip through strings for no benefit.
+        //
+        // A number is rendered from the `f64` serde_json already parsed it into
+        // — not from the caller's own text, which is gone by the time this runs
+        // (this crate does not enable `arbitrary_precision`). So a literal with
+        // more precision than a double can hold arrives here already rounded,
+        // and the string form is the only way to carry one exactly. Documented
+        // in the README beside the type mapping.
         PgType::Numeric => match v {
             Value::String(s) => Ok(Bind::Text(s.clone())),
             Value::Number(n) => Ok(Bind::Text(n.to_string())),
@@ -293,7 +307,17 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
     }
     match pg {
         PgType::Bool => collect(values, Value::as_bool, "Bool").map(Bind::BoolArray),
-        PgType::Int2 | PgType::Int4 => collect(
+        PgType::Int2 => collect(
+            values,
+            |v| {
+                v.as_i64()
+                    .and_then(|n| i16::try_from(n).ok())
+                    .map(i32::from)
+            },
+            "an integer in smallint range",
+        )
+        .map(Bind::Int4Array),
+        PgType::Int4 => collect(
             values,
             |v| v.as_i64().and_then(|n| i32::try_from(n).ok()),
             "an integer",
@@ -370,11 +394,15 @@ mod tests {
     /// `int2` has no bind of its own: it goes out as int4 and the cast narrows
     /// it, so an out-of-range value is refused by Postgres rather than wrapped.
     #[test]
-    fn smallint_binds_through_int4() {
+    fn smallint_binds_through_int4_but_keeps_its_own_range() {
         assert!(matches!(
             json_to_bind(&json!(7), &PgType::Int2).unwrap(),
             Bind::Int4(7)
         ));
+        // Knowable from the value, so it fails here rather than at the server.
+        let err = json_to_bind(&json!(100000), &PgType::Int2).unwrap_err();
+        assert!(format!("{err}").contains("smallint range"), "{err}");
+        assert!(json_to_bind(&json!(100000), &PgType::Int4).is_ok());
     }
 
     #[test]

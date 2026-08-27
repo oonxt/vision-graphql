@@ -527,3 +527,47 @@ async fn sdl_check_exits_one_when_the_file_is_stale() {
     assert!(stderr.contains("+ type "), "{stderr}");
     assert!(stderr.contains("more changed lines"), "{stderr}");
 }
+
+/// A column the engine cannot map is absent from the schema, which is invisible
+/// from the outside — `diff` is where that hole gets said out loud.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_reports_columns_with_no_type_mapping() {
+    let (url, _c) = boot_pg().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::raw_sql("ALTER TABLE users ADD COLUMN tags TEXT[], ADD COLUMN blob BYTEA;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["diff", "--url", &url, "--config", "/dev/null"])
+        .output()
+        .expect("run cli");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not exposed (no type mapping"), "{text}");
+    assert!(text.contains("users.tags (ARRAY (_text))"), "{text}");
+    assert!(text.contains("users.blob (bytea)"), "{text}");
+    // It is not drift: the overlay is not wrong, so the exit status is clean.
+    assert_eq!(out.status.code(), Some(0), "{text}");
+
+    // …and a table the filter excludes gets no notice about its columns.
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            &url,
+            "--config",
+            "/dev/null",
+            "--ignore-tables",
+            "users",
+        ])
+        .output()
+        .expect("run cli");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("users.tags"), "{text}");
+}

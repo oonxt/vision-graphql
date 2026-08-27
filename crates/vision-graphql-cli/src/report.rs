@@ -81,11 +81,9 @@ fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()>
     Ok(())
 }
 
-/// Printed on both the clean and dirty paths: it is not drift, but leaving it
-/// silent would let `diff` read as "everything checked out" when part of the
-/// overlay was never looked at.
-/// Columns the engine cannot carry. Not drift, but the only place this becomes
-/// visible: from the outside the column simply is not there.
+/// Columns the engine cannot carry. Printed on both the clean and dirty paths:
+/// not drift, but the only place it becomes visible — from the outside the
+/// column simply is not there.
 fn write_skipped<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if report.skipped_columns.is_empty() {
         return Ok(());
@@ -112,6 +110,9 @@ fn write_skipped<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<
     Ok(())
 }
 
+/// Repoints aimed at a schema that was not introspected. Printed on both paths
+/// for the same reason: leaving it silent would let `diff` read as "everything
+/// checked out" when part of the overlay was never looked at.
 fn write_unverified<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if report.unverified_repoints.is_empty() {
         return Ok(());

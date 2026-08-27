@@ -196,10 +196,14 @@ Most of the mapping is unremarkable — `integer` is `Int`, `text` is `String`.
 Three things are worth knowing.
 
 **`numeric` takes a number or a string.** It is carried to the server as text
-and cast there, so nothing is rounded in transit, but that is a reason to accept
-a string, not to refuse a number: a column that reads back as `12.34` and then
-rejects `_gt: 10` makes every caller round-trip through strings for nothing.
-Both work; use the string form for a value a float cannot hold exactly.
+and cast there, but that is a reason to accept a string, not to refuse a number:
+a column that reads back as `12.34` and then rejects `_gt: 10` makes every
+caller round-trip through strings for nothing.
+
+Use the string form when the value needs more precision than a double holds.
+A JSON number has already been parsed into an `f64` before this crate sees it,
+so `12345678901234567890.12` arrives rounded and there is no way to recover what
+was written; `"12345678901234567890.12"` is carried through exactly.
 
 **A type with no mapping means the column is not there.** Arrays, `bytea`,
 `interval` and `inet` have none, and introspection leaves those columns out of
@@ -210,9 +214,9 @@ relation goes missing with it. That used to be a log line and nothing else;
 
 ```
 not exposed (no type mapping — these columns are absent from the schema):
-  - public.items.tags (ARRAY)
-  - public.items.blob (bytea)
-    2 column(s) across 2 type(s): ARRAY, bytea
+  - items.tags (ARRAY (_text))
+  - items.blob (bytea)
+    2 column(s) across 2 type(s): ARRAY (_text), bytea
 ```
 
 **A Postgres enum column** is exposed as a custom scalar named after the type
