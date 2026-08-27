@@ -2,7 +2,9 @@
 name = "vision-graphql-cli"
 version = "0.12.0"
 edition = "2021"
-rust-version = "1.85"
+# Tracks what the dependency graph actually needs, not an aspiration: sqlx 0.9
+# requires 1.94, so nothing here can build below it. CI checks this.
+rust-version = "1.94"
 description = "CLI to generate and validate vision-graphql schema overlays."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oonxt/vision-graphql"
