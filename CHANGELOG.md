@@ -11,6 +11,14 @@ used to be silent, so read **Breaking** before upgrading.
 
 ### Fixed
 
+- **`_eq: null` returned an empty result instead of saying anything.** SQL
+  answers `col = NULL` with no rows, which is not what a caller writing it
+  means, and an empty result is indistinguishable from a filter that legitimately
+  matched nothing. Comparisons against null — including through a variable, and
+  including on a compiled statement where the value arrives later — are refused
+  with a message naming `_is_null`. `_by_pk(id: null)` likewise. A null is still
+  a value in `_set` and in an inserted column.
+
 - **A column whose exposed name differed from its physical one could not be
   selected at all.** The IR field was called `physical` and held the physical
   name, while every reader looked it up with `find_column`, which is keyed by

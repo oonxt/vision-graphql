@@ -70,6 +70,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `returning` clause on mutations (with nested relations) | ✓ |
 | Multi-request transactions (`Engine::transaction`) | ✓ |
 | Operators: `_eq`/`_neq`/`_gt`/`_gte`/`_lt`/`_lte`/`_like`/`_ilike`/`_nlike`/`_nilike`/`_in`/`_nin`/`_is_null` | ✓ |
+| Comparing against `null` is refused, not silently empty | ✓ |
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
 | Field aliases (`abundance: data`) | ✓ |
@@ -720,8 +721,18 @@ so, and a misspelled argument names itself.
 
 ## Strictness
 
-Two rules worth knowing before pointing a client at this, both of which used to
+Three rules worth knowing before pointing a client at this, all of which used to
 be silent:
+
+**A comparison against `null` is an error.** SQL's answer to `col = NULL` is no
+rows — not "the rows whose column is null", which is what someone writing
+`_eq: null` means. Returning an empty result would be the shape of a right
+answer to a question nobody asked, so it says so instead and names `_is_null`,
+which does mean it. This holds for a variable too: `_eq: $x` with `$x` null is
+the same question asked one request later, and a compiled statement carries the
+refusal to where the value arrives. A null stays a value where it is one —
+`_set: {col: null}` and an inserted `null` are untouched.
+
 
 **Unknown arguments are rejected, everywhere.** Including on `_by_pk` roots,
 which read the arguments they want by name and used to leave the rest alone —

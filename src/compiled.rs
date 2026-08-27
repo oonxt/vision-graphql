@@ -349,12 +349,15 @@ mod tests {
             resolve_binds(&specs, &Inputs::variables(&given).with_defaults(&defaults)).unwrap(),
             vec![Bind::Text("given".into())]
         );
-        // Supplied as null: still the request — null is a value, not an absence.
+        // Supplied as null: still the request, not the default — an explicit
+        // null is a value, not an absence. In a comparison it is now refused
+        // rather than compared (see `types::null_comparison`), and that refusal
+        // is itself the proof: falling back to the default would have succeeded
+        // with "fallback".
         let null = json!({"t": null});
-        assert_eq!(
-            resolve_binds(&specs, &Inputs::variables(&null).with_defaults(&defaults)).unwrap(),
-            vec![Bind::Null]
-        );
+        let err =
+            resolve_binds(&specs, &Inputs::variables(&null).with_defaults(&defaults)).unwrap_err();
+        assert!(format!("{err}").contains("_is_null"), "{err}");
     }
 
     #[test]
