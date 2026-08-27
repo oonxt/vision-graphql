@@ -85,6 +85,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | TOML config overlay (`expose_as`, `schema`, `hide_columns`, manual relations) | ✓ |
 | Typed Rust builder API | ✓ |
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
+| Column-level scope: `ScopeSet::columns` / `hide_columns`, per role, per request | ✓ |
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
 | Computed fields | Not implemented |
 | Pre-parse limits on document size and nesting (`ParseLimits`) | ✓ |
@@ -492,6 +493,39 @@ let mine = scoped.query("query { orders { id title } }", None).await?;
 // `scoped.query("query { staffs { id } }", …)` → Error::ScopeDenied.
 # Ok(()) }
 ```
+
+### Columns
+
+Row rules decide *which* records a caller sees; column rules decide *what* of
+each record. They are independent — a table can be `unrestricted` for rows and
+still withhold a column — and they are per request, so one schema serves every
+role:
+
+```rust
+# use vision_graphql::{ScopePolicy, Schema};
+# use vision_graphql::predicate::{col, principal};
+# fn example(schema: &Schema) -> Result<(), vision_graphql::Error> {
+let policy = ScopePolicy::builder()
+    .allow("staff", col("org").eq(principal()))
+    .columns("staff", ["id", "org", "name"])   // and nothing else
+    .validate(schema)?;                        // a typo here fails now, not later
+# let _ = policy; Ok(()) }
+```
+
+`columns` is an allowlist and `hide_columns` its complement. Prefer the
+allowlist: the difference is what a migration does to it. A column added
+tomorrow is invisible under `columns` until someone names it, and visible to
+every caller the moment it exists under `hide_columns` — which is exactly the
+case a denylist gets wrong. This is also what distinguishes it from the
+overlay's `hide_columns`, which is global and fixed when the schema is built.
+
+A withheld column is refused, not omitted: a response missing a field the
+document asked for is a wrong answer wearing the shape of a right one. And the
+refusal covers every position that reads the column, not only the selection —
+`where`, `order_by`, `distinct_on`, aggregate functions, `_by_pk` arguments,
+`_set`, inserted columns at every nested level, and `on_conflict`'s
+`update_columns`. Sorting by a column you may not read still tells you its
+values, and filtering on it answers the question outright.
 
 Scope predicates are trusted policy: they are injected as-is and never
 re-scoped themselves. `scoped.transaction(…)` hands the closure a

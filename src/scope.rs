@@ -33,7 +33,7 @@
 //! a pre-image filter, so a conflicting row outside scope is skipped rather than
 //! overwritten; the post-insert check still applies to the resulting row.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::{BoolExpr, Field, MutationField, Operation, RootBody};
 use crate::error::{Error, Result};
@@ -53,6 +53,37 @@ pub enum TableScope {
     Deny,
 }
 
+/// Which columns of a table a scoped caller may touch.
+///
+/// The two forms differ in what a migration does to them, which is the whole
+/// choice: [`Only`] is an allowlist, so a column added tomorrow is invisible
+/// until someone names it; [`Except`] is a denylist, so that column is visible
+/// to every caller the moment it exists. Prefer [`Only`] wherever the set is
+/// knowable — a schema grows by columns nobody thought about, and that is
+/// precisely the case a denylist gets wrong.
+///
+/// One set covers reading and writing alike: a column a caller may not see is
+/// not one it may set either.
+///
+/// [`Only`]: ColumnScope::Only
+/// [`Except`]: ColumnScope::Except
+#[derive(Debug, Clone)]
+pub enum ColumnScope {
+    /// Only these columns, by exposed name.
+    Only(BTreeSet<String>),
+    /// Every column except these.
+    Except(BTreeSet<String>),
+}
+
+impl ColumnScope {
+    fn admits(&self, column: &str) -> bool {
+        match self {
+            ColumnScope::Only(cols) => cols.contains(column),
+            ColumnScope::Except(cols) => !cols.contains(column),
+        }
+    }
+}
+
 /// Per-table access rules for one scoped execution context.
 ///
 /// Typically built once per request from the authenticated principal and
@@ -60,6 +91,11 @@ pub enum TableScope {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeSet {
     tables: HashMap<String, TableScope>,
+    /// Per-table column rules. Absent means every column of that table, which
+    /// keeps column restriction orthogonal to row restriction: a table can be
+    /// `unrestricted` for rows and still withhold a column, and the other way
+    /// round.
+    columns: HashMap<String, ColumnScope>,
 }
 
 impl ScopeSet {
@@ -77,6 +113,41 @@ impl ScopeSet {
     pub fn unrestricted(mut self, table: impl Into<String>) -> Self {
         self.tables.insert(table.into(), TableScope::Unrestricted);
         self
+    }
+
+    /// Restrict `table` to these columns and no others.
+    ///
+    /// Fail-closed against a growing schema: a column added later is not
+    /// admitted until it is named here. See [`ColumnScope`].
+    pub fn columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns.insert(
+            table.into(),
+            ColumnScope::Only(columns.into_iter().map(Into::into).collect()),
+        );
+        self
+    }
+
+    /// Withhold these columns of `table`, admitting the rest — including any
+    /// added later, which is what makes [`ScopeSet::columns`] the safer form.
+    pub fn hide_columns<I, S>(mut self, table: impl Into<String>, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns.insert(
+            table.into(),
+            ColumnScope::Except(columns.into_iter().map(Into::into).collect()),
+        );
+        self
+    }
+
+    /// The column rule for `table`, if it has one.
+    pub fn column_scope(&self, table: &str) -> Option<&ColumnScope> {
+        self.columns.get(table)
     }
 
     /// Explicitly refuse access to `table`.
@@ -97,6 +168,64 @@ impl ScopeSet {
 
 /// Resolve the predicate to inject for `table`: `Ok(Some(expr))` to AND in,
 /// `Ok(None)` for unrestricted, `Err` when denied or absent (fail-closed).
+/// Columns an aggregate function reads.
+fn agg_columns(op: &crate::ast::AggOp) -> Vec<&str> {
+    use crate::ast::{AggField, AggOp};
+    match op {
+        AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
+        AggOp::Sum { fields }
+        | AggOp::Avg { fields }
+        | AggOp::Max { fields }
+        | AggOp::Min { fields } => fields
+            .iter()
+            .filter_map(|f| match f {
+                AggField::Column(c) => Some(c.column.as_str()),
+                AggField::Typename { .. } => None,
+            })
+            .collect(),
+        AggOp::Typename => Vec::new(),
+    }
+}
+
+/// Refuse a column the scope does not admit.
+///
+/// Refusing rather than dropping it from the selection: a response missing a
+/// field the document asked for is a wrong answer wearing the shape of a right
+/// one, and a caller comparing against a column it may not read learns its
+/// contents from which rows come back either way.
+fn check_column(scope: &ScopeSet, table: &Table, column: &str) -> Result<()> {
+    match scope.column_scope(&table.exposed_name) {
+        Some(rule) if !rule.admits(column) => Err(Error::ScopeColumnDenied {
+            table: table.exposed_name.clone(),
+            column: column.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Every column a selection reads directly. Relations recurse elsewhere, each
+/// against its own target table.
+fn check_selection(fields: &[Field], table: &Table, scope: &ScopeSet) -> Result<()> {
+    for f in fields {
+        match f {
+            Field::Column { physical, .. } | Field::JsonPath { physical, .. } => {
+                check_column(scope, table, physical)?;
+            }
+            Field::Typename { .. } | Field::Relation { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// `distinct_on` reads its columns as surely as a selection does — the rows
+/// that come back are chosen by their values.
+fn check_args_columns(args: &crate::ast::QueryArgs, table: &Table, scope: &ScopeSet) -> Result<()> {
+    for c in &args.distinct_on {
+        check_column(scope, table, c)?;
+    }
+    Ok(())
+}
+
 fn resolve(scope: &ScopeSet, table: &str) -> Result<Option<BoolExpr>> {
     match scope.get(table) {
         Some(TableScope::Allow(expr)) => Ok(Some(expr.clone())),
@@ -185,11 +314,27 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
         merge_and_into(&mut root.args.where_, expr);
     }
     scope_order_by(&mut root.args, table, scope, schema)?;
+    check_args_columns(&root.args, table, scope)?;
     match &mut root.body {
-        RootBody::List { selection } | RootBody::ByPk { selection, .. } => {
+        RootBody::List { selection } => {
             scope_fields(selection, table, scope, schema)?;
         }
-        RootBody::Aggregate { nodes, .. } => {
+        RootBody::ByPk { pk, selection } => {
+            // A key column can be restricted like any other, and `_by_pk` reads
+            // it by matching on a value the caller supplied.
+            for (column, _) in pk.iter() {
+                check_column(scope, table, column)?;
+            }
+            scope_fields(selection, table, scope, schema)?;
+        }
+        RootBody::Aggregate { ops, nodes, .. } => {
+            // `max { salary }` answers a question about a column as surely as
+            // selecting it does, and over few enough rows it answers it exactly.
+            for sel in ops.iter() {
+                for column in agg_columns(&sel.op) {
+                    check_column(scope, table, column)?;
+                }
+            }
             if let Some(fields) = nodes.as_mut() {
                 scope_fields(fields, table, scope, schema)?;
             }
@@ -217,6 +362,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             alias,
             table,
             objects,
+            on_conflict,
             returning,
             scope_check,
             ..
@@ -224,10 +370,19 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             let t = lookup_table(schema, table, alias)?;
             *scope_check = resolve(scope, table)?;
             scope_fields(returning, t, scope, schema)?;
+            if let Some(oc) = on_conflict.as_mut() {
+                for column in &oc.update_columns {
+                    check_column(scope, t, column)?;
+                }
+                if let Some(w) = oc.where_.as_mut() {
+                    scope_bool_expr(w, t, scope, schema)?;
+                }
+            }
             // Recurse through nested inserts, resolving each nested target
             // table's check. An absent/denied nested table fails closed here,
             // before any SQL is built.
             for obj in objects.iter_mut() {
+                check_insert_columns(obj, t, scope, schema)?;
                 scope_insert_object(obj, scope)?;
             }
             Ok(())
@@ -236,6 +391,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             alias,
             table,
             where_,
+            set,
             returning,
             scope_check,
             ..
@@ -244,6 +400,10 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             // Scope EXISTS targets in the user-written where before injecting.
             scope_bool_expr(where_, t, scope, schema)?;
             scope_fields(returning, t, scope, schema)?;
+            // A column the caller may not read is not one it may write.
+            for column in set.keys() {
+                check_column(scope, t, column)?;
+            }
             let pred = resolve(scope, table)?;
             // Same predicate twice: pre-image filter (AND-ed into the WHERE) and
             // post-update check (the renderer's guard CTE). The filter restricts
@@ -273,24 +433,34 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
         MutationField::UpdateByPk {
             alias,
             table,
+            pk,
+            set,
             selection,
             scope: slot,
-            ..
         } => {
             let t = lookup_table(schema, table, alias)?;
             scope_fields(selection, t, scope, schema)?;
+            for (column, _) in pk.iter() {
+                check_column(scope, t, column)?;
+            }
+            for column in set.keys() {
+                check_column(scope, t, column)?;
+            }
             *slot = resolve(scope, table)?;
             Ok(())
         }
         MutationField::DeleteByPk {
             alias,
             table,
+            pk,
             selection,
             scope: slot,
-            ..
         } => {
             let t = lookup_table(schema, table, alias)?;
             scope_fields(selection, t, scope, schema)?;
+            for (column, _) in pk.iter() {
+                check_column(scope, t, column)?;
+            }
             *slot = resolve(scope, table)?;
             Ok(())
         }
@@ -301,6 +471,33 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
 /// `obj`, recursively. Each nested target table must be in the scope set; an
 /// absent/denied one fails closed (`Error::ScopeDenied`). The predicate itself
 /// is policy and is not re-scoped.
+/// Columns written by one inserted row, and by every row nested under it.
+///
+/// Each level is checked against its own target table: a caller allowed to
+/// write `posts.title` is not thereby allowed to write `users.role` through a
+/// nested insert.
+fn check_insert_columns(
+    obj: &crate::ast::InsertObject,
+    table: &Table,
+    scope: &ScopeSet,
+    schema: &Schema,
+) -> Result<()> {
+    for column in obj.columns.keys() {
+        check_column(scope, table, column)?;
+    }
+    for nested in obj.nested_arrays.values() {
+        let target = lookup_table(schema, &nested.table, &table.exposed_name)?;
+        for row in &nested.rows {
+            check_insert_columns(row, target, scope, schema)?;
+        }
+    }
+    for nested in obj.nested_objects.values() {
+        let target = lookup_table(schema, &nested.table, &table.exposed_name)?;
+        check_insert_columns(&nested.row, target, scope, schema)?;
+    }
+    Ok(())
+}
+
 fn scope_insert_object(obj: &mut crate::ast::InsertObject, scope: &ScopeSet) -> Result<()> {
     for nai in obj.nested_arrays.values_mut() {
         nai.scope_check = resolve(scope, &nai.table)?;
@@ -322,6 +519,7 @@ fn scope_fields(
     scope: &ScopeSet,
     schema: &Schema,
 ) -> Result<()> {
+    check_selection(fields, parent, scope)?;
     for field in fields {
         let Field::Relation {
             name,
@@ -349,6 +547,7 @@ fn scope_fields(
             merge_and_into(&mut args.where_, expr);
         }
         scope_order_by(args, target, scope, schema)?;
+        check_args_columns(args, target, scope)?;
         scope_fields(selection, target, scope, schema)?;
     }
     Ok(())
@@ -394,6 +593,9 @@ fn scope_order_by(
             hop.filter = resolve(scope, &rel.target_table)?;
             cur = target;
         }
+        // Sorting by a column reads it: the row order is a function of its
+        // values, and for a low-cardinality column it discloses them outright.
+        check_column(scope, cur, &ob.column)?;
     }
     Ok(())
 }
@@ -433,7 +635,12 @@ fn scope_bool_expr(
             }
             Ok(())
         }
-        BoolExpr::Compare { .. } | BoolExpr::IsNull { .. } | BoolExpr::InList { .. } => Ok(()),
+        // Filtering on a column reads it — which rows come back is a function
+        // of its values, so a caller that may not select it may not compare
+        // against it either.
+        BoolExpr::Compare { column, .. }
+        | BoolExpr::IsNull { column, .. }
+        | BoolExpr::InList { column, .. } => check_column(scope, table, column),
     }
 }
 
@@ -832,5 +1039,180 @@ mod tests {
             roots[0].args.where_.as_ref().unwrap(),
             BoolExpr::Relation { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use crate::ast::CmpOp;
+    use crate::schema::{PgType, Relation, Table};
+    use serde_json::json;
+
+    fn schema() -> Schema {
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("name", "name", PgType::Text, true)
+                    .column("salary", "salary", PgType::Int4, true)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("draft", "draft", PgType::Bool, false)
+                    .primary_key(&["id"]),
+            )
+            .build()
+    }
+
+    /// `salary` is not in the set; everything else on `users` is.
+    fn scope() -> ScopeSet {
+        ScopeSet::new()
+            .unrestricted("users")
+            .unrestricted("posts")
+            .columns("users", ["id", "name"])
+    }
+
+    fn lower(q: &str) -> Operation {
+        crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap()
+    }
+
+    fn apply(q: &str) -> Result<Operation> {
+        let mut op = lower(q);
+        apply_scope(&mut op, &scope(), &schema())?;
+        Ok(op)
+    }
+
+    fn denied(q: &str) -> String {
+        let err = apply(q).unwrap_err();
+        assert!(
+            matches!(err, Error::ScopeColumnDenied { .. }),
+            "expected a column denial, got {err:?}"
+        );
+        format!("{err}")
+    }
+
+    #[test]
+    fn an_admitted_column_passes_everywhere() {
+        apply("{ users { id name posts { id draft } } }").unwrap();
+        apply("{ users(where: {name: {_eq: \"a\"}}, order_by: [{name: asc}]) { id } }").unwrap();
+        apply("{ users_by_pk(id: 1) { name } }").unwrap();
+    }
+
+    #[test]
+    fn selecting_a_withheld_column_is_refused() {
+        let msg = denied("{ users { id salary } }");
+        assert!(msg.contains("salary"), "{msg}");
+        // Refused, not dropped: a response missing a field the document asked
+        // for is a wrong answer shaped like a right one.
+        denied("{ users_by_pk(id: 1) { salary } }");
+        denied("{ users_aggregate { nodes { salary } } }");
+    }
+
+    /// Reading is not the only way to learn a column's value.
+    #[test]
+    fn a_withheld_column_cannot_be_filtered_sorted_or_counted_on() {
+        denied("{ users(where: {salary: {_gt: 100}}) { id } }");
+        denied("{ users(where: {salary: {_is_null: true}}) { id } }");
+        denied("{ users(where: {salary: {_in: [1, 2]}}) { id } }");
+        denied("{ users(where: {_or: [{salary: {_gt: 1}}]}) { id } }");
+        denied("{ users(order_by: [{salary: desc}]) { id } }");
+        denied("{ users(distinct_on: [salary]) { id } }");
+        denied("{ users_aggregate { aggregate { max { salary } } } }");
+        denied("{ users_aggregate { aggregate { count(columns: [salary]) } } }");
+    }
+
+    #[test]
+    fn a_withheld_column_cannot_be_written() {
+        denied(r#"mutation { insert_users(objects: [{salary: 1}]) { affected_rows } }"#);
+        denied(
+            r#"mutation { update_users(where: {id: {_eq: 1}}, _set: {salary: 1}) {
+                 affected_rows } }"#,
+        );
+        denied(r#"mutation { update_users_by_pk(pk_columns: {id: 1}, _set: {salary: 1}) { id } }"#);
+        denied(r#"mutation { insert_users(objects: [{name: "a"}]) { returning { salary } } }"#);
+    }
+
+    /// Each level of a nested insert answers to its own table's rules.
+    #[test]
+    fn nested_insert_columns_answer_to_their_own_table() {
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .unrestricted("posts")
+            .columns("users", ["id", "name"])
+            .columns("posts", ["id", "user_id"]);
+        let mut op = lower(
+            r#"mutation { insert_users(objects: [{name: "a", posts: {data: [{draft: true}]}}]) {
+                 affected_rows } }"#,
+        );
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(
+            format!("{err}").contains("draft"),
+            "the child's column, against the child's rules: {err}"
+        );
+    }
+
+    /// The rules follow the relation: `posts` is unrestricted here, and reading
+    /// it through `users` does not borrow `users`' restriction.
+    #[test]
+    fn a_relations_columns_are_the_targets() {
+        apply("{ users { id posts { draft } } }").unwrap();
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .unrestricted("posts")
+            .columns("posts", ["id"]);
+        let mut op = lower("{ users { id posts { draft } } }");
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(format!("{err}").contains("draft"), "{err}");
+    }
+
+    #[test]
+    fn hide_columns_is_the_complement_and_admits_what_it_does_not_name() {
+        let scope = ScopeSet::new()
+            .unrestricted("users")
+            .hide_columns("users", ["salary"]);
+        let mut op = lower("{ users { id name } }");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let mut op = lower("{ users { salary } }");
+        assert!(apply_scope(&mut op, &scope, &schema()).is_err());
+    }
+
+    #[test]
+    fn a_table_with_no_column_rule_admits_every_column() {
+        let scope = ScopeSet::new().unrestricted("users").unrestricted("posts");
+        let mut op = lower("{ users { id name salary } }");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+    }
+
+    #[test]
+    fn row_and_column_rules_are_independent() {
+        // Restricted rows, restricted columns, on a table that is `allow`ed
+        // rather than `unrestricted`.
+        let scope = ScopeSet::new()
+            .allow(
+                "users",
+                BoolExpr::Compare {
+                    column: "id".into(),
+                    op: CmpOp::Eq,
+                    value: json!(7).into(),
+                },
+            )
+            .columns("users", ["id", "name"]);
+        let mut op = lower("{ users { id name } }");
+        apply_scope(&mut op, &scope, &schema()).unwrap();
+        let Operation::Query(roots) = &op else {
+            panic!()
+        };
+        assert!(
+            roots[0].args.where_.is_some(),
+            "the row predicate still lands"
+        );
+
+        let mut op = lower("{ users { salary } }");
+        assert!(apply_scope(&mut op, &scope, &schema()).is_err());
     }
 }

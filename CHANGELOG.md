@@ -158,7 +158,7 @@ used to be silent, so read **Breaking** before upgrading.
 
 ### Breaking
 
-- `Error::Limit` is a new variant.
+- `Error::Limit` and `Error::ScopeColumnDenied` are new variants.
 - The aggregate IR changed shape: `RootBody::Aggregate.ops` is
   `Vec<AggSelect>` (a response key plus an op) rather than `Vec<AggOp>`;
   `AggOp::Count` is a struct variant carrying `columns` and `distinct`;

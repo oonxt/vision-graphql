@@ -28,6 +28,12 @@ pub enum Error {
     #[error("scope: table '{table}' is not accessible in scoped execution")]
     ScopeDenied { table: String },
 
+    /// A column the scope does not admit. Separate from [`Error::ScopeDenied`]
+    /// so an endpoint can tell "you may not read this table at all" from "not
+    /// this column of it", which are different things to report.
+    #[error("scope: column '{column}' on '{table}' is not accessible in scoped execution")]
+    ScopeColumnDenied { table: String, column: String },
+
     #[error("scope: {0}")]
     Scope(String),
 
