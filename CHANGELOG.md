@@ -3,7 +3,7 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
-## Unreleased
+## 0.13.0 — 2026-08-27
 
 Hardening for the case where a document reaches the engine from a client rather
 than from the application's own source. Several of these change behaviour that

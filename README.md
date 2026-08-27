@@ -79,7 +79,6 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
 | JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
-| Schema introspection | ✓ |
 | Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
 | PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
 | Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
@@ -88,11 +87,28 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Typed results: `run_as::<T>` / `query_as::<T>` / `MutationResult<T>` | ✓ |
 | Column-level scope: `ScopeSet::columns` / `hide_columns`, per role, per request | ✓ |
 | Scoped execution: `Engine::scoped(ScopeSet)`, per-table predicates, deny-by-default | ✓ read queries + `delete` (incl. `_by_pk`) + `update` (filter + post-update check) + `insert` (post-insert check at every nested level, upsert pre-image filter) |
-| Computed fields | Not implemented |
 | Pre-parse limits on document size and nesting (`ParseLimits`) | ✓ |
 | Execution limits: relation depth, table reads, default/max row limit (`ExecutionLimits`) | ✓ |
 | Persisted queries: compile a set at startup, run by key (`QueryRegistry`) | ✓ |
 | Subscriptions | Not implemented |
+
+### Not implemented
+
+Known gaps, so they are findable rather than discovered. Each has been looked at
+and left, not forgotten.
+
+| Gap | Notes |
+|---|---|
+| `operationName` on `Engine::query` | A document with several operations can only be run through `Engine::compile`, which does take one. |
+| GraphQL-shaped errors | [`Error`] is a Rust enum; there is no `errors: [{message, path, extensions}]` envelope, and `Error::Database` carries PostgreSQL's own message. A host serving HTTP maps them itself, and should decide what to pass on. |
+| Aggregates on a relation (`user { posts_aggregate { … } }`) | Only root `<table>_aggregate` exists. |
+| Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
+| `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
+| `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
+| Array, `bytea`, `interval`, `inet` columns | No type mapping: the column is left out of the schema, and `vision-gql diff` reports it. |
+| PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
+| Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
+| Computed fields, subscriptions | Not planned. |
 
 ## JSON/JSONB path reads
 
