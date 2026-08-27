@@ -329,12 +329,14 @@ impl AggregateBuilder {
         });
     }
 
-    /// `sum` over the named columns.
-    pub fn sum(mut self, cols: &[&str]) -> Self {
+    /// One body for every function: the response key comes from
+    /// [`AggFunc::name`](crate::ast::AggFunc::name), so a method pasted in for
+    /// the next function cannot publish under a key that names a different one.
+    fn agg(mut self, func: crate::ast::AggFunc, cols: &[&str]) -> Self {
         self.push(
-            "sum",
+            func.name(),
             AggOp::Func {
-                func: crate::ast::AggFunc::Sum,
+                func,
                 fields: cols
                     .iter()
                     .map(|s| crate::ast::AggField::column(*s))
@@ -342,141 +344,56 @@ impl AggregateBuilder {
             },
         );
         self
+    }
+
+    /// `sum` over the named columns.
+    pub fn sum(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Sum, cols)
     }
 
     /// `avg` over the named columns.
-    pub fn avg(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "avg",
-            AggOp::Func {
-                func: crate::ast::AggFunc::Avg,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn avg(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Avg, cols)
     }
 
     /// `max` over the named columns.
-    pub fn max(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "max",
-            AggOp::Func {
-                func: crate::ast::AggFunc::Max,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn max(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Max, cols)
     }
 
     /// `min` over the named columns.
-    pub fn min(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "min",
-            AggOp::Func {
-                func: crate::ast::AggFunc::Min,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn min(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Min, cols)
     }
 
     /// `stddev` over the named columns.
-    pub fn stddev(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "stddev",
-            AggOp::Func {
-                func: crate::ast::AggFunc::Stddev,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn stddev(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Stddev, cols)
     }
 
     /// `stddev_pop` over the named columns.
-    pub fn stddev_pop(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "stddev_pop",
-            AggOp::Func {
-                func: crate::ast::AggFunc::StddevPop,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn stddev_pop(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::StddevPop, cols)
     }
 
     /// `stddev_samp` over the named columns.
-    pub fn stddev_samp(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "stddev_samp",
-            AggOp::Func {
-                func: crate::ast::AggFunc::StddevSamp,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn stddev_samp(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::StddevSamp, cols)
     }
 
     /// `variance` over the named columns.
-    pub fn variance(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "variance",
-            AggOp::Func {
-                func: crate::ast::AggFunc::Variance,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn variance(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::Variance, cols)
     }
 
     /// `var_pop` over the named columns.
-    pub fn var_pop(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "var_pop",
-            AggOp::Func {
-                func: crate::ast::AggFunc::VarPop,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn var_pop(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::VarPop, cols)
     }
 
     /// `var_samp` over the named columns.
-    pub fn var_samp(mut self, cols: &[&str]) -> Self {
-        self.push(
-            "var_samp",
-            AggOp::Func {
-                func: crate::ast::AggFunc::VarSamp,
-                fields: cols
-                    .iter()
-                    .map(|s| crate::ast::AggField::column(*s))
-                    .collect(),
-            },
-        );
-        self
+    pub fn var_samp(self, cols: &[&str]) -> Self {
+        self.agg(crate::ast::AggFunc::VarSamp, cols)
     }
 
     pub fn nodes(mut self, cols: &[&str]) -> Self {

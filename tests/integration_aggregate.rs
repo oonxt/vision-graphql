@@ -513,3 +513,75 @@ async fn every_aggregate_function_runs_and_is_published_as_its_result_type() {
         assert_eq!(actual, pg_type, "{func}({column})");
     }
 }
+
+/// `boolean`, `uuid` and enums order — `_gt` works on every one — but
+/// PostgreSQL defines no `max`/`min` aggregate over them: publishing those
+/// fields published a query whose only possible answer was "function
+/// max(boolean) does not exist", from the database, at request time.
+#[tokio::test]
+async fn max_min_are_not_offered_where_postgres_has_none() {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+           CREATE TABLE t (
+               id SERIAL PRIMARY KEY,
+               label TEXT NOT NULL,
+               day DATE NOT NULL,
+               flag BOOLEAN NOT NULL,
+               token UUID NOT NULL DEFAULT gen_random_uuid(),
+               state mood NOT NULL
+           );
+           INSERT INTO t (label, day, flag, state) VALUES
+             ('a', '2024-01-01', true, 'sad'),
+             ('b', '2024-06-01', false, 'happy');"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect(&pool).await.unwrap().build();
+    let engine = Engine::new(
+        pool.clone(),
+        Schema::introspect(&pool).await.unwrap().build(),
+    );
+
+    // What stays: max over text and dates, run for real.
+    let v = engine
+        .query("{ t_aggregate { aggregate { max { label day } } } }", None)
+        .await
+        .expect("max over text and date is PostgreSQL's own");
+    assert_eq!(v["t_aggregate"]["aggregate"]["max"]["label"], "b");
+    assert_eq!(v["t_aggregate"]["aggregate"]["max"]["day"], "2024-06-01");
+
+    // What goes: the schema stops publishing them…
+    let ts = schema.type_system();
+    let vision_graphql::type_system::TypeDef::Object { fields, .. } = ts
+        .get("t_max_fields")
+        .expect("max group exists for label/day")
+    else {
+        panic!("t_max_fields should be an object");
+    };
+    for absent in ["flag", "token", "state"] {
+        assert!(
+            !fields.iter().any(|f| f.name == absent),
+            "PostgreSQL has no max over '{absent}'"
+        );
+    }
+
+    // …and lowering refuses what it never published, with the reason, rather
+    // than letting the database answer with an opaque error.
+    for column in ["flag", "token", "state"] {
+        let err = engine
+            .query(
+                &format!("{{ t_aggregate {{ aggregate {{ max {{ {column} }} }} }} }}"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not apply") && msg.contains(column),
+            "{msg}"
+        );
+    }
+}

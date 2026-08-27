@@ -241,26 +241,26 @@ pub fn scalar_name(pg: &PgType) -> String {
     }
 }
 
-/// Every per-column aggregate, in the order they are published.
-const ALL_AGG_FUNCS: [AggFunc; 10] = [
-    AggFunc::Sum,
-    AggFunc::Avg,
-    AggFunc::Max,
-    AggFunc::Min,
-    AggFunc::Stddev,
-    AggFunc::StddevPop,
-    AggFunc::StddevSamp,
-    AggFunc::Variance,
-    AggFunc::VarPop,
-    AggFunc::VarSamp,
-];
-
 /// Whether `func` means anything for a column of this type.
 pub fn applies(func: AggFunc, pg: &PgType) -> bool {
     if func.numeric_only() {
         pg.is_numeric()
     } else {
-        pg.is_orderable()
+        pg.has_max_min()
+    }
+}
+
+/// Why [`applies`] said no, for the error the caller raises.
+///
+/// One sentence per way of failing, shared by both entry points — the parser
+/// and the renderer — so the document path and the builder get the same reason.
+pub fn why_inapplicable(func: AggFunc, pg: &PgType) -> &'static str {
+    if func.numeric_only() {
+        "it is not a number"
+    } else if !pg.is_orderable() {
+        "it has no ordering"
+    } else {
+        "PostgreSQL defines no max/min for its type"
     }
 }
 
@@ -270,6 +270,12 @@ pub fn applies(func: AggFunc, pg: &PgType) -> bool {
 /// `integer` is a `numeric`, and a client generating code against `Int` would
 /// have been generating the wrong thing. The mapping is PostgreSQL's, from its
 /// aggregate function table.
+///
+/// The *value* still travels as a JSON number, like a `numeric` column does
+/// (see `numeric_accepts_the_json_numbers_it_returns`): digits beyond double
+/// precision are rounded by the JSON round-trip on the way out. That is the
+/// deliberate trade — a string would make one scalar serialize two ways — and
+/// an opt-in exact (stringified) transport is the recorded follow-up.
 fn result_type(func: AggFunc, pg: &PgType) -> PgType {
     use AggFunc::*;
     match func {
@@ -564,10 +570,10 @@ impl<'a> Builder<'a> {
             ]),
         ];
 
-        // sum/avg over numeric columns; max/min over anything ordered. A group
-        // with no columns to put in it is not published at all, rather than
-        // published empty.
-        for func in ALL_AGG_FUNCS {
+        // sum/avg over numeric columns; max/min where PostgreSQL defines them.
+        // A group with no columns to put in it is not published at all, rather
+        // than published empty.
+        for func in AggFunc::ALL {
             let cols: Vec<Field> = t
                 .columns()
                 .filter(|c| applies(func, &c.pg_type))
@@ -1222,6 +1228,51 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"name"));
         assert!(!names.contains(&"data"), "jsonb has no max worth offering");
+    }
+
+    /// `boolean`, `uuid` and enums order — `_gt` works on every one — but
+    /// PostgreSQL defines no `max`/`min` over them, so publishing those fields
+    /// published a query whose only possible answer was a database error.
+    #[test]
+    fn max_min_skip_types_postgres_cannot_max() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("things", "public", "things")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("label", "label", PgType::Text, true)
+                    .column("day", "day", PgType::Date, true)
+                    .column("flag", "flag", PgType::Bool, true)
+                    .column("token", "token", PgType::Uuid, true)
+                    .column(
+                        "mood",
+                        "mood",
+                        PgType::Enum {
+                            schema: "public".into(),
+                            name: "mood".into(),
+                        },
+                        true,
+                    )
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let ts = TypeSystem::build(&schema);
+        let TypeDef::Object { fields, .. } = ts.get("things_max_fields").unwrap() else {
+            panic!("expected object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"label"), "{names:?}");
+        assert!(names.contains(&"day"), "{names:?}");
+        for absent in ["flag", "token", "mood"] {
+            assert!(
+                !names.contains(&absent),
+                "PostgreSQL has no max over '{absent}': {names:?}"
+            );
+        }
+        // The ordering comparisons stay: the types order fine.
+        let TypeDef::InputObject { fields, .. } = ts.get("uuid_comparison_exp").unwrap() else {
+            panic!("expected input object");
+        };
+        assert!(fields.iter().any(|f| f.name == "_gt"), "{fields:?}");
     }
 
     #[test]

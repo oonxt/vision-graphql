@@ -347,6 +347,25 @@ pub enum AggFunc {
 }
 
 impl AggFunc {
+    /// Every function, in the order they are published.
+    ///
+    /// The one hand-maintained list. `from_name` and the type system both walk
+    /// it, so a variant missing here is missing from parsing and publishing
+    /// alike — one place to notice, instead of one copy per file that each
+    /// fails on its own.
+    pub const ALL: [AggFunc; 10] = [
+        AggFunc::Sum,
+        AggFunc::Avg,
+        AggFunc::Max,
+        AggFunc::Min,
+        AggFunc::Stddev,
+        AggFunc::StddevPop,
+        AggFunc::StddevSamp,
+        AggFunc::Variance,
+        AggFunc::VarPop,
+        AggFunc::VarSamp,
+    ];
+
     /// The name in a document, which is also the SQL function's name.
     pub fn name(self) -> &'static str {
         match self {
@@ -364,24 +383,13 @@ impl AggFunc {
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "sum" => AggFunc::Sum,
-            "avg" => AggFunc::Avg,
-            "max" => AggFunc::Max,
-            "min" => AggFunc::Min,
-            "stddev" => AggFunc::Stddev,
-            "stddev_pop" => AggFunc::StddevPop,
-            "stddev_samp" => AggFunc::StddevSamp,
-            "variance" => AggFunc::Variance,
-            "var_pop" => AggFunc::VarPop,
-            "var_samp" => AggFunc::VarSamp,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|f| f.name() == name)
     }
 
     /// Whether the function only means something for a number.
     ///
-    /// `max` and `min` order anything PostgreSQL can order; the rest are
+    /// `max` and `min` reach further — text, dates, times — though not to
+    /// everything with an ordering (see `PgType::has_max_min`); the rest are
     /// arithmetic, and offering `stddev` over a `text` column would be offering
     /// a query that cannot run.
     pub fn numeric_only(self) -> bool {

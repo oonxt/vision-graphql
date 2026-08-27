@@ -126,3 +126,45 @@ async fn builder_delete_by_where() {
         .expect("delete ok");
     assert_eq!(v["delete_users"]["affected_rows"], json!(1));
 }
+
+/// The document path is refused at lowering; the typed builder never goes near
+/// the parser. The same refusal has to come out of rendering — an
+/// `Error::Validate` with the reason, not PostgreSQL's "function stddev(text)
+/// does not exist" at request time.
+#[tokio::test]
+async fn builder_aggregate_refuses_what_the_schema_never_published() {
+    let (engine, db) = setup().await;
+    let err = engine
+        .run(Query::aggregate("users").stddev(&["name"]))
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not apply") && msg.contains("name"),
+        "{msg}"
+    );
+
+    // Same choke point for `max` over a type that orders but that PostgreSQL
+    // cannot max — the schema here says `token` is a uuid; the physical table
+    // is never reached, which is the point.
+    let engine = Engine::new(
+        db.pool.clone(),
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("token", "token", PgType::Uuid, true)
+                    .primary_key(&["id"]),
+            )
+            .build(),
+    );
+    let err = engine
+        .run(Query::aggregate("users").max(&["token"]))
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not apply") && msg.contains("token"),
+        "{msg}"
+    );
+}

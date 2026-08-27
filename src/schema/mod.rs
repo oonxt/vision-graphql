@@ -52,11 +52,21 @@ impl PgType {
         )
     }
 
-    /// Whether values of this type have an order — which is what `max`, `min`
-    /// and `_gt`-family comparisons need. Everything but `json`/`jsonb`, which
-    /// PostgreSQL orders in a way nobody should depend on.
+    /// Whether values of this type have an order — which is what `_gt`-family
+    /// comparisons need. Everything but `json`/`jsonb`, which PostgreSQL orders
+    /// in a way nobody should depend on.
     pub fn is_orderable(&self) -> bool {
         !matches!(self, PgType::Json | PgType::Jsonb)
+    }
+
+    /// Whether PostgreSQL defines `max`/`min` for this type.
+    ///
+    /// Not the same question as [`is_orderable`](Self::is_orderable): `boolean`,
+    /// `uuid` and user enums all order — `_gt` works on every one — but
+    /// `max(boolean)`, `max(uuid)` and `max` of an enum do not exist (verified
+    /// against 17.4), so publishing them would publish a query that cannot run.
+    pub fn has_max_min(&self) -> bool {
+        self.is_orderable() && !matches!(self, PgType::Bool | PgType::Uuid | PgType::Enum { .. })
     }
 }
 

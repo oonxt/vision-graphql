@@ -2652,11 +2652,10 @@ fn lower_aggregate_selection(
                                         message: format!(
                                             "'{op_name}' does not apply to '{}': {}",
                                             col.exposed_name,
-                                            if func.numeric_only() {
-                                                "it is not a number"
-                                            } else {
-                                                "it has no ordering"
-                                            }
+                                            crate::type_system::why_inapplicable(
+                                                func,
+                                                &col.pg_type
+                                            )
                                         ),
                                     });
                                 }
