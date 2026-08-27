@@ -7,6 +7,14 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Added
 
+- **Aggregates on a relation**: `authors { posts_aggregate { aggregate { count } } }`,
+  the same shape the root offers, over one row's children — which is what a
+  paginated list needs, since the page and its total then travel in one request.
+  Array relations only: an object relation is a single row and asking says so.
+  It obeys the scope, because counting a table is reading it — the target's
+  predicate lands in the aggregate's `WHERE`, a denied table is denied here too,
+  and a withheld column cannot be summed. It counts against `ExecutionLimits`
+  as the correlated subquery it is.
 - **GraphQL-shaped errors**: `Error::to_graphql_response` and
   `Error::to_graphql_error` produce the wire form, `Error::code` the stable
   classification that goes in `extensions.code` and that an HTTP layer maps to a

@@ -175,6 +175,25 @@ impl ScopeSet {
 
 /// Resolve the predicate to inject for `table`: `Ok(Some(expr))` to AND in,
 /// `Ok(None)` for unrestricted, `Err` when denied or absent (fail-closed).
+/// The table a relation points at, with the name the scope set is keyed by.
+fn relation_target<'s>(
+    parent: &Table,
+    name: &str,
+    schema: &'s Schema,
+) -> Result<(String, &'s Table)> {
+    let rel = parent.find_relation(name).ok_or_else(|| Error::Validate {
+        path: format!("{}.{name}", parent.exposed_name),
+        message: format!("unknown relation '{name}' on '{}'", parent.exposed_name),
+    })?;
+    let target = schema
+        .table(&rel.target_table)
+        .ok_or_else(|| Error::Validate {
+            path: format!("{}.{name}", parent.exposed_name),
+            message: format!("unknown table '{}'", rel.target_table),
+        })?;
+    Ok((rel.target_table.clone(), target))
+}
+
 /// Columns an aggregate function reads.
 fn agg_columns(op: &crate::ast::AggOp) -> Vec<&str> {
     use crate::ast::{AggField, AggOp};
@@ -218,7 +237,7 @@ fn check_selection(fields: &[Field], table: &Table, scope: &ScopeSet) -> Result<
             Field::Column { column, .. } | Field::JsonPath { column, .. } => {
                 check_column(scope, table, column)?;
             }
-            Field::Typename { .. } | Field::Relation { .. } => {}
+            Field::Typename { .. } | Field::Relation { .. } | Field::RelationAggregate { .. } => {}
         }
     }
     Ok(())
@@ -548,6 +567,42 @@ fn scope_fields(
     schema: &Schema,
 ) -> Result<()> {
     check_selection(fields, parent, scope)?;
+
+    // A `_aggregate` on a relation reads the target table exactly as selecting
+    // it does — it just answers with a count instead of the rows. So it resolves
+    // the same way and fails closed the same way: a caller who may not read a
+    // table must not be able to count it either, and `count` over a filtered set
+    // is a question about the rows behind the filter.
+    for field in fields.iter_mut() {
+        let Field::RelationAggregate {
+            name,
+            args,
+            ops,
+            nodes,
+            ..
+        } = field
+        else {
+            continue;
+        };
+        let (target_name, target) = relation_target(parent, name, schema)?;
+        if let Some(w) = args.where_.as_mut() {
+            scope_bool_expr(w, target, scope, schema)?;
+        }
+        if let Some(expr) = resolve(scope, &target_name)? {
+            merge_and_into(&mut args.where_, expr);
+        }
+        scope_order_by(args, target, scope, schema)?;
+        check_args_columns(args, target, scope)?;
+        for sel in ops.iter() {
+            for column in agg_columns(&sel.op) {
+                check_column(scope, target, column)?;
+            }
+        }
+        if let Some(node_fields) = nodes.as_mut() {
+            scope_fields(node_fields, target, scope, schema)?;
+        }
+    }
+
     for field in fields {
         let Field::Relation {
             name,

@@ -274,7 +274,8 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
             Field::Column { alias, .. }
             | Field::JsonPath { alias, .. }
             | Field::Typename { alias }
-            | Field::Relation { alias, .. } => alias,
+            | Field::Relation { alias, .. }
+            | Field::RelationAggregate { alias, .. } => alias,
         }
     }
 
@@ -1794,9 +1795,75 @@ fn lower_selection_set(
                     continue;
                 }
 
-                let col = table.find_column(name).ok_or_else(|| Error::Validate {
-                    path: format!("{parent_path}.{alias}"),
-                    message: format!("unknown column '{name}' on '{}'", table.exposed_name),
+                // `<rel>_aggregate`, but only once a real column of that name
+                // has had its chance: a column is the thing that exists, and a
+                // synthesized field must not shadow one — the same rule that
+                // keeps an auto-derived relation from shadowing a column.
+                if let Some(base) = name.strip_suffix("_aggregate") {
+                    if table.find_column(name).is_none() {
+                        if let Some(rel) = table.find_relation(base) {
+                            if rel.kind != crate::schema::RelKind::Array {
+                                return Err(Error::Validate {
+                                    path: format!("{parent_path}.{alias}"),
+                                    message: format!(
+                                        "'{base}' is an object relation, which is one row; \
+                                         there is nothing to aggregate"
+                                    ),
+                                });
+                            }
+                            let target =
+                                schema
+                                    .table(&rel.target_table)
+                                    .ok_or_else(|| Error::Validate {
+                                        path: format!("{parent_path}.{alias}"),
+                                        message: format!(
+                                            "relation target table '{}' missing",
+                                            rel.target_table
+                                        ),
+                                    })?;
+                            let path = format!("{parent_path}.{alias}");
+                            let args = lower_args(&field.arguments, target, schema, vars, &path)?;
+                            let AggregateSelection {
+                                ops,
+                                nodes,
+                                typenames,
+                            } = lower_aggregate_selection(
+                                &field.selection_set.node,
+                                target,
+                                vars,
+                                &path,
+                            )?;
+                            out.push(Field::RelationAggregate {
+                                name: base.to_string(),
+                                alias,
+                                args,
+                                ops,
+                                nodes,
+                                typenames,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
+                let col = table.find_column(name).ok_or_else(|| {
+                    // Someone writing `posts_aggregate` meant the relation, and
+                    // being told there is no such *column* sends them looking in
+                    // the wrong place.
+                    let message = match name.strip_suffix("_aggregate") {
+                        Some(base) => format!(
+                            "unknown field '{name}' on '{}': there is no column by that name, \
+                             and no array relation '{base}' to aggregate",
+                            table.exposed_name
+                        ),
+                        None => {
+                            format!("unknown column '{name}' on '{}'", table.exposed_name)
+                        }
+                    };
+                    Error::Validate {
+                        path: format!("{parent_path}.{alias}"),
+                        message,
+                    }
                 })?;
                 out.push(lower_scalar_field(
                     &field.arguments,
@@ -3820,6 +3887,79 @@ mod tests {
         assert!(lower(&doc, &json!({}), None, &s).is_ok());
         let err = lower(&doc, &json!({}), Some("Anything"), &s).unwrap_err();
         assert!(format!("{err}").contains("'Anything' not found"), "{err}");
+    }
+
+    #[test]
+    fn a_relation_aggregate_lowers_against_the_target_table() {
+        let s = schema_with_relations();
+        let op = parse_and_lower(
+            "{ users { posts_aggregate(where: {id: {_gt: 1}}) { aggregate { count } } } }",
+            &json!({}),
+            None,
+            &s,
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query");
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!("expected List");
+        };
+        match &selection[0] {
+            Field::RelationAggregate {
+                name, args, ops, ..
+            } => {
+                assert_eq!(name, "posts");
+                // The `where` belongs to the target, not the parent.
+                assert!(args.where_.is_some());
+                assert_eq!(ops.len(), 1);
+            }
+            other => panic!("expected RelationAggregate, got {other:?}"),
+        }
+    }
+
+    /// A column is the thing that exists; a synthesized field must not shadow
+    /// one — the same rule that keeps an auto-derived relation from doing it.
+    #[test]
+    fn a_real_column_wins_over_the_synthesized_aggregate_field() {
+        let s = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("posts_aggregate", "posts_aggregate", PgType::Text, true)
+                    .primary_key(&["id"])
+                    .relation(
+                        "posts",
+                        crate::schema::Relation::array("posts").on([("id", "user_id")]),
+                    ),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let op = parse_and_lower("{ users { posts_aggregate } }", &json!({}), None, &s).unwrap();
+        let Operation::Query(roots) = op else {
+            panic!()
+        };
+        let crate::ast::RootBody::List { selection } = &roots[0].body else {
+            panic!()
+        };
+        assert!(
+            matches!(&selection[0], Field::Column { column, .. } if column == "posts_aggregate"),
+            "{:?}",
+            selection[0]
+        );
+    }
+
+    #[test]
+    fn an_unknown_aggregate_field_says_what_it_looked_for() {
+        let err = parse_and_lower("{ users { nope_aggregate } }", &json!({}), None, &schema())
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no array relation 'nope'"), "{msg}");
     }
 
     #[test]

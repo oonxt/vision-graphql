@@ -549,6 +549,25 @@ impl ExecutionLimits {
         depth: usize,
     ) -> Result<()> {
         for f in fields.iter_mut() {
+            // A relation aggregate is a correlated subquery over the target
+            // table like any relation field, and nests like one.
+            if let crate::ast::Field::RelationAggregate {
+                name, args, nodes, ..
+            } = f
+            {
+                self.count_read(reads)?;
+                self.check_depth(depth + 1)?;
+                let rel = table.and_then(|t| t.find_relation(name));
+                let target = rel.and_then(|r| schema.table(&r.target_table));
+                // `nodes` returns rows, so a default limit belongs there and
+                // nowhere else — the same rule the root aggregate follows.
+                let fill = nodes.is_some();
+                self.args(args, true, fill, target, schema, reads, depth + 1)?;
+                if let Some(node_fields) = nodes.as_mut() {
+                    self.fields(node_fields, target, schema, reads, depth + 1)?;
+                }
+                continue;
+            }
             let crate::ast::Field::Relation {
                 name,
                 args,

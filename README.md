@@ -62,6 +62,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | Area | Status |
 |---|---|
 | Select, `_by_pk`, `_aggregate` | ✓ |
+| Aggregates on a relation (`user { posts_aggregate { … } }`) | ✓ |
 | Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, with field aliases | ✓ |
 | Object + Array relations | ✓ |
 | `EXISTS` relation filters in `where` | ✓ |
@@ -101,7 +102,6 @@ and left, not forgotten.
 
 | Gap | Notes |
 |---|---|
-| Aggregates on a relation (`user { posts_aggregate { … } }`) | Only root `<table>_aggregate` exists. |
 | Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
 | `stddev` / `variance` | `count` / `sum` / `avg` / `max` / `min` only. |
 | `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
@@ -728,6 +728,27 @@ query {
   }
 }
 ```
+
+An array relation carries the same field, over that row's children — which is
+what a paginated list needs, since the page and its total are one request:
+
+```graphql
+{ authors {
+    posts(limit: 10, order_by: [{score: desc}]) { title }
+    posts_aggregate { aggregate { count } }
+    published: posts_aggregate(where: {draft: {_eq: false}}) { aggregate { count } }
+} }
+```
+
+It renders as a correlated subquery like any relation field, takes the same
+arguments, and answers `count: 0` for a parent with no children rather than
+going missing. Object relations do not have one: a single row has nothing to
+aggregate, and asking says so.
+
+Counting a table is reading it, so a scope applies: the target's row predicate
+lands in the aggregate's `WHERE`, a table the scope denies is denied here too,
+and a withheld column cannot be summed or maxed. A number that answered the
+question the rows were refused would be a hole with extra steps.
 
 `count` takes `columns` and `distinct`; the other functions take their columns
 as a selection set. Field aliases work here like anywhere else — `total: count`

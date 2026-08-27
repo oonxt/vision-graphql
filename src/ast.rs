@@ -465,6 +465,22 @@ pub enum Field {
         args: QueryArgs,
         selection: Vec<Field>,
     },
+    /// `posts_aggregate` on a row: the same shape as a root `_aggregate`, over
+    /// the rows of an array relation instead of a whole table.
+    ///
+    /// A separate variant rather than a flag on [`Field::Relation`] because it
+    /// answers with a different thing — an aggregate object, not a list of rows
+    /// — and every walker has to treat the two differently anyway.
+    RelationAggregate {
+        /// Name of the array relation, without the `_aggregate` suffix.
+        name: String,
+        alias: String,
+        args: QueryArgs,
+        ops: Vec<AggSelect>,
+        nodes: Option<Vec<Field>>,
+        /// Response keys asking for the `<table>_aggregate` type name.
+        typenames: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
