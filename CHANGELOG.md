@@ -3,7 +3,7 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
-## Unreleased
+## 0.16.0 — 2026-08-28
 
 ### Fixed
 
