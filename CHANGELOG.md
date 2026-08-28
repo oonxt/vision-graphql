@@ -60,7 +60,11 @@ release commits; entries from 0.13.0 on are written as the work lands.
   a `jsonb` column and `_like` on an `int` were lowered and rendered — orderings
   and casts nobody should depend on — while `__schema` said no such operator
   existed. The renderer now asks the same predicate the type system publishes
-  from, so the two cannot drift.
+  from, so the two cannot drift. This applies to scope-policy predicates too:
+  a `ScopePolicy` that compares a `jsonb` column with `.gt()` (or a non-text
+  column with `.like()`) was relying on that undependable ordering and is now
+  refused at render, per request — check policies against this before
+  upgrading.
 - **An SDL description ending in `"` or `\` produced an unparseable block
   string.** Latent — descriptions are fixed templates today — but the plan of
   record is to carry table comments in them. Such a description now moves to a

@@ -477,7 +477,7 @@ impl ExecutionLimits {
         let refs: Vec<&crate::ast::InsertObject> = objects.iter().collect();
         self.count_nested_inserts(&refs, reads)?;
         drop(refs);
-        self.nested_insert_predicates(objects, reads)
+        self.nested_insert_predicates(objects.iter_mut(), reads)
     }
 
     /// The per-relation read counting, over references — a value recursion here
@@ -512,34 +512,67 @@ impl ExecutionLimits {
     /// and scope check render `EXISTS` subqueries like the top-level ones do,
     /// so they answer to the same ceilings — until this existed, one nesting
     /// level was all it took to walk around `max_table_reads`.
-    fn nested_insert_predicates(
+    ///
+    /// Walked per relation batch, not per parent row, because that is what the
+    /// renderer emits: one CTE per relation, carrying the *first* wrapper's
+    /// `on_conflict` and scope check for the whole batch. Counting each row's
+    /// copy rejected a fifty-row bulk insert for an EXISTS the statement
+    /// renders once — the same over-count the read counting above was already
+    /// cured of.
+    fn nested_insert_predicates<'a>(
         &self,
-        objects: &mut [crate::ast::InsertObject],
+        objects: impl Iterator<Item = &'a mut crate::ast::InsertObject>,
         reads: &mut usize,
     ) -> Result<()> {
+        use std::collections::BTreeMap;
+
+        let mut arrays: BTreeMap<&str, Vec<&mut crate::ast::NestedArrayInsert>> = BTreeMap::new();
+        let mut objs: BTreeMap<&str, Vec<&mut crate::ast::NestedObjectInsert>> = BTreeMap::new();
         for o in objects {
-            for nested in o.nested_arrays.values_mut() {
-                if let Some(w) = nested
-                    .on_conflict
-                    .as_mut()
-                    .and_then(|oc| oc.where_.as_mut())
-                {
-                    self.bool_expr(w, reads, 0)?;
-                }
-                self.predicate(&mut nested.scope_check, reads)?;
-                self.nested_insert_predicates(&mut nested.rows, reads)?;
+            for (name, nested) in o.nested_arrays.iter_mut() {
+                arrays.entry(name).or_default().push(nested);
             }
-            for nested in o.nested_objects.values_mut() {
-                if let Some(w) = nested
-                    .on_conflict
-                    .as_mut()
-                    .and_then(|oc| oc.where_.as_mut())
-                {
-                    self.bool_expr(w, reads, 0)?;
-                }
-                self.predicate(&mut nested.scope_check, reads)?;
-                self.nested_insert_predicates(std::slice::from_mut(&mut nested.row), reads)?;
+            for (name, nested) in o.nested_objects.iter_mut() {
+                objs.entry(name).or_default().push(nested);
             }
+        }
+        for batch in arrays.into_values() {
+            let mut first = true;
+            let mut rows: Vec<&mut crate::ast::InsertObject> = Vec::new();
+            for nested in batch {
+                if first {
+                    first = false;
+                    if let Some(w) = nested
+                        .on_conflict
+                        .as_mut()
+                        .and_then(|oc| oc.where_.as_mut())
+                    {
+                        self.bool_expr(w, reads, 0)?;
+                    }
+                    self.predicate(&mut nested.scope_check, reads)?;
+                }
+                rows.extend(nested.rows.iter_mut());
+            }
+            self.nested_insert_predicates(rows.into_iter(), reads)?;
+        }
+        for batch in objs.into_values() {
+            let mut first = true;
+            let mut rows: Vec<&mut crate::ast::InsertObject> = Vec::new();
+            for nested in batch {
+                if first {
+                    first = false;
+                    if let Some(w) = nested
+                        .on_conflict
+                        .as_mut()
+                        .and_then(|oc| oc.where_.as_mut())
+                    {
+                        self.bool_expr(w, reads, 0)?;
+                    }
+                    self.predicate(&mut nested.scope_check, reads)?;
+                }
+                rows.push(&mut nested.row);
+            }
+            self.nested_insert_predicates(rows.into_iter(), reads)?;
         }
         Ok(())
     }
@@ -1226,6 +1259,29 @@ mod exec_tests {
             .unwrap_err();
         assert!(format!("{err}").contains("table positions"), "{err}");
         let mut op = crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap();
+        ExecutionLimits::new()
+            .max_table_reads(3)
+            .apply(&mut op, &schema())
+            .unwrap();
+    }
+
+    /// The renderer emits one on_conflict per relation batch (the first
+    /// wrapper's), so the walk must count it once — not once per parent row,
+    /// which rejected ordinary bulk inserts for an EXISTS rendered once.
+    #[test]
+    fn a_bulk_insert_counts_nested_on_conflict_once_per_batch() {
+        let rows: String = (0..50)
+            .map(|i| {
+                format!(
+                    r#"{{id: {i}, posts: {{ data: [{{id: {i}}}],
+                         on_conflict: {{ constraint: "posts_pkey", update_columns: ["id"],
+                                        where: {{user: {{id: {{_gt: 1}}}}}} }} }}}}, "#
+                )
+            })
+            .collect();
+        let q = format!("mutation {{ insert_users(objects: [{rows}]) {{ affected_rows }} }}");
+        let mut op = crate::parser::parse_and_lower(&q, &json!({}), None, &schema()).unwrap();
+        // insert_users + the batched posts CTE + one EXISTS for the batch.
         ExecutionLimits::new()
             .max_table_reads(3)
             .apply(&mut op, &schema())

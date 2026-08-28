@@ -190,6 +190,33 @@ fn render_list(
     Ok(())
 }
 
+/// Refuse two selection fields answering to one response key.
+///
+/// The parser merges duplicates (or refuses the unmergeable) before they get
+/// here, but the typed builder does not — and both `AS "key"` output columns
+/// and `json_build_object` entries keep the last duplicate silently when the
+/// row decodes.
+fn ensure_unique_selection_keys(fields: &[Field], path: &str) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let key = match f {
+            Field::Column { alias, .. }
+            | Field::JsonPath { alias, .. }
+            | Field::Typename { alias }
+            | Field::Relation { alias, .. }
+            | Field::RelationAggregate { alias, .. } => alias.as_str(),
+        };
+        if seen.contains(&key) {
+            return Err(Error::Validate {
+                path: format!("{path}.{key}"),
+                message: format!("two fields both answer to '{key}'; give one of them an alias"),
+            });
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 fn render_inner_select(
     root: &RootField,
     selection: &[Field],
@@ -198,6 +225,7 @@ fn render_inner_select(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &root.alias)?;
     ctx.sql.push_str("SELECT ");
     if !root.args.distinct_on.is_empty() {
         ctx.sql.push_str("DISTINCT ON (");
@@ -531,6 +559,7 @@ fn render_relation_subquery(
     parent_path: &str,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &format!("{parent_path}.{alias}"))?;
     let rel = parent_table
         .find_relation(name)
         .ok_or_else(|| Error::Validate {
@@ -1154,6 +1183,7 @@ fn render_by_pk(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
     ctx.sql.push_str("(SELECT row_to_json(");
@@ -2709,6 +2739,7 @@ fn render_json_build_object_for_nodes(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(fields, parent_path)?;
     ctx.sql.push_str("json_build_object(");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -4848,6 +4879,52 @@ mod tests {
         assert!(format!("{err}").contains("'_like' does not apply"), "{err}");
         // The published ones still render.
         render(&compare("id", CmpOp::Gt), &schema).unwrap();
+    }
+
+    #[test]
+    fn builder_duplicate_selection_keys_are_refused() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        // The parser merges duplicates before rendering; the builder has no
+        // such pass, and json_build_object / AS-column duplicates silently
+        // last-win on decode.
+        let schema = users_schema();
+        let dup = || {
+            vec![
+                Field::Column {
+                    column: "id".into(),
+                    alias: "x".into(),
+                },
+                Field::Column {
+                    column: "name".into(),
+                    alias: "x".into(),
+                },
+            ]
+        };
+        let list = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List { selection: dup() },
+        }]);
+        let err = render(&list, &schema).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'x'"), "{err}");
+
+        let nodes = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "agg".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
+                nodes: Some(dup()),
+                typenames: Vec::new(),
+                nodes_limit: None,
+            },
+        }]);
+        let err = render(&nodes, &schema).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'x'"), "{err}");
     }
 
     #[test]
