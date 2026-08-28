@@ -585,3 +585,154 @@ async fn max_min_are_not_offered_where_postgres_has_none() {
         );
     }
 }
+
+fn schema_with_posts() -> Schema {
+    use vision_graphql::schema::Relation;
+    Schema::builder()
+        .table(
+            Table::new("users", "public", "users")
+                .column("id", "id", PgType::Int4, false)
+                .column("name", "name", PgType::Text, false)
+                .column("score", "score", PgType::Int4, false)
+                .primary_key(&["id"])
+                .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+        )
+        .table(
+            Table::new("posts", "public", "posts")
+                .column("id", "id", PgType::Int4, false)
+                .column("user_id", "user_id", PgType::Int4, false)
+                .column("name", "name", PgType::Text, false)
+                .primary_key(&["id"])
+                .relation("user", Relation::object("users").on([("user_id", "id")])),
+        )
+        .build()
+}
+
+async fn setup_with_posts() -> (Engine, common::TestDb) {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    score INT NOT NULL
+                );
+                CREATE TABLE posts (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL REFERENCES users(id),
+                    name TEXT NOT NULL
+                );
+                INSERT INTO users (name, score) VALUES
+                    ('alice', 10),
+                    ('bob',   20),
+                    ('cara',  30);
+                -- posts.name orders OPPOSITE to the author's name, so a sort
+                -- that reads the wrong table gives itself away.
+                INSERT INTO posts (user_id, name) VALUES
+                    (1, 'z-post'),
+                    (2, 'm-post'),
+                    (3, 'a-post');
+                "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let engine = Engine::new(pool, schema_with_posts());
+    (engine, db)
+}
+
+/// `nodes` publishes the full row type, relations included; the lowering used
+/// to refuse them, and the renderer's shared source did not project the join
+/// columns a relation correlates on.
+#[tokio::test]
+async fn aggregate_nodes_carry_relations() {
+    let (engine, _db) = setup_with_posts().await;
+    let v: Value = engine
+        .query(
+            "{ users_aggregate { aggregate { count } nodes {
+                name posts { name } posts_aggregate { aggregate { count } }
+            } } }",
+            None,
+        )
+        .await
+        .expect("query ok");
+    assert_eq!(v["users_aggregate"]["aggregate"]["count"], json!(3));
+    let nodes = v["users_aggregate"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 3);
+    let alice = nodes.iter().find(|n| n["name"] == "alice").expect("alice");
+    assert_eq!(alice["posts"], json!([{"name": "z-post"}]));
+    assert_eq!(alice["posts_aggregate"]["aggregate"]["count"], json!(1));
+}
+
+/// The same shape when `nodes` reads a source of its own (an injected default
+/// limit) — the other arm of the renderer.
+#[tokio::test]
+async fn aggregate_nodes_carry_relations_under_a_default_limit() {
+    use vision_graphql::limits::ExecutionLimits;
+    let (engine, _db) = setup_with_posts().await;
+    let engine = engine.with_limits(ExecutionLimits::new().default_limit(2));
+    let v: Value = engine
+        .query(
+            "{ users_aggregate { aggregate { count } nodes { name posts { name } } } }",
+            None,
+        )
+        .await
+        .expect("query ok");
+    // The cap lands on `nodes` alone; `count` still answers for every row.
+    assert_eq!(v["users_aggregate"]["aggregate"]["count"], json!(3));
+    let nodes = v["users_aggregate"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["posts"], json!([{"name": "z-post"}]));
+}
+
+/// `order_by` through a relation must sort by the *target's* column. The old
+/// renderer read only the column name, so `{user: {name: asc}}` silently
+/// sorted by `posts.name` — which is seeded to order the opposite way.
+#[tokio::test]
+async fn aggregate_order_by_through_a_relation_sorts_by_the_target_table() {
+    let (engine, _db) = setup_with_posts().await;
+    let v: Value = engine
+        .query(
+            "{ posts_aggregate(order_by: {user: {name: asc}}, limit: 2) { nodes { name } } }",
+            None,
+        )
+        .await
+        .expect("query ok");
+    // alice's post first, then bob's — post names would give a-post, m-post.
+    assert_eq!(
+        v["posts_aggregate"]["nodes"],
+        json!([{"name": "z-post"}, {"name": "m-post"}])
+    );
+}
+
+/// A builder alias is an arbitrary string; it must come back as the response
+/// key, not as SQL.
+#[tokio::test]
+async fn a_builder_alias_with_a_quote_round_trips() {
+    use vision_graphql::ast::{AggOp, AggSelect, Field, Operation, QueryArgs, RootBody, RootField};
+    let (engine, _db) = setup_with_posts().await;
+    let hostile = "o'brien', (SELECT 1)) --";
+    let op = Operation::Query(vec![RootField {
+        table: "users".into(),
+        alias: "agg".into(),
+        args: QueryArgs::default(),
+        body: RootBody::Aggregate {
+            ops: vec![AggSelect {
+                alias: "count".into(),
+                op: AggOp::count(),
+            }],
+            nodes: Some(vec![Field::Column {
+                column: "name".into(),
+                alias: hostile.into(),
+            }]),
+            typenames: Vec::new(),
+            nodes_limit: None,
+        },
+    }]);
+    let v: Value = engine.run(op).await.expect("run ok");
+    assert_eq!(v["agg"]["aggregate"]["count"], json!(3));
+    let nodes = v["agg"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[0][hostile], json!("alice"));
+}

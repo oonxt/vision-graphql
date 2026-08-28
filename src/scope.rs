@@ -194,22 +194,6 @@ fn relation_target<'s>(
     Ok((rel.target_table.clone(), target))
 }
 
-/// Columns an aggregate function reads.
-fn agg_columns(op: &crate::ast::AggOp) -> Vec<&str> {
-    use crate::ast::{AggField, AggOp};
-    match op {
-        AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-        AggOp::Func { fields, .. } => fields
-            .iter()
-            .filter_map(|f| match f {
-                AggField::Column(c) => Some(c.column.as_str()),
-                AggField::Typename { .. } => None,
-            })
-            .collect(),
-        AggOp::Typename => Vec::new(),
-    }
-}
-
 /// Refuse a column the scope does not admit.
 ///
 /// Refusing rather than dropping it from the selection: a response missing a
@@ -354,7 +338,7 @@ fn scope_root(root: &mut crate::ast::RootField, scope: &ScopeSet, schema: &Schem
             // `max { salary }` answers a question about a column as surely as
             // selecting it does, and over few enough rows it answers it exactly.
             for sel in ops.iter() {
-                for column in agg_columns(&sel.op) {
+                for column in sel.op.columns_read() {
                     check_column(scope, table, column)?;
                 }
             }
@@ -591,7 +575,7 @@ fn scope_fields(
         scope_order_by(args, target, scope, schema)?;
         check_args_columns(args, target, scope)?;
         for sel in ops.iter() {
-            for column in agg_columns(&sel.op) {
+            for column in sel.op.columns_read() {
                 check_column(scope, target, column)?;
             }
         }

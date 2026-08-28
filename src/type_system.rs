@@ -302,6 +302,34 @@ fn is_stringish(pg: &PgType) -> bool {
     matches!(pg, PgType::Text | PgType::Varchar)
 }
 
+/// Whether a comparison operator is published for a column type — and therefore
+/// whether the renderer accepts it, since the two must answer alike in both
+/// directions. [`comparison_exp`](Builder::comparison_exp) builds the published
+/// inputs from this, and `sql.rs` checks every rendered comparison against it;
+/// a second hand-written copy of either side is how `_gt` over `jsonb` came to
+/// be accepted while never being published.
+pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &PgType) -> bool {
+    use crate::ast::CmpOp::*;
+    match op {
+        Eq | Neq => true,
+        Gt | Gte | Lt | Lte => pg.is_orderable(),
+        Like | ILike | NLike | NILike => is_stringish(pg),
+    }
+}
+
+/// Why [`cmp_applies`] said no, in the words of the schema.
+pub(crate) fn why_cmp_inapplicable(op: crate::ast::CmpOp, pg: &PgType) -> &'static str {
+    use crate::ast::CmpOp::*;
+    match op {
+        Eq | Neq => "always applies",
+        Gt | Gte | Lt | Lte => {
+            debug_assert!(!pg.is_orderable());
+            "json/jsonb values have no published ordering"
+        }
+        Like | ILike | NLike | NILike => "pattern matching applies to text columns only",
+    }
+}
+
 const BUILT_IN_SCALARS: [&str; 5] = ["Int", "Float", "String", "Boolean", "ID"];
 
 /// Values of the `order_by` enum — exactly the placements
@@ -527,14 +555,20 @@ impl<'a> Builder<'a> {
                     // The same field the root offers, over this row's children.
                     // Only for array relations: an object relation is one row
                     // and the lowering refuses to aggregate it, so publishing
-                    // one would advertise what would then be rejected.
-                    fields.push(
-                        Field::new(
-                            format!("{name}_aggregate"),
-                            TypeRef::named(type_names::aggregate(target)).non_null(),
-                        )
-                        .with_args(aggregate_args(target)),
-                    );
+                    // one would advertise what would then be rejected. And only
+                    // when no real column answers to the name — the lowering
+                    // lets a column win over a synthesized field, so publishing
+                    // both would put two fields under one key on this object.
+                    let agg_name = format!("{name}_aggregate");
+                    if t.find_column(&agg_name).is_none() {
+                        fields.push(
+                            Field::new(
+                                agg_name,
+                                TypeRef::named(type_names::aggregate(target)).non_null(),
+                            )
+                            .with_args(aggregate_args(target)),
+                        );
+                    }
                 }
             }
         }
@@ -802,12 +836,12 @@ impl<'a> Builder<'a> {
             InputValue::new("_nin", named().non_null().list()),
             InputValue::new("_is_null", TypeRef::named("Boolean")),
         ];
-        if pg.is_orderable() {
+        if cmp_applies(crate::ast::CmpOp::Gt, pg) {
             for op in ["_gt", "_gte", "_lt", "_lte"] {
                 fields.push(InputValue::new(op, named()));
             }
         }
-        if is_stringish(pg) {
+        if cmp_applies(crate::ast::CmpOp::Like, pg) {
             for op in ["_like", "_nlike", "_ilike", "_nilike"] {
                 fields.push(InputValue::new(op, named()));
             }
@@ -820,6 +854,12 @@ impl<'a> Builder<'a> {
     }
 
     fn query_root(&mut self, tables: &[&std::sync::Arc<Table>]) -> String {
+        // A real table named `users_aggregate` keeps its root field, and the
+        // synthesized aggregate over `users` yields — the same real-thing-wins
+        // rule the lowering applies. Emitting both meant two fields under one
+        // name on this object, which is not a legal GraphQL type.
+        let taken: std::collections::HashSet<&str> =
+            tables.iter().map(|t| t.exposed_name.as_str()).collect();
         let mut fields = Vec::new();
         for t in tables {
             let row = type_names::row(t).to_string();
@@ -831,18 +871,20 @@ impl<'a> Builder<'a> {
                 .with_args(list_args(t))
                 .described(format!("Rows of `{}`.", t.exposed_name)),
             );
-            fields.push(
-                Field::new(
-                    type_names::aggregate(t),
-                    TypeRef::named(type_names::aggregate(t)).non_null(),
-                )
-                .with_args(aggregate_args(t)),
-            );
-            if let Some(args) = pk_args(t) {
+            if !taken.contains(type_names::aggregate(t).as_str()) {
                 fields.push(
-                    Field::new(format!("{}_by_pk", t.exposed_name), TypeRef::named(&row))
-                        .with_args(args),
+                    Field::new(
+                        type_names::aggregate(t),
+                        TypeRef::named(type_names::aggregate(t)).non_null(),
+                    )
+                    .with_args(aggregate_args(t)),
                 );
+            }
+            let by_pk = format!("{}_by_pk", t.exposed_name);
+            if !taken.contains(by_pk.as_str()) {
+                if let Some(args) = pk_args(t) {
+                    fields.push(Field::new(by_pk, TypeRef::named(&row)).with_args(args));
+                }
             }
         }
         fields.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1393,5 +1435,84 @@ mod tests {
             )
             .build();
         assert!(TypeSystem::build(&schema).mutation_root().is_none());
+    }
+
+    /// A real table named like a synthesized field keeps its own root field,
+    /// and the synthesized one yields — two fields under one name is not a
+    /// legal GraphQL object, and the lowering resolves the name to the real
+    /// table anyway.
+    #[test]
+    fn a_real_table_shadowing_a_synthesized_field_is_published_once() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .table(
+                Table::new("users_aggregate", "public", "users_aggregate").column(
+                    "id",
+                    "id",
+                    PgType::Int4,
+                    false,
+                ),
+            )
+            .table(Table::new("users_by_pk", "public", "users_by_pk").column(
+                "id",
+                "id",
+                PgType::Int4,
+                false,
+            ))
+            .build();
+        let ts = TypeSystem::build(&schema);
+        let TypeDef::Object { fields, .. } = ts.get(ts.query_root()).unwrap() else {
+            panic!("expected object");
+        };
+        for name in ["users_aggregate", "users_by_pk"] {
+            assert_eq!(
+                fields.iter().filter(|f| f.name == name).count(),
+                1,
+                "{name}: {fields:?}"
+            );
+        }
+        // The surviving field is the real table's list field, not the
+        // aggregate object.
+        let f = fields.iter().find(|f| f.name == "users_aggregate").unwrap();
+        assert!(
+            matches!(&f.ty, TypeRef::NonNull(inner) if matches!(**inner, TypeRef::List(_))),
+            "{f:?}"
+        );
+    }
+
+    /// The same rule one level down: a column named `<rel>_aggregate` wins
+    /// over the field synthesized from the relation.
+    #[test]
+    fn a_column_shadowing_a_relation_aggregate_is_published_once() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("posts_aggregate", "posts_aggregate", PgType::Text, true)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("user_id", "user_id", PgType::Int4, false),
+            )
+            .build();
+        let ts = TypeSystem::build(&schema);
+        let TypeDef::Object { fields, .. } = ts.get("users").unwrap() else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|f| f.name == "posts_aggregate")
+                .count(),
+            1,
+            "{fields:?}"
+        );
     }
 }

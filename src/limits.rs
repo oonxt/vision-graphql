@@ -469,7 +469,24 @@ impl ExecutionLimits {
     /// The renderer batches every parent row's children into one CTE per
     /// relation name, so counting per row made a fifty-row bulk insert look like
     /// fifty subqueries when it renders two — and rejected it.
-    fn insert_batch(&self, objects: &[crate::ast::InsertObject], reads: &mut usize) -> Result<()> {
+    fn insert_batch(
+        &self,
+        objects: &mut [crate::ast::InsertObject],
+        reads: &mut usize,
+    ) -> Result<()> {
+        let refs: Vec<&crate::ast::InsertObject> = objects.iter().collect();
+        self.count_nested_inserts(&refs, reads)?;
+        drop(refs);
+        self.nested_insert_predicates(objects, reads)
+    }
+
+    /// The per-relation read counting, over references — a value recursion here
+    /// cloned every nested subtree once per level, just to count it.
+    fn count_nested_inserts(
+        &self,
+        objects: &[&crate::ast::InsertObject],
+        reads: &mut usize,
+    ) -> Result<()> {
         use std::collections::BTreeMap;
 
         let mut children: BTreeMap<(&str, bool), Vec<&crate::ast::InsertObject>> = BTreeMap::new();
@@ -486,8 +503,43 @@ impl ExecutionLimits {
         }
         for rows in children.into_values() {
             self.count_read(reads)?;
-            let owned: Vec<crate::ast::InsertObject> = rows.into_iter().cloned().collect();
-            self.insert_batch(&owned, reads)?;
+            self.count_nested_inserts(&rows, reads)?;
+        }
+        Ok(())
+    }
+
+    /// The predicates nested inserts carry: each level's `on_conflict.where`
+    /// and scope check render `EXISTS` subqueries like the top-level ones do,
+    /// so they answer to the same ceilings — until this existed, one nesting
+    /// level was all it took to walk around `max_table_reads`.
+    fn nested_insert_predicates(
+        &self,
+        objects: &mut [crate::ast::InsertObject],
+        reads: &mut usize,
+    ) -> Result<()> {
+        for o in objects {
+            for nested in o.nested_arrays.values_mut() {
+                if let Some(w) = nested
+                    .on_conflict
+                    .as_mut()
+                    .and_then(|oc| oc.where_.as_mut())
+                {
+                    self.bool_expr(w, reads, 0)?;
+                }
+                self.predicate(&mut nested.scope_check, reads)?;
+                self.nested_insert_predicates(&mut nested.rows, reads)?;
+            }
+            for nested in o.nested_objects.values_mut() {
+                if let Some(w) = nested
+                    .on_conflict
+                    .as_mut()
+                    .and_then(|oc| oc.where_.as_mut())
+                {
+                    self.bool_expr(w, reads, 0)?;
+                }
+                self.predicate(&mut nested.scope_check, reads)?;
+                self.nested_insert_predicates(std::slice::from_mut(&mut nested.row), reads)?;
+            }
         }
         Ok(())
     }
@@ -1153,6 +1205,31 @@ mod exec_tests {
             .apply(&mut op, &schema())
             .unwrap_err();
         assert!(format!("{err}").contains("table positions"), "{err}");
+    }
+
+    /// The nested level renders the same EXISTS the top level does, so it
+    /// answers to the same ceiling — walking only the top level meant one
+    /// nesting level was all it took to walk around `max_table_reads`.
+    #[test]
+    fn a_nested_on_conflict_filter_counts_as_a_read() {
+        let q = r#"mutation { insert_users(objects: [{id: 1, posts: {
+                 data: [{id: 1}],
+                 on_conflict: { constraint: "posts_pkey", update_columns: ["id"],
+                                where: {user: {id: {_gt: 1}}} }
+               }}]) { affected_rows } }"#;
+        let mut op = crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap();
+        // insert_users + the batched posts CTE = 2; the EXISTS inside the
+        // nested on_conflict is the third.
+        let err = ExecutionLimits::new()
+            .max_table_reads(2)
+            .apply(&mut op, &schema())
+            .unwrap_err();
+        assert!(format!("{err}").contains("table positions"), "{err}");
+        let mut op = crate::parser::parse_and_lower(q, &json!({}), None, &schema()).unwrap();
+        ExecutionLimits::new()
+            .max_table_reads(3)
+            .apply(&mut op, &schema())
+            .unwrap();
     }
 
     #[test]

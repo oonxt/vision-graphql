@@ -389,28 +389,7 @@ fn merge_fields(fields: Vec<Field>, parent_path: &str) -> Result<Vec<Field>> {
     Ok(out)
 }
 
-/// Every response key in one operation must be distinct.
-///
-/// Root fields are not merged the way selection-set fields are: two roots under
-/// one key differ in what they select, what they filter and often in kind
-/// (`users` vs `users_aggregate` aliased alike), and there is no defensible way
-/// to fold that into one. Rendering both is what used to happen, and the second
-/// silently overwrote the first in the result object.
-fn ensure_unique_root_aliases<'a>(aliases: impl Iterator<Item = &'a str>) -> Result<()> {
-    let mut seen: Vec<&str> = Vec::new();
-    for alias in aliases {
-        if seen.contains(&alias) {
-            return Err(Error::Validate {
-                path: alias.to_string(),
-                message: format!(
-                    "two root fields both answer to '{alias}'; give one of them an alias"
-                ),
-            });
-        }
-        seen.push(alias);
-    }
-    Ok(())
-}
+use crate::ast::ensure_unique_root_aliases;
 
 /// Answer `__schema` / `__type` now, from the schema's type system.
 ///
@@ -571,6 +550,18 @@ fn validate_fragments(fragments: &Fragments<'_>) -> Result<()> {
         if let Some(d) = done.get(name) {
             return Ok(*d);
         }
+        // Checked on the way *in*, not just on the way back up: this function is
+        // the first thing that walks the chain, and each level here is a stack
+        // frame. A five-thousand-fragment chain nests one brace per fragment, so
+        // the pre-parse text-depth scan sees depth 1 — and an overflow in Rust
+        // aborts the process, so waiting to measure the chain after recursing is
+        // measuring it from inside the failure.
+        if path.len() > MAX_CHAIN {
+            return Err(Error::Validate {
+                path: format!("fragment {name}"),
+                message: format!("fragment chain is deeper than the limit of {MAX_CHAIN}"),
+            });
+        }
         if path.contains(&name) {
             path.push(name);
             return Err(Error::Validate {
@@ -665,8 +656,18 @@ fn lower_query(
                     .map(|a| a.node.as_str().to_string())
                     .unwrap_or_else(|| name.to_string());
 
+                // Suffix roots are synthesized only once a real table of the
+                // literal name has had its chance: a table is the thing that
+                // exists, and a table someone actually named `users_aggregate`
+                // must stay reachable — the same rule that keeps a synthesized
+                // `<rel>_aggregate` from shadowing a column in a selection set.
+                let shadowed_by_table = schema.table(name).is_some();
+
                 // Aggregate root: "<table>_aggregate"
-                if let Some(base_name) = name.strip_suffix("_aggregate") {
+                if let Some(base_name) = name
+                    .strip_suffix("_aggregate")
+                    .filter(|_| !shadowed_by_table)
+                {
                     if let Some(table) = schema.table(base_name) {
                         let args = lower_args(&field.arguments, table, schema, vars, &alias)?;
                         reject_distinct_on_aggregate(&args, &alias)?;
@@ -677,7 +678,9 @@ fn lower_query(
                         } = lower_aggregate_selection(
                             &field.selection_set.node,
                             table,
+                            schema,
                             vars,
+                            fragments,
                             &alias,
                         )?;
                         roots.push(RootField {
@@ -696,7 +699,8 @@ fn lower_query(
                 }
 
                 // By-PK root: "<table>_by_pk"
-                if let Some(base_name) = name.strip_suffix("_by_pk") {
+                if let Some(base_name) = name.strip_suffix("_by_pk").filter(|_| !shadowed_by_table)
+                {
                     if let Some(table) = schema.table(base_name) {
                         if table.primary_key.is_empty() {
                             return Err(Error::Validate {
@@ -1736,6 +1740,7 @@ fn parse_returning(
     parent_path: &str,
 ) -> Result<(Vec<Field>, Vec<String>)> {
     let mut returning: Vec<Field> = Vec::new();
+    let mut saw_returning = false;
     // `__typename` here names the mutation-response type, not the row type, so
     // it cannot ride along inside `returning`.
     let mut typenames: Vec<String> = Vec::new();
@@ -1757,9 +1762,23 @@ fn parse_returning(
                 reject_typename_arguments(&field.arguments, &alias, parent_path)?;
                 typenames.push(alias);
             }
-            "affected_rows" => {}
+            "affected_rows" => {
+                reject_fixed_key_alias(field, "affected_rows", parent_path)?;
+                if let Some((first, _)) = field.arguments.first() {
+                    return Err(Error::Validate {
+                        path: format!("{parent_path}.affected_rows.{}", first.node.as_str()),
+                        message: "'affected_rows' takes no arguments".into(),
+                    });
+                }
+            }
             "returning" => {
-                returning = lower_selection_set(
+                reject_fixed_key_alias(field, "returning", parent_path)?;
+                // Repeated blocks merge, exactly as two spreads of one fragment
+                // merge inside a row selection — reassigning here meant
+                // `returning { id } returning { name }` answered with `name`
+                // alone.
+                saw_returning = true;
+                let mut fields = lower_selection_set(
                     &field.selection_set.node,
                     table,
                     schema,
@@ -1767,6 +1786,7 @@ fn parse_returning(
                     fragments,
                     &format!("{parent_path}.returning"),
                 )?;
+                returning.append(&mut fields);
             }
             other => {
                 return Err(Error::Validate {
@@ -1777,6 +1797,9 @@ fn parse_returning(
         }
     }
     dedup_keys(&mut typenames);
+    if saw_returning {
+        returning = merge_fields(returning, &format!("{parent_path}.returning"))?;
+    }
     Ok((returning, typenames))
 }
 
@@ -1906,7 +1929,9 @@ fn lower_selection_set(
                             } = lower_aggregate_selection(
                                 &field.selection_set.node,
                                 target,
+                                schema,
                                 vars,
+                                fragments,
                                 &path,
                             )?;
                             out.push(Field::RelationAggregate {
@@ -2549,16 +2574,36 @@ struct AggregateSelection {
     typenames: Vec<String>,
 }
 
+/// Refuse an alias on a field whose response key the renderer pins.
+///
+/// `aggregate`, `nodes`, `returning` and `affected_rows` render under their own
+/// names — the IR does not carry a key for them. Accepting `n: nodes { … }` and
+/// answering under `nodes` anyway hands the caller a response shaped differently
+/// from the document they sent, which is worse than saying no.
+fn reject_fixed_key_alias(field: &GqlField, fixed: &str, parent_path: &str) -> Result<()> {
+    match field.alias.as_ref().map(|a| a.node.as_str()) {
+        None => Ok(()),
+        Some(a) if a == fixed => Ok(()),
+        Some(a) => Err(Error::Validate {
+            path: format!("{parent_path}.{a}"),
+            message: format!("'{fixed}' cannot be aliased; it always answers under '{fixed}'"),
+        }),
+    }
+}
+
 fn lower_aggregate_selection(
     set: &SelectionSet,
     table: &Table,
+    schema: &Schema,
     vars: Bindings<'_>,
+    fragments: &Fragments<'_>,
     parent_path: &str,
 ) -> Result<AggregateSelection> {
     use crate::ast::{AggCol, AggField, AggOp, AggSelect};
 
     let mut ops: Vec<AggSelect> = Vec::new();
-    let mut nodes: Option<Vec<Field>> = None;
+    let mut node_fields: Vec<Field> = Vec::new();
+    let mut saw_nodes = false;
     let mut typenames: Vec<String> = Vec::new();
 
     for sel in &set.items {
@@ -2571,6 +2616,15 @@ fn lower_aggregate_selection(
         let key = field.name.node.as_str();
         match key {
             "aggregate" => {
+                reject_fixed_key_alias(field, "aggregate", parent_path)?;
+                if let Some((first, _)) = field.arguments.first() {
+                    return Err(Error::Validate {
+                        path: format!("{parent_path}.aggregate.{}", first.node.as_str()),
+                        message: "'aggregate' takes no arguments; \
+                                  filters go on the _aggregate field itself"
+                            .into(),
+                    });
+                }
                 for s in &field.selection_set.node.items {
                     let Selection::Field(sf) = &s.node else {
                         return Err(Error::Parse(
@@ -2680,17 +2734,51 @@ fn lower_aggregate_selection(
                             });
                         }
                     };
-                    ops.push(AggSelect { alias, op });
+                    // The same key twice: identical requests merge (a fragment
+                    // spread twice is ordinary), differing ones conflict — the
+                    // renderer keys one json_build_object by these aliases, and
+                    // a duplicate key means one answer silently replaces the
+                    // other in the decoded response.
+                    match ops.iter().find(|existing| existing.alias == alias) {
+                        None => ops.push(AggSelect { alias, op }),
+                        Some(existing) if existing.op == op => {}
+                        Some(_) => {
+                            return Err(Error::Validate {
+                                path: format!("{parent_path}.aggregate.{alias}"),
+                                message: format!(
+                                    "two aggregate fields both answer to '{alias}' but ask for \
+                                     different things; give one of them an alias"
+                                ),
+                            });
+                        }
+                    }
                 }
             }
             "nodes" => {
-                let fields = lower_selection_columns_only(
+                reject_fixed_key_alias(field, "nodes", parent_path)?;
+                if let Some((first, _)) = field.arguments.first() {
+                    return Err(Error::Validate {
+                        path: format!("{parent_path}.nodes.{}", first.node.as_str()),
+                        message: "'nodes' takes no arguments; \
+                                  filters go on the _aggregate field itself"
+                            .into(),
+                    });
+                }
+                // Repeated blocks merge instead of the later one replacing the
+                // earlier — `nodes { id } nodes { name }` used to answer with
+                // `name` alone. The full selection lowering, not a columns-only
+                // one: the published `nodes` type is the row type, relations
+                // included, and the renderer supports them.
+                saw_nodes = true;
+                let mut fields = lower_selection_set(
                     &field.selection_set.node,
                     table,
+                    schema,
                     vars,
+                    fragments,
                     &format!("{parent_path}.nodes"),
                 )?;
-                nodes = Some(fields);
+                node_fields.append(&mut fields);
             }
             TYPENAME => {
                 let alias = field
@@ -2710,6 +2798,11 @@ fn lower_aggregate_selection(
         }
     }
     dedup_keys(&mut typenames);
+    let nodes = if saw_nodes {
+        Some(merge_fields(node_fields, &format!("{parent_path}.nodes"))?)
+    } else {
+        None
+    };
     Ok(AggregateSelection {
         ops,
         nodes,
@@ -2776,46 +2869,6 @@ fn parse_count_args(
         });
     }
     Ok(crate::ast::AggOp::Count { columns, distinct })
-}
-
-fn lower_selection_columns_only(
-    set: &SelectionSet,
-    table: &Table,
-    vars: Bindings<'_>,
-    parent_path: &str,
-) -> Result<Vec<Field>> {
-    let mut out = Vec::new();
-    for sel in &set.items {
-        let Selection::Field(f) = &sel.node else {
-            return Err(Error::Parse(
-                "fragments not supported inside aggregate nodes".into(),
-            ));
-        };
-        let field = &f.node;
-        let name = field.name.node.as_str();
-        let alias = field
-            .alias
-            .as_ref()
-            .map(|a| a.node.as_str().to_string())
-            .unwrap_or_else(|| name.to_string());
-        if name == TYPENAME {
-            reject_typename_arguments(&field.arguments, &alias, parent_path)?;
-            out.push(Field::Typename { alias });
-            continue;
-        }
-        let col = table.find_column(name).ok_or_else(|| Error::Validate {
-            path: format!("{parent_path}.{alias}"),
-            message: format!("unknown column '{name}' on '{}'", table.exposed_name),
-        })?;
-        out.push(lower_scalar_field(
-            &field.arguments,
-            col,
-            alias,
-            vars,
-            parent_path,
-        )?);
-    }
-    merge_fields(out, parent_path)
 }
 
 #[cfg(test)]
@@ -4112,5 +4165,202 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("uid"));
+    }
+
+    /// The bound must fire on the way *into* the chain. Run on a deliberately
+    /// small stack: without the entry check, the walk descends all four
+    /// thousand frames before measuring, and reaching the assertion at all is
+    /// the test — an overflow aborts the process.
+    #[test]
+    fn deep_fragment_chain_is_refused_before_it_recurses() {
+        let mut doc = String::from("query { users { ...f0 } }\n");
+        const N: usize = 3500;
+        for i in 0..N - 1 {
+            doc.push_str(&format!("fragment f{i} on users {{ ...f{} }}\n", i + 1));
+        }
+        doc.push_str(&format!("fragment f{} on users {{ id }}\n", N - 1));
+        assert!(
+            doc.len() < crate::limits::DEFAULT_MAX_BYTES,
+            "{}",
+            doc.len()
+        );
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                parse_and_lower(&doc, &json!({}), None, &schema())
+                    .map(|_| ())
+                    .unwrap_err()
+            })
+            .unwrap();
+        let err = handle.join().expect("no overflow");
+        assert!(
+            format!("{err}").contains("fragment chain is deeper"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_aggregate_keys_conflict_instead_of_overwriting() {
+        // One json_build_object key per alias: the second `count` used to
+        // silently replace the first in the decoded response.
+        let err = parse_and_lower(
+            "{ users_aggregate { aggregate { count } aggregate { count(columns: [id]) } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'count'"), "{err}");
+    }
+
+    #[test]
+    fn identical_aggregate_keys_merge() {
+        let op = parse_and_lower(
+            "{ users_aggregate { aggregate { count } aggregate { count } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        let crate::ast::RootBody::Aggregate { ops, .. } = &roots[0].body else {
+            panic!("expected Aggregate")
+        };
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn repeated_nodes_blocks_merge() {
+        // `nodes { id } nodes { name }` used to answer with `name` alone.
+        let op = parse_and_lower(
+            "{ users_aggregate { nodes { id } nodes { name } } }",
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        let crate::ast::RootBody::Aggregate { nodes, .. } = &roots[0].body else {
+            panic!("expected Aggregate")
+        };
+        assert_eq!(nodes.as_deref().map(<[Field]>::len), Some(2));
+    }
+
+    #[test]
+    fn aggregate_and_nodes_cannot_be_aliased() {
+        for q in [
+            "{ users_aggregate { agg: aggregate { count } } }",
+            "{ users_aggregate { n: nodes { id } } }",
+        ] {
+            let err = parse_and_lower(q, &json!({}), None, &schema()).unwrap_err();
+            assert!(
+                format!("{err}").contains("cannot be aliased"),
+                "{q} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_nodes_lower_relations() {
+        // `nodes` publishes the full row type, relations included; a
+        // columns-only lowering refused what `__schema` promised.
+        let op = parse_and_lower(
+            "{ users_aggregate { nodes { id posts { title } posts_aggregate { aggregate { count } } } } }",
+            &json!({}),
+            None,
+            &schema_with_relations(),
+        )
+        .unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        let crate::ast::RootBody::Aggregate { nodes, .. } = &roots[0].body else {
+            panic!("expected Aggregate")
+        };
+        let nodes = nodes.as_deref().unwrap();
+        assert!(nodes.iter().any(|f| matches!(f, Field::Relation { .. })));
+        assert!(nodes
+            .iter()
+            .any(|f| matches!(f, Field::RelationAggregate { .. })));
+    }
+
+    #[test]
+    fn repeated_returning_blocks_merge() {
+        // Reassignment meant `returning { id } returning { name }` answered
+        // with `name` alone.
+        let op = parse_and_lower(
+            r#"mutation { update_users(where: {id: {_eq: 1}}, _set: {name: "x"}) {
+                returning { id } returning { name }
+            } }"#,
+            &json!({}),
+            None,
+            &schema(),
+        )
+        .unwrap();
+        let Operation::Mutation(fields) = op else {
+            panic!("expected Mutation")
+        };
+        let crate::ast::MutationField::Update { returning, .. } = &fields[0] else {
+            panic!("expected Update")
+        };
+        assert_eq!(returning.len(), 2);
+    }
+
+    #[test]
+    fn returning_and_affected_rows_cannot_be_aliased() {
+        for q in [
+            r#"mutation { update_users(where: {id: {_eq: 1}}, _set: {name: "x"}) { rows: returning { id } } }"#,
+            r#"mutation { update_users(where: {id: {_eq: 1}}, _set: {name: "x"}) { n: affected_rows } }"#,
+        ] {
+            let err = parse_and_lower(q, &json!({}), None, &schema()).unwrap_err();
+            assert!(
+                format!("{err}").contains("cannot be aliased"),
+                "{q} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_table_wins_over_suffix_synthesis_at_the_root() {
+        // A table someone actually named `users_aggregate` must stay
+        // reachable; the synthesized aggregate over `users` yields.
+        let s = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .table(
+                Table::new("users_aggregate", "public", "users_aggregate").column(
+                    "id",
+                    "id",
+                    PgType::Int4,
+                    false,
+                ),
+            )
+            .table(Table::new("users_by_pk", "public", "users_by_pk").column(
+                "id",
+                "id",
+                PgType::Int4,
+                false,
+            ))
+            .build();
+        let op = parse_and_lower("{ users_aggregate { id } }", &json!({}), None, &s).unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        assert!(matches!(roots[0].body, crate::ast::RootBody::List { .. }));
+        assert_eq!(roots[0].table, "users_aggregate");
+
+        let op = parse_and_lower("{ users_by_pk { id } }", &json!({}), None, &s).unwrap();
+        let Operation::Query(roots) = op else {
+            panic!("expected Query")
+        };
+        assert!(matches!(roots[0].body, crate::ast::RootBody::List { .. }));
+        assert_eq!(roots[0].table, "users_by_pk");
     }
 }

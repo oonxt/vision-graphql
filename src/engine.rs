@@ -9,7 +9,7 @@ use crate::policy::ScopePolicy;
 use crate::predicate::Principal;
 use crate::schema::Schema;
 use crate::scope::{apply_scope, ScopeSet};
-use crate::sql::{render, render_now};
+use crate::sql::render;
 use crate::types::Inputs;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -48,16 +48,32 @@ fn unwrap_and_deserialize<T: DeserializeOwned>(mut data: Value, alias: Option<&s
     serde_json::from_value(payload).map_err(|e| Error::Decode(e.to_string()))
 }
 
-/// Apply the limits, then render. Paired in one function because every entry
-/// point needs both and in this order: a new one that called `render_now`
-/// directly would run unbounded, with nothing to notice it.
+/// Apply the limits, then render, leaving parameters symbolic. The one
+/// pipeline every entry point shares, in this order: a new one that called
+/// `render` directly would run unbounded, with nothing to notice it. The
+/// compile path keeps the symbolic specs; the eager paths resolve them at once
+/// via [`prepare`]. A pass added here reaches compiled and persisted
+/// statements and one-shot requests alike — `compile_inner` used to re-spell
+/// this inline, which is exactly how it would have missed the next pass.
+fn prepare_symbolic(
+    op: &mut Operation,
+    schema: &Schema,
+    limits: &ExecutionLimits,
+) -> Result<(String, Vec<crate::types::BindSpec>)> {
+    limits.apply(op, schema)?;
+    render(op, schema)
+}
+
+/// [`prepare_symbolic`] for the fully-literal paths: every parameter resolves
+/// now, with no variables and no principal.
 fn prepare(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
 ) -> Result<(String, Vec<crate::types::Bind>)> {
-    limits.apply(op, schema)?;
-    render_now(op, schema, &Inputs::none())
+    let (sql, specs) = prepare_symbolic(op, schema, limits)?;
+    let binds = crate::types::resolve_binds(&specs, &Inputs::none())?;
+    Ok((sql, binds))
 }
 
 pub struct Engine {
@@ -262,9 +278,8 @@ impl Engine {
         if let Some(policy) = policy {
             apply_scope(&mut op, &policy.symbolic(), &self.schema)?;
         }
-        self.limits.apply(&mut op, &self.schema)?;
         let root_alias = single_root_alias(&op).map(String::from);
-        let (sql, specs) = render(&op, &self.schema)?;
+        let (sql, specs) = prepare_symbolic(&mut op, &self.schema, &self.limits)?;
         Ok(CompiledQuery {
             sql,
             specs,
