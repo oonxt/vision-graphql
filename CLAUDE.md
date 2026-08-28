@@ -85,6 +85,13 @@ its place when a reader would otherwise "fix" the thing it protects.
 6. **CHANGELOG.** Every user-visible change goes under `## Unreleased`, in the
    voice of what went wrong and what it now does. Version bumps are their own
    `chore: release` commit — do not bump as a side effect.
+7. **Publishing is the tag.** Pushing `vX.Y.Z` (the tag goes on the release
+   commit, as every release so far) triggers `.github/workflows/release.yml`:
+   it re-runs the gates on what the tag points at, refuses a tag that disagrees
+   with the manifests or the CHANGELOG, and publishes both crates via crates.io
+   Trusted Publishing. Do not `cargo publish` locally — this machine's cargo
+   has its registry source replaced, which is one of the reasons the workflow
+   exists.
 
 ## Testing environment
 
