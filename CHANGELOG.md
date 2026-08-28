@@ -3,6 +3,23 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Changed
+
+- **Releases publish from CI.** Pushing a `vX.Y.Z` tag now runs the same four
+  gates in a clean environment, checks the tag against both manifests and the
+  CHANGELOG, and publishes both crates via crates.io Trusted Publishing — the
+  first publish went out from a laptop whose cargo had its registry replaced,
+  which is exactly the variance a release should not depend on. One-time
+  setup: register the workflow as a trusted publisher for each crate on
+  crates.io.
+- **Dependency floors moved up.** `toml` 0.8 → 1 (a runtime dependency of both
+  crates — consumers see the new major in their tree), `testcontainers`
+  0.23 → 0.27 with `testcontainers-modules` 0.15, `criterion` 0.5 → 0.8 (both
+  test/bench-only). No API or MSRV impact — the declared 1.94 still clears
+  every floor by a margin.
+
 ## 0.16.0 — 2026-08-28
 
 ### Fixed

@@ -1,0 +1,96 @@
+name: Release
+
+# Publishing is tag-driven: the release flow ends with `git push origin vX.Y.Z`,
+# and this workflow turns that tag into the crates.io publish — in a clean
+# environment, after the same gates CI runs, with the tag checked against what
+# the manifests actually say. A local `cargo publish` depends on whatever the
+# machine's registry setup happens to be (this repo has already been published
+# once through a source-replaced cargo that needed `--registry crates-io`);
+# this path has no such variance.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The tag is a claim about a version; check the claim before shipping it.
+  # A tag pointing at manifests that say something else would publish a crate
+  # whose number nobody chose.
+  version:
+    name: tag matches the manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, both manifests, and the CHANGELOG agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          lib=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          cli=$(grep -m1 '^version' crates/vision-graphql-cli/Cargo.toml | cut -d'"' -f2)
+          dep=$(grep -m1 'vision-graphql.*version = ' crates/vision-graphql-cli/Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          echo "tag $tag / lib $lib / cli $cli / cli's dep on lib $dep"
+          test "$tag" = "$lib" || { echo "tag and library version differ"; exit 1; }
+          test "$tag" = "$cli" || { echo "tag and CLI version differ"; exit 1; }
+          test "$tag" = "$dep" || { echo "CLI depends on a different library version"; exit 1; }
+          grep -q "^## $tag " CHANGELOG.md || { echo "CHANGELOG has no dated entry for $tag"; exit 1; }
+
+  # The same four gates the workflow in ci.yml runs. Re-run here rather than
+  # trusted from main's last green: the tag may not point at that commit, and
+  # what gets published is what the tag points at.
+  gates:
+    name: fmt, clippy, tests, doctests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.4-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo nextest run --workspace --test-threads 4
+      - run: cargo test --workspace --doc
+
+  publish:
+    name: publish to crates.io
+    needs: [version, gates]
+    runs-on: ubuntu-latest
+    environment: release
+    # Trusted Publishing: crates.io mints a short-lived token against this
+    # workflow's OIDC identity, so no long-lived registry token lives in the
+    # repository's secrets. One-time setup per crate, on crates.io under
+    # Settings → Trusted Publishing: repository `oonxt/vision-graphql`,
+    # workflow `release.yml`, environment `release`.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # Library first: the CLI depends on it at this exact version, and cargo
+      # waits for the first publish to be visible in the index before the
+      # second resolves against it.
+      - run: cargo publish -p vision-graphql
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - run: cargo publish -p vision-graphql-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
