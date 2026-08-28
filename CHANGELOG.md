@@ -3,6 +3,114 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **A builder alias could rewrite the SQL.** Response keys inside an
+  aggregate's `nodes` — and column aliases in every other selection — were
+  interpolated into the statement unescaped. On the document path a GraphQL
+  name cannot carry a quote, but `Engine::run` takes arbitrary strings: an
+  apostrophe in an alias broke the statement, and a crafted one injected SQL.
+  Every alias now goes through the same escaping as every other literal and
+  identifier.
+- **A long fragment chain crashed the process before its limit fired.** The
+  chain bound was checked after recursing, on the way back up — so ~3500
+  linearly chained fragments, well under the byte limit and nesting one brace
+  each, overflowed the stack first, and a stack overflow aborts the process.
+  The bound is now checked on the way in.
+- **Nested inserts' `on_conflict` filters escaped the execution limits.** The
+  cost walk read only the top-level `on_conflict.where`; a nested insert one
+  level down could chain any number of relation predicates, each rendering an
+  `EXISTS` subquery, with no `CostLimit` error. The walk now descends with the
+  renderer — and no longer clones every nested subtree per level to do it.
+- **The builder path could silently mis-aggregate.** `distinct_on` on an
+  aggregate was ignored, `count_distinct` with no columns dropped its
+  `DISTINCT`, an aggregate function with no columns rendered `{}` with the
+  function never applied, two ops under one key overwrote each other in the
+  response, and two roots sharing an alias lost the first one — each refused by
+  the parser, none by the renderer, and `Engine::run` never goes near the
+  parser. All five are now refused where both entry points meet.
+- **`order_by` through a relation on an `_aggregate` field sorted by the wrong
+  table.** The aggregate source's hand-rolled `ORDER BY` read only the column
+  name, so `posts_aggregate(order_by: {user: {name: asc}})` sorted by
+  `posts.name` whenever the name existed on both tables — silently — and
+  errored on a schema-published query otherwise. It also never rendered
+  `NULLS FIRST|LAST`. The aggregate source now uses the same `ORDER BY`
+  renderer as row lists.
+- **Duplicate keys inside `_aggregate` and mutation payloads silently
+  overwrote each other.** `aggregate { count } aggregate { count(columns: …) }`
+  answered with only the second; `nodes { id } nodes { name }` dropped `id`;
+  `returning { id } returning { name }` dropped `id`; and inside a function
+  block, `sum { a: id a: score }` kept only the score. Identical requests now
+  merge, conflicting ones are refused — the same rule row selections already
+  had, applied at rendering too so the typed builder cannot slip duplicates
+  past it. Aliases on `aggregate`, `nodes`, `returning` and `affected_rows` are
+  refused outright rather than answered under the wrong key, since the renderer
+  pins those response keys. Arguments on those four fields, which used to parse
+  and then be read by nobody — `nodes(limit: 5)`, `returning(limit: 1)` — are
+  refused the same way.
+- **A synthesized mutation name could shadow a real table's.** With tables
+  `users` and `users_one`, `insert_users_one` lowered as the one-row insert
+  into `users` — silently writing a different table than the name reads — and
+  the mutation root published two fields under one name. The literal reading
+  wins now, at lowering and in what is published; same for `update_/delete_…`
+  against a table actually named `…_by_pk`.
+- **A table named like an aggregate type silently corrupted the published
+  schema.** A real table `users_aggregate` and the synthesized aggregate type
+  over `users` collided in the type map, one silently replacing the other —
+  SDL and `__schema` then described a shape the server does not answer with.
+  The real table keeps the name; the aggregate machinery over the shadowed
+  table is withdrawn as a unit — its types, the root field, relation
+  `_aggregate` fields answering with it — and lowering refuses those aggregates
+  with the reason instead of implementing what is no longer published. A
+  relation literally named `<x>_aggregate` likewise keeps its field.
+- **A fragment bomb turned lowering into CPU exhaustion.** Lowering re-expands
+  a fragment at every spread site, so forty fragments each spreading the next
+  twice — a one-kilobyte document — cost 2^40 expansions with every text limit
+  satisfied. Fragment validation now computes the expansion count (linearly,
+  memoized) and refuses past 10,000. Composed nesting is bounded the same way:
+  fragments each nesting within the text limit could chain to thousands of
+  lowering levels, each a stack frame; the composed depth now answers to the
+  same limit as the text.
+- **A deep builder-supplied insert tree crashed the process.** Nothing bounded
+  how deep `InsertObject` nesting recursed — not the scope rewrite, not the
+  cost walk (which skips entirely when limits are unbounded), not the renderer
+  — and a stack overflow aborts rather than unwinds. All three now refuse
+  nesting past the same limit the document path has always had, before
+  descending it.
+- **A real table named like a synthesized field was unreachable.** A table
+  actually called `users_aggregate` could never be queried — the root lowering
+  synthesized an aggregate over `users` first — and the type system published
+  both fields under one name, which is not a legal GraphQL object. The real
+  table now wins at the root, in selection sets, and in what is published.
+- **Aggregate `nodes` refused the relations the schema published.**
+  Introspection and SDL type `nodes` as the full row type, relations included;
+  the lowering accepted columns only, so a client generated from `__schema`
+  was refused a query the schema promised — and the renderer supported it all
+  along. `nodes` now lowers exactly like any row selection.
+- **Comparison operators the schema never published were accepted.** `_gt` on
+  a `jsonb` column and `_like` on an `int` were lowered and rendered — orderings
+  and casts nobody should depend on — while `__schema` said no such operator
+  existed. The renderer now asks the same predicate the type system publishes
+  from, so the two cannot drift. This applies to scope-policy predicates too:
+  a `ScopePolicy` that compares a `jsonb` column with `.gt()` (or a non-text
+  column with `.like()`) was relying on that undependable ordering and is now
+  refused at render, per request — check policies against this before
+  upgrading.
+- **An SDL description ending in `"` or `\` produced an unparseable block
+  string.** Latent — descriptions are fixed templates today — but the plan of
+  record is to carry table comments in them. Such a description now moves to a
+  line of its own.
+
+### Changed
+
+- **The compile path shares the prepare pipeline.** `compile_inner` re-spelled
+  scope→limits→render inline; a pass added to `prepare` would have silently
+  skipped compiled and persisted statements. Both now route through one
+  function, and the root-alias uniqueness check moved into rendering, where no
+  entry point can miss it.
+
 ## 0.15.0 — 2026-08-27
 
 ### Added

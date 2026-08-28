@@ -115,6 +115,10 @@ impl RenderCtx {
 }
 
 fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Result<()> {
+    // Checked here and not only in the parser: the typed builder never goes
+    // near the parser, and two roots sharing a key mean the second silently
+    // overwrites the first in the decoded response.
+    crate::ast::ensure_unique_root_aliases(roots.iter().map(|r| r.alias.as_str()))?;
     ctx.sql.push_str("SELECT json_build_object(");
     for (i, root) in roots.iter().enumerate() {
         if i > 0 {
@@ -186,6 +190,33 @@ fn render_list(
     Ok(())
 }
 
+/// Refuse two selection fields answering to one response key.
+///
+/// The parser merges duplicates (or refuses the unmergeable) before they get
+/// here, but the typed builder does not — and both `AS "key"` output columns
+/// and `json_build_object` entries keep the last duplicate silently when the
+/// row decodes.
+fn ensure_unique_selection_keys(fields: &[Field], path: &str) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let key = match f {
+            Field::Column { alias, .. }
+            | Field::JsonPath { alias, .. }
+            | Field::Typename { alias }
+            | Field::Relation { alias, .. }
+            | Field::RelationAggregate { alias, .. } => alias.as_str(),
+        };
+        if seen.contains(&key) {
+            return Err(Error::Validate {
+                path: format!("{path}.{key}"),
+                message: format!("two fields both answer to '{key}'; give one of them an alias"),
+            });
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 fn render_inner_select(
     root: &RootField,
     selection: &[Field],
@@ -194,6 +225,7 @@ fn render_inner_select(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &root.alias)?;
     ctx.sql.push_str("SELECT ");
     if !root.args.distinct_on.is_empty() {
         ctx.sql.push_str("DISTINCT ON (");
@@ -220,11 +252,14 @@ fn render_inner_select(
                     path: format!("{}.{}", root.alias, alias),
                     message: format!("unknown column '{column}' on '{}'", root.table),
                 })?;
+                // quote_ident on the alias too: parser aliases are GraphQL
+                // Names, but builder aliases are arbitrary strings, and a
+                // quote in one must not escape the identifier.
                 write!(
                     ctx.sql,
-                    r#"{table_alias}.{} AS "{}""#,
+                    "{table_alias}.{} AS {}",
                     quote_ident(&col.physical_name),
-                    alias
+                    quote_ident(alias)
                 )
                 .unwrap();
             }
@@ -239,7 +274,7 @@ fn render_inner_select(
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, r#"{expr} AS "{alias}""#).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(alias)).unwrap();
             }
             Field::Relation {
                 name,
@@ -313,6 +348,45 @@ fn render_where(
     Ok(())
 }
 
+/// The operator's name in a document, for error messages.
+fn cmp_gql_name(op: crate::ast::CmpOp) -> &'static str {
+    use crate::ast::CmpOp::*;
+    match op {
+        Eq => "_eq",
+        Neq => "_neq",
+        Gt => "_gt",
+        Gte => "_gte",
+        Lt => "_lt",
+        Lte => "_lte",
+        Like => "_like",
+        ILike => "_ilike",
+        NLike => "_nlike",
+        NILike => "_nilike",
+    }
+}
+
+/// Refuse a comparison the schema does not publish for the column's type.
+///
+/// The same predicate the type system builds the comparison inputs from
+/// (`type_system::cmp_applies`), asked at the one point both entry points pass
+/// through. Without it the builder accepted `_gt` over `jsonb` — an ordering
+/// PostgreSQL will evaluate and nobody should depend on — while `__schema`
+/// said no such operator existed.
+fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Result<()> {
+    if crate::type_system::cmp_applies(op, &col.pg_type) {
+        return Ok(());
+    }
+    Err(Error::Validate {
+        path: format!("where.{}", col.exposed_name),
+        message: format!(
+            "operator '{}' does not apply to '{}': {}",
+            cmp_gql_name(op),
+            col.exposed_name,
+            crate::type_system::why_cmp_inapplicable(op, &col.pg_type)
+        ),
+    })
+}
+
 fn render_bool_expr(
     expr: &crate::ast::BoolExpr,
     table: &Table,
@@ -335,6 +409,7 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
+            check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
@@ -484,6 +559,7 @@ fn render_relation_subquery(
     parent_path: &str,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &format!("{parent_path}.{alias}"))?;
     let rel = parent_table
         .find_relation(name)
         .ok_or_else(|| Error::Validate {
@@ -530,9 +606,9 @@ fn render_relation_subquery(
                 })?;
                 write!(
                     ctx.sql,
-                    r#"{remote_alias}.{} AS "{}""#,
+                    "{remote_alias}.{} AS {}",
                     quote_ident(&col.physical_name),
-                    fa
+                    quote_ident(fa)
                 )
                 .unwrap();
             }
@@ -547,7 +623,7 @@ fn render_relation_subquery(
                 })?;
                 let err_path = format!("{parent_path}.{alias}.{fa}");
                 let expr = render_json_path_expr(&remote_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, r#"{expr} AS "{fa}""#).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(fa)).unwrap();
             }
             Field::Relation {
                 name: cname,
@@ -716,7 +792,7 @@ fn render_relation_aggregate_field(
         parent_path,
         ctx,
     )?;
-    write!(ctx.sql, r#" AS "{alias}""#).unwrap();
+    write!(ctx.sql, " AS {}", quote_ident(alias)).unwrap();
     Ok(())
 }
 
@@ -743,7 +819,7 @@ fn render_relation_field(
         parent_path,
         ctx,
     )?;
-    write!(ctx.sql, r#" AS "{alias}""#).unwrap();
+    write!(ctx.sql, " AS {}", quote_ident(alias)).unwrap();
     Ok(())
 }
 
@@ -1075,9 +1151,9 @@ fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCt
 fn render_typename_select(table: &Table, alias: &str, ctx: &mut RenderCtx) {
     write!(
         ctx.sql,
-        r#"'{}'::text AS "{}""#,
+        "'{}'::text AS {}",
         escape_string_literal(crate::type_names::row(table)),
-        alias
+        quote_ident(alias)
     )
     .unwrap();
 }
@@ -1107,6 +1183,7 @@ fn render_by_pk(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
     ctx.sql.push_str("(SELECT row_to_json(");
@@ -1125,9 +1202,9 @@ fn render_by_pk(
                 })?;
                 write!(
                     ctx.sql,
-                    r#"{inner_alias}.{} AS "{}""#,
+                    "{inner_alias}.{} AS {}",
                     quote_ident(&col.physical_name),
-                    alias
+                    quote_ident(alias)
                 )
                 .unwrap();
             }
@@ -1142,7 +1219,7 @@ fn render_by_pk(
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(&inner_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, r#"{expr} AS "{alias}""#).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(alias)).unwrap();
             }
             Field::Relation {
                 name,
@@ -1297,6 +1374,8 @@ fn render_mutation(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::MutationField;
+    // See render_query: the builder path has no other duplicate-key guard.
+    crate::ast::ensure_unique_root_aliases(fields.iter().map(MutationField::alias))?;
     check_mutable(fields, schema)?;
     ctx.sql.push_str("WITH ");
     for (i, mf) in fields.iter().enumerate() {
@@ -1432,6 +1511,7 @@ fn render_insert_cte(
         scope_check,
         None,
         false, // top-level: NOT nested
+        0,
         schema,
         ctx,
     )
@@ -1447,12 +1527,26 @@ fn render_insert_cte_recursive(
     scope_check: Option<&crate::ast::BoolExpr>,
     parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
     is_nested_cte: bool,
+    depth: usize,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use std::collections::BTreeSet;
 
     debug_assert_eq!(objects.len(), parent_ords.len());
+
+    // The unconditional bound on insert-tree nesting, at the point every
+    // entry point passes: the walk in ExecutionLimits short-circuits when the
+    // limits are unbounded, and a stack overflow here aborts the process.
+    if depth > crate::limits::DEFAULT_MAX_DEPTH {
+        return Err(Error::Validate {
+            path: "objects".into(),
+            message: format!(
+                "nested inserts nest deeper than the limit of {}",
+                crate::limits::DEFAULT_MAX_DEPTH
+            ),
+        });
+    }
 
     let table = schema.table(table_name).ok_or_else(|| Error::Validate {
         path: cte.into(),
@@ -1540,6 +1634,7 @@ fn render_insert_cte_recursive(
             child_scope_check.as_ref(),
             None, // NOT a child-of-parent; this is a prerequisite insert
             true, // this is a nested CTE
+            depth + 1,
             schema,
             ctx,
         )?;
@@ -1805,6 +1900,7 @@ fn render_insert_cte_recursive(
                 child_scope_check.as_ref(),
                 Some((&parent_ord_cte_name, rel, table)),
                 true, // this is a nested CTE
+                depth + 1,
                 schema,
                 ctx,
             )?;
@@ -2325,6 +2421,30 @@ fn render_aggregate_object(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    // The parser refuses both of these with a document path; the typed builder
+    // never goes near the parser, so the checks that keep a plausible wrong
+    // answer from going out have to live here too.
+    if !args.distinct_on.is_empty() {
+        return Err(Error::Validate {
+            path: format!("{path}.distinct_on"),
+            message: "an aggregate cannot take 'distinct_on'; \
+                      use `count(columns: [\u{2026}], distinct: true)` to count distinct values"
+                .into(),
+        });
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for sel in ops {
+        if seen.contains(&sel.alias.as_str()) {
+            return Err(Error::Validate {
+                path: format!("{path}.aggregate.{}", sel.alias),
+                message: format!(
+                    "two aggregate fields both answer to '{}'; give one of them an alias",
+                    sel.alias
+                ),
+            });
+        }
+        seen.push(sel.alias.as_str());
+    }
     let inner_alias = ctx.next_alias("t");
 
     // Whether anything in the projection actually reads the source rows. Type
@@ -2501,6 +2621,15 @@ fn render_agg_op(
     let key = escape_string_literal(&sel.alias);
     match &sel.op {
         AggOp::Count { columns, distinct } => {
+            // The parser refuses this pairing; the builder can still construct
+            // it, and dropping the DISTINCT silently answers a different
+            // question than the one asked.
+            if *distinct && columns.is_empty() {
+                return Err(Error::Validate {
+                    path: format!("aggregate.{}.distinct", sel.alias),
+                    message: "'distinct' needs 'columns' to be distinct on".into(),
+                });
+            }
             write!(ctx.sql, "'{key}', count(").unwrap();
             if columns.is_empty() {
                 ctx.sql.push('*');
@@ -2556,6 +2685,31 @@ fn render_agg_func(
 ) -> Result<()> {
     use crate::ast::AggField;
     let pg_func = func.name();
+    // Same rule the parser applies: a function with no column to apply to
+    // would render `{}` with the function never called — an answer that looks
+    // complete and contains nothing.
+    if !fields.iter().any(|f| matches!(f, AggField::Column(_))) {
+        return Err(Error::Validate {
+            path: format!("aggregate.{key}"),
+            message: format!("'{pg_func}' needs at least one column"),
+        });
+    }
+    // One key per alias inside the group too — the parser merges duplicates,
+    // the builder has no pass that would.
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let k = match f {
+            AggField::Column(c) => c.alias.as_str(),
+            AggField::Typename { alias } => alias.as_str(),
+        };
+        if seen.contains(&k) {
+            return Err(Error::Validate {
+                path: format!("aggregate.{key}.{k}"),
+                message: format!("two fields both answer to '{k}'; give one of them an alias"),
+            });
+        }
+        seen.push(k);
+    }
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -2618,6 +2772,7 @@ fn render_json_build_object_for_nodes(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    ensure_unique_selection_keys(fields, parent_path)?;
     ctx.sql.push_str("json_build_object(");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -2638,9 +2793,15 @@ fn render_json_build_object_for_nodes(
                     path: format!("{parent_path}.nodes.{alias}"),
                     message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
+                // Escaped like every other response key: on the parser path a
+                // GraphQL Name cannot carry a quote, but these aliases also
+                // arrive from the typed builder, where they are arbitrary
+                // strings — unescaped, one apostrophe breaks the statement and
+                // a crafted one rewrites it.
                 write!(
                     ctx.sql,
-                    "'{alias}', {table_alias}.{}",
+                    "'{}', {table_alias}.{}",
+                    escape_string_literal(alias),
                     quote_ident(&col.physical_name)
                 )
                 .unwrap();
@@ -2656,7 +2817,7 @@ fn render_json_build_object_for_nodes(
                 })?;
                 let err_path = format!("{parent_path}.nodes.{alias}");
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, "'{alias}', {expr}").unwrap();
+                write!(ctx.sql, "'{}', {expr}", escape_string_literal(alias)).unwrap();
             }
             Field::Relation {
                 name,
@@ -2664,7 +2825,7 @@ fn render_json_build_object_for_nodes(
                 args,
                 selection,
             } => {
-                write!(ctx.sql, "'{rel_alias}', ").unwrap();
+                write!(ctx.sql, "'{}', ", escape_string_literal(rel_alias)).unwrap();
                 render_relation_subquery(
                     name,
                     rel_alias,
@@ -2686,7 +2847,7 @@ fn render_json_build_object_for_nodes(
                 typenames,
                 nodes_limit,
             } => {
-                write!(ctx.sql, "'{rel_alias}', ").unwrap();
+                write!(ctx.sql, "'{}', ", escape_string_literal(rel_alias)).unwrap();
                 render_relation_aggregate(
                     name,
                     rel_alias,
@@ -2719,25 +2880,13 @@ fn render_aggregate_source(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    use crate::ast::AggOp;
     use std::collections::BTreeSet;
 
     let mut cols_needed: BTreeSet<String> = BTreeSet::new();
     for sel in ops {
         // `count(columns: …)` reads columns too, so the inner select has to
         // project them just like sum/avg/max/min do.
-        let names: Vec<&str> = match &sel.op {
-            AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
-            AggOp::Func { fields, .. } => fields
-                .iter()
-                .filter_map(|f| match f {
-                    crate::ast::AggField::Column(c) => Some(c.column.as_str()),
-                    crate::ast::AggField::Typename { .. } => None,
-                })
-                .collect(),
-            AggOp::Typename => Vec::new(),
-        };
-        for c in names {
+        for c in sel.op.columns_read() {
             let col = table.find_column(c).ok_or_else(|| Error::Validate {
                 path: format!("{path}.aggregate"),
                 message: format!("unknown column '{c}' on '{}'", table.exposed_name),
@@ -2749,9 +2898,27 @@ fn render_aggregate_source(
         for f in fields {
             let column = match f {
                 Field::Column { column, .. } | Field::JsonPath { column, .. } => column,
-                Field::Typename { .. }
-                | Field::Relation { .. }
-                | Field::RelationAggregate { .. } => continue,
+                // A relation under `nodes` correlates back to this source on
+                // the relation's local columns, so those must be projected —
+                // the subquery reads them off the source alias, not the table.
+                Field::Relation { name, .. } | Field::RelationAggregate { name, .. } => {
+                    let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
+                        path: format!("{path}.nodes"),
+                        message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
+                    })?;
+                    for (local, _) in &rel.mapping {
+                        let col = table.find_column(local).ok_or_else(|| Error::Validate {
+                            path: format!("{path}.nodes"),
+                            message: format!(
+                                "relation mapping: unknown local column '{local}' on '{}'",
+                                table.exposed_name
+                            ),
+                        })?;
+                        cols_needed.insert(col.physical_name.clone());
+                    }
+                    continue;
+                }
+                Field::Typename { .. } => continue,
             };
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("{path}.nodes"),
@@ -2850,23 +3017,25 @@ fn render_aggregate_source(
         ctx.sql.push_str(if filtered { " AND " } else { " WHERE " });
         render_bool_expr(expr, table, &src_alias, schema, ctx)?;
     }
+    // The same renderer the row list uses — a hand-rolled loop here read only
+    // `ob.column`, so an `order_by` through a relation silently sorted by the
+    // source table's column of that name, and `NULLS FIRST|LAST` never
+    // rendered at all.
     if !args.order_by.is_empty() {
         ctx.sql.push_str(" ORDER BY ");
         for (i, ob) in args.order_by.iter().enumerate() {
             if i > 0 {
                 ctx.sql.push_str(", ");
             }
-            let col = table
-                .find_column(&ob.column)
-                .ok_or_else(|| Error::Validate {
-                    path: format!("{path}.order_by.{}", ob.column),
-                    message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
-                })?;
-            let dir = match ob.direction {
-                crate::ast::OrderDir::Asc => "ASC",
-                crate::ast::OrderDir::Desc => "DESC",
-            };
-            write!(ctx.sql, "{} {dir}", quote_ident(&col.physical_name)).unwrap();
+            render_order_by_expr(
+                ob,
+                table,
+                &src_alias,
+                schema,
+                &format!("{path}.order_by"),
+                ctx,
+            )?;
+            render_order_dir(ob, ctx);
         }
     }
     render_limit_offset(args, path, ctx);
@@ -2923,6 +3092,7 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
+            check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
             let op_str = match op {
@@ -4528,5 +4698,286 @@ mod tests {
 
         let (sql, _binds) = render(&op, &schema).unwrap();
         insta::assert_snapshot!(sql);
+    }
+
+    /// Builder aliases are arbitrary strings, unlike parser aliases (GraphQL
+    /// Names). Every position one reaches must escape it.
+    #[test]
+    fn builder_aliases_cannot_break_out_of_sql_strings() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        let schema = users_schema();
+        let hostile = "x', (SELECT usename FROM pg_user LIMIT 1)) --";
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "agg".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
+                nodes: Some(vec![Field::Column {
+                    column: "name".into(),
+                    alias: hostile.into(),
+                }]),
+                typenames: Vec::new(),
+                nodes_limit: None,
+            },
+        }]);
+        let (sql, _) = render(&op, &schema).unwrap();
+        assert!(
+            sql.contains("'x'', (SELECT usename FROM pg_user LIMIT 1)) --'"),
+            "the alias must land as one escaped literal, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn builder_alias_cannot_break_out_of_an_identifier() {
+        let schema = users_schema();
+        let hostile = r#"a" FROM pg_user; --"#;
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    column: "name".into(),
+                    alias: hostile.into(),
+                }],
+            },
+        }]);
+        let (sql, _) = render(&op, &schema).unwrap();
+        assert!(
+            sql.contains(r#"AS "a"" FROM pg_user; --""#),
+            "the alias must land as one quoted identifier, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn two_builder_roots_answering_to_one_key_are_refused() {
+        // The parser has always refused this; the builder rendered both and
+        // the first result silently vanished behind the second.
+        let schema = users_schema();
+        let root = || RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List {
+                selection: vec![Field::Column {
+                    column: "id".into(),
+                    alias: "id".into(),
+                }],
+            },
+        };
+        let err = render(&Operation::Query(vec![root(), root()]), &schema).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'users'"), "{err}");
+    }
+
+    #[test]
+    fn builder_aggregate_refuses_distinct_on() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        let schema = users_schema();
+        let op = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "agg".into(),
+            args: QueryArgs {
+                distinct_on: vec!["name".into()],
+                ..QueryArgs::default()
+            },
+            body: RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
+                nodes: None,
+                typenames: Vec::new(),
+                nodes_limit: None,
+            },
+        }]);
+        let err = render(&op, &schema).unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot take 'distinct_on'"),
+            "{err}"
+        );
+    }
+
+    fn aggregate_root(ops: Vec<crate::ast::AggSelect>) -> Operation {
+        Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "agg".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops,
+                nodes: None,
+                typenames: Vec::new(),
+                nodes_limit: None,
+            },
+        }])
+    }
+
+    #[test]
+    fn builder_count_distinct_without_columns_is_refused() {
+        use crate::ast::{AggOp, AggSelect};
+        // Dropping the DISTINCT answered a different question; the parser
+        // refuses the pairing and the renderer must too.
+        let op = aggregate_root(vec![AggSelect {
+            alias: "count".into(),
+            op: AggOp::Count {
+                columns: Vec::new(),
+                distinct: true,
+            },
+        }]);
+        let err = render(&op, &users_schema()).unwrap_err();
+        assert!(
+            format!("{err}").contains("'distinct' needs 'columns'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn builder_agg_func_without_columns_is_refused() {
+        use crate::ast::{AggFunc, AggOp, AggSelect};
+        // `{}` with the function never applied looks complete and contains
+        // nothing.
+        let op = aggregate_root(vec![AggSelect {
+            alias: "sum".into(),
+            op: AggOp::Func {
+                func: AggFunc::Sum,
+                fields: Vec::new(),
+            },
+        }]);
+        let err = render(&op, &users_schema()).unwrap_err();
+        assert!(
+            format!("{err}").contains("needs at least one column"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn builder_duplicate_aggregate_keys_are_refused() {
+        use crate::ast::{AggOp, AggSelect};
+        let op = aggregate_root(vec![
+            AggSelect {
+                alias: "count".into(),
+                op: AggOp::count(),
+            },
+            AggSelect {
+                alias: "count".into(),
+                op: AggOp::Count {
+                    columns: vec!["name".into()],
+                    distinct: false,
+                },
+            },
+        ]);
+        let err = render(&op, &users_schema()).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'count'"), "{err}");
+    }
+
+    /// Publish and implement must agree in both directions: `__schema` never
+    /// offered `_gt` on jsonb or `_like` on int, so the renderer must not
+    /// quietly accept them from the builder.
+    #[test]
+    fn unpublished_comparison_operators_are_refused() {
+        use crate::ast::{BoolExpr, CmpOp};
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("data", "data", PgType::Jsonb, true),
+            )
+            .build();
+        let compare = |column: &str, op| {
+            Operation::Query(vec![RootField {
+                table: "users".into(),
+                alias: "users".into(),
+                args: QueryArgs {
+                    where_: Some(BoolExpr::Compare {
+                        column: column.into(),
+                        op,
+                        value: crate::ast::Val::Lit(serde_json::json!(1)),
+                    }),
+                    ..QueryArgs::default()
+                },
+                body: RootBody::List {
+                    selection: vec![Field::Column {
+                        column: "id".into(),
+                        alias: "id".into(),
+                    }],
+                },
+            }])
+        };
+        let err = render(&compare("data", CmpOp::Gt), &schema).unwrap_err();
+        assert!(format!("{err}").contains("'_gt' does not apply"), "{err}");
+        let err = render(&compare("id", CmpOp::Like), &schema).unwrap_err();
+        assert!(format!("{err}").contains("'_like' does not apply"), "{err}");
+        // The published ones still render.
+        render(&compare("id", CmpOp::Gt), &schema).unwrap();
+    }
+
+    #[test]
+    fn builder_duplicate_selection_keys_are_refused() {
+        use crate::ast::{AggOp, AggSelect, RootBody};
+        // The parser merges duplicates before rendering; the builder has no
+        // such pass, and json_build_object / AS-column duplicates silently
+        // last-win on decode.
+        let schema = users_schema();
+        let dup = || {
+            vec![
+                Field::Column {
+                    column: "id".into(),
+                    alias: "x".into(),
+                },
+                Field::Column {
+                    column: "name".into(),
+                    alias: "x".into(),
+                },
+            ]
+        };
+        let list = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "users".into(),
+            args: QueryArgs::default(),
+            body: RootBody::List { selection: dup() },
+        }]);
+        let err = render(&list, &schema).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'x'"), "{err}");
+
+        let nodes = Operation::Query(vec![RootField {
+            table: "users".into(),
+            alias: "agg".into(),
+            args: QueryArgs::default(),
+            body: RootBody::Aggregate {
+                ops: vec![AggSelect {
+                    alias: "count".into(),
+                    op: AggOp::count(),
+                }],
+                nodes: Some(dup()),
+                typenames: Vec::new(),
+                nodes_limit: None,
+            },
+        }]);
+        let err = render(&nodes, &schema).unwrap_err();
+        assert!(format!("{err}").contains("both answer to 'x'"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_order_by_walks_the_relation_path() {
+        // The hand-rolled ORDER BY read only `ob.column`, so ordering
+        // `posts_aggregate` by `{user: {name: asc}}` sorted by a column of
+        // `posts` — silently, whenever the name existed on both tables.
+        let schema = users_posts_schema();
+        let op = crate::parser::parse_and_lower(
+            "{ posts_aggregate(order_by: {user: {name: desc_nulls_last}}, limit: 2) { nodes { id } } }",
+            &serde_json::json!({}),
+            None,
+            &schema,
+        )
+        .unwrap();
+        let (sql, _) = render(&op, &schema).unwrap();
+        assert!(
+            sql.contains("ORDER BY (SELECT"),
+            "must correlate through the relation, got: {sql}"
+        );
+        assert!(sql.contains(") DESC NULLS LAST"), "got: {sql}");
     }
 }

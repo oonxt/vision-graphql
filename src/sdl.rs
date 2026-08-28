@@ -107,7 +107,15 @@ fn render_description(description: Option<&str>, indent: usize, out: &mut String
     let pad = " ".repeat(indent);
     // The one sequence a block string cannot contain.
     let safe = d.replace(r#"""""#, r#"\""""#);
-    writeln!(out, "{pad}\"\"\"{safe}\"\"\"").unwrap();
+    // A trailing `"` would fuse with the closing quotes into `""""`, which a
+    // parser reads as the terminator plus a stray quote; a trailing `\` would
+    // escape the terminator itself. Both survive on a line of their own —
+    // block-string semantics trim the surrounding blank lines back out.
+    if safe.ends_with('"') || safe.ends_with('\\') {
+        writeln!(out, "{pad}\"\"\"\n{safe}\n{pad}\"\"\"").unwrap();
+    } else {
+        writeln!(out, "{pad}\"\"\"{safe}\"\"\"").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +177,26 @@ mod tests {
         // Same schema, same bytes — otherwise it is useless as a committed
         // artifact to diff.
         assert_eq!(render(&ts()), render(&ts()));
+    }
+
+    /// A description ending in `"` fuses with the closing quotes into `""""`,
+    /// and one ending in `\` escapes the terminator itself — both must move to
+    /// a line of their own. Latent until descriptions carry table comments,
+    /// which is the plan of record for them.
+    #[test]
+    fn a_description_ending_in_a_quote_or_backslash_stays_parseable() {
+        let mut out = String::new();
+        render_description(Some(r#"says "hi""#), 2, &mut out);
+        assert_eq!(out, "  \"\"\"\nsays \"hi\"\n  \"\"\"\n");
+
+        let mut out = String::new();
+        render_description(Some(r"ends in \"), 0, &mut out);
+        assert_eq!(out, "\"\"\"\nends in \\\n\"\"\"\n");
+
+        // The plain form is untouched.
+        let mut out = String::new();
+        render_description(Some("plain"), 2, &mut out);
+        assert_eq!(out, "  \"\"\"plain\"\"\"\n");
     }
 
     #[test]

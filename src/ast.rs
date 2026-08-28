@@ -405,6 +405,53 @@ impl AggOp {
             distinct: false,
         }
     }
+
+    /// The columns this operation reads.
+    ///
+    /// The one answer to that question: `apply_scope` checks these against the
+    /// column rules, and the renderer projects them into the aggregate's inner
+    /// select. Each used to keep a copy of this match, which is exactly how a
+    /// future variant gets taught to one walker and not the other.
+    pub fn columns_read(&self) -> Vec<&str> {
+        match self {
+            AggOp::Count { columns, .. } => columns.iter().map(String::as_str).collect(),
+            AggOp::Func { fields, .. } => fields
+                .iter()
+                .filter_map(|f| match f {
+                    AggField::Column(c) => Some(c.column.as_str()),
+                    AggField::Typename { .. } => None,
+                })
+                .collect(),
+            AggOp::Typename => Vec::new(),
+        }
+    }
+}
+
+/// Every response key in one operation must be distinct.
+///
+/// Root fields are not merged the way selection-set fields are: two roots under
+/// one key differ in what they select, what they filter and often in kind
+/// (`users` vs `users_aggregate` aliased alike), and there is no defensible way
+/// to fold that into one. Rendering both is what used to happen, and the second
+/// silently overwrote the first in the result object.
+///
+/// Called from the renderer — the one point every entry point passes through —
+/// and from the parser, whose duplicate call buys nothing but an error path
+/// that names the document instead of the IR.
+pub(crate) fn ensure_unique_root_aliases<'a>(aliases: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for alias in aliases {
+        if seen.contains(&alias) {
+            return Err(Error::Validate {
+                path: alias.to_string(),
+                message: format!(
+                    "two root fields both answer to '{alias}'; give one of them an alias"
+                ),
+            });
+        }
+        seen.push(alias);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
