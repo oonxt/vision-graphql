@@ -383,7 +383,7 @@ fn scope_mutation(mf: &mut MutationField, scope: &ScopeSet, schema: &Schema) -> 
             // before any SQL is built.
             for obj in objects.iter_mut() {
                 check_insert_columns(obj, t, scope, schema)?;
-                scope_insert_object(obj, scope)?;
+                scope_insert_object(obj, scope, 0)?;
             }
             Ok(())
         }
@@ -526,16 +526,33 @@ fn check_on_conflict(
     Ok(())
 }
 
-fn scope_insert_object(obj: &mut crate::ast::InsertObject, scope: &ScopeSet) -> Result<()> {
+fn scope_insert_object(
+    obj: &mut crate::ast::InsertObject,
+    scope: &ScopeSet,
+    depth: usize,
+) -> Result<()> {
+    // On scoped paths this runs before the limits walk, so it is the first
+    // recursion over a builder-supplied insert tree — it needs the same
+    // unconditional bound: a stack overflow aborts the process, and no check
+    // downstream fires from inside one.
+    if depth > crate::limits::DEFAULT_MAX_DEPTH {
+        return Err(Error::Validate {
+            path: "objects".into(),
+            message: format!(
+                "nested inserts nest deeper than the limit of {}",
+                crate::limits::DEFAULT_MAX_DEPTH
+            ),
+        });
+    }
     for nai in obj.nested_arrays.values_mut() {
         nai.scope_check = resolve(scope, &nai.table)?;
         for row in nai.rows.iter_mut() {
-            scope_insert_object(row, scope)?;
+            scope_insert_object(row, scope, depth + 1)?;
         }
     }
     for noi in obj.nested_objects.values_mut() {
         noi.scope_check = resolve(scope, &noi.table)?;
-        scope_insert_object(&mut noi.row, scope)?;
+        scope_insert_object(&mut noi.row, scope, depth + 1)?;
     }
     Ok(())
 }
@@ -919,6 +936,34 @@ mod tests {
             },
         );
         parent
+    }
+
+    /// The scope rewrite runs before the limits walk on scoped paths, so it is
+    /// the first recursion over a builder-supplied insert tree and carries the
+    /// same unconditional depth bound.
+    #[test]
+    fn a_deep_insert_tree_is_refused_before_the_scope_walk_recurses() {
+        let mut obj = crate::ast::InsertObject::default();
+        for _ in 0..200 {
+            let mut parent = crate::ast::InsertObject::default();
+            parent.nested_arrays.insert(
+                "posts".into(),
+                crate::ast::NestedArrayInsert {
+                    table: "posts".into(),
+                    rows: vec![obj],
+                    on_conflict: None,
+                    scope_check: None,
+                },
+            );
+            obj = parent;
+        }
+        let mut op = Operation::Mutation(vec![insert("users", vec![obj])]);
+        let scope = ScopeSet::new().unrestricted("users").unrestricted("posts");
+        let err = apply_scope(&mut op, &scope, &schema()).unwrap_err();
+        assert!(
+            format!("{err}").contains("nest deeper than the limit"),
+            "{err}"
+        );
     }
 
     #[test]

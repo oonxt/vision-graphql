@@ -1511,6 +1511,7 @@ fn render_insert_cte(
         scope_check,
         None,
         false, // top-level: NOT nested
+        0,
         schema,
         ctx,
     )
@@ -1526,12 +1527,26 @@ fn render_insert_cte_recursive(
     scope_check: Option<&crate::ast::BoolExpr>,
     parent_link: Option<(&str, &crate::schema::Relation, &crate::schema::Table)>,
     is_nested_cte: bool,
+    depth: usize,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use std::collections::BTreeSet;
 
     debug_assert_eq!(objects.len(), parent_ords.len());
+
+    // The unconditional bound on insert-tree nesting, at the point every
+    // entry point passes: the walk in ExecutionLimits short-circuits when the
+    // limits are unbounded, and a stack overflow here aborts the process.
+    if depth > crate::limits::DEFAULT_MAX_DEPTH {
+        return Err(Error::Validate {
+            path: "objects".into(),
+            message: format!(
+                "nested inserts nest deeper than the limit of {}",
+                crate::limits::DEFAULT_MAX_DEPTH
+            ),
+        });
+    }
 
     let table = schema.table(table_name).ok_or_else(|| Error::Validate {
         path: cte.into(),
@@ -1619,6 +1634,7 @@ fn render_insert_cte_recursive(
             child_scope_check.as_ref(),
             None, // NOT a child-of-parent; this is a prerequisite insert
             true, // this is a nested CTE
+            depth + 1,
             schema,
             ctx,
         )?;
@@ -1884,6 +1900,7 @@ fn render_insert_cte_recursive(
                 child_scope_check.as_ref(),
                 Some((&parent_ord_cte_name, rel, table)),
                 true, // this is a nested CTE
+                depth + 1,
                 schema,
                 ctx,
             )?;
@@ -2676,6 +2693,22 @@ fn render_agg_func(
             path: format!("aggregate.{key}"),
             message: format!("'{pg_func}' needs at least one column"),
         });
+    }
+    // One key per alias inside the group too — the parser merges duplicates,
+    // the builder has no pass that would.
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let k = match f {
+            AggField::Column(c) => c.alias.as_str(),
+            AggField::Typename { alias } => alias.as_str(),
+        };
+        if seen.contains(&k) {
+            return Err(Error::Validate {
+                path: format!("aggregate.{key}.{k}"),
+                message: format!("two fields both answer to '{k}'; give one of them an alias"),
+            });
+        }
+        seen.push(k);
     }
     write!(ctx.sql, "'{key}', json_build_object(").unwrap();
     for (i, f) in fields.iter().enumerate() {

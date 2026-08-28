@@ -41,11 +41,44 @@ release commits; entries from 0.13.0 on are written as the work lands.
 - **Duplicate keys inside `_aggregate` and mutation payloads silently
   overwrote each other.** `aggregate { count } aggregate { count(columns: …) }`
   answered with only the second; `nodes { id } nodes { name }` dropped `id`;
-  `returning { id } returning { name }` dropped `id`. Identical requests now
+  `returning { id } returning { name }` dropped `id`; and inside a function
+  block, `sum { a: id a: score }` kept only the score. Identical requests now
   merge, conflicting ones are refused — the same rule row selections already
-  had. Aliases on `aggregate`, `nodes`, `returning` and `affected_rows` are
+  had, applied at rendering too so the typed builder cannot slip duplicates
+  past it. Aliases on `aggregate`, `nodes`, `returning` and `affected_rows` are
   refused outright rather than answered under the wrong key, since the renderer
-  pins those response keys.
+  pins those response keys. Arguments on those four fields, which used to parse
+  and then be read by nobody — `nodes(limit: 5)`, `returning(limit: 1)` — are
+  refused the same way.
+- **A synthesized mutation name could shadow a real table's.** With tables
+  `users` and `users_one`, `insert_users_one` lowered as the one-row insert
+  into `users` — silently writing a different table than the name reads — and
+  the mutation root published two fields under one name. The literal reading
+  wins now, at lowering and in what is published; same for `update_/delete_…`
+  against a table actually named `…_by_pk`.
+- **A table named like an aggregate type silently corrupted the published
+  schema.** A real table `users_aggregate` and the synthesized aggregate type
+  over `users` collided in the type map, one silently replacing the other —
+  SDL and `__schema` then described a shape the server does not answer with.
+  The real table keeps the name; the aggregate machinery over the shadowed
+  table is withdrawn as a unit — its types, the root field, relation
+  `_aggregate` fields answering with it — and lowering refuses those aggregates
+  with the reason instead of implementing what is no longer published. A
+  relation literally named `<x>_aggregate` likewise keeps its field.
+- **A fragment bomb turned lowering into CPU exhaustion.** Lowering re-expands
+  a fragment at every spread site, so forty fragments each spreading the next
+  twice — a one-kilobyte document — cost 2^40 expansions with every text limit
+  satisfied. Fragment validation now computes the expansion count (linearly,
+  memoized) and refuses past 10,000. Composed nesting is bounded the same way:
+  fragments each nesting within the text limit could chain to thousands of
+  lowering levels, each a stack frame; the composed depth now answers to the
+  same limit as the text.
+- **A deep builder-supplied insert tree crashed the process.** Nothing bounded
+  how deep `InsertObject` nesting recursed — not the scope rewrite, not the
+  cost walk (which skips entirely when limits are unbounded), not the renderer
+  — and a stack overflow aborts rather than unwinds. All three now refuse
+  nesting past the same limit the document path has always had, before
+  descending it.
 - **A real table named like a synthesized field was unreachable.** A table
   actually called `users_aggregate` could never be queried — the root lowering
   synthesized an aggregate over `users` first — and the type system published

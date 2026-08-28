@@ -475,9 +475,28 @@ impl ExecutionLimits {
         reads: &mut usize,
     ) -> Result<()> {
         let refs: Vec<&crate::ast::InsertObject> = objects.iter().collect();
-        self.count_nested_inserts(&refs, reads)?;
+        self.count_nested_inserts(&refs, reads, 0)?;
         drop(refs);
-        self.nested_insert_predicates(objects.iter_mut(), reads)
+        self.nested_insert_predicates(objects.iter_mut(), reads, 0)
+    }
+
+    /// The unconditional bound on insert-tree nesting.
+    ///
+    /// This walk runs on every request, configured ceilings or none, and it is
+    /// the first thing that recurses over a builder-supplied insert tree — so
+    /// like the fragment-chain bound, it must refuse the depth before
+    /// descending it: a stack overflow aborts the process, and no configured
+    /// `max_table_reads` fires from inside one.
+    fn check_insert_depth(depth: usize) -> Result<()> {
+        if depth > DEFAULT_MAX_DEPTH {
+            return Err(Error::Validate {
+                path: "objects".into(),
+                message: format!(
+                    "nested inserts nest deeper than the limit of {DEFAULT_MAX_DEPTH}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// The per-relation read counting, over references — a value recursion here
@@ -486,9 +505,11 @@ impl ExecutionLimits {
         &self,
         objects: &[&crate::ast::InsertObject],
         reads: &mut usize,
+        depth: usize,
     ) -> Result<()> {
         use std::collections::BTreeMap;
 
+        Self::check_insert_depth(depth)?;
         let mut children: BTreeMap<(&str, bool), Vec<&crate::ast::InsertObject>> = BTreeMap::new();
         for o in objects {
             for (name, nested) in &o.nested_arrays {
@@ -503,7 +524,7 @@ impl ExecutionLimits {
         }
         for rows in children.into_values() {
             self.count_read(reads)?;
-            self.count_nested_inserts(&rows, reads)?;
+            self.count_nested_inserts(&rows, reads, depth + 1)?;
         }
         Ok(())
     }
@@ -523,9 +544,11 @@ impl ExecutionLimits {
         &self,
         objects: impl Iterator<Item = &'a mut crate::ast::InsertObject>,
         reads: &mut usize,
+        depth: usize,
     ) -> Result<()> {
         use std::collections::BTreeMap;
 
+        Self::check_insert_depth(depth)?;
         let mut arrays: BTreeMap<&str, Vec<&mut crate::ast::NestedArrayInsert>> = BTreeMap::new();
         let mut objs: BTreeMap<&str, Vec<&mut crate::ast::NestedObjectInsert>> = BTreeMap::new();
         for o in objects {
@@ -553,7 +576,7 @@ impl ExecutionLimits {
                 }
                 rows.extend(nested.rows.iter_mut());
             }
-            self.nested_insert_predicates(rows.into_iter(), reads)?;
+            self.nested_insert_predicates(rows.into_iter(), reads, depth + 1)?;
         }
         for batch in objs.into_values() {
             let mut first = true;
@@ -572,7 +595,7 @@ impl ExecutionLimits {
                 }
                 rows.push(&mut nested.row);
             }
-            self.nested_insert_predicates(rows.into_iter(), reads)?;
+            self.nested_insert_predicates(rows.into_iter(), reads, depth + 1)?;
         }
         Ok(())
     }
@@ -1263,6 +1286,65 @@ mod exec_tests {
             .max_table_reads(3)
             .apply(&mut op, &schema())
             .unwrap();
+    }
+
+    /// This walk is the first recursion over a builder-supplied insert tree,
+    /// so it carries the unconditional depth bound — a configured ceiling
+    /// cannot fire from inside a stack overflow.
+    #[test]
+    fn a_deep_builder_insert_tree_is_refused_before_it_recurses() {
+        use crate::ast::{InsertObject, MutationField, NestedArrayInsert};
+        use crate::schema::Relation;
+        let schema = Schema::builder()
+            .table(
+                Table::new("t", "public", "t")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("parent_id", "parent_id", PgType::Int4, true)
+                    .primary_key(&["id"])
+                    .relation("children", Relation::array("t").on([("id", "parent_id")])),
+            )
+            .build();
+        let mut obj = InsertObject::default();
+        for _ in 0..200 {
+            let mut parent = InsertObject::default();
+            parent.nested_arrays.insert(
+                "children".into(),
+                NestedArrayInsert {
+                    table: "t".into(),
+                    rows: vec![obj],
+                    on_conflict: None,
+                    scope_check: None,
+                },
+            );
+            obj = parent;
+        }
+        let mut op = Operation::Mutation(vec![MutationField::Insert {
+            alias: "insert_t".into(),
+            table: "t".into(),
+            objects: vec![obj],
+            on_conflict: None,
+            returning: Vec::new(),
+            response_typenames: Vec::new(),
+            one: false,
+            scope_check: None,
+        }]);
+        // Any bounded configuration walks the tree, so the bound must fire
+        // before the walk descends…
+        let err = ExecutionLimits::new()
+            .default_limit(10)
+            .apply(&mut op, &schema)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("nest deeper than the limit"),
+            "{err}"
+        );
+        // …and unbounded limits skip the walk entirely, so the renderer
+        // carries the same bound.
+        let err = crate::sql::render(&op, &schema).unwrap_err();
+        assert!(
+            format!("{err}").contains("nest deeper than the limit"),
+            "{err}"
+        );
     }
 
     /// The renderer emits one on_conflict per relation batch (the first
