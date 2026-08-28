@@ -103,7 +103,7 @@ and left, not forgotten.
 | Gap | Notes |
 |---|---|
 | `distinct_on` on an `_aggregate` | The aggregate's source does not render it, so it is refused rather than dropped, and not published. `count(columns: […], distinct: true)` counts distinct values. |
-| Relations inside aggregate `nodes`, fragments inside `aggregate` | Columns only. |
+| Fragments inside an `_aggregate` selection | The `aggregate`/`nodes` keys are matched literally; a fragment there is refused. `nodes` itself is a full row selection — relations included — and takes fragments like any other. |
 | `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
 | Array, `bytea`, `interval`, `inet` columns | No type mapping: the column is left out of the schema, and `vision-gql diff` reports it. |
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
