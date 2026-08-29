@@ -3,7 +3,16 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
-## Unreleased
+## 0.16.1 — 2026-08-29
+
+### Added
+
+- **`Engine::schema()`.** The post-overlay [`Schema`] the engine answers with,
+  for hosts that validate configuration against it — a deployment generating
+  queries from config needs to check tables, columns and keys against what
+  this engine actually publishes, and re-running introspection would validate
+  against a schema that can drift from this one (a different overlay, a table
+  created since).
 
 ### Changed
 
