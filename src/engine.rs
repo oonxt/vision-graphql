@@ -136,6 +136,19 @@ impl Engine {
         &self.limits
     }
 
+    /// The schema this engine answers with — post-overlay, so exposed names,
+    /// hidden columns and manual relations are all as the engine will actually
+    /// serve them.
+    ///
+    /// Exists for hosts that validate *configuration* against the engine: a
+    /// deployment that generates queries from config needs to check its tables,
+    /// columns and keys against what this engine publishes, and re-running
+    /// introspection to do so would validate against a schema that can drift
+    /// from this one (a different overlay, a table created since).
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// The shared document cache. Exposed for `clear()` and for size
     /// inspection; every handle spawned from this engine uses the same one.
     pub fn parse_cache(&self) -> &Arc<ParseCache> {
