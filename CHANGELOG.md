@@ -3,7 +3,7 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
-## Unreleased
+## 0.17.0 — 2026-09-01
 
 ### Added
 
@@ -34,6 +34,12 @@ release commits; entries from 0.13.0 on are written as the work lands.
   new warning advises does not exist. `limit`/`offset` stay unpublished: the
   field is one row, and a `limit` above one turns the scalar subquery into a
   runtime error.
+
+### Changed
+
+- **`IntrospectedTable` and `Table` carry `unique_indexes`.** A new public
+  field on each — code building `IntrospectedTable` by struct literal needs
+  the field added, which is why this release is 0.17.0 and not 0.16.2.
 
 ## 0.16.1 — 2026-08-29
 
