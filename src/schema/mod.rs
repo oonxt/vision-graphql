@@ -159,6 +159,17 @@ pub struct Table {
     /// [`crate::type_system`] — a constraint name tends to contain its column
     /// names, which is exactly what hiding a column meant to withhold.
     pub unique_constraints: std::collections::BTreeMap<String, Vec<String>>,
+    /// Plain unique indexes (`CREATE UNIQUE INDEX`, no constraint), as
+    /// `index name -> key columns`.
+    ///
+    /// Kept apart from [`unique_constraints`](Self::unique_constraints) because
+    /// the two answer different questions: `ON CONFLICT ON CONSTRAINT` needs a
+    /// real constraint name and would break on an index name, while uniqueness
+    /// reasoning — [`Schema::warnings`] — accepts either. Postgres itself
+    /// accepts a plain unique index as a foreign-key target, so treating only
+    /// constraints as proof of uniqueness warned forever about schemas that
+    /// are provably fine.
+    pub unique_indexes: std::collections::BTreeMap<String, Vec<String>>,
     relations_by_name: HashMap<String, Relation>,
     /// Relation names in the order they were added. Same reason as
     /// [`Table::column_order`].
@@ -187,6 +198,7 @@ impl Table {
             column_order: Vec::new(),
             primary_key: Vec::new(),
             unique_constraints: Default::default(),
+            unique_indexes: Default::default(),
             relations_by_name: HashMap::new(),
             relation_order: Vec::new(),
             read_only: false,
@@ -224,6 +236,16 @@ impl Table {
     /// Declare a unique constraint by name.
     pub fn unique_constraint(mut self, name: &str, cols: &[&str]) -> Self {
         self.unique_constraints.insert(
+            name.to_string(),
+            cols.iter().map(|c| (*c).to_string()).collect(),
+        );
+        self
+    }
+
+    /// Declare a plain unique index by name — uniqueness without a constraint.
+    /// See [`Table::unique_indexes`] for why it is not a `unique_constraint`.
+    pub fn unique_index(mut self, name: &str, cols: &[&str]) -> Self {
+        self.unique_indexes.insert(
             name.to_string(),
             cols.iter().map(|c| (*c).to_string()).collect(),
         );
@@ -275,6 +297,57 @@ impl Table {
 
     pub(crate) fn relations_iter(&self) -> impl Iterator<Item = (&String, &Relation)> {
         self.relations()
+    }
+}
+
+/// A schema shape that no query will fail on, but that can quietly answer one
+/// wrongly. Produced by [`Schema::warnings`]; also logged (`tracing::warn`)
+/// when an [`Engine`](crate::Engine) is constructed, so a serving deployment
+/// that never calls `warnings()` still hears about it once at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemaWarning {
+    /// An object relation whose mapped remote columns are not covered by any
+    /// unique constraint, plain unique index, or primary key of the target
+    /// table.
+    ///
+    /// The subquery for an object relation renders `LIMIT 1`. When the mapped
+    /// columns match more than one target row and the query gives no
+    /// `order_by`, there is no `ORDER BY` either — which row Postgres returns
+    /// is undefined, looks fine, and can differ between executions. The two
+    /// ways out are per-query `order_by`, or extending the mapping until a
+    /// unique constraint covers it. Relations derived from foreign keys never
+    /// trigger this: Postgres requires the referenced columns to be unique.
+    NonDeterministicObjectRelation {
+        /// Exposed name of the table carrying the relation.
+        table: String,
+        /// The relation's field name.
+        relation: String,
+        /// Exposed name of the target table.
+        target: String,
+        /// The remote columns the mapping filters the target by.
+        remote_columns: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for SchemaWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaWarning::NonDeterministicObjectRelation {
+                table,
+                relation,
+                target,
+                remote_columns,
+            } => write!(
+                f,
+                "object relation {table}.{relation} can return an arbitrary row: \
+                 no unique constraint, unique index, or primary key on \
+                 \"{target}\" covers ({}) and its subquery is LIMIT 1 with no ORDER BY; \
+                 add order_by in queries, or extend the mapping to columns a \
+                 unique constraint covers",
+                remote_columns.join(", ")
+            ),
+        }
     }
 }
 
@@ -339,6 +412,81 @@ impl Schema {
         self.tables_by_exposed.get(exposed)
     }
 
+    /// Shapes in this schema that will not fail any query but can quietly
+    /// answer one wrongly. Ordered by table name, so the list is the same on
+    /// every run.
+    ///
+    /// This exists because the failure it describes is invisible at runtime:
+    /// an object relation over a non-unique match returns *a* row, the
+    /// response validates, and the wrong answer is only noticed when the data
+    /// has already gone somewhere. Field reports confirmed exactly that —
+    /// "nothing broke on launch day, the data grew crooked". Callers building
+    /// admin or validation tooling should surface these to whoever owns the
+    /// schema; a serving deployment also hears them logged once when its
+    /// [`Engine`](crate::Engine) is constructed.
+    pub fn warnings(&self) -> Vec<SchemaWarning> {
+        let mut out = Vec::new();
+        for (tname, table) in self.tables() {
+            for (rname, rel) in table.relations() {
+                if rel.kind != RelKind::Object {
+                    continue;
+                }
+                // A dangling target is a different problem with a loud failure
+                // of its own at query time; nothing to say about row choice.
+                let Some(target) = self.table(&rel.target_table) else {
+                    continue;
+                };
+                // A mapping naming a column the target does not expose is a
+                // broken relation with a loud error of its own at query time
+                // ("unknown remote column"); row choice is not the thing to
+                // say about it, and saying it anyway would put two findings
+                // with conflicting advice on one typo.
+                if rel
+                    .mapping
+                    .iter()
+                    .any(|(l, r)| table.find_column(l).is_none() || target.find_column(r).is_none())
+                {
+                    continue;
+                }
+                // Compare everything in physical-column space. Mappings and
+                // primary keys name exposed columns; constraints and indexes
+                // introspected from Postgres carry physical names. Resolving
+                // each name to exactly one canonical form (its physical name
+                // when the exposed column exists, itself otherwise — a
+                // constraint can cover a hidden column) keeps the check
+                // injective: pooling both spellings into one set once let a
+                // single mapping entry satisfy two different constraint
+                // columns.
+                let canonical = |name: &'_ str| -> String {
+                    target
+                        .find_column(name)
+                        .map(|c| c.physical_name.clone())
+                        .unwrap_or_else(|| name.to_string())
+                };
+                let remote: std::collections::BTreeSet<String> =
+                    rel.mapping.iter().map(|(_, r)| canonical(r)).collect();
+                let covered = |cols: &[String]| {
+                    !cols.is_empty() && cols.iter().all(|c| remote.contains(&canonical(c)))
+                };
+                // The overlay's logical primary_key counts even though nothing
+                // enforces it: it is the caller's assertion of what identifies
+                // a row, and doubting it here would warn on every keyed view.
+                let pinned = covered(&target.primary_key)
+                    || target.unique_constraints.values().any(|c| covered(c))
+                    || target.unique_indexes.values().any(|c| covered(c));
+                if !pinned {
+                    out.push(SchemaWarning::NonDeterministicObjectRelation {
+                        table: tname.clone(),
+                        relation: rname.clone(),
+                        target: rel.target_table.clone(),
+                        remote_columns: rel.mapping.iter().map(|(_, r)| r.clone()).collect(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Introspect the `public` schema and return a ready-to-customize builder.
     /// Shorthand for [`Schema::introspect_schemas`] with `["public"]`.
     pub async fn introspect(pool: &sqlx::PgPool) -> crate::error::Result<SchemaBuilder> {
@@ -398,6 +546,10 @@ impl SchemaBuilder {
         self
     }
 
+    // Deliberately silent: logging warnings here put every one on stderr twice
+    // in `vision-gql diff` (once tracing-formatted, once in the report) and
+    // sidestepped the CLI's table filters. Serving deployments hear them at
+    // `Engine` construction instead; tooling calls [`Schema::warnings`].
     pub fn build(self) -> Schema {
         Schema {
             tables_by_exposed: self.tables,
@@ -488,5 +640,205 @@ mod tests {
         let posts = schema.table("posts").unwrap();
         let rel = posts.find_relation("user").unwrap();
         assert_eq!(rel.kind, RelKind::Object);
+    }
+
+    /// The dictionary table from the field report: keyed by (serial, type),
+    /// but the relation maps only `serial`. Which dictionary row the object
+    /// relation returns is then up to Postgres.
+    fn dict_table() -> Table {
+        Table::new("dict", "public", "dict")
+            .column("id", "id", PgType::Int4, false)
+            .column("serial", "serial", PgType::Text, false)
+            .column("type", "type", PgType::Text, false)
+            .primary_key(&["id"])
+            .unique_constraint("dict_serial_type_key", &["serial", "type"])
+    }
+
+    fn results_table(mapping: &[(&str, &str)]) -> Table {
+        Table::new("results", "public", "results")
+            .column("id", "id", PgType::Int4, false)
+            .column("serial", "serial", PgType::Text, false)
+            .column("type", "type", PgType::Text, false)
+            .primary_key(&["id"])
+            .relation(
+                "pathogen",
+                Relation::object("dict").on(mapping.iter().copied()),
+            )
+    }
+
+    #[test]
+    fn object_relation_without_unique_coverage_warns() {
+        let schema = Schema::builder()
+            .table(dict_table())
+            .table(results_table(&[("serial", "serial")]))
+            .build();
+        let warnings = schema.warnings();
+        assert_eq!(
+            warnings,
+            vec![SchemaWarning::NonDeterministicObjectRelation {
+                table: "results".into(),
+                relation: "pathogen".into(),
+                target: "dict".into(),
+                remote_columns: vec!["serial".into()],
+            }]
+        );
+        let text = warnings[0].to_string();
+        assert!(text.contains("results.pathogen"), "got: {text}");
+        assert!(text.contains("order_by"), "got: {text}");
+    }
+
+    /// The day-of fix from the report: mapping both columns reaches the
+    /// composite unique constraint, and the warning goes away.
+    #[test]
+    fn object_relation_covered_by_composite_unique_is_silent() {
+        let schema = Schema::builder()
+            .table(dict_table())
+            .table(results_table(&[("serial", "serial"), ("type", "type")]))
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    #[test]
+    fn object_relation_covered_by_primary_key_is_silent() {
+        // build_users_posts_relations' shape: posts.user maps user_id -> users.id.
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", PgType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("user_id", "user_id", PgType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// A mapping *wider* than the constraint still pins one row: equality on a
+    /// superset of a unique key matches at most what the key matches.
+    #[test]
+    fn mapping_superset_of_unique_key_is_silent() {
+        let schema = Schema::builder()
+            .table(dict_table())
+            .table({
+                let t = results_table(&[("serial", "serial"), ("type", "type")]);
+                t.relation(
+                    "pathogen",
+                    Relation::object("dict").on([
+                        ("serial", "serial"),
+                        ("type", "type"),
+                        ("id", "id"),
+                    ]),
+                )
+            })
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// Array relations are rendered as aggregates, not LIMIT 1 — many rows is
+    /// their meaning, not a hazard.
+    #[test]
+    fn array_relation_never_warns() {
+        let schema = Schema::builder()
+            .table(dict_table())
+            .table(
+                Table::new("results", "public", "results")
+                    .column("serial", "serial", PgType::Text, false)
+                    .relation(
+                        "entries",
+                        Relation::array("dict").on([("serial", "serial")]),
+                    ),
+            )
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// A target with no key knowledge at all — a view, typically — cannot be
+    /// pinned, so an object relation onto it warns.
+    #[test]
+    fn object_relation_onto_keyless_target_warns() {
+        let schema = Schema::builder()
+            .table(Table::new("dict_view", "public", "dict_view").column(
+                "serial",
+                "serial",
+                PgType::Text,
+                false,
+            ))
+            .table(
+                Table::new("results", "public", "results")
+                    .column("serial", "serial", PgType::Text, false)
+                    .relation(
+                        "pathogen",
+                        Relation::object("dict_view").on([("serial", "serial")]),
+                    ),
+            )
+            .build();
+        assert_eq!(schema.warnings().len(), 1);
+    }
+
+    /// A relation whose target is not in the schema fails loudly at query
+    /// time; row choice is not the thing to say about it.
+    #[test]
+    fn dangling_target_is_not_this_warning() {
+        let schema = Schema::builder()
+            .table(results_table(&[("serial", "serial")]))
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// Same reasoning as a dangling target: a mapping naming a column the
+    /// target does not expose errors loudly at query time ("unknown remote
+    /// column"), and warning about row choice on top of that drift would give
+    /// one typo two findings with conflicting advice.
+    #[test]
+    fn broken_mapping_is_not_this_warning() {
+        let schema = Schema::builder()
+            .table(dict_table())
+            .table(results_table(&[("serial", "serial_typo")]))
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// Uniqueness via a plain `CREATE UNIQUE INDEX` counts: Postgres accepts
+    /// one as an FK target, so a schema relying on it is provably fine and a
+    /// permanent warning on it would teach people to ignore the real ones.
+    #[test]
+    fn plain_unique_index_coverage_is_silent() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("dict", "public", "dict")
+                    .column("serial", "serial", PgType::Text, false)
+                    .unique_index("dict_serial_idx", &["serial"]),
+            )
+            .table(results_table(&[("serial", "serial")]))
+            .build();
+        assert_eq!(schema.warnings(), vec![]);
+    }
+
+    /// Coverage is checked per canonical (physical) column, so one mapping
+    /// entry cannot satisfy a constraint on a *different* column that merely
+    /// shares a spelling across the exposed/physical namespaces.
+    #[test]
+    fn constraint_on_a_different_column_with_a_shared_spelling_still_warns() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("dict", "public", "dict")
+                    // exposed "code" is physical "serial"; exposed "serial" is
+                    // physical "legacy_serial", and carries the unique key.
+                    .column("code", "serial", PgType::Text, false)
+                    .column("serial", "legacy_serial", PgType::Text, false)
+                    .unique_constraint("dict_serial_key", &["serial"]),
+            )
+            .table(
+                Table::new("results", "public", "results")
+                    .column("code", "code", PgType::Text, false)
+                    .relation("pathogen", Relation::object("dict").on([("code", "code")])),
+            )
+            .build();
+        assert_eq!(schema.warnings().len(), 1, "got {:?}", schema.warnings());
     }
 }

@@ -339,6 +339,15 @@ qualifier. If the target schema was not introspected, `diff` reports the repoint
 as *not checked* rather than passing it silently — add it to `--schema` to have
 it verified.
 
+`diff` additionally warns — without failing — about object relations whose
+mapped remote columns no unique constraint, plain unique index, or primary key
+of the target covers: their `LIMIT 1` subquery has no `ORDER BY`, so which row
+answers is up to Postgres, and the wrong row is only noticed downstream. The
+JSON output carries these as a structured `relation_warnings` array; the same
+warnings are available in-process via `Schema::warnings()` and are logged when
+an `Engine` is constructed. Fix by adding `order_by` on the relation field in
+queries, or by extending the mapping until a unique constraint covers it.
+
 Filter what gets processed with comma-separated globs:
 
 ```bash

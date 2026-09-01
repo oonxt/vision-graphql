@@ -27,6 +27,27 @@ pub struct DiffReport {
     /// naming it is told it does not exist. If the dropped column is part of a
     /// key or a foreign key, a `_by_pk` field or a whole relation goes with it.
     pub skipped_columns: Vec<SkippedColumn>,
+    /// Shapes the engine will answer without error but possibly wrongly —
+    /// today, object relations whose mapped columns no unique constraint of
+    /// the target covers, so their `LIMIT 1` subquery picks an arbitrary row.
+    ///
+    /// Not drift and not counted: the overlay matches the database fine. But
+    /// this is the finding that is invisible everywhere else — the query runs,
+    /// the answer validates, and the wrong row is only noticed downstream — so
+    /// it is reported here, structured, for tooling to pass along.
+    pub relation_warnings: Vec<RelationWarning>,
+}
+
+/// See [`DiffReport::relation_warnings`]. A flattened
+/// [`vision_graphql::SchemaWarning`] with its rendered message, so a consumer
+/// can either anchor on the fields or just show the text.
+#[derive(Debug, Serialize)]
+pub struct RelationWarning {
+    pub table: String,
+    pub relation: String,
+    pub target: String,
+    pub remote_columns: Vec<String>,
+    pub message: String,
 }
 
 /// See [`DiffReport::skipped_columns`].
@@ -110,6 +131,61 @@ impl DiffReport {
             + self.expose_as_collisions.len()
             + self.bad_repoints.len()
     }
+}
+
+/// Warnings from the schema the database plus this overlay would actually
+/// expose — built through the same merge path the engine uses, so FK-derived
+/// relations, renames, and overlay relations are all in view.
+///
+/// Consumes the [`IntrospectedDb`] (the merge does); call after [`find_drift`],
+/// which only borrows it.
+pub fn relation_warnings(
+    db: IntrospectedDb,
+    cfg: &ConfigOverlay,
+    filter: &TableFilter,
+) -> Vec<RelationWarning> {
+    use vision_graphql::schema::merge;
+    let schema = merge::apply_config(merge::build_from_introspection(db), cfg).build();
+    // `--include`/`--ignore` are matched against overlay keys — pre-expose_as
+    // names — everywhere else in this report, and a warning carries the *final*
+    // exposed name. Map it back before filtering, or a renamed table's warning
+    // is dropped by the very `--include` that asked for the table, and kept by
+    // the `--ignore` that dismissed it.
+    let source_key: BTreeMap<&str, &str> = cfg
+        .tables
+        .iter()
+        .filter_map(|(k, o)| o.expose_as.as_deref().map(|new| (new, k.as_str())))
+        .collect();
+    schema
+        .warnings()
+        .into_iter()
+        .filter_map(|w| {
+            let message = w.to_string();
+            match w {
+                vision_graphql::SchemaWarning::NonDeterministicObjectRelation {
+                    table,
+                    relation,
+                    target,
+                    remote_columns,
+                } => {
+                    let filter_name = source_key.get(table.as_str()).copied();
+                    filter
+                        .keep(filter_name.unwrap_or(&table))
+                        .then_some(RelationWarning {
+                            table,
+                            relation,
+                            target,
+                            remote_columns,
+                            message,
+                        })
+                }
+                // A future warning variant still reaches serving deployments
+                // via the Engine constructor's log; this report only carries
+                // the ones it has fields for.
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter) -> DiffReport {
@@ -317,6 +393,7 @@ mod tests {
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },
@@ -349,6 +426,7 @@ mod tests {
                 columns: archive_cols,
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },
@@ -510,6 +588,7 @@ mod tests {
                 }],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },
@@ -525,6 +604,124 @@ mod tests {
         let r = find_drift(&cfg, &db, &no_filter());
         assert_eq!(r.expose_as_collisions.len(), 1);
         assert_eq!(r.expose_as_collisions[0].exposed_name, "profiles");
+    }
+
+    /// A dictionary keyed (serial, type) but related on serial alone: the
+    /// merge-built schema carries the overlay relation, and the warning names
+    /// it with the message a UI can show verbatim.
+    fn db_results_and_dict() -> IntrospectedDb {
+        let mut db = IntrospectedDb::default();
+        db.tables.insert(
+            ("public".into(), "results".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "results".into(),
+                columns: vec![col("serial")],
+                primary_key: vec![],
+                unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
+                foreign_keys: vec![],
+                read_only: false,
+            },
+        );
+        db.tables.insert(
+            ("public".into(), "dict".into()),
+            IntrospectedTable {
+                schema: "public".into(),
+                name: "dict".into(),
+                columns: vec![col("serial"), col("type")],
+                primary_key: vec![],
+                unique_constraints: [(
+                    "dict_serial_type_key".to_string(),
+                    vec!["serial".to_string(), "type".to_string()],
+                )]
+                .into(),
+                unique_indexes: Default::default(),
+                foreign_keys: vec![],
+                read_only: false,
+            },
+        );
+        db
+    }
+
+    fn pathogen_cfg(mapping: Vec<(String, String)>) -> ConfigOverlay {
+        let mut cfg = ConfigOverlay::default();
+        cfg.tables.insert(
+            "results".into(),
+            TableOverlay {
+                relations: vec![RelationOverlay {
+                    name: "pathogen".into(),
+                    kind: RelationKindOverlay::Object,
+                    target: "dict".into(),
+                    mapping,
+                }],
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn underdetermined_object_relation_is_warned() {
+        let cfg = pathogen_cfg(vec![("serial".into(), "serial".into())]);
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(warnings[0].table, "results");
+        assert_eq!(warnings[0].relation, "pathogen");
+        assert_eq!(warnings[0].target, "dict");
+        assert!(warnings[0].message.contains("order_by"));
+    }
+
+    #[test]
+    fn mapping_covering_the_unique_key_is_not_warned() {
+        let cfg = pathogen_cfg(vec![
+            ("serial".into(), "serial".into()),
+            ("type".into(), "type".into()),
+        ]);
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn filter_applies_to_relation_warnings() {
+        let cfg = pathogen_cfg(vec![("serial".into(), "serial".into())]);
+        let ignore = vec!["results".to_string()];
+        let f = TableFilter::new(None, Some(&ignore)).unwrap();
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    /// The filter matches overlay keys everywhere else in this report, so it
+    /// must here too: with `expose_as` renaming the table, `--ignore <old>`
+    /// still suppresses the warning and `--include <old>` still keeps it —
+    /// even though the warning itself names the *new* exposed name.
+    #[test]
+    fn filter_matches_overlay_key_when_expose_as_renames() {
+        let mut cfg = pathogen_cfg(vec![("serial".into(), "serial".into())]);
+        cfg.tables.get_mut("results").unwrap().expose_as = Some("lab_results".into());
+
+        let include = vec!["results".to_string()];
+        let f = TableFilter::new(Some(&include), None).unwrap();
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(warnings[0].table, "lab_results");
+
+        let ignore = vec!["results".to_string()];
+        let f = TableFilter::new(None, Some(&ignore)).unwrap();
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    /// A typo'd remote column is drift with a loud query-time error of its
+    /// own; the row-choice warning stays out of its way (checked in the
+    /// library, asserted here because the double report was found here).
+    #[test]
+    fn drifted_mapping_gets_no_extra_warning() {
+        let cfg = pathogen_cfg(vec![("serial".into(), "serial_typo".into())]);
+        let r = find_drift(&cfg, &db_results_and_dict(), &no_filter());
+        assert!(!r.is_clean(), "the typo must still be drift");
+        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
     #[test]

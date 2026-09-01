@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use vision_graphql::schema::config::parse;
 use vision_graphql::schema::introspect::introspect_schemas;
 
-use crate::analyze::find_drift;
+use crate::analyze::{find_drift, relation_warnings};
 use crate::cmd_generate;
 use crate::filter::TableFilter;
 use crate::render::redact_url;
@@ -32,7 +32,8 @@ pub async fn run(args: Args) -> Result<()> {
         .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
-    let report = find_drift(&cfg, &db, &filter);
+    let mut report = find_drift(&cfg, &db, &filter);
+    report.relation_warnings = relation_warnings(db, &cfg, &filter);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

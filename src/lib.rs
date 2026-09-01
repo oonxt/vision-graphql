@@ -88,5 +88,5 @@ pub use parse_cache::ParseCache;
 pub use persisted::QueryRegistry;
 pub use policy::{ScopePolicy, ScopePolicyBuilder, ScopeRule};
 pub use predicate::{and, col, not, or, param, principal, rel, Col, Operand, Principal, ScopeExpr};
-pub use schema::Schema;
+pub use schema::{Schema, SchemaWarning};
 pub use scope::{ColumnScope, ScopeSet, TableScope};

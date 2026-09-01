@@ -112,6 +112,10 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
             let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
             t = t.unique_constraint(name, &refs);
         }
+        for (name, cols) in &it.unique_indexes {
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_index(name, &refs);
+        }
         for (src, name, rel) in &rels {
             if src != exposed {
                 continue;
@@ -236,6 +240,10 @@ pub fn apply_config(
         for (name, cols) in &old.unique_constraints {
             let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
             t = t.unique_constraint(name, &refs);
+        }
+        for (name, cols) in &old.unique_indexes {
+            let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+            t = t.unique_index(name, &refs);
         }
 
         let overlay_rel_names: std::collections::BTreeSet<&str> = overlay
@@ -393,6 +401,7 @@ mod tests {
                 }],
                 primary_key: vec!["title".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },
@@ -416,6 +425,7 @@ mod tests {
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![IntrospectedForeignKey {
                     constraint_name: "benchmarks_value_type_fkey".into(),
                     to_schema: "public".into(),
@@ -465,6 +475,7 @@ mod tests {
                 }],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },
@@ -488,6 +499,7 @@ mod tests {
                 ],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![IntrospectedForeignKey {
                     constraint_name: "posts_user_id_fkey".into(),
                     from_columns: vec!["user_id".into()],
@@ -591,6 +603,7 @@ mod tests {
                 columns,
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys,
                 read_only: false,
             }
@@ -787,6 +800,7 @@ mod tests {
                 }],
                 primary_key: vec!["id".into()],
                 unique_constraints: Default::default(),
+                unique_indexes: Default::default(),
                 foreign_keys: vec![],
                 read_only: false,
             },

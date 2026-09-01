@@ -37,6 +37,14 @@ pub struct IntrospectedTable {
     pub columns: Vec<IntrospectedColumn>,
     pub primary_key: Vec<String>,
     pub unique_constraints: BTreeMap<String, Vec<String>>,
+    /// Plain unique indexes — `CREATE UNIQUE INDEX` with no constraint behind
+    /// it. Valid, non-partial, non-expression ones only: those are the indexes
+    /// whose key columns provably pin a row, which is what
+    /// [`Schema::warnings`](crate::Schema::warnings) needs (Postgres accepts
+    /// such an index as a foreign-key target, so constraints alone undercount
+    /// uniqueness). Kept apart from `unique_constraints` because
+    /// `ON CONFLICT ON CONSTRAINT` cannot name an index.
+    pub unique_indexes: BTreeMap<String, Vec<String>>,
     pub foreign_keys: Vec<IntrospectedForeignKey>,
     /// The relation is not a base table, so it must not be handed mutation
     /// roots: a view (Postgres auto-updates a simple one straight through to the
@@ -224,6 +232,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 columns: Vec::new(),
                 primary_key: Vec::new(),
                 unique_constraints: BTreeMap::new(),
+                unique_indexes: Default::default(),
                 foreign_keys: Vec::new(),
                 read_only: false,
             });
@@ -330,6 +339,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 columns: Vec::new(),
                 primary_key: Vec::new(),
                 unique_constraints: BTreeMap::new(),
+                unique_indexes: Default::default(),
                 foreign_keys: Vec::new(),
                 // Postgres cannot write a materialized view at all; it can only
                 // be REFRESHed.
@@ -392,6 +402,48 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
                 .entry(constraint)
                 .or_default()
                 .push(cname);
+        }
+    }
+
+    // Plain unique indexes, from pg_catalog — information_schema only sees
+    // constraints, and Postgres accepts a bare `CREATE UNIQUE INDEX` both as a
+    // foreign-key target and as proof a match is unique. The guards are what
+    // make the uniqueness claim hold: `indisvalid` excludes an index a failed
+    // CREATE INDEX CONCURRENTLY left behind (it enforces nothing),
+    // `indpred IS NULL` excludes partial indexes (unique over some rows only),
+    // `indexprs IS NULL` excludes expression indexes (unique over a computed
+    // value, not the column), and `ord <= indnkeyatts` drops INCLUDE payload
+    // columns that take no part in uniqueness.
+    let rows = sqlx::query(
+        r#"
+        SELECT n.nspname::text, c.relname::text, ic.relname::text, a.attname::text
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+        WHERE i.indisunique AND i.indisvalid
+          AND i.indpred IS NULL AND i.indexprs IS NULL
+          AND k.ord <= i.indnkeyatts
+          AND n.nspname::text = ANY($1)
+        ORDER BY n.nspname, c.relname, ic.relname, k.ord
+        "#,
+    )
+    .bind(&wanted)
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let schema: String = row.get(0);
+        let tname: String = row.get(1);
+        let index: String = row.get(2);
+        let cname: String = row.get(3);
+        if let Some(t) = db.tables.get_mut(&(schema, tname)) {
+            // The index behind a unique or primary key constraint shares the
+            // constraint's name; carrying it twice is harmless but noisy.
+            if !t.unique_constraints.contains_key(&index) {
+                t.unique_indexes.entry(index).or_default().push(cname);
+            }
         }
     }
 

@@ -20,9 +20,21 @@ pub fn write<W: Write>(report: &DiffReport, format: Format, out: &mut W) -> std:
 fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if report.is_clean() {
         writeln!(out, "OK: no overlay drift detected")?;
-        write_unverified(report, out)?;
-        return write_skipped(report, out);
+    } else {
+        write_drift(report, out)?;
     }
+    // Sections that print whether or not drift was found: what could not be
+    // checked, what the engine cannot carry, and what will answer wrongly
+    // without erroring. One tail for both paths — when this was written twice,
+    // every new section was one forgotten call away from silently never
+    // printing on one of them.
+    write_unverified(report, out)?;
+    write_skipped(report, out)?;
+    write_warnings(report, out)?;
+    Ok(())
+}
+
+fn write_drift<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
     if !report.missing_tables.is_empty() {
         writeln!(
             out,
@@ -76,8 +88,20 @@ fn write_text<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()>
         }
     }
     writeln!(out, "{} issues found", report.issue_count())?;
-    write_unverified(report, out)?;
-    write_skipped(report, out)?;
+    Ok(())
+}
+
+/// Object relations that can silently answer with the wrong row. Not drift —
+/// the overlay matches the database — but printed on both paths because this
+/// is the only report that can see it before the data goes crooked.
+fn write_warnings<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
+    if report.relation_warnings.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "warnings (not drift, not counted):")?;
+    for w in &report.relation_warnings {
+        writeln!(out, "  - {}", w.message)?;
+    }
     Ok(())
 }
 
@@ -145,6 +169,7 @@ mod tests {
     fn dirty_report() -> DiffReport {
         DiffReport {
             skipped_columns: Vec::new(),
+            relation_warnings: Vec::new(),
             missing_tables: vec!["ghosts".into()],
             missing_columns: vec![MissingColumn {
                 table: "users".into(),
@@ -216,6 +241,37 @@ mod tests {
         assert!(s.starts_with("OK"), "got: {s}");
         assert!(s.contains("not checked"), "got: {s}");
         assert!(s.contains("--schema cold_storage"), "got: {s}");
+    }
+
+    /// A relation warning is advice, not drift: it prints on the clean path
+    /// and must not flip the exit code.
+    #[test]
+    fn relation_warnings_print_without_counting_as_issues() {
+        let report = DiffReport {
+            relation_warnings: vec![crate::analyze::RelationWarning {
+                table: "results".into(),
+                relation: "pathogen".into(),
+                target: "dict".into(),
+                remote_columns: vec!["serial".into()],
+                message: "object relation results.pathogen can return an arbitrary row".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(report.is_clean(), "warnings must not fail diff");
+        assert_eq!(report.issue_count(), 0);
+
+        let mut buf = Vec::new();
+        write(&report, Format::Text, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("OK"), "got: {s}");
+        assert!(s.contains("warnings (not drift"), "got: {s}");
+        assert!(s.contains("results.pathogen"), "got: {s}");
+
+        let mut buf = Vec::new();
+        write(&report, Format::Json, &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["relation_warnings"][0]["table"], "results");
+        assert_eq!(v["relation_warnings"][0]["remote_columns"][0], "serial");
     }
 
     #[test]
