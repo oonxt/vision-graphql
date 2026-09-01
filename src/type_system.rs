@@ -556,7 +556,10 @@ impl<'a> Builder<'a> {
             let target_row = type_names::row(target).to_string();
             match rel.kind {
                 RelKind::Object => {
-                    fields.push(Field::new(name, TypeRef::named(target_row)));
+                    fields.push(
+                        Field::new(name, TypeRef::named(target_row))
+                            .with_args(object_rel_args(target)),
+                    );
                 }
                 RelKind::Array => {
                     fields.push(
@@ -1032,6 +1035,25 @@ fn list_args(t: &Table) -> Vec<InputValue> {
         InputValue::new(
             "distinct_on",
             TypeRef::named(select_column_enum_name(t)).non_null().list(),
+        ),
+    ]
+}
+
+/// Arguments an object relation field takes — long implemented by the
+/// lowering, published since [`Schema::warnings`] began advising `order_by` as
+/// the fix for a non-unique match: advice the published schema denies is
+/// advice a code generator cannot follow. `where` narrows the match,
+/// `order_by` decides which row answers when it is not unique.
+///
+/// `limit` and `offset` stay unpublished: the field is one row, and a `limit`
+/// above one turns the scalar subquery into a runtime "more than one row"
+/// error — publishing it would publish a query that cannot run.
+fn object_rel_args(t: &Table) -> Vec<InputValue> {
+    vec![
+        InputValue::new("where", TypeRef::named(bool_exp_name(t))),
+        InputValue::new(
+            "order_by",
+            TypeRef::named(order_by_name(t)).non_null().list(),
         ),
     ]
 }

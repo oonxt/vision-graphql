@@ -83,8 +83,22 @@ pub struct Engine {
     limits: ExecutionLimits,
 }
 
+/// Log what [`Schema::warnings`] found, once, at engine construction.
+///
+/// Here rather than at `SchemaBuilder::build`: every serving deployment passes
+/// through an `Engine` constructor exactly once per engine, while schemas are
+/// also built by tooling (SDL export, `vision-gql diff`) that reports the same
+/// warnings on its own channel and does not want a second, unfilterable copy
+/// on stderr.
+fn log_schema_warnings(schema: &Schema) {
+    for w in schema.warnings() {
+        tracing::warn!(target: "vision_graphql::schema", "{w}");
+    }
+}
+
 impl Engine {
     pub fn new(pool: PgPool, schema: Schema) -> Self {
+        log_schema_warnings(&schema);
         Self {
             pool,
             schema: Arc::new(schema),
@@ -96,6 +110,7 @@ impl Engine {
     /// Same as [`Engine::new`], with an explicit parse-cache capacity.
     /// `capacity == 0` parses every request from scratch.
     pub fn with_parse_cache_capacity(pool: PgPool, schema: Schema, capacity: usize) -> Self {
+        log_schema_warnings(&schema);
         Self {
             pool,
             schema: Arc::new(schema),
@@ -112,6 +127,7 @@ impl Engine {
     /// engine per role — the way per-role column visibility is expressed — would
     /// otherwise parse the same document once per role.
     pub fn with_parse_cache(pool: PgPool, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
+        log_schema_warnings(&schema);
         Self {
             pool,
             schema: Arc::new(schema),

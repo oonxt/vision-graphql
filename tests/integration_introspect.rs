@@ -54,6 +54,59 @@ async fn introspect_auto_derives_relations() {
     );
 }
 
+/// Uniqueness introspection must see what Postgres actually accepts as proof
+/// of uniqueness, not just `information_schema` constraints: a plain
+/// `CREATE UNIQUE INDEX` is a valid FK target, so a schema relying on one is
+/// provably fine and must not warn — while a *partial* unique index pins rows
+/// only under its predicate and must not count.
+#[tokio::test]
+async fn unique_index_counts_for_warnings_partial_does_not() {
+    let db = common::fresh_db().await;
+    let pool = db.pool.clone();
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE sdict (serial TEXT NOT NULL);
+        CREATE UNIQUE INDEX sdict_serial_idx ON sdict(serial);
+        CREATE TABLE half_dict (serial TEXT NOT NULL, active BOOL NOT NULL);
+        CREATE UNIQUE INDEX half_dict_serial_idx ON half_dict(serial) WHERE active;
+        -- an FK referencing the plain unique index: Postgres accepts it, and
+        -- the auto-derived object relation must come out silent.
+        CREATE TABLE refs (
+            id SERIAL PRIMARY KEY,
+            serial TEXT NOT NULL REFERENCES sdict(serial)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    let cfg = vision_graphql::schema::config::parse(
+        r#"
+        [[tables.refs.relations]]
+        name = "half"
+        kind = "object"
+        target = "half_dict"
+        mapping = [["serial", "serial"]]
+        "#,
+    )
+    .expect("overlay");
+    let schema = Schema::introspect(&pool)
+        .await
+        .expect("introspect")
+        .apply_config(&cfg)
+        .build();
+
+    let warnings = schema.warnings();
+    assert_eq!(warnings.len(), 1, "got {warnings:?}");
+    match &warnings[0] {
+        vision_graphql::SchemaWarning::NonDeterministicObjectRelation {
+            table, relation, ..
+        } => assert_eq!((table.as_str(), relation.as_str()), ("refs", "half")),
+        other => panic!("unexpected warning: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn introspect_runs_queries_end_to_end() {
     let (pool, _db) = setup_pool().await;

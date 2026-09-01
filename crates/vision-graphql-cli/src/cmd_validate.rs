@@ -52,6 +52,26 @@ pub fn run(path: &Path) -> Result<()> {
 
     if issues.is_empty() {
         println!("OK: {}", path.display());
+        // Whether an object relation's mapping is covered by a unique
+        // constraint needs the database, which validate deliberately does not
+        // have. Left silent, "OK" reads as "all checked" — which is exactly
+        // how the nondeterministic-row report reached the field unchecked —
+        // so point at the command that can look.
+        let declares_object_relation = cfg.tables.values().any(|o| {
+            o.relations.iter().any(|r| {
+                matches!(
+                    r.kind,
+                    vision_graphql::schema::config::RelationKindOverlay::Object
+                )
+            })
+        });
+        if declares_object_relation {
+            println!(
+                "note: object relations are declared; whether each mapping is \
+                 covered by a unique constraint needs the database — \
+                 `vision-gql diff` checks it and warns"
+            );
+        }
         Ok(())
     } else {
         for i in &issues {
@@ -131,6 +151,25 @@ mod tests {
             r#"
             [tables.users]
             schema = "archive"
+        "#,
+        );
+        assert!(run(f.path()).is_ok());
+    }
+
+    /// validate cannot see unique constraints, so an overlay declaring object
+    /// relations must succeed — the determinism check is `diff`'s, and the
+    /// run() path prints a note saying so (the note goes to stdout, which a
+    /// unit test cannot capture; what is asserted here is that declaring an
+    /// object relation does not become an issue).
+    #[test]
+    fn object_relation_is_not_an_offline_issue() {
+        let f = temp_file(
+            r#"
+            [[tables.results.relations]]
+            name = "pathogen"
+            kind = "object"
+            target = "dict"
+            mapping = [["serial", "serial"]]
         "#,
         );
         assert!(run(f.path()).is_ok());

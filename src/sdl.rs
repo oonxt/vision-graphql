@@ -137,7 +137,8 @@ mod tests {
                 Table::new("posts", "public", "posts")
                     .column("id", "id", PgType::Int4, false)
                     .column("user_id", "user_id", PgType::Int4, false)
-                    .primary_key(&["id"]),
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build();
         TypeSystem::build(&schema)
@@ -157,6 +158,13 @@ mod tests {
         let sdl = render(&ts());
         assert!(
             sdl.contains("posts(where: posts_bool_exp, order_by: [posts_order_by!], limit: Int, offset: Int, distinct_on: [posts_select_column!]): [posts!]!"),
+            "{sdl}"
+        );
+        // Object relations publish the arguments the lowering accepts — the
+        // `order_by` here is the remedy Schema::warnings advises, so a code
+        // generator has to be able to see it.
+        assert!(
+            sdl.contains("user(where: users_bool_exp, order_by: [users_order_by!]): users"),
             "{sdl}"
         );
     }

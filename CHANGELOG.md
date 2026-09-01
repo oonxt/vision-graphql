@@ -3,6 +3,38 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **An underdetermined object relation now says so.** An object relation whose
+  mapped remote columns no unique constraint, plain unique index, or primary
+  key of the target covers renders a `LIMIT 1` subquery with no `ORDER BY` —
+  Postgres picks the row, the answer validates, and the wrong row is only
+  noticed downstream (field report: a dictionary keyed `(serial, type)`,
+  related on `serial` alone). The engine now warns instead of staying silent:
+  structured [`SchemaWarning`]s from the new `Schema::warnings()`, logged via
+  `tracing::warn` once when an `Engine` is constructed, and reported by
+  `vision-gql diff` on both text and JSON output (a `relation_warnings` array)
+  without counting as drift — the exit code does not change. Rendering is
+  untouched; the two ways out the message names are a per-query `order_by`, or
+  extending the mapping until a unique constraint covers it. Relations derived
+  from foreign keys never trigger it — whatever unique constraint or index the
+  FK references is exactly what the check accepts. Introspection now reads
+  plain unique indexes (valid, non-partial, non-expression; key columns only)
+  into the new `Table::unique_indexes`, kept apart from `unique_constraints`
+  because `ON CONFLICT ON CONSTRAINT` cannot name an index. A relation whose
+  mapping is itself broken (a column the table does not expose) is not warned
+  about — that mistake already fails loudly at query time. `vision-gql
+  validate` stays offline and cannot run this check; when the overlay declares
+  object relations it now says so and points at `diff`.
+- **Object relation fields publish `where` and `order_by`.** The lowering has
+  accepted both all along, but the type system offered object relations no
+  arguments — so `__schema`/SDL told code generators that the `order_by` the
+  new warning advises does not exist. `limit`/`offset` stay unpublished: the
+  field is one row, and a `limit` above one turns the scalar subquery into a
+  runtime error.
+
 ## 0.16.1 — 2026-08-29
 
 ### Added

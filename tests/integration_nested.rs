@@ -11,7 +11,14 @@ fn schema() -> Schema {
                 .column("id", "id", PgType::Int4, false)
                 .column("name", "name", PgType::Text, false)
                 .primary_key(&["id"])
-                .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+                .relation("posts", Relation::array("posts").on([("id", "user_id")]))
+                // Deliberately non-unique (alice has two posts): the relation
+                // Schema::warnings flags, and the per-query order_by remedy the
+                // warning advises — which therefore has to actually work.
+                .relation(
+                    "latest_post",
+                    Relation::object("posts").on([("id", "user_id")]),
+                ),
         )
         .table(
             Table::new("posts", "public", "posts")
@@ -88,6 +95,35 @@ async fn object_relation_returns_single_nested_row() {
     assert_eq!(posts.len(), 3);
     assert_eq!(posts[0]["user"]["name"], json!("alice"));
     assert_eq!(posts[2]["user"]["name"], json!("bob"));
+}
+
+/// The remedy `Schema::warnings` advises for a non-unique object relation:
+/// `order_by` (and `where`) on the object relation field decide which row
+/// answers, instead of leaving the choice to Postgres.
+#[tokio::test]
+async fn object_relation_order_by_picks_the_row() {
+    let (engine, _db) = setup().await;
+    let v: Value = engine
+        .query(
+            "query { users(order_by: [{id: asc}]) { name \
+             latest_post(order_by: [{id: desc}]) { title } } }",
+            None,
+        )
+        .await
+        .expect("query ok");
+    let users = v["users"].as_array().unwrap();
+    assert_eq!(users[0]["latest_post"]["title"], json!("a2"));
+    assert_eq!(users[1]["latest_post"]["title"], json!("b1"));
+
+    let v: Value = engine
+        .query(
+            "query { users(order_by: [{id: asc}]) { name \
+             latest_post(where: {published: {_eq: true}}, order_by: [{id: desc}]) { title } } }",
+            None,
+        )
+        .await
+        .expect("query ok");
+    assert_eq!(v["users"][0]["latest_post"]["title"], json!("a1"));
 }
 
 #[tokio::test]

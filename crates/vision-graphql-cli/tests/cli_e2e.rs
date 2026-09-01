@@ -273,6 +273,89 @@ async fn diff_clean_overlay_exits_zero() {
     let _ = std::fs::remove_file(&p);
 }
 
+/// validate is offline and cannot see unique constraints, so when the overlay
+/// declares object relations its "OK" must not read as "all checked" — it
+/// points at `diff`, which can look.
+#[test]
+fn validate_notes_object_relations_need_diff() {
+    let p = write_temp_toml(
+        "obj_rel.toml",
+        r#"
+        [[tables.results.relations]]
+        name = "pathogen"
+        kind = "object"
+        target = "dict"
+        mapping = [["serial", "serial"]]
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["validate", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("OK"), "got: {s}");
+    assert!(s.contains("vision-gql diff"), "got: {s}");
+    let _ = std::fs::remove_file(&p);
+}
+
+/// An object relation onto a column no unique constraint covers: reported as
+/// a warning on stdout — text and JSON — but never as drift, so the exit code
+/// stays 0. The FK-derived `posts.user` relation targets the primary key and
+/// must stay silent, which "exactly one warning" checks for free.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_warns_on_underdetermined_object_relation_without_failing() {
+    let db = boot_pg().await;
+    let url = db.url.clone();
+    let p = write_temp_toml(
+        "underdetermined.toml",
+        r#"
+        [[tables.posts.relations]]
+        name = "author_by_name"
+        kind = "object"
+        target = "users"
+        mapping = [["title", "name"]]
+        "#,
+    );
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+    let out = Command::new(bin)
+        .args(["diff", "--url", &url, "--config", p.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "a warning must not fail diff; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("OK"), "got: {s}");
+    assert!(s.contains("warnings (not drift"), "got: {s}");
+    assert!(s.contains("posts.author_by_name"), "got: {s}");
+
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            &url,
+            "--config",
+            p.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["relation_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    assert_eq!(warnings[0]["table"], "posts");
+    assert_eq!(warnings[0]["relation"], "author_by_name");
+    assert_eq!(warnings[0]["target"], "users");
+    assert_eq!(warnings[0]["remote_columns"][0], "name");
+    let _ = std::fs::remove_file(&p);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn diff_stale_hide_column_exits_one() {
     let db = boot_pg().await;
