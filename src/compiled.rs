@@ -106,7 +106,7 @@
 //! transaction still go through [`TxClient`](crate::TxClient).
 
 use crate::error::{Error, Result};
-use crate::types::BindSpec;
+use crate::types::{json_equiv, BindSpec};
 use serde_json::{Map, Value};
 
 /// A rendered statement plus the recipe for its parameters.
@@ -156,8 +156,11 @@ impl CompiledQuery {
     /// The rendered SQL. Stable for the life of this value — that is the point
     /// of compiling — so it is what to `EXPLAIN`, log, or diff in review.
     ///
-    /// For an operation with `@choices`, the SQL of the first combination of
-    /// values; [`shapes`](Self::shapes) has every one.
+    /// For an operation with `@choices` this is one statement of several — the
+    /// first combination's — and an `EXPLAIN`, a log line or an allowlist built
+    /// from it alone covers that one shape. [`shapes`](Self::shapes) has every
+    /// one; [`shape_count`](Self::shape_count) says whether there is more than
+    /// one to look at.
     pub fn sql(&self) -> &str {
         &self.shapes[0].sql
     }
@@ -241,16 +244,11 @@ impl CompiledQuery {
         if self.choices.is_empty() {
             return Ok(&self.shapes[0]);
         }
+        let inputs = crate::types::Inputs::variables(variables).with_defaults(&self.defaults);
         let mut wanted: Vec<(&str, &Value)> = Vec::with_capacity(self.choices.len());
         for (name, values) in &self.choices {
-            let v = variables
-                .get(name)
-                .or_else(|| self.defaults.get(name))
-                .ok_or_else(|| Error::Variable {
-                    name: name.clone(),
-                    message: "not bound".into(),
-                })?;
-            if !values.contains(v) {
+            let v = inputs.variable(name)?;
+            if !values.iter().any(|c| json_equiv(c, v)) {
                 return Err(Error::Variable {
                     name: name.clone(),
                     message: format!("{v} is not one of the values declared by @choices"),
@@ -260,7 +258,11 @@ impl CompiledQuery {
         }
         self.shapes
             .iter()
-            .find(|s| wanted.iter().all(|(n, v)| s.pinned.get(*n) == Some(v)))
+            .find(|s| {
+                wanted
+                    .iter()
+                    .all(|(n, v)| s.pinned.get(*n).is_some_and(|p| json_equiv(p, v)))
+            })
             .ok_or_else(|| Error::Validate {
                 path: "@choices".into(),
                 message: "internal: no compiled shape for a declared combination of values".into(),
@@ -279,6 +281,7 @@ pub(crate) fn compile(
 ) -> Result<CompiledQuery> {
     let contract = crate::parser::variable_contract(doc, operation_name)?;
     let combinations = choice_combinations(&contract.choices)?;
+    let symbolic_scope = policy.map(|p| p.symbolic());
     let mut shapes = Vec::with_capacity(combinations.len());
     let mut root_alias = None;
     for pinned in combinations {
@@ -294,8 +297,8 @@ pub(crate) fn compile(
             operation_name,
             schema,
         )?;
-        if let Some(policy) = policy {
-            crate::scope::apply_scope(&mut op, &policy.symbolic(), schema)?;
+        if let Some(scope) = &symbolic_scope {
+            crate::scope::apply_scope(&mut op, scope, schema)?;
         }
         root_alias = crate::engine::single_root_alias(&op).map(String::from);
         let (sql, specs) = crate::engine::prepare_symbolic(&mut op, schema, limits)?;
@@ -547,55 +550,68 @@ mod tests {
     #[test]
     fn optional_compiles_to_a_null_guard_around_the_comparison() {
         let q = compile_doc(
-            r#"query($t: String @optional, $ids: [Int!] @optional) {
-                 orders(where: {title: {_ilike: $t}, id: {_in: $ids}}) { id }
+            r#"query($t: String @optional, $ids: [Int!] @optional, $not: [Int!] @optional) {
+                 orders(where: {title: {_ilike: $t}, id: {_in: $ids, _nin: $not}}) { id }
                }"#,
         )
         .unwrap();
         let sql = q.sql();
         assert!(
-            sql.contains(r#"($1::text IS NULL OR o0."title" ILIKE $1::text)"#)
-                || sql.contains(r#"($1::text IS NULL OR "#),
+            sql.contains(r#"($1::text IS NULL OR t0."title" ILIKE $1::text)"#),
             "{sql}"
         );
         assert!(
-            sql.contains("IS NULL OR") && sql.contains("= ANY ($2::int4[])"),
+            sql.contains(r#"($2::int4[] IS NULL OR t0."id" = ANY ($2::int4[]))"#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"($3::int4[] IS NULL OR t0."id" <> ALL ($3::int4[]))"#),
             "{sql}"
         );
         // One placeholder each, used twice.
-        assert_eq!(q.bind_count(), 2);
-        assert_eq!(sql.matches("$1::").count(), 2, "{sql}");
-        assert_eq!(sql.matches("$2::").count(), 2, "{sql}");
-        assert_eq!(q.variables(), vec!["t".to_string(), "ids".to_string()]);
+        assert_eq!(q.bind_count(), 3);
+        for n in 1..=3 {
+            assert_eq!(sql.matches(&format!("${n}::")).count(), 2, "{sql}");
+        }
+        assert_eq!(
+            q.variables(),
+            vec!["t".to_string(), "ids".to_string(), "not".to_string()]
+        );
 
         let shape = q.shape_for(&json!({})).unwrap();
-        // Leaving both out: nulls, which the SQL turns into TRUE.
+        // Leaving them out: nulls, which the SQL turns into TRUE.
         assert_eq!(
             resolve_binds(
                 &shape.specs,
-                &Inputs::variables(&json!({"t": null, "ids": null}))
+                &Inputs::variables(&json!({"t": null, "ids": null, "not": null}))
             )
             .unwrap(),
             vec![
                 Bind::Null(crate::types::NullOf::Text),
-                Bind::Null(crate::types::NullOf::Int4Array)
+                Bind::Null(crate::types::NullOf::Int4Array),
+                Bind::Null(crate::types::NullOf::Int4Array),
             ]
         );
         // Supplying them: the ordinary binds.
         assert_eq!(
             resolve_binds(
                 &shape.specs,
-                &Inputs::variables(&json!({"t": "%a%", "ids": [1, 2]}))
+                &Inputs::variables(&json!({"t": "%a%", "ids": [1, 2], "not": [3]}))
             )
             .unwrap(),
             vec![
                 Bind::Text("%a%".into()),
-                Bind::Int4Array(vec![Some(1), Some(2)])
+                Bind::Int4Array(vec![Some(1), Some(2)]),
+                Bind::Int4Array(vec![Some(3)]),
             ]
         );
         // Not supplied at all is still not bound: an optional filter is one the
         // request says nothing about *by passing null*, not one it may forget.
-        let err = resolve_binds(&shape.specs, &Inputs::variables(&json!({"t": "x"}))).unwrap_err();
+        let err = resolve_binds(
+            &shape.specs,
+            &Inputs::variables(&json!({"t": "x", "not": null})),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, Error::Variable { name, .. } if name == "ids"),
             "{err:?}"
@@ -668,6 +684,136 @@ mod tests {
                 "{what} (eager): {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn optional_is_refused_under_or_and_not() {
+        // "Dropped" is TRUE, which under `_or` admits every row and under
+        // `_not` none. Neither is leaving a filter out, so neither is offered.
+        for q in [
+            "query($t: String @optional) { orders(where: {_or: [{title: {_eq: $t}}, {id: {_eq: 1}}]}) { id } }",
+            "query($t: String @optional) { orders(where: {_not: {title: {_eq: $t}}}) { id } }",
+            "query($t: String @optional) { orders(where: {_and: [{_or: [{title: {_eq: $t}}]}]}) { id } }",
+            "query($t: String @optional) { users(where: {_or: [{orders: {title: {_eq: $t}}}]}) { id } }",
+        ] {
+            let err = compile_doc(q).unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message.contains("_or") && message.contains("@optional")),
+                "{q}: {err:?}"
+            );
+            let doc = parse_document(q).unwrap();
+            let vars = json!({"t": null});
+            let err = lower_with(&doc, Bindings::eager(&vars), None, &schema()).unwrap_err();
+            assert!(matches!(&err, Error::Validate { .. }), "{q} (eager): {err:?}");
+        }
+        // Under `_and`, and inside a relation predicate that is itself under
+        // a conjunction, it applies.
+        let q = compile_doc(
+            "query($t: String @optional) { users(where: {_and: [{orders: {title: {_eq: $t}}}, {id: {_eq: 1}}]}) { id } }",
+        )
+        .unwrap();
+        assert!(q.sql().contains("IS NULL OR"), "{}", q.sql());
+    }
+
+    #[test]
+    fn optional_null_still_validates_the_comparison() {
+        // Whether a document is valid must not depend on the request's value:
+        // `_ilike` on an int column is refused with a null as with a string.
+        let schema = schema();
+        let doc = parse_document(
+            "query($t: String @optional) { orders(where: {id: {_ilike: $t}}) { id } }",
+        )
+        .unwrap();
+        for vars in [json!({"t": null}), json!({"t": "x"})] {
+            let op = lower_with(&doc, Bindings::eager(&vars), None, &schema).unwrap();
+            let err = render(&op, &schema).unwrap_err();
+            assert!(format!("{err}").contains("does not apply"), "{vars}: {err}");
+        }
+        let err =
+            compile_doc("query($t: String @optional) { orders(where: {id: {_ilike: $t}}) { id } }")
+                .unwrap_err();
+        assert!(format!("{err}").contains("does not apply"), "{err}");
+    }
+
+    #[test]
+    fn optional_applies_in_an_inserts_on_conflict_where() {
+        // `on_conflict.where` is a `where` like `update`'s, so the directive
+        // applies there — eagerly, since an insert argument does not compile
+        // with a variable in it, and that refusal is the one that shows.
+        let schema = schema();
+        let doc = parse_document(
+            "mutation($owner: Int @optional) {
+                 insert_users(objects: [{id: 1, name: \"a\"}], on_conflict: {constraint: users_pkey, update_columns: [name], where: {id: {_eq: $owner}}}) { affected_rows }
+             }",
+        )
+        .unwrap();
+        for vars in [json!({"owner": null}), json!({"owner": 3})] {
+            let op = lower_with(&doc, Bindings::eager(&vars), None, &schema).unwrap();
+            let (sql, _) = render(&op, &schema).unwrap();
+            assert!(sql.contains("ON CONFLICT"), "{sql}");
+            assert_eq!(
+                sql.contains("WHERE TRUE"),
+                vars["owner"].is_null(),
+                "{vars}: {sql}"
+            );
+        }
+        let err = lower_with(&doc, Bindings::symbolic(), None, &schema).unwrap_err();
+        assert!(matches!(err, Error::NotCompilable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn choices_compare_numbers_by_value() {
+        // `1` and `1.0` bind the same, so a list written one way admits a
+        // client that serialises the other.
+        let q =
+            compile_doc("query($n: Int! @choices(values: [1, 2])) { orders(limit: $n) { id } }")
+                .unwrap();
+        assert!(q.shape_for(&json!({"n": 1.0})).is_ok());
+        assert!(q.shape_for(&json!({"n": 3})).is_err());
+        let err = compile_doc(
+            "query($n: Float! @choices(values: [1.0, 1])) { orders(limit: $n) { id } }",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_choices_variable_must_be_supplied_on_both_paths() {
+        // Even one the operation never reads: the compiled statement needs it
+        // to pick a shape, and the two paths must agree on what a request
+        // has to carry.
+        let source =
+            "query($sort: [orders_order_by!]! @choices(values: [[{id: asc}]])) { orders { id } }";
+        let q = compile_doc(source).unwrap();
+        let err = q.shape_for(&json!({})).unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "sort"),
+            "{err:?}"
+        );
+        let doc = parse_document(source).unwrap();
+        let err = lower_with(&doc, Bindings::eager(&json!({})), None, &schema()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "sort"),
+            "{err:?}"
+        );
+        // The public building blocks refuse an out-of-list pin too.
+        let pinned = json!({"sort": [{"id": "desc"}]});
+        let err = lower_with(&doc, Bindings::pinned(&pinned), None, &schema()).unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "sort"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_variable_directive_is_one_error_on_both_paths() {
+        let source = "query($t: String @deprecated) { orders(where: {title: {_eq: $t}}) { id } }";
+        let via_compile = compile_doc(source).unwrap_err();
+        let doc = parse_document(source).unwrap();
+        let via_query =
+            lower_with(&doc, Bindings::eager(&json!({"t": "x"})), None, &schema()).unwrap_err();
+        assert_eq!(format!("{via_compile}"), format!("{via_query}"));
+        assert_eq!(via_compile.code(), via_query.code());
     }
 
     #[test]

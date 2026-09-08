@@ -516,29 +516,43 @@ async fn choices_and_a_policy_compose_per_shape() {
 #[tokio::test(flavor = "multi_thread")]
 async fn optional_filters_apply_when_supplied_and_drop_when_null() {
     let (engine, _db) = setup().await;
-    let source = r#"query($t: String @optional, $ids: [Int!] @optional, $ref: uuid @optional) {
-        orders(where: {title: {_ilike: $t}, id: {_in: $ids}, ref: {_eq: $ref}}, order_by: {id: asc}) { title }
+    let source = r#"query($t: String @optional, $ids: [Int!] @optional, $not: [Int!] @optional, $ref: uuid @optional) {
+        orders(where: {title: {_ilike: $t}, id: {_in: $ids, _nin: $not}, ref: {_eq: $ref}}, order_by: {id: asc}) { title }
     }"#;
     let q = engine.compile(source).expect("compile");
     assert_eq!(q.shape_count(), 1);
 
     let cases: Vec<(Value, Vec<&str>)> = vec![
         (
-            json!({"t": null, "ids": null, "ref": null}),
+            json!({"t": null, "ids": null, "not": null, "ref": null}),
             vec!["a-1", "a-2", "b-1"],
         ),
         (
-            json!({"t": "a-%", "ids": null, "ref": null}),
+            json!({"t": "a-%", "ids": null, "not": null, "ref": null}),
             vec!["a-1", "a-2"],
         ),
-        (json!({"t": null, "ids": [3], "ref": null}), vec!["b-1"]),
-        (json!({"t": null, "ids": [], "ref": null}), vec![]),
         (
-            json!({"t": null, "ids": null, "ref": "00000000-0000-0000-0000-000000000003"}),
+            json!({"t": null, "ids": [3], "not": null, "ref": null}),
             vec!["b-1"],
         ),
         (
-            json!({"t": "%1", "ids": [1, 3], "ref": "00000000-0000-0000-0000-000000000001"}),
+            json!({"t": null, "ids": [], "not": null, "ref": null}),
+            vec![],
+        ),
+        (
+            json!({"t": null, "ids": null, "not": [1, 3], "ref": null}),
+            vec!["a-2"],
+        ),
+        (
+            json!({"t": null, "ids": null, "not": [], "ref": null}),
+            vec!["a-1", "a-2", "b-1"],
+        ),
+        (
+            json!({"t": null, "ids": null, "not": null, "ref": "00000000-0000-0000-0000-000000000003"}),
+            vec!["b-1"],
+        ),
+        (
+            json!({"t": "%1", "ids": [1, 3], "not": [3], "ref": "00000000-0000-0000-0000-000000000001"}),
             vec!["a-1"],
         ),
     ];
@@ -551,7 +565,7 @@ async fn optional_filters_apply_when_supplied_and_drop_when_null() {
 
     // Leaving a variable out is not the same as passing null.
     let err = engine
-        .execute(&q, Some(json!({"t": null, "ids": null})))
+        .execute(&q, Some(json!({"t": null, "ids": null, "not": null})))
         .await
         .unwrap_err();
     assert!(

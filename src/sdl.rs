@@ -38,20 +38,11 @@ pub fn render(ts: &TypeSystem) -> String {
 
 fn render_directive(d: &DirectiveDef, out: &mut String) {
     render_description(d.description.as_deref(), 0, out);
-    let args = if d.args.is_empty() {
-        String::new()
-    } else {
-        let args: Vec<String> = d
-            .args
-            .iter()
-            .map(|a| format!("{}: {}{}", a.name, render_ref(&a.ty), default_of(a)))
-            .collect();
-        format!("({})", args.join(", "))
-    };
     writeln!(
         out,
-        "directive @{}{args} on {}",
+        "directive @{}{} on {}",
         d.name,
+        render_args(&d.args),
         d.locations.join(" | ")
     )
     .unwrap();
@@ -94,19 +85,26 @@ fn render_field(f: &Field, out: &mut String) {
         writeln!(out, "  {}: {}", f.name, render_ref(&f.ty)).unwrap();
         return;
     }
-    let args: Vec<String> = f
-        .args
-        .iter()
-        .map(|a| format!("{}: {}{}", a.name, render_ref(&a.ty), default_of(a)))
-        .collect();
     writeln!(
         out,
-        "  {}({}): {}",
+        "  {}{}: {}",
         f.name,
-        args.join(", "),
+        render_args(&f.args),
         render_ref(&f.ty)
     )
     .unwrap();
+}
+
+/// `(a: T, b: U = v)`, or nothing when there are no arguments.
+fn render_args(args: &[InputValue]) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| format!("{}: {}{}", a.name, render_ref(&a.ty), default_of(a)))
+        .collect();
+    format!("({})", args.join(", "))
 }
 
 fn default_of(v: &InputValue) -> String {

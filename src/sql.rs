@@ -1089,6 +1089,13 @@ fn render_optional(
     };
     match inner {
         BoolExpr::Compare { column, op, value } => {
+            // Checked before the null shortcut: whether the document is valid
+            // must not depend on which value this request sent.
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            check_cmp_applies(*op, col)?;
             match value.as_lit() {
                 Some(v) if v.is_null() => {
                     ctx.sql.push_str("TRUE");
@@ -1097,11 +1104,6 @@ fn render_optional(
                 Some(_) => return render_plain(ctx),
                 None => {}
             }
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            check_cmp_applies(*op, col)?;
             let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
             let cast = pg_type_cast(&col.pg_type);
             write!(
@@ -1118,6 +1120,10 @@ fn render_optional(
             values,
             negated,
         } => {
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
             match values.as_lit() {
                 Some(v) if v.is_null() => {
                     ctx.sql.push_str("TRUE");
@@ -1130,10 +1136,6 @@ fn render_optional(
                 // A composite with no variables left: same as a literal list.
                 return render_plain(ctx);
             }
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
             let n = ctx.push_optional_array(values, &col.pg_type, || format!("where.{column}"))?;
             let cast = pg_type_cast(&col.pg_type);
             let pred = if *negated { "<> ALL" } else { "= ANY" };

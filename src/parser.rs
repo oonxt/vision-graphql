@@ -7,6 +7,7 @@ use crate::ast::{
 use crate::error::{Error, Result};
 use crate::limits::ParseLimits;
 use crate::schema::{Schema, Table};
+use crate::types::json_equiv;
 use async_graphql_parser::parse_query;
 use async_graphql_parser::types::{
     DocumentOperations, ExecutableDocument, Field as GqlField, FragmentDefinition, OperationType,
@@ -96,19 +97,27 @@ pub fn lower_with(
         }
         _ => variables,
     };
-    // A `@choices` variable holds one of its declared values on every path,
-    // not only the compiled one: a document must mean the same thing under
-    // `Engine::query` as under `Engine::compile`, or moving between them
-    // would change what a request is allowed to ask.
-    if let Mode::Eager(vars) = variables.mode {
-        for (name, values) in &contract.choices {
-            if let Some(v) = vars.get(name) {
-                if !values.contains(v) {
-                    return Err(Error::Variable {
-                        name: name.clone(),
-                        message: format!("{v} is not one of the values declared by @choices"),
-                    });
-                }
+    // A `@choices` variable holds one of its declared values in both modes,
+    // not only under the engine's compile: a document must mean the same thing
+    // under `Engine::query` as under `Engine::compile`, or moving between them
+    // would change what a request is allowed to ask. Eagerly the request must
+    // supply it — even one the operation never reads, since the compiled
+    // statement needs it to pick a shape and the two must agree on what a
+    // request has to carry; pinned, the pin must be one of the values.
+    for (name, values) in &contract.choices {
+        let v = match variables.mode {
+            Mode::Eager(vars) => Some(vars.get(name).ok_or_else(|| Error::Variable {
+                name: name.clone(),
+                message: "not bound".into(),
+            })?),
+            Mode::Symbolic { pinned } => pinned.get(name),
+        };
+        if let Some(v) = v {
+            if !values.iter().any(|c| json_equiv(c, v)) {
+                return Err(Error::Variable {
+                    name: name.clone(),
+                    message: format!("{v} is not one of the values declared by @choices"),
+                });
             }
         }
     }
@@ -481,13 +490,7 @@ fn reject_directives(op: OpInfo<'_>, fragments: &Fragments<'_>) -> Result<()> {
         where_: &str,
     ) -> Result<()> {
         if let Some(d) = directives.first() {
-            let name = d.node.name.node.as_str();
-            return Err(Error::Validate {
-                path: format!("@{name}"),
-                message: format!(
-                    "directives are not supported; '@{name}' on {where_} would have no effect"
-                ),
-            });
+            return Err(unsupported_directive(d.node.name.node.as_str(), where_));
         }
         Ok(())
     }
@@ -532,9 +535,23 @@ fn reject_directives(op: OpInfo<'_>, fragments: &Fragments<'_>) -> Result<()> {
     walk(op.selection_set)
 }
 
+/// The one refusal for a directive this engine does not implement.
+fn unsupported_directive(name: &str, where_: &str) -> Error {
+    Error::Validate {
+        path: format!("@{name}"),
+        message: format!(
+            "directives are not supported; '@{name}' on {where_} would have no effect"
+        ),
+    }
+}
+
+/// `@choices`: the values a variable may take. See [`crate::compiled`].
+pub const CHOICES: &str = "choices";
+/// `@optional`: a null drops the comparison the variable is the operand of.
+pub const OPTIONAL: &str = "optional";
 /// The directives a variable definition may carry. Everything else is refused;
-/// see [`reject_directives`].
-pub const KNOWN_VARIABLE_DIRECTIVES: [&str; 2] = ["choices", "optional"];
+/// see [`reject_directives`]. The type system publishes exactly this list.
+pub const KNOWN_VARIABLE_DIRECTIVES: [&str; 2] = [CHOICES, OPTIONAL];
 
 /// The most shapes one compiled statement may hold — the product of every
 /// `@choices` list in the operation. Each shape is a full lowering and
@@ -587,7 +604,7 @@ fn contract_of(
             }
             seen.push(dname);
             match dname {
-                "optional" => {
+                OPTIONAL => {
                     if let Some((arg, _)) = d.node.arguments.first() {
                         return Err(refuse(format!(
                             "@optional takes no arguments; got '{}'",
@@ -606,7 +623,7 @@ fn contract_of(
                     }
                     out.optional.push(name.to_string());
                 }
-                "choices" => {
+                CHOICES => {
                     let mut values = None;
                     for (arg, v) in &d.node.arguments {
                         match arg.node.as_str() {
@@ -642,7 +659,7 @@ fn contract_of(
                         return Err(refuse("@choices needs at least one value".into()));
                     }
                     for (i, item) in items.iter().enumerate() {
-                        if items[..i].contains(item) {
+                        if items[..i].iter().any(|seen| json_equiv(seen, item)) {
                             return Err(refuse(format!("@choices lists {item} twice")));
                         }
                     }
@@ -650,7 +667,7 @@ fn contract_of(
                         let default = default.node.clone().into_json().map_err(|e| {
                             refuse(format!("default value is not representable as JSON: {e}"))
                         })?;
-                        if !items.contains(&default) {
+                        if !items.iter().any(|v| json_equiv(v, &default)) {
                             return Err(refuse(format!(
                                 "default value {default} is not one of the values \
                                  declared by @choices"
@@ -659,15 +676,13 @@ fn contract_of(
                     }
                     out.choices.push((name.to_string(), items));
                 }
-                other => {
-                    return Err(refuse(format!(
-                        "directives are not supported; '@{other}' on a variable \
-                         definition would have no effect"
-                    )))
-                }
+                // The same refusal `reject_directives` gives, so the two entry
+                // points — which reach the two checks in opposite orders —
+                // report one error for one document.
+                other => return Err(unsupported_directive(other, "a variable definition")),
             }
         }
-        if seen.contains(&"optional") && seen.contains(&"choices") {
+        if seen.contains(&OPTIONAL) && seen.contains(&CHOICES) {
             return Err(refuse(
                 "@optional and @choices on one variable contradict each other: list \
                  null among the values instead"
@@ -1357,11 +1372,11 @@ fn parse_insert_args(
                 }
             }
             "on_conflict" => {
-                let json = gql_to_json(v, vars, &format!("{parent_path}.on_conflict"))?;
                 on_conflict = Some(parse_on_conflict(
-                    &json,
+                    v,
                     table,
                     schema,
+                    vars,
                     &format!("{parent_path}.on_conflict"),
                 )?);
             }
@@ -1525,9 +1540,10 @@ fn parse_insert_object(
                     // Parse optional on_conflict against the CHILD table.
                     let on_conflict = if let Some(oc_json) = wrapper.get("on_conflict") {
                         Some(parse_on_conflict(
-                            oc_json,
+                            &json_to_gql(oc_json),
                             target,
                             schema,
+                            Bindings::eager(&Value::Null),
                             &format!("{path}.{k}.on_conflict"),
                         )?)
                     } else {
@@ -1624,9 +1640,10 @@ fn parse_insert_object(
                     // Parse optional on_conflict against the CHILD table.
                     let on_conflict = if let Some(oc_json) = wrapper.get("on_conflict") {
                         Some(parse_on_conflict(
-                            oc_json,
+                            &json_to_gql(oc_json),
                             target,
                             schema,
+                            Bindings::eager(&Value::Null),
                             &format!("{path}.{k}.on_conflict"),
                         )?)
                     } else {
@@ -1725,16 +1742,49 @@ fn gql_object_to_val_map(
     Ok(out)
 }
 
+/// Under symbolic lowering, refuse any variable in `v` that is not pinned,
+/// with the same refusal a structural position gives; a no-op eagerly.
+fn refuse_unpinned_variables(v: &GqlValue, vars: Bindings<'_>, path: &str) -> Result<()> {
+    match v {
+        GqlValue::Variable(name) => vars.value_now(name.as_str(), path).map(|_| ()),
+        GqlValue::List(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, x)| refuse_unpinned_variables(x, vars, &format!("{path}[{i}]"))),
+        GqlValue::Object(kv) => kv
+            .iter()
+            .try_for_each(|(k, x)| refuse_unpinned_variables(x, vars, &format!("{path}.{k}"))),
+        _ => Ok(()),
+    }
+}
+
+/// An `on_conflict` argument. Its `where` is lowered from the GraphQL value
+/// like any other `where`, so an `@optional` variable applies there as it does
+/// in `update`'s; the rest is read as JSON, which is where a variable in an
+/// insert argument is refused under symbolic lowering, as everywhere in one.
 fn parse_on_conflict(
-    json: &Value,
+    value: &GqlValue,
     table: &Table,
     schema: &Schema,
+    vars: Bindings<'_>,
     path: &str,
 ) -> Result<crate::ast::OnConflict> {
-    let obj = json.as_object().ok_or_else(|| Error::Validate {
-        path: path.into(),
-        message: "expected object".into(),
-    })?;
+    let value = structural(value, vars, path)?;
+    let GqlValue::Object(fields) = value.as_ref() else {
+        return Err(Error::Validate {
+            path: path.into(),
+            message: "expected object".into(),
+        });
+    };
+    let mut obj = serde_json::Map::new();
+    let mut where_gql = None;
+    for (k, v) in fields {
+        if k.as_str() == "where" {
+            where_gql = Some(v);
+        } else {
+            obj.insert(k.to_string(), gql_to_json(v, vars, &format!("{path}.{k}"))?);
+        }
+    }
     let constraint = obj
         .get("constraint")
         .and_then(|v| v.as_str())
@@ -1791,19 +1841,22 @@ fn parse_on_conflict(
             update_columns.push(cn.to_string());
         }
     }
-    let where_ = obj
-        .get("where")
+    // An insert argument is compiled as written — see `crate::compiled` —
+    // and this `where` is part of one: a variable in it is refused under
+    // symbolic lowering as it is in the rows, before `@optional` gets a say.
+    if let Some(w) = where_gql {
+        refuse_unpinned_variables(w, vars, &format!("{path}.where"))?;
+    }
+    let where_ = where_gql
         .map(|w| {
             lower_where(
-                &json_to_gql(w),
+                w,
                 // The real schema: an empty one made a relation predicate here
                 // fail with "relation target table missing", which named the
                 // wrong cause and made `on_conflict: { where: { rel: … } }`
                 // impossible to write.
                 Names::Schema { table, schema },
-                // `w` came from `gql_to_json`, so every variable in it is
-                // already substituted and the mode cannot matter.
-                Bindings::eager(&Value::Null),
+                vars,
                 &format!("{path}.where"),
             )
         })
@@ -2475,10 +2528,11 @@ pub(crate) fn lower_where(
                         message: "expected array".into(),
                     });
                 };
+                let inner_vars = vars.under(vars.disjunctive || key == "_or");
                 let inner: Result<Vec<BoolExpr>> = items
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| lower_where(x, names, vars, &format!("{path}.{key}[{i}]")))
+                    .map(|(i, x)| lower_where(x, names, inner_vars, &format!("{path}.{key}[{i}]")))
                     .collect();
                 parts.push(if key == "_and" {
                     BoolExpr::And(inner?)
@@ -2490,7 +2544,7 @@ pub(crate) fn lower_where(
                 parts.push(BoolExpr::Not(Box::new(lower_where(
                     v,
                     names,
-                    vars,
+                    vars.under(true),
                     &format!("{path}._not"),
                 )?)));
             }
@@ -2525,6 +2579,16 @@ pub(crate) fn lower_where(
                     let operand = |v: &GqlValue| -> Result<(Val, bool)> {
                         if let GqlValue::Variable(name) = v {
                             if vars.is_optional(name.as_str()) {
+                                if vars.disjunctive {
+                                    return Err(Error::Validate {
+                                        path: op_path(),
+                                        message: format!(
+                                            "'${name}' is declared @optional, which cannot apply \
+                                             under `_or` or `_not`: a dropped comparison is TRUE, \
+                                             which would admit every row there or none"
+                                        ),
+                                    });
+                                }
                                 return Ok((vars.value_of(name.as_str(), &op_path())?, true));
                             }
                         }
@@ -2810,6 +2874,13 @@ pub struct Bindings<'a> {
     /// Variables the operation declared `@optional`. See
     /// [`BoolExpr::Optional`].
     optional: &'a [String],
+    /// Whether the `where` being lowered is under an `_or` or a `_not`, where
+    /// an `@optional` comparison is refused: "dropped" means `TRUE`, which
+    /// under `_or` admits every row and under `_not` none — neither is what
+    /// leaving a filter out means. Carried into a relation predicate: under
+    /// `_not`, a dropped comparison on the related rows would turn "no such
+    /// order" into "no orders at all".
+    disjunctive: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2823,7 +2894,7 @@ enum Mode<'a> {
     Symbolic { pinned: &'a Value },
 }
 
-/// The empty object every plain symbolic lowering pins to.
+/// Nothing pinned: a null, on which `get` finds no name.
 static NO_PINS: Value = Value::Null;
 
 impl<'a> Bindings<'a> {
@@ -2832,6 +2903,7 @@ impl<'a> Bindings<'a> {
         Bindings {
             mode: Mode::Eager(variables),
             optional: &[],
+            disjunctive: false,
         }
     }
 
@@ -2848,6 +2920,7 @@ impl<'a> Bindings<'a> {
         Bindings {
             mode: Mode::Symbolic { pinned },
             optional: &[],
+            disjunctive: false,
         }
     }
 
@@ -2858,6 +2931,13 @@ impl<'a> Bindings<'a> {
 
     fn with_optional(self, optional: &'a [String]) -> Self {
         Bindings { optional, ..self }
+    }
+
+    fn under(self, disjunctive: bool) -> Self {
+        Bindings {
+            disjunctive,
+            ..self
+        }
     }
 
     fn is_optional(&self, name: &str) -> bool {
@@ -2898,8 +2978,9 @@ impl<'a> Bindings<'a> {
                 path: path.to_string(),
                 message: format!(
                     "'${name}' decides the shape of the SQL here, so it cannot be left \
-                     to execution time; move it to a value position, declare the values \
-                     it may take with @choices, or run this query with Engine::query instead"
+                     to execution time; move it to a value position, bound it with \
+                     @choices (Engine::compile then compiles one statement per value), \
+                     or run this query with Engine::query instead"
                 ),
             }),
         }

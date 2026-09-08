@@ -245,7 +245,7 @@ impl TypeSystem {
 fn directive_defs() -> Vec<DirectiveDef> {
     vec![
         DirectiveDef {
-            name: "choices".into(),
+            name: crate::parser::CHOICES.into(),
             description: Some(
                 "The values this variable may take, as literals of its type. A request \
                  supplying any other value is refused. A compiled statement is compiled \
@@ -261,7 +261,7 @@ fn directive_defs() -> Vec<DirectiveDef> {
             )],
         },
         DirectiveDef {
-            name: "optional".into(),
+            name: crate::parser::OPTIONAL.into(),
             description: Some(
                 "A null for this variable drops the comparison it is the operand of \
                  (`_eq: $x`, `_in: $x`, …) instead of being refused. The variable may \

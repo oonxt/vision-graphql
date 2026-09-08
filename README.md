@@ -166,7 +166,7 @@ lowering, schema resolution, scope rewriting, SQL generation — and hands back 
 let q = engine.compile(
     "query($ids: [Int!], $n: Int!) { users(where: {id: {_in: $ids}}, limit: $n) { id name } }",
 )?;
-println!("{}", q.sql());          // stable — EXPLAIN it, log it, diff it in review
+println!("{}", q.sql());          // stable — EXPLAIN it, log it, diff it in review (one shape; see @choices below)
 assert_eq!(q.variables(), ["ids", "n"]);
 
 // per request — 43 ns of CPU before the query hits PostgreSQL
@@ -230,8 +230,10 @@ request may drop says so on the variable: a null for `$creator: uuid @optional`
 drops the comparison it is the operand of (`creator_id: {_eq: $creator}`),
 compiled as `($1::uuid IS NULL OR creator_id = $1::uuid)` — one statement for
 both requests — and, run eagerly, left out of the SQL altogether. The variable
-must be nullable and may only be the whole value of a comparison operator;
-anywhere else it is refused rather than quietly un-optional. Leaving the
+must be nullable and may only be the whole value of a comparison operator in
+a conjunction — under `_or` or `_not` a dropped comparison would admit every
+row or none, so it is refused there, as anywhere else it would quietly be
+un-optional. Leaving the
 variable out of the request is still an error: null is "no filter", absence is
 a mistake.
 
