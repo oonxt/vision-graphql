@@ -64,9 +64,34 @@ impl From<f64> for Operand {
     }
 }
 
-/// A named parameter reference, e.g. `param("tenant_id")`.
+/// A named parameter reference, e.g. `param("tenant_id")`. A dotted name —
+/// `param("claim.school_id")` — reads that field of an object-valued parameter;
+/// see [`Principal::get`] for the lookup rule. Every segment must be an
+/// identifier (`[A-Za-z_][A-Za-z0-9_]*`), which
+/// [`validate`](crate::policy::ScopePolicyBuilder::validate) checks — the same
+/// grammar the TOML loader applies to `"$name"`.
 pub fn param(name: impl Into<String>) -> Operand {
     Operand::Param(name.into())
+}
+
+/// Whether `s` is a well-formed parameter reference: `ident(.ident)*`, each
+/// `ident` matching `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// One grammar for both entry points. The TOML loader applies it to decide what
+/// a `"$…"` string is; `validate` applies it to every `Operand::Param` the DSL
+/// built, so a name that can never resolve is refused when the policy is built
+/// rather than on every request, blamed on the caller's principal.
+pub(crate) fn is_param_ref(s: &str) -> bool {
+    s.split('.').all(is_ident)
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The default-named parameter (`principal`). Sugar for `param("principal")`.
@@ -219,7 +244,9 @@ impl Principal {
         Self::default()
     }
 
-    /// Bind `name` to `value`. Chainable.
+    /// Bind `name` to `value`. Chainable. An object value can be read field by
+    /// field from a policy (`param("claim.school_id")`, TOML
+    /// `"$claim.school_id"`); see [`Principal::get`].
     pub fn set(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
         self.params.insert(name.into(), value.into());
         self
@@ -229,11 +256,16 @@ impl Principal {
     /// bound object (`claim.school_id` reads field `school_id` of parameter
     /// `claim`).
     ///
-    /// A name bound as-is always wins over a walk, so a host that set the
-    /// dotted key itself gets exactly what it set. Walking stops at anything
-    /// that is not an object — `None`, not `Null`, because a field that is not
-    /// there and a field that is null are different answers, and only the
-    /// second one should reach a comparison.
+    /// The whole reference is tried as a bound name first, so a host that set
+    /// the key `"claim.school_id"` itself gets exactly what it set; otherwise
+    /// the text before the first dot names the parameter and the rest is a
+    /// path of object keys. Only that one split is tried: a key that itself
+    /// contains a dot cannot be addressed by a path, and a verbatim-bound
+    /// `"claim.org"` is not consulted for `claim.org.id`. Walking stops at
+    /// anything that is not an object — `None`, not `Null`, because a field
+    /// that is not there and a field that is null are different answers. A
+    /// null that is there is handed on, and the predicate then treats it as it
+    /// treats any null value (a comparison refuses it).
     pub fn get(&self, name: &str) -> Option<&Value> {
         if let Some(v) = self.params.get(name) {
             return Some(v);
@@ -434,6 +466,22 @@ mod tests {
             .set("claim.school_id", 1)
             .set("claim", json!({"school_id": 2}));
         assert_eq!(p.get("claim.school_id"), Some(&json!(1)));
+        // Only the whole reference is tried verbatim: a bound dotted prefix is
+        // not a parameter the path can start from.
+        let p = Principal::new().set("claim.org", json!({"id": 3}));
+        assert_eq!(p.get("claim.org.id"), None);
+    }
+
+    #[test]
+    fn param_ref_grammar() {
+        for ok in ["principal", "_t1", "claim.school_id", "a.b.c"] {
+            assert!(is_param_ref(ok), "{ok}");
+        }
+        for bad in [
+            "", "1st", "claim.", ".x", "a..b", "a b", "a-b", "{a}", "a:b",
+        ] {
+            assert!(!is_param_ref(bad), "{bad}");
+        }
     }
 
     #[test]

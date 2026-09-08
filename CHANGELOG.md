@@ -5,17 +5,28 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ## Unreleased
 
-### Fixed
+### Breaking
 
-- **A malformed `$…` reference in a TOML scope policy is refused when the
-  policy loads.** `"$claim.school_id"`, `"$1st"`, `"$claim id"` — anything
-  after `$` that was not a bare identifier — used to load as the literal string
-  it was spelled with, so `where = { school_id = { _eq = "$claim.school_id" } }`
+- **A TOML scope policy refuses a `$…` string that is not a parameter
+  reference.** `"$claim.school_id"`, `"$1st"`, `"$claim id"` — anything after
+  `$` that was not a bare identifier — used to load as the literal string it
+  was spelled with, so `where = { school_id = { _eq = "$claim.school_id" } }`
   became `school_id = '$claim.school_id'`: a predicate matching no row, behind
   a 200, from a policy that looked like it worked (field report: a first
   deployment took a while to find why). `ScopePolicy::from_toml` now returns
-  `Error::Scope`, naming the position (`scope.courses.where.school_id`) and
-  the string. `$$` still escapes a literal `$`.
+  `Error::Scope` naming the position (`scope.courses.where.school_id`) and the
+  string. This also refuses a leading-`$` literal that was meant as one
+  (`_like = "$%"`, `_eq = "$5"`): spell it `$$%`, `$$5`. Strings inside an
+  object or array literal on a json/jsonb column get the same treatment — a
+  `$…` there has nothing to resolve it and is refused, `$$` unescapes.
+- **`ScopePolicyBuilder::validate` checks parameter names.** The DSL's
+  `param(...)` took any string; a name the TOML loader would refuse
+  (`param("claim.")`, `param("tenant id")`) passed `validate` and then failed on
+  every request as a parameter the principal had not supplied. Both entry
+  points now apply one grammar, `name` or `name.field` with identifier
+  segments, and `validate` returns `Error::Validate` at `scope.<table>.<column>`
+  for anything else. A parameter named with a `-`, `:` or space has to be
+  bound under an identifier instead.
 
 ### Added
 
@@ -26,9 +37,11 @@ release commits; entries from 0.13.0 on are written as the work lands.
   flat `claim_school_id` per dimension. Resolution is the same on both paths —
   `bind` and a compiled statement's `execute_scoped`. A field the bound object
   does not have fails closed as a missing parameter (`principal.claim.school_id`),
-  not as a comparison against null; a field explicitly set to null is passed on
-  as null. A name bound verbatim with a dot in it is still found first, so
-  nothing that resolved before resolves differently now.
+  not as a comparison against null. A field that is there but null is handed
+  on as null, and the predicate refuses it the way it refuses any null in a
+  comparison. The whole reference is tried as a bound name first, so a key
+  `"claim.school_id"` a host set verbatim resolves as before; a key that itself
+  contains a dot cannot be reached by a path.
 
 ## 0.17.0 — 2026-09-01
 

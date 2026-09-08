@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::predicate::{Principal, ScopeExpr};
+use crate::predicate::{is_param_ref, Operand, Principal, ScopeExpr};
 use crate::schema::{Schema, Table};
 use crate::scope::{ColumnScope, ScopeSet};
 
@@ -265,7 +265,30 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
                 .ok_or_else(|| Error::Validate {
                     path: format!("{path}.{column}"),
                     message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-                })
+                })?;
+            let operands: &[Operand] = match expr {
+                ScopeExpr::Compare { value, .. } => std::slice::from_ref(value),
+                ScopeExpr::InList { values, .. } => values,
+                _ => &[],
+            };
+            for operand in operands {
+                if let Operand::Param(name) = operand {
+                    // A name the grammar refuses can never be looked up, so
+                    // failing it here — once, on the policy — beats failing
+                    // it per request with a message that blames the principal.
+                    if !is_param_ref(name) {
+                        return Err(Error::Validate {
+                            path: format!("{path}.{column}"),
+                            message: format!(
+                                "'{name}' is not a parameter reference; expected \
+                                 `name` or `name.field` (identifiers: \
+                                 [A-Za-z_][A-Za-z0-9_]*)"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -332,6 +355,43 @@ mod tests {
             .validate(&schema())
             .unwrap_err();
         assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_param_name() {
+        // The DSL takes any string; the grammar is enforced where the TOML
+        // loader enforces it too, so both entry points agree.
+        for bad in ["claim.", "a..b", "tenant id", "tenant-id"] {
+            let err = ScopePolicy::builder()
+                .allow("orders", col("user_id").eq(crate::predicate::param(bad)))
+                .validate(&schema())
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { path, message }
+                    if path == "scope.orders.user_id" && message.contains(bad)),
+                "{bad}: {err:?}"
+            );
+        }
+        // Inside `_in` lists as well.
+        let err = ScopePolicy::builder()
+            .allow(
+                "orders",
+                col("user_id").in_([
+                    crate::predicate::param("ok"),
+                    crate::predicate::param("not ok"),
+                ]),
+            )
+            .validate(&schema())
+            .unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+        // Dotted references are well-formed.
+        ScopePolicy::builder()
+            .allow(
+                "orders",
+                col("user_id").eq(crate::predicate::param("claim.user_id")),
+            )
+            .validate(&schema())
+            .unwrap();
     }
 
     #[test]

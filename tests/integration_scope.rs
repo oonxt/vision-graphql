@@ -795,21 +795,40 @@ async fn scope_policy_dotted_reference_reads_object_param_on_both_paths() {
     assert_eq!(v["orders"], json!([{"title": "b-order-1"}]));
     assert_eq!(v["samples"], json!([{"serial": "S-B1"}]));
 
-    // Compiled: one statement, the field read out of the principal per request.
+    // Compiled: one statement, the field read out of the principal per
+    // request — at the root and inside the relation-chain subquery alike.
     let compiled = engine
-        .compile_scoped("query { orders { title } }", &policy)
+        .compile_scoped("query { orders { title } samples { serial } }", &policy)
         .expect("compile");
     let v = engine
         .execute_scoped(&compiled, None, &bob)
         .await
         .expect("execute as bob");
     assert_eq!(v["orders"], json!([{"title": "b-order-1"}]));
+    assert_eq!(v["samples"], json!([{"serial": "S-B1"}]));
     let alice = Principal::new().set("claim", json!({"user_id": 1}));
     let v = engine
         .execute_scoped(&compiled, None, &alice)
         .await
         .expect("execute as alice");
     assert_eq!(v["orders"].as_array().expect("array").len(), 2);
+    assert_eq!(v["samples"].as_array().expect("array").len(), 2);
+
+    // A field that is there but null is handed on as null, and the predicate
+    // refuses it as it refuses any null in a comparison — not `= NULL`, which
+    // would be no rows behind a 200.
+    let null_field = Principal::new().set("claim", json!({"user_id": null}));
+    let err = engine
+        .execute_scoped(&compiled, None, &null_field)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+    let err = engine
+        .scoped(policy.bind(&null_field).expect("bind carries the null"))
+        .query("query { orders { title } }", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
 
     // The bound object lacking the field fails closed on both paths — never a
     // comparison against null that returns no rows behind a 200.

@@ -42,7 +42,7 @@ use crate::ast::{BoolExpr, Val};
 use crate::error::{Error, Result};
 use crate::parser::lower_where;
 use crate::policy::{ScopePolicy, ScopeRule};
-use crate::predicate::{Operand, ScopeExpr};
+use crate::predicate::{is_param_ref, Operand, ScopeExpr};
 use crate::schema::Schema;
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +100,7 @@ fn build_rule(table_name: &str, tr: &TableRule, schema: &Schema) -> Result<Scope
         Error::Scope(format!("tables.{table_name}: unknown table '{table_name}'"))
     })?;
     let json = toml_to_json(where_toml);
+    let path = format!("scope.{table_name}.where");
     // The TOML has no GraphQL variables in it, so the lowering mode is moot;
     // it goes through the same walker as a written-out `where` argument.
     let lowered = lower_where(
@@ -107,12 +108,9 @@ fn build_rule(table_name: &str, tr: &TableRule, schema: &Schema) -> Result<Scope
         table,
         schema,
         crate::parser::Bindings::Eager(&Value::Null),
-        &format!("scope.{table_name}.where"),
+        &path,
     )?;
-    Ok(ScopeRule::Allow(to_template(
-        lowered,
-        &format!("scope.{table_name}.where"),
-    )?))
+    Ok(ScopeRule::Allow(to_template(lowered, &path)?))
 }
 
 /// Convert a `toml::Value` into the `serde_json::Value` shape `lower_where`
@@ -174,17 +172,15 @@ fn to_template(expr: BoolExpr, path: &str) -> Result<ScopeExpr> {
     })
 }
 
-/// Map a lowered `_in` list to operands. TOML cannot produce anything but a
-/// literal list here, so a non-list is treated as a single element.
+/// Map a lowered `_in` list to operands. Lowering has already refused a
+/// non-list here.
 fn val_to_operands(v: Val, path: &str) -> Result<Vec<Operand>> {
     match v {
         Val::Lit(Value::Array(items)) => items
             .into_iter()
             .map(|i| to_operand(Val::Lit(i), path))
             .collect(),
-        Val::Lit(other) => Ok(vec![to_operand(Val::Lit(other), path)?]),
-        // Unreachable from TOML: no GraphQL variables and no principal exist here.
-        _ => Ok(Vec::new()),
+        other => Err(non_literal(path, &other)),
     }
 }
 
@@ -199,8 +195,7 @@ fn val_to_operands(v: Val, path: &str) -> Result<Vec<Operand>> {
 /// name. Someone who wants a literal starting with `$` has `$$`.
 fn to_operand(v: Val, path: &str) -> Result<Operand> {
     let Val::Lit(v) = v else {
-        // Same as above: TOML predicates contain literals only.
-        return Ok(Operand::Lit(Value::Null));
+        return Err(non_literal(path, &v));
     };
     if let Value::String(s) = &v {
         if let Some(rest) = s.strip_prefix("$$") {
@@ -217,22 +212,50 @@ fn to_operand(v: Val, path: &str) -> Result<Operand> {
             )));
         }
     }
-    Ok(Operand::Lit(v))
+    // A json/jsonb column takes an object or array literal, whose strings get
+    // the same treatment: `$$` unescapes, and a `$…` is refused — an operand
+    // is one literal or one parameter, so a reference inside a composite has
+    // nothing to resolve it and would otherwise ship as text.
+    Ok(Operand::Lit(unescape_composite(v, path)?))
 }
 
-/// `ident(.ident)*` — a parameter name, optionally followed by a field path.
-fn is_param_ref(s: &str) -> bool {
-    !s.is_empty() && s.split('.').all(is_ident)
+fn unescape_composite(v: Value, path: &str) -> Result<Value> {
+    Ok(match v {
+        Value::String(s) => {
+            if let Some(rest) = s.strip_prefix("$$") {
+                Value::String(format!("${rest}"))
+            } else if s.starts_with('$') {
+                return Err(Error::Scope(format!(
+                    "{path}: '{s}' inside an object or array literal: a parameter \
+                     reference cannot be part of a literal; use `$$` for a literal '$'"
+                )));
+            } else {
+                Value::String(s)
+            }
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|i| unescape_composite(i, path))
+                .collect::<Result<_>>()?,
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, i)| Ok((k, unescape_composite(i, path)?)))
+                .collect::<Result<_>>()?,
+        ),
+        other => other,
+    })
 }
 
-/// `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+/// Lowering a TOML predicate under eager bindings yields literals only — there
+/// are no variables to leave symbolic and no principal yet. Should something
+/// else arrive, refusing beats inventing a value: an empty `_nin` list renders
+/// as `TRUE`, which would make the rule an unrestricted table.
+fn non_literal(path: &str, v: &Val) -> Error {
+    Error::Scope(format!(
+        "{path}: internal: non-literal value {v:?} in a TOML policy"
+    ))
 }
 
 #[cfg(test)]
@@ -379,6 +402,53 @@ mod tests {
                 "{bad}: {msg}"
             );
         }
+
+        // Inside an object or array literal (a json/jsonb column) too: an
+        // operand is one literal or one parameter, so a reference in there has
+        // nothing to resolve it and must not ship as text. `$$` still escapes.
+        let jsonb = Schema::builder()
+            .table(
+                Table::new("docs", "public", "docs")
+                    .column("id", "id", PgType::Int4, false)
+                    .column("meta", "meta", PgType::Jsonb, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        for bad in [
+            r#"{ owner = "$principal" }"#,
+            r#"["$principal"]"#,
+            r#"{ a = { b = ["x", "$p"] } }"#,
+        ] {
+            let toml = format!("[tables.docs]\nwhere = {{ meta = {{ _eq = {bad} }} }}");
+            let err = parse(&toml, &jsonb).unwrap_err();
+            assert!(
+                matches!(&err, Error::Scope(m) if m.starts_with("scope.docs.where.meta:")),
+                "{bad}: {err:?}"
+            );
+        }
+        let err = parse(
+            r#"
+                [tables.docs]
+                where = { meta = { _in = [{ owner = "$principal" }] } }
+            "#,
+            &jsonb,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Scope(_)), "{err:?}");
+        let policy = parse(
+            r#"
+                [tables.docs]
+                where = { meta = { _eq = { price = "$$5", tags = ["$$x"] } } }
+            "#,
+            &jsonb,
+        )
+        .unwrap();
+        let set = policy.bind(&Principal::new()).unwrap();
+        let crate::TableScope::Allow(BoolExpr::Compare { value, .. }) = set.get("docs").unwrap()
+        else {
+            panic!("expected compare");
+        };
+        assert_eq!(*value, serde_json::json!({"price": "$5", "tags": ["$x"]}));
 
         // Inside `_in` lists and relation chains too — every value position
         // goes through the same check.
