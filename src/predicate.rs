@@ -297,6 +297,31 @@ impl Operand {
 }
 
 impl ScopeExpr {
+    /// Append every parameter name this template references to `out`.
+    pub(crate) fn collect_params(&self, out: &mut std::collections::BTreeSet<String>) {
+        match self {
+            ScopeExpr::And(parts) | ScopeExpr::Or(parts) => {
+                for p in parts {
+                    p.collect_params(out);
+                }
+            }
+            ScopeExpr::Not(inner) | ScopeExpr::Relation { inner, .. } => inner.collect_params(out),
+            ScopeExpr::Compare { value, .. } => {
+                if let Operand::Param(name) = value {
+                    out.insert(name.clone());
+                }
+            }
+            ScopeExpr::IsNull { .. } => {}
+            ScopeExpr::InList { values, .. } => {
+                for v in values {
+                    if let Operand::Param(name) = v {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Resolve this template against `p`, producing a concrete `BoolExpr`.
     /// Errors only when a referenced parameter is missing from `p`.
     pub fn resolve(&self, p: &Principal) -> Result<BoolExpr> {
