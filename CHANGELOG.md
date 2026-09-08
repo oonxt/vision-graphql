@@ -5,6 +5,18 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ## Unreleased
 
+### Breaking
+
+- `Bind::Null` carries the type it stands in for: `Bind::Null(NullOf)`. See
+  the fix below. `BindSpec::Array` gains a `reject_null` field.
+- `parser::Bindings` is a struct built with `Bindings::eager(&vars)`,
+  `Bindings::symbolic()` or `Bindings::pinned(&values)` instead of an enum
+  matched on; `parser::lower_where` takes a `Names` resolver in place of a
+  table and schema.
+- The SDL export and `__schema.directives` list the two directives below, and
+  the SDL always defines `scalar jsonb`. An SDL file checked in CI gains those
+  lines on the next `vision-gql sdl`.
+
 ### Added
 
 - **A compiled statement can hold a bounded set of shapes: `@choices`.**
