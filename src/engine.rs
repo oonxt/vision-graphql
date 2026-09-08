@@ -29,7 +29,7 @@ pub struct MutationResult<T> {
 
 /// When an operation has exactly one root field, return its response alias so
 /// typed APIs can unwrap the Hasura data envelope (`{"users": [...]}` → `[...]`).
-fn single_root_alias(op: &Operation) -> Option<&str> {
+pub(crate) fn single_root_alias(op: &Operation) -> Option<&str> {
     match op {
         Operation::Query(roots) if roots.len() == 1 => Some(&roots[0].alias),
         Operation::Mutation(fields) if fields.len() == 1 => Some(fields[0].alias()),
@@ -55,7 +55,7 @@ fn unwrap_and_deserialize<T: DeserializeOwned>(mut data: Value, alias: Option<&s
 /// via [`prepare`]. A pass added here reaches compiled and persisted
 /// statements and one-shot requests alike — `compile_inner` used to re-spell
 /// this inline, which is exactly how it would have missed the next pass.
-fn prepare_symbolic(
+pub(crate) fn prepare_symbolic(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
@@ -298,24 +298,7 @@ impl Engine {
         policy: Option<&ScopePolicy>,
     ) -> Result<CompiledQuery> {
         let doc = self.parse_cache.get(source)?;
-        let mut op = crate::parser::lower_with(
-            &doc,
-            crate::parser::Bindings::Symbolic,
-            operation_name,
-            &self.schema,
-        )?;
-        if let Some(policy) = policy {
-            apply_scope(&mut op, &policy.symbolic(), &self.schema)?;
-        }
-        let root_alias = single_root_alias(&op).map(String::from);
-        let (sql, specs) = prepare_symbolic(&mut op, &self.schema, &self.limits)?;
-        Ok(CompiledQuery {
-            sql,
-            specs,
-            root_alias,
-            defaults: crate::parser::variable_defaults(&doc, operation_name)?,
-            scoped: policy.is_some(),
-        })
+        crate::compiled::compile(&doc, operation_name, policy, &self.schema, &self.limits)
     }
 
     /// Run a statement compiled by [`Engine::compile`] with this request's
@@ -336,10 +319,11 @@ impl Engine {
             ));
         }
         let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let shape = compiled.shape_for(&vars)?;
         let inputs = Inputs::variables(&vars).with_defaults(&compiled.defaults);
-        let binds = crate::types::resolve_binds(&compiled.specs, &inputs)?;
-        tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled");
-        crate::executor::execute(&self.pool, &compiled.sql, &binds).await
+        let binds = crate::types::resolve_binds(&shape.specs, &inputs)?;
+        tracing::debug!(target: "vision_graphql::engine", sql = %shape.sql, binds = binds.len(), "executing compiled");
+        crate::executor::execute(&self.pool, &shape.sql, &binds).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -362,12 +346,13 @@ impl Engine {
             ));
         }
         let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let shape = compiled.shape_for(&vars)?;
         let inputs = Inputs::variables(&vars)
             .with_defaults(&compiled.defaults)
             .with_principal(principal);
-        let binds = crate::types::resolve_binds(&compiled.specs, &inputs)?;
-        tracing::debug!(target: "vision_graphql::engine", sql = %compiled.sql, binds = binds.len(), "executing compiled scoped");
-        crate::executor::execute(&self.pool, &compiled.sql, &binds).await
+        let binds = crate::types::resolve_binds(&shape.specs, &inputs)?;
+        tracing::debug!(target: "vision_graphql::engine", sql = %shape.sql, binds = binds.len(), "executing compiled scoped");
+        crate::executor::execute(&self.pool, &shape.sql, &binds).await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and

@@ -115,7 +115,16 @@ pub enum BindSpec {
         reject_null: bool,
     },
     /// An `_in` / `_nin` list, resolving to a JSON array.
-    Array { val: Val, pg: PgType, path: String },
+    Array {
+        val: Val,
+        pg: PgType,
+        path: String,
+        /// Whether a null here is refused. Set for a plain `_in`, where a null
+        /// is not a list and `= ANY(NULL)` would match nothing; not set for an
+        /// `@optional` operand, where a null is the request leaving the filter
+        /// out and binds as SQL NULL.
+        reject_null: bool,
+    },
     /// A `limit` / `offset` supplied as a variable.
     Count {
         val: crate::ast::Count,
@@ -166,6 +175,25 @@ impl BindSpec {
 
     /// Same as [`BindSpec::scalar`] for an `_in` / `_nin` list.
     pub(crate) fn array(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        Self::array_inner(val, pg, path, true)
+    }
+
+    /// An `_in` / `_nin` list that may be null. See
+    /// [`BindSpec::Array::reject_null`].
+    pub(crate) fn optional_array(
+        val: Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<Self> {
+        Self::array_inner(val, pg, path, false)
+    }
+
+    fn array_inner(
+        val: Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+        reject_null: bool,
+    ) -> Result<Self> {
         if val.is_lit() {
             let path = path();
             let no_inputs = Inputs::none();
@@ -173,12 +201,16 @@ impl BindSpec {
                 path: path.clone(),
                 message: format!("{e}"),
             })?;
+            if !reject_null && resolved.is_null() {
+                return Ok(BindSpec::Fixed(Bind::Null));
+            }
             return bind_array(&resolved, pg, &path).map(BindSpec::Fixed);
         }
         Ok(BindSpec::Array {
             val,
             pg: pg.clone(),
             path: path(),
+            reject_null,
         })
     }
 
@@ -204,8 +236,16 @@ impl BindSpec {
                     message: format!("{e}"),
                 })
             }
-            BindSpec::Array { val, pg, path } => {
+            BindSpec::Array {
+                val,
+                pg,
+                path,
+                reject_null,
+            } => {
                 let v = val.resolve(inputs)?;
+                if !*reject_null && v.is_null() {
+                    return Ok(Bind::Null);
+                }
                 bind_array(&v, pg, path)
             }
             BindSpec::Count { val, path } => {

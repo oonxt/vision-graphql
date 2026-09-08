@@ -746,7 +746,9 @@ impl ExecutionLimits {
                     self.bool_expr(p, reads, depth)?;
                 }
             }
-            BoolExpr::Not(inner) => self.bool_expr(inner, reads, depth)?,
+            BoolExpr::Not(inner) | BoolExpr::Optional(inner) => {
+                self.bool_expr(inner, reads, depth)?
+            }
             BoolExpr::Relation { inner, .. } => {
                 self.count_read(reads)?;
                 self.check_depth(depth + 1)?;
@@ -994,7 +996,7 @@ mod exec_tests {
         let doc =
             crate::parser::parse_document("query($n: Int) { users(limit: $n) { id } }").unwrap();
         let mut op =
-            crate::parser::lower_with(&doc, crate::parser::Bindings::Symbolic, None, &schema())
+            crate::parser::lower_with(&doc, crate::parser::Bindings::symbolic(), None, &schema())
                 .unwrap();
         ExecutionLimits::new()
             .max_limit(100)
@@ -1104,7 +1106,7 @@ mod exec_tests {
         )
         .unwrap();
         let mut op =
-            crate::parser::lower_with(&doc, crate::parser::Bindings::Symbolic, None, &schema())
+            crate::parser::lower_with(&doc, crate::parser::Bindings::symbolic(), None, &schema())
                 .unwrap();
         ExecutionLimits::new()
             .max_limit(10)

@@ -98,6 +98,19 @@ impl RenderCtx {
         Ok(self.binds.len())
     }
 
+    /// Append an `_in` / `_nin` list parameter that may be null. See
+    /// [`BindSpec::optional_array`].
+    fn push_optional_array(
+        &mut self,
+        val: &Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds
+            .push(BindSpec::optional_array(val.clone(), pg, path)?);
+        Ok(self.binds.len())
+    }
+
     /// Append a parameter the renderer determined on its own.
     fn push_fixed(&mut self, bind: Bind) -> usize {
         self.binds.push(BindSpec::Fixed(bind));
@@ -394,7 +407,7 @@ fn render_bool_expr(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    use crate::ast::{BoolExpr, CmpOp};
+    use crate::ast::BoolExpr;
     match expr {
         BoolExpr::And(parts) => render_bool_list(parts, "AND", table, table_alias, schema, ctx),
         BoolExpr::Or(parts) => render_bool_list(parts, "OR", table, table_alias, schema, ctx),
@@ -412,18 +425,7 @@ fn render_bool_expr(
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
-            let op_str = match op {
-                CmpOp::Eq => "=",
-                CmpOp::Neq => "<>",
-                CmpOp::Gt => ">",
-                CmpOp::Gte => ">=",
-                CmpOp::Lt => "<",
-                CmpOp::Lte => "<=",
-                CmpOp::Like => "LIKE",
-                CmpOp::ILike => "ILIKE",
-                CmpOp::NLike => "NOT LIKE",
-                CmpOp::NILike => "NOT ILIKE",
-            };
+            let op_str = cmp_sql(*op);
             write!(
                 ctx.sql,
                 "{table_alias}.{} {op_str} {placeholder}",
@@ -431,6 +433,9 @@ fn render_bool_expr(
             )
             .unwrap();
             Ok(())
+        }
+        BoolExpr::Optional(inner) => {
+            render_optional(inner, table, Some(table_alias), schema, ctx)
         }
         BoolExpr::IsNull { column, negated } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
@@ -1052,6 +1057,130 @@ fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
             let n = ctx.push_count(count, || path.to_string());
             write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
         }
+    }
+}
+
+/// The SQL spelling of a comparison operator.
+fn cmp_sql(op: crate::ast::CmpOp) -> &'static str {
+    use crate::ast::CmpOp;
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Neq => "<>",
+        CmpOp::Gt => ">",
+        CmpOp::Gte => ">=",
+        CmpOp::Lt => "<",
+        CmpOp::Lte => "<=",
+        CmpOp::Like => "LIKE",
+        CmpOp::ILike => "ILIKE",
+        CmpOp::NLike => "NOT LIKE",
+        CmpOp::NILike => "NOT ILIKE",
+    }
+}
+
+/// [`BoolExpr::Optional`]: the comparison when its operand has a value, `TRUE`
+/// when it is null.
+///
+/// A literal operand is decided here — a null renders `TRUE`, anything else
+/// renders exactly as it would unwrapped, so the eager path's SQL is untouched
+/// by the wrapper. A variable is decided per request without changing the
+/// statement: `($n IS NULL OR column = $n)`, one placeholder used twice. The
+/// null case is decided by the parameter, not by the planner seeing a
+/// constant, so this form is what the compiled path needs and the only one
+/// that keeps one statement for both requests.
+///
+/// `alias` is `None` for the unaliased contexts (`render_bool_expr_no_alias`).
+fn render_optional(
+    inner: &crate::ast::BoolExpr,
+    table: &Table,
+    alias: Option<&str>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::BoolExpr;
+    let render_plain = |ctx: &mut RenderCtx| match alias {
+        Some(a) => render_bool_expr(inner, table, a, schema, ctx),
+        None => render_bool_expr_no_alias(inner, table, schema, ctx),
+    };
+    let qualified = |col: &crate::schema::Column| match alias {
+        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name)),
+        None => quote_ident(&col.physical_name),
+    };
+    match inner {
+        BoolExpr::Compare { column, op, value } => {
+            match value.as_lit() {
+                Some(v) if v.is_null() => {
+                    ctx.sql.push_str("TRUE");
+                    return Ok(());
+                }
+                Some(_) => return render_plain(ctx),
+                None => {}
+            }
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            check_cmp_applies(*op, col)?;
+            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+            let cast = pg_type_cast(&col.pg_type);
+            write!(
+                ctx.sql,
+                "(${n}::{cast} IS NULL OR {} {} ${n}::{cast})",
+                qualified(col),
+                cmp_sql(*op)
+            )
+            .unwrap();
+            Ok(())
+        }
+        BoolExpr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            match values.as_lit() {
+                Some(v) if v.is_null() => {
+                    ctx.sql.push_str("TRUE");
+                    return Ok(());
+                }
+                Some(_) => return render_plain(ctx),
+                None => {}
+            }
+            if values.is_lit() {
+                // A composite with no variables left: same as a literal list.
+                return render_plain(ctx);
+            }
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            let n = ctx.push_optional_array(values, &col.pg_type, || format!("where.{column}"))?;
+            let cast = pg_type_cast(&col.pg_type);
+            let pred = if *negated { "<> ALL" } else { "= ANY" };
+            write!(
+                ctx.sql,
+                "(${n}::{cast}[] IS NULL OR {} {pred} (${n}::{cast}[]))",
+                qualified(col)
+            )
+            .unwrap();
+            Ok(())
+        }
+        // The lowering only ever wraps a comparison; the typed builder could
+        // wrap anything. There is no reading of "optional" for a conjunction
+        // that is not a guess, so it is refused rather than guessed.
+        other => Err(Error::Validate {
+            path: "where".into(),
+            message: format!(
+                "Optional wraps a single comparison (`_eq`, `_in`, …), not {}",
+                match other {
+                    BoolExpr::And(_) => "`_and`",
+                    BoolExpr::Or(_) => "`_or`",
+                    BoolExpr::Not(_) => "`_not`",
+                    BoolExpr::Relation { .. } => "a relation predicate",
+                    BoolExpr::IsNull { .. } => "`_is_null`",
+                    BoolExpr::Optional(_) => "another Optional",
+                    BoolExpr::Compare { .. } | BoolExpr::InList { .. } => unreachable!(),
+                }
+            ),
+        }),
     }
 }
 
@@ -3049,7 +3178,7 @@ fn render_bool_expr_no_alias(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    use crate::ast::{BoolExpr, CmpOp};
+    use crate::ast::BoolExpr;
     match expr {
         BoolExpr::And(parts) => {
             if parts.is_empty() {
@@ -3095,18 +3224,7 @@ fn render_bool_expr_no_alias(
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
             let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
-            let op_str = match op {
-                CmpOp::Eq => "=",
-                CmpOp::Neq => "<>",
-                CmpOp::Gt => ">",
-                CmpOp::Gte => ">=",
-                CmpOp::Lt => "<",
-                CmpOp::Lte => "<=",
-                CmpOp::Like => "LIKE",
-                CmpOp::ILike => "ILIKE",
-                CmpOp::NLike => "NOT LIKE",
-                CmpOp::NILike => "NOT ILIKE",
-            };
+            let op_str = cmp_sql(*op);
             write!(
                 ctx.sql,
                 "{} {op_str} {placeholder}",
@@ -3115,6 +3233,7 @@ fn render_bool_expr_no_alias(
             .unwrap();
             Ok(())
         }
+        BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
         BoolExpr::IsNull { column, negated } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
