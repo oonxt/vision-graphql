@@ -10,7 +10,7 @@
 //! Types come out sorted by name, so that diff is about the schema and not about
 //! `HashMap` iteration order.
 
-use crate::type_system::{Field, InputValue, TypeDef, TypeRef, TypeSystem};
+use crate::type_system::{DirectiveDef, Field, InputValue, TypeDef, TypeRef, TypeSystem};
 use std::fmt::Write;
 
 /// SDL for the whole type system, roots included.
@@ -24,11 +24,37 @@ pub fn render(ts: &TypeSystem) -> String {
     }
     out.push_str("}\n");
 
+    for d in ts.directives() {
+        out.push('\n');
+        render_directive(d, &mut out);
+    }
+
     for def in ts.types() {
         out.push('\n');
         render_type(def, &mut out);
     }
     out
+}
+
+fn render_directive(d: &DirectiveDef, out: &mut String) {
+    render_description(d.description.as_deref(), 0, out);
+    let args = if d.args.is_empty() {
+        String::new()
+    } else {
+        let args: Vec<String> = d
+            .args
+            .iter()
+            .map(|a| format!("{}: {}{}", a.name, render_ref(&a.ty), default_of(a)))
+            .collect();
+        format!("({})", args.join(", "))
+    };
+    writeln!(
+        out,
+        "directive @{}{args} on {}",
+        d.name,
+        d.locations.join(" | ")
+    )
+    .unwrap();
 }
 
 fn render_type(def: &TypeDef, out: &mut String) {

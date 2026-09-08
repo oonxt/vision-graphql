@@ -202,7 +202,7 @@ impl BindSpec {
                 message: format!("{e}"),
             })?;
             if !reject_null && resolved.is_null() {
-                return Ok(BindSpec::Fixed(Bind::Null));
+                return Ok(BindSpec::Fixed(Bind::Null(NullOf::array(pg))));
             }
             return bind_array(&resolved, pg, &path).map(BindSpec::Fixed);
         }
@@ -244,7 +244,7 @@ impl BindSpec {
             } => {
                 let v = val.resolve(inputs)?;
                 if !*reject_null && v.is_null() {
-                    return Ok(Bind::Null);
+                    return Ok(Bind::Null(NullOf::array(pg)));
                 }
                 bind_array(&v, pg, path)
             }
@@ -294,7 +294,15 @@ pub fn resolve_binds(specs: &[BindSpec], inputs: &Inputs<'_>) -> Result<Vec<Bind
 /// rendered SQL casts it (`$1::uuid`) so the server performs the conversion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bind {
-    Null,
+    /// A SQL NULL, declared as the type a value in this position would be.
+    ///
+    /// The type matters even though the value is null. sqlx prepares a
+    /// statement on its first execution with the types of *that* execution's
+    /// parameters and reuses it, by SQL text, for every later one on the
+    /// connection; a null sent as text where the next request sends an
+    /// `int4[]` leaves the server decoding array bytes as text. A compiled
+    /// statement that is first run with a null variable is exactly that case.
+    Null(NullOf),
     Bool(bool),
     Int4(i32),
     Int8(i64),
@@ -307,9 +315,62 @@ pub enum Bind {
     TextArray(Vec<Option<String>>),
 }
 
+/// The type a [`Bind::Null`] stands in for: the [`Bind`] variant a non-null
+/// value in the same position would use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOf {
+    Bool,
+    Int4,
+    Int8,
+    Float8,
+    Text,
+    BoolArray,
+    Int4Array,
+    Int8Array,
+    Float8Array,
+    TextArray,
+}
+
+impl NullOf {
+    /// The bind type of a scalar value of `pg` — the one [`json_to_bind`]
+    /// produces for a non-null value.
+    pub fn scalar(pg: &PgType) -> Self {
+        match pg {
+            PgType::Bool => NullOf::Bool,
+            PgType::Int2 | PgType::Int4 => NullOf::Int4,
+            PgType::Int8 => NullOf::Int8,
+            PgType::Float4 | PgType::Float8 => NullOf::Float8,
+            PgType::Numeric
+            | PgType::Text
+            | PgType::Varchar
+            | PgType::Uuid
+            | PgType::Timestamp
+            | PgType::TimestampTz
+            | PgType::Date
+            | PgType::Time
+            | PgType::Enum { .. }
+            | PgType::Json
+            | PgType::Jsonb => NullOf::Text,
+        }
+    }
+
+    /// The bind type of a list of `pg` — the one [`json_to_bind_array`]
+    /// produces.
+    pub fn array(pg: &PgType) -> Self {
+        match NullOf::scalar(pg) {
+            NullOf::Bool => NullOf::BoolArray,
+            NullOf::Int4 => NullOf::Int4Array,
+            NullOf::Int8 => NullOf::Int8Array,
+            NullOf::Float8 => NullOf::Float8Array,
+            NullOf::Text => NullOf::TextArray,
+            array => array,
+        }
+    }
+}
+
 pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
     if v.is_null() {
-        return Ok(Bind::Null);
+        return Ok(Bind::Null(NullOf::scalar(pg)));
     }
     match pg {
         PgType::Bool => v
@@ -478,7 +539,22 @@ mod tests {
     #[test]
     fn convert_null_value() {
         let bind = json_to_bind(&json!(null), &PgType::Int4).unwrap();
-        assert!(matches!(bind, Bind::Null));
+        assert_eq!(bind, Bind::Null(NullOf::Int4));
+        // Declared as what a value would be, per type — see `Bind::Null`.
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Uuid).unwrap(),
+            Bind::Null(NullOf::Text)
+        );
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Bool).unwrap(),
+            Bind::Null(NullOf::Bool)
+        );
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Int8).unwrap(),
+            Bind::Null(NullOf::Int8)
+        );
+        assert_eq!(NullOf::array(&PgType::Int2), NullOf::Int4Array);
+        assert_eq!(NullOf::array(&PgType::Jsonb), NullOf::TextArray);
     }
 
     /// `int2` has no bind of its own: it goes out as int4 and the cast narrows

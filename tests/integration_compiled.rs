@@ -25,6 +25,8 @@ fn schema() -> Schema {
                 .column("id", "id", PgType::Int4, false)
                 .column("user_id", "user_id", PgType::Int4, false)
                 .column("title", "title", PgType::Text, false)
+                .column("ref", "ref", PgType::Uuid, true)
+                .column("qty", "qty", PgType::Int4, true)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )
@@ -41,11 +43,15 @@ async fn setup() -> (Engine, common::TestDb) {
         CREATE TABLE orders (
             id SERIAL PRIMARY KEY,
             user_id INT NOT NULL REFERENCES users(id),
-            title TEXT NOT NULL
+            title TEXT NOT NULL,
+            ref UUID,
+            qty INT
         );
         INSERT INTO users (name) VALUES ('alice'), ('bob');
-        INSERT INTO orders (user_id, title) VALUES
-            (1, 'a-1'), (1, 'a-2'), (2, 'b-1');
+        INSERT INTO orders (user_id, title, ref) VALUES
+            (1, 'a-1', '00000000-0000-0000-0000-000000000001'),
+            (1, 'a-2', NULL),
+            (2, 'b-1', '00000000-0000-0000-0000-000000000003');
         "#,
     )
     .execute(&pool)
@@ -413,4 +419,193 @@ async fn an_uncompilable_query_says_so_and_still_runs_per_request() {
         .await
         .unwrap();
     assert_eq!(titles(&data, "orders"), ["b-1"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn choices_pick_the_ordering_the_request_asks_for() {
+    let (engine, _db) = setup().await;
+    let source = r#"query($sort: [orders_order_by!]! @choices(values: [[{title: asc}], [{title: desc}], [{id: desc}]])) {
+        orders(order_by: $sort) { title }
+    }"#;
+    let q = engine.compile(source).expect("compile");
+    assert_eq!(q.shape_count(), 3);
+
+    for (sort, expect) in [
+        (json!([{"title": "asc"}]), ["a-1", "a-2", "b-1"]),
+        (json!([{"title": "desc"}]), ["b-1", "a-2", "a-1"]),
+        (json!([{"id": "desc"}]), ["b-1", "a-2", "a-1"]),
+    ] {
+        let vars = json!({"sort": sort});
+        let compiled = engine.execute(&q, Some(vars.clone())).await.unwrap();
+        assert_eq!(titles(&compiled, "orders"), expect, "{vars}");
+        // The same document answers the same under the per-request path.
+        let eager = engine.query(source, Some(vars)).await.unwrap();
+        assert_eq!(compiled, eager);
+    }
+
+    // A value the document never offered: refused on both paths, not sorted
+    // some other way.
+    let vars = json!({"sort": [{"id": "asc"}]});
+    let err = engine.execute(&q, Some(vars.clone())).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Variable { name, message } if name == "sort" && message.contains("@choices")),
+        "{err:?}"
+    );
+    let err = engine.query(source, Some(vars)).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Variable { name, .. } if name == "sort"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn choices_and_a_policy_compose_per_shape() {
+    let (engine, _db) = setup().await;
+    let policy = ScopePolicy::builder()
+        .allow("orders", col("user_id").eq(principal()))
+        .validate(&schema())
+        .expect("policy");
+    let q = engine
+        .compile_scoped(
+            r#"query($sort: [orders_order_by!]! @choices(values: [[{id: asc}], [{id: desc}]]),
+                     $null: Boolean! @choices(values: [true, false])) {
+                 orders(order_by: $sort, where: {ref: {_is_null: $null}}) { title }
+               }"#,
+            &policy,
+        )
+        .expect("compile");
+    assert_eq!(q.shape_count(), 4);
+    for (_, sql) in q.shapes() {
+        assert!(
+            sql.contains("user_id"),
+            "scope predicate missing from a shape: {sql}"
+        );
+    }
+
+    let alice = Principal::new().set("principal", 1);
+    let bob = Principal::new().set("principal", 2);
+    let data = engine
+        .execute_scoped(
+            &q,
+            Some(json!({"sort": [{"id": "desc"}], "null": false})),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles(&data, "orders"), ["a-1"]);
+    let data = engine
+        .execute_scoped(
+            &q,
+            Some(json!({"sort": [{"id": "desc"}], "null": true})),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles(&data, "orders"), ["a-2"]);
+    let data = engine
+        .execute_scoped(
+            &q,
+            Some(json!({"sort": [{"id": "asc"}], "null": false})),
+            &bob,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles(&data, "orders"), ["b-1"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn optional_filters_apply_when_supplied_and_drop_when_null() {
+    let (engine, _db) = setup().await;
+    let source = r#"query($t: String @optional, $ids: [Int!] @optional, $ref: uuid @optional) {
+        orders(where: {title: {_ilike: $t}, id: {_in: $ids}, ref: {_eq: $ref}}, order_by: {id: asc}) { title }
+    }"#;
+    let q = engine.compile(source).expect("compile");
+    assert_eq!(q.shape_count(), 1);
+
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (
+            json!({"t": null, "ids": null, "ref": null}),
+            vec!["a-1", "a-2", "b-1"],
+        ),
+        (
+            json!({"t": "a-%", "ids": null, "ref": null}),
+            vec!["a-1", "a-2"],
+        ),
+        (json!({"t": null, "ids": [3], "ref": null}), vec!["b-1"]),
+        (json!({"t": null, "ids": [], "ref": null}), vec![]),
+        (
+            json!({"t": null, "ids": null, "ref": "00000000-0000-0000-0000-000000000003"}),
+            vec!["b-1"],
+        ),
+        (
+            json!({"t": "%1", "ids": [1, 3], "ref": "00000000-0000-0000-0000-000000000001"}),
+            vec!["a-1"],
+        ),
+    ];
+    for (vars, expect) in cases {
+        let compiled = engine.execute(&q, Some(vars.clone())).await.unwrap();
+        assert_eq!(titles(&compiled, "orders"), expect, "{vars}");
+        let eager = engine.query(source, Some(vars)).await.unwrap();
+        assert_eq!(compiled, eager);
+    }
+
+    // Leaving a variable out is not the same as passing null.
+    let err = engine
+        .execute(&q, Some(json!({"t": null, "ids": null})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Variable { name, .. } if name == "ref"),
+        "{err:?}"
+    );
+}
+
+/// A statement is prepared on the connection with the types of the request
+/// that first ran it and reused, by SQL text, for every later one. A null
+/// used to go out as text whatever the column, so a compiled statement first
+/// run with a null and then with a number failed on the second request — on
+/// that connection only, which read as a flaky test rather than a bug.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_first_run_does_not_fix_the_parameter_type_for_later_ones() {
+    let (_engine, db) = setup().await;
+    // One connection, so the second execution provably reuses the first's
+    // prepared statement.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db.url)
+        .await
+        .expect("connect");
+    let engine = Engine::new(pool, schema());
+
+    let q = engine
+        .compile(
+            "mutation($qty: Int, $ids: [Int!] @optional) {
+                 update_orders(where: {id: {_in: $ids}}, _set: {qty: $qty}) { affected_rows }
+             }",
+        )
+        .expect("compile");
+    let data = engine
+        .execute(&q, Some(json!({"qty": null, "ids": null})))
+        .await
+        .unwrap();
+    assert_eq!(data["update_orders"]["affected_rows"], 3);
+    let data = engine
+        .execute(&q, Some(json!({"qty": 5, "ids": [1, 2]})))
+        .await
+        .unwrap();
+    assert_eq!(data["update_orders"]["affected_rows"], 2);
+
+    let q = engine
+        .compile("query($ids: [Int!] @optional) { orders(where: {id: {_in: $ids}}, order_by: {id: asc}) { qty } }")
+        .expect("compile");
+    let data = engine
+        .execute(&q, Some(json!({"ids": null})))
+        .await
+        .unwrap();
+    assert_eq!(
+        data["orders"],
+        json!([{"qty": 5}, {"qty": 5}, {"qty": null}])
+    );
+    let data = engine.execute(&q, Some(json!({"ids": [3]}))).await.unwrap();
+    assert_eq!(data["orders"], json!([{"qty": null}]));
 }

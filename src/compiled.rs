@@ -48,6 +48,59 @@
 //! values, `delete`'s `where` — compiles. Run the rest through
 //! [`Engine::query`](crate::Engine::query), which is unaffected.
 //!
+//! # Bounded shapes: `@choices`
+//!
+//! A shape-deciding variable *can* be compiled when the document says which
+//! values it may take:
+//!
+//! ```graphql
+//! query List($sort: [courses_order_by!]! @choices(values: [[{created_at: desc}], [{title: asc}], [{title: desc}]])) {
+//!   courses(order_by: $sort) { id title }
+//! }
+//! ```
+//!
+//! The statement is compiled once per value — one *shape* each, lowered,
+//! scoped, bounded and rendered exactly as a single statement is — and
+//! [`Engine::execute`](crate::Engine::execute) picks the shape whose values
+//! the request supplied (compared as JSON). A value outside the list is
+//! refused, on this path and under `Engine::query` alike, so the document asks
+//! the same question however it is run. Several `@choices` variables multiply
+//! out; the product is capped at [`MAX_SHAPES`](crate::parser::MAX_SHAPES).
+//! `_is_null: $b @choices(values: [true, false])` is the same idea for a
+//! boolean. This is what makes a sortable list with a handful of orderings
+//! one persisted statement rather than one per ordering.
+//!
+//! On this engine's parser the directive goes *before* a default value
+//! (`$sort: T @choices(values: […]) = […]`), the reverse of the spec's order;
+//! a document that must also pass a spec-conformant parser leaves the default
+//! out and has the request supply the value.
+//!
+//! # Filters the request may leave out: `@optional`
+//!
+//! Comparing against null is refused (`_eq: null` matches nothing and reads
+//! as an empty result), and that refusal follows a variable to execution
+//! time. A filter the request may drop has to say so:
+//!
+//! ```graphql
+//! query List($creator: uuid @optional, $status: [String!] @optional) {
+//!   courses(where: {creator_id: {_eq: $creator}, status: {_in: $status}}) { id }
+//! }
+//! ```
+//!
+//! A null for an `@optional` variable drops the comparison it is the operand
+//! of. Compiled, that is one statement — `($1::uuid IS NULL OR creator_id =
+//! $1::uuid)` — serving both the request that filters and the one that does
+//! not; run eagerly, a null leaves the comparison out and a value renders it
+//! exactly as it would without the directive. The variable must be nullable
+//! and may only stand as the whole value of a comparison operator; anywhere
+//! else (`limit`, `_set`, an element of a list, `_is_null`) it is refused
+//! rather than silently un-optional. Leaving the variable out of the request
+//! is still an error: null is the request saying "no filter", absence is the
+//! request forgetting.
+//!
+//! Both directives are published by `__schema` and the SDL, and are the only
+//! directives this engine accepts.
+//!
 //! A [`CompiledQuery`] runs on the pool, not inside
 //! [`Engine::transaction`](crate::Engine::transaction); mutations that need a
 //! transaction still go through [`TxClient`](crate::TxClient).
@@ -210,8 +263,7 @@ impl CompiledQuery {
             .find(|s| wanted.iter().all(|(n, v)| s.pinned.get(*n) == Some(v)))
             .ok_or_else(|| Error::Validate {
                 path: "@choices".into(),
-                message: "internal: no compiled shape for a declared combination of values"
-                    .into(),
+                message: "internal: no compiled shape for a declared combination of values".into(),
             })
     }
 }
@@ -389,7 +441,10 @@ mod tests {
             "{err:?}"
         );
         let err = q.shape_for(&json!({})).unwrap_err();
-        assert!(matches!(&err, Error::Variable { name, .. } if name == "sort"), "{err:?}");
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "sort"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -440,8 +495,18 @@ mod tests {
         let shape = q
             .shape_for(&json!({"sort": [{"id": "desc"}], "null": false}))
             .unwrap();
-        assert!(shape.sql.contains("IS NOT NULL") && shape.sql.contains(r#""id" DESC"#), "{}", shape.sql);
-        assert_eq!(shape.pinned, json!({"sort": [{"id": "desc"}], "null": false}).as_object().cloned().unwrap());
+        assert!(
+            shape.sql.contains("IS NOT NULL") && shape.sql.contains(r#""id" DESC"#),
+            "{}",
+            shape.sql
+        );
+        assert_eq!(
+            shape.pinned,
+            json!({"sort": [{"id": "desc"}], "null": false})
+                .as_object()
+                .cloned()
+                .unwrap()
+        );
 
         // The bound. 257 values for one variable is one over.
         let values: Vec<String> = (0..=256).map(|n| n.to_string()).collect();
@@ -470,7 +535,10 @@ mod tests {
         for (pinned, _) in q.shapes() {
             let shape = q.shape_for(&Value::Object(pinned.clone())).unwrap();
             let binds = resolve_binds(&shape.specs, &Inputs::variables(&json!({}))).unwrap();
-            assert_eq!(binds, vec![Bind::Text(pinned["t"].as_str().unwrap().into())]);
+            assert_eq!(
+                binds,
+                vec![Bind::Text(pinned["t"].as_str().unwrap().into())]
+            );
         }
         // Still listed as a variable the request must supply.
         assert_eq!(q.variables(), vec!["t".to_string()]);
@@ -490,7 +558,10 @@ mod tests {
                 || sql.contains(r#"($1::text IS NULL OR "#),
             "{sql}"
         );
-        assert!(sql.contains("IS NULL OR") && sql.contains("= ANY ($2::int4[])"), "{sql}");
+        assert!(
+            sql.contains("IS NULL OR") && sql.contains("= ANY ($2::int4[])"),
+            "{sql}"
+        );
         // One placeholder each, used twice.
         assert_eq!(q.bind_count(), 2);
         assert_eq!(sql.matches("$1::").count(), 2, "{sql}");
@@ -500,18 +571,35 @@ mod tests {
         let shape = q.shape_for(&json!({})).unwrap();
         // Leaving both out: nulls, which the SQL turns into TRUE.
         assert_eq!(
-            resolve_binds(&shape.specs, &Inputs::variables(&json!({"t": null, "ids": null}))).unwrap(),
-            vec![Bind::Null, Bind::Null]
+            resolve_binds(
+                &shape.specs,
+                &Inputs::variables(&json!({"t": null, "ids": null}))
+            )
+            .unwrap(),
+            vec![
+                Bind::Null(crate::types::NullOf::Text),
+                Bind::Null(crate::types::NullOf::Int4Array)
+            ]
         );
         // Supplying them: the ordinary binds.
         assert_eq!(
-            resolve_binds(&shape.specs, &Inputs::variables(&json!({"t": "%a%", "ids": [1, 2]}))).unwrap(),
-            vec![Bind::Text("%a%".into()), Bind::Int4Array(vec![Some(1), Some(2)])]
+            resolve_binds(
+                &shape.specs,
+                &Inputs::variables(&json!({"t": "%a%", "ids": [1, 2]}))
+            )
+            .unwrap(),
+            vec![
+                Bind::Text("%a%".into()),
+                Bind::Int4Array(vec![Some(1), Some(2)])
+            ]
         );
         // Not supplied at all is still not bound: an optional filter is one the
         // request says nothing about *by passing null*, not one it may forget.
         let err = resolve_binds(&shape.specs, &Inputs::variables(&json!({"t": "x"}))).unwrap_err();
-        assert!(matches!(&err, Error::Variable { name, .. } if name == "ids"), "{err:?}");
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "ids"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -525,17 +613,33 @@ mod tests {
             parse_document("query($t: String) { orders(where: {title: {_eq: $t}}) { id } }")
                 .unwrap();
         let vars = json!({"t": "x"});
-        let a = render(&lower_with(&with, Bindings::eager(&vars), None, &schema).unwrap(), &schema).unwrap();
-        let b = render(&lower_with(&without, Bindings::eager(&vars), None, &schema).unwrap(), &schema).unwrap();
+        let a = render(
+            &lower_with(&with, Bindings::eager(&vars), None, &schema).unwrap(),
+            &schema,
+        )
+        .unwrap();
+        let b = render(
+            &lower_with(&without, Bindings::eager(&vars), None, &schema).unwrap(),
+            &schema,
+        )
+        .unwrap();
         assert_eq!(a.0, b.0);
 
         // A null: the comparison is gone, and no parameter is left behind.
         let vars = json!({"t": null});
-        let (sql, specs) = render(&lower_with(&with, Bindings::eager(&vars), None, &schema).unwrap(), &schema).unwrap();
+        let (sql, specs) = render(
+            &lower_with(&with, Bindings::eager(&vars), None, &schema).unwrap(),
+            &schema,
+        )
+        .unwrap();
         assert!(sql.contains("TRUE") && !sql.contains("$1"), "{sql}");
         assert!(specs.is_empty());
         // Without the declaration the same request is still refused.
-        let err = render(&lower_with(&without, Bindings::eager(&vars), None, &schema).unwrap(), &schema).unwrap_err();
+        let err = render(
+            &lower_with(&without, Bindings::eager(&vars), None, &schema).unwrap(),
+            &schema,
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("null"), "{err}");
     }
 

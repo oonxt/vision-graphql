@@ -418,9 +418,7 @@ fn render_bool_expr(
             .unwrap();
             Ok(())
         }
-        BoolExpr::Optional(inner) => {
-            render_optional(inner, table, Some(table_alias), schema, ctx)
-        }
+        BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
         BoolExpr::IsNull { column, negated } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),

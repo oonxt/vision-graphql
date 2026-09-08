@@ -20,14 +20,17 @@
 //!
 //! # Directives
 //!
-//! The directive list is empty, and it is honest: this engine implements no
-//! directives, and the lowering rejects a document that carries one rather than
-//! ignoring it. Publishing `@include`/`@skip` here would tell a client it may
-//! send something that would then silently not happen.
+//! The directive list holds exactly what the lowering implements — `@choices`
+//! and `@optional` on variable definitions, see [`crate::compiled`] — and the
+//! lowering rejects a document carrying any other rather than ignoring it.
+//! Publishing `@include`/`@skip` here would tell a client it may send something
+//! that would then silently not happen.
 
 use crate::error::{Error, Result};
 use crate::parser::Fragments;
-use crate::type_system::{Field as TsField, InputValue, TypeDef, TypeRef, TypeSystem};
+use crate::type_system::{
+    DirectiveDef, Field as TsField, InputValue, TypeDef, TypeRef, TypeSystem,
+};
 use async_graphql_parser::types::{Selection, SelectionSet};
 use serde_json::{Map, Value};
 
@@ -63,9 +66,14 @@ pub fn resolve_schema(
                 Some(m) => named_type(m, &field.selection_set.node, ts, fragments)?,
                 None => Value::Null,
             },
-            // No subscriptions, and no directives — see the module docs.
+            // No subscriptions — see the module docs.
             "subscriptionType" => Value::Null,
-            "directives" => Value::Array(Vec::new()),
+            "directives" => Value::Array(
+                ts.directives()
+                    .iter()
+                    .map(|d| resolve_directive(d, &field.selection_set.node, ts, fragments))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
             other => {
                 return Err(Error::Validate {
                     path: format!("__schema.{other}"),
@@ -258,6 +266,47 @@ fn resolve_input_value(
                 return Err(Error::Validate {
                     path: format!("__InputValue.{other}"),
                     message: format!("unknown field '{other}' on __InputValue"),
+                })
+            }
+        };
+        insert_field(&mut out, alias, value)?;
+    }
+    Ok(Value::Object(out))
+}
+
+fn resolve_directive(
+    d: &DirectiveDef,
+    set: &SelectionSet,
+    ts: &TypeSystem,
+    fragments: &Fragments<'_>,
+) -> Result<Value> {
+    let mut out = Map::new();
+    for (alias, field) in flatten(set, fragments)? {
+        let name = field.name.node.as_str();
+        let value = match name {
+            "__typename" => Value::String("__Directive".into()),
+            "name" => Value::String(d.name.clone()),
+            "description" => match &d.description {
+                Some(desc) => Value::String(desc.clone()),
+                None => Value::Null,
+            },
+            "locations" => Value::Array(
+                d.locations
+                    .iter()
+                    .map(|l| Value::String((*l).into()))
+                    .collect(),
+            ),
+            "args" => Value::Array(
+                d.args
+                    .iter()
+                    .map(|a| resolve_input_value(a, &field.selection_set.node, ts, fragments))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            "isRepeatable" => Value::Bool(false),
+            other => {
+                return Err(Error::Validate {
+                    path: format!("__Directive.{other}"),
+                    message: format!("unknown field '{other}' on __Directive"),
                 })
             }
         };
@@ -551,8 +600,41 @@ mod tests {
     }
 
     #[test]
-    fn directives_are_empty_because_none_are_implemented() {
-        let v = run("{ __schema { directives { name } } }");
-        assert_eq!(v["directives"], Value::Array(Vec::new()));
+    fn directives_list_what_the_lowering_implements() {
+        let v = run(
+            "{ __schema { directives { name locations isRepeatable args { name type { kind ofType { kind ofType { kind ofType { name } } } } } } } }",
+        );
+        let names: Vec<&str> = v["directives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["choices", "optional"]);
+        let choices = &v["directives"][0];
+        assert_eq!(
+            choices["locations"],
+            serde_json::json!(["VARIABLE_DEFINITION"])
+        );
+        assert_eq!(choices["isRepeatable"], Value::Bool(false));
+        assert_eq!(choices["args"][0]["name"], "values");
+        // `[jsonb!]!`
+        let ty = &choices["args"][0]["type"];
+        assert_eq!(ty["kind"], "NON_NULL");
+        assert_eq!(ty["ofType"]["kind"], "LIST");
+        assert_eq!(ty["ofType"]["ofType"]["kind"], "NON_NULL");
+        assert_eq!(ty["ofType"]["ofType"]["ofType"]["name"], "jsonb");
+        assert_eq!(v["directives"][1]["args"], serde_json::json!([]));
+        // An unknown meta field is an error here as everywhere else.
+        let ts = TypeSystem::build(&schema());
+        let doc = parse_document("{ __schema { directives { nope } } }").unwrap();
+        let DocumentOperations::Single(op) = &doc.operations else {
+            panic!("expected one operation");
+        };
+        let Selection::Field(root) = &op.node.selection_set.node.items[0].node else {
+            panic!("expected a field");
+        };
+        let err = resolve_schema(&root.node.selection_set.node, &ts, &HashMap::new()).unwrap_err();
+        assert!(format!("{err}").contains("__Directive"), "{err}");
     }
 }

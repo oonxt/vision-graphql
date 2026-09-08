@@ -106,9 +106,7 @@ pub fn lower_with(
                 if !values.contains(v) {
                     return Err(Error::Variable {
                         name: name.clone(),
-                        message: format!(
-                            "{v} is not one of the values declared by @choices"
-                        ),
+                        message: format!("{v} is not one of the values declared by @choices"),
                     });
                 }
             }
@@ -645,9 +643,7 @@ fn contract_of(
                     }
                     for (i, item) in items.iter().enumerate() {
                         if items[..i].contains(item) {
-                            return Err(refuse(format!(
-                                "@choices lists {item} twice"
-                            )));
+                            return Err(refuse(format!("@choices lists {item} twice")));
                         }
                     }
                     if let Some(default) = &def.node.default_value {

@@ -104,8 +104,18 @@ async fn graphiql_introspection_query_is_answered() {
         .collect();
     assert!(values.contains(&"users_name_key"), "{values:?}");
 
-    // No directives are implemented, so none are advertised.
-    assert_eq!(s["directives"], serde_json::json!([]));
+    // Exactly the directives the lowering implements are advertised.
+    let directives: Vec<&str> = s["directives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(directives, ["choices", "optional"]);
+    assert_eq!(
+        s["directives"][0]["locations"],
+        serde_json::json!(["VARIABLE_DEFINITION"])
+    );
 
     // Every type a field or argument refers to is itself in the list, or a
     // client walking the schema hits a hole.
@@ -157,8 +167,8 @@ async fn introspection_is_off_unless_enabled_and_mixes_with_data() {
     assert_eq!(v["__type"]["name"], "users");
     assert_eq!(v["users"][0]["name"], "alice");
 
-    // Directives are rejected rather than silently ignored, which is what makes
-    // the empty directive list above honest.
+    // Any other directive is rejected rather than silently ignored, which is
+    // what makes the directive list above honest.
     let err = e2
         .query("{ users { id @include(if: true) } }", None)
         .await

@@ -1,7 +1,7 @@
 //! Execute generated SQL against PostgreSQL.
 
 use crate::error::Result;
-use crate::types::Bind;
+use crate::types::{Bind, NullOf};
 use serde_json::Value;
 use sqlx::postgres::Postgres;
 
@@ -20,7 +20,18 @@ where
     let mut q = sqlx::query_scalar::<Postgres, Value>(sqlx::AssertSqlSafe(sql));
     for b in binds {
         q = match b {
-            Bind::Null => q.bind(None::<String>),
+            Bind::Null(of) => match of {
+                NullOf::Bool => q.bind(None::<bool>),
+                NullOf::Int4 => q.bind(None::<i32>),
+                NullOf::Int8 => q.bind(None::<i64>),
+                NullOf::Float8 => q.bind(None::<f64>),
+                NullOf::Text => q.bind(None::<String>),
+                NullOf::BoolArray => q.bind(None::<Vec<Option<bool>>>),
+                NullOf::Int4Array => q.bind(None::<Vec<Option<i32>>>),
+                NullOf::Int8Array => q.bind(None::<Vec<Option<i64>>>),
+                NullOf::Float8Array => q.bind(None::<Vec<Option<f64>>>),
+                NullOf::TextArray => q.bind(None::<Vec<Option<String>>>),
+            },
             Bind::Bool(v) => q.bind(*v),
             Bind::Int4(v) => q.bind(*v),
             Bind::Int8(v) => q.bind(*v),

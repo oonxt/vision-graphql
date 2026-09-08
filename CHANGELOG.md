@@ -7,6 +7,47 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Added
 
+- **A compiled statement can hold a bounded set of shapes: `@choices`.**
+  `order_by: $sort` was `NotCompilable` — the variable decides the SQL's
+  shape — so a list with five sortable columns was ten persisted documents,
+  and a host whose documents are compiled statements fell back to hand-written
+  SQL outside the scope policy for the ordinary sortable, filterable list
+  (field report). A variable definition can now declare the values it may
+  take, `$sort: [t_order_by!]! @choices(values: [[{a: asc}], [{a: desc}]])`,
+  and `Engine::compile` lowers the operation once per value: one shape each,
+  scoped and limited like any other statement, picked per request by the
+  value supplied. A value outside the list is refused on both paths, so a
+  document means the same under `Engine::query`. Several `@choices` multiply
+  out, capped at 256 shapes. `CompiledQuery::shapes()` / `shape_count()` /
+  `choices()` expose them; `sql()` and `bind_count()` answer for the first
+  shape. `_is_null: $b @choices(values: [true, false])` covers the boolean
+  case. The parser wants the directive before a default value.
+- **A filter the request may leave out: `@optional`.** A null in a comparison
+  is refused, and `_eq: $x` with `x` null was refused at execution too, so
+  an optional filter had no spelling short of a sentinel (`_ilike "%"`) — and
+  none at all for a uuid. `$x: uuid @optional` now makes a null drop the
+  comparison the variable is the operand of: compiled as
+  `($1::uuid IS NULL OR col = $1::uuid)` in one statement, or left out of an
+  eagerly-lowered one. The variable must be nullable and may only be the whole
+  operand of a comparison; used anywhere else it is refused. An absent
+  variable is still an error.
+- **`__schema.directives` and the SDL now list the two directives**, with
+  `@choices(values: [jsonb!]!)` publishing the `jsonb` scalar it names. Any
+  other directive is still refused. An SDL file checked in CI (`vision-gql
+  sdl --check`) gains two `directive` lines and possibly `scalar jsonb`.
+
+### Fixed
+
+- **A compiled statement first run with a null variable failed on the next
+  request that supplied a value, on that connection.** Every null was bound
+  as text; sqlx prepares a statement with the types of the request that first
+  ran it and reuses it by SQL text on the connection, so a later `int4[]` or
+  `int4` value was decoded by the server as text (`invalid byte sequence for
+  encoding "UTF8": 0x00`) — on the connection that had seen the null first and
+  no other, which reads as a flaky test. `Bind::Null` now carries the type a
+  value in its position would have (`Bind::Null(NullOf::Int4Array)`), and the
+  executor binds it as that type's null.
+
 - **A policy can say which parameters it references.**
   `scope_config::referenced_params(toml)` returns the set of `$name` /
   `$name.field` references in a TOML policy, without a schema. It runs the
