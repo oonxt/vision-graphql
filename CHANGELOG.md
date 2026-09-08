@@ -3,6 +3,33 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **A malformed `$…` reference in a TOML scope policy is refused when the
+  policy loads.** `"$claim.school_id"`, `"$1st"`, `"$claim id"` — anything
+  after `$` that was not a bare identifier — used to load as the literal string
+  it was spelled with, so `where = { school_id = { _eq = "$claim.school_id" } }`
+  became `school_id = '$claim.school_id'`: a predicate matching no row, behind
+  a 200, from a policy that looked like it worked (field report: a first
+  deployment took a while to find why). `ScopePolicy::from_toml` now returns
+  `Error::Scope`, naming the position (`scope.courses.where.school_id`) and
+  the string. `$$` still escapes a literal `$`.
+
+### Added
+
+- **A scope parameter reference can read into an object: `$claim.school_id`.**
+  In TOML, `"$name.field"` (any depth) reads that field of parameter `name`;
+  in the DSL, `param("claim.school_id")` does the same. A host binds one object
+  (`Principal::new().set("claim", json!({"school_id": 7}))`) instead of one
+  flat `claim_school_id` per dimension. Resolution is the same on both paths —
+  `bind` and a compiled statement's `execute_scoped`. A field the bound object
+  does not have fails closed as a missing parameter (`principal.claim.school_id`),
+  not as a comparison against null; a field explicitly set to null is passed on
+  as null. A name bound verbatim with a dot in it is still found first, so
+  nothing that resolved before resolves differently now.
+
 ## 0.17.0 — 2026-09-01
 
 ### Added

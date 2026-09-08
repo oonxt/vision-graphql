@@ -225,8 +225,22 @@ impl Principal {
         self
     }
 
+    /// Look up a parameter reference: a bound name, or a dotted path into a
+    /// bound object (`claim.school_id` reads field `school_id` of parameter
+    /// `claim`).
+    ///
+    /// A name bound as-is always wins over a walk, so a host that set the
+    /// dotted key itself gets exactly what it set. Walking stops at anything
+    /// that is not an object — `None`, not `Null`, because a field that is not
+    /// there and a field that is null are different answers, and only the
+    /// second one should reach a comparison.
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.params.get(name)
+        if let Some(v) = self.params.get(name) {
+            return Some(v);
+        }
+        let (head, rest) = name.split_once('.')?;
+        rest.split('.')
+            .try_fold(self.params.get(head)?, |v, key| v.as_object()?.get(key))
     }
 }
 
@@ -369,6 +383,57 @@ mod tests {
         let expr = col("tenant_id").eq(param("tenant_id"));
         let err = expr.resolve(&Principal::new()).unwrap_err();
         assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn dotted_param_reads_into_a_bound_object() {
+        let expr = col("school_id").eq(param("claim.school_id"));
+        let p = Principal::new().set("claim", json!({"school_id": 12, "role": "staff"}));
+        let BoolExpr::Compare { value, .. } = expr.resolve(&p).unwrap() else {
+            panic!("expected compare");
+        };
+        assert_eq!(value, json!(12));
+
+        // A path can go more than one level down.
+        let p = Principal::new().set("claim", json!({"org": {"id": 3}}));
+        let BoolExpr::Compare { value, .. } =
+            col("org_id").eq(param("claim.org.id")).resolve(&p).unwrap()
+        else {
+            panic!("expected compare");
+        };
+        assert_eq!(value, json!(3));
+    }
+
+    #[test]
+    fn dotted_param_missing_field_is_an_error_not_null() {
+        // The object is bound but lacks the field: fail closed, exactly like an
+        // unbound flat parameter, rather than comparing against null.
+        let expr = col("school_id").eq(param("claim.school_id"));
+        let p = Principal::new().set("claim", json!({"role": "staff"}));
+        let err = expr.resolve(&p).unwrap_err();
+        assert!(
+            matches!(err, Error::Validate { ref path, .. } if path == "principal.claim.school_id"),
+            "{err:?}"
+        );
+
+        // Walking into a non-object is the same: nothing to read.
+        let p = Principal::new().set("claim", json!("opaque"));
+        assert!(expr.resolve(&p).is_err());
+
+        // An explicit null field is a value, and is handed on as one.
+        let p = Principal::new().set("claim", json!({"school_id": null}));
+        let BoolExpr::Compare { value, .. } = expr.resolve(&p).unwrap() else {
+            panic!("expected compare");
+        };
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn a_dotted_key_bound_verbatim_wins_over_the_walk() {
+        let p = Principal::new()
+            .set("claim.school_id", 1)
+            .set("claim", json!({"school_id": 2}));
+        assert_eq!(p.get("claim.school_id"), Some(&json!(1)));
     }
 
     #[test]

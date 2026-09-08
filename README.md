@@ -596,8 +596,12 @@ let scope = policy.bind(&Principal::new().set("tenant_id", tenant).set("user_id"
 ```
 
 The same policy can be loaded from TOML (`ScopePolicy::from_toml`), where `where`
-uses the query `where` object syntax and `"$name"` marks a parameter (`$$`
-escapes a literal `$`):
+uses the query `where` object syntax and `"$name"` marks a parameter. A
+`"$name.field"` reads a field of an object-valued parameter, so a host can bind
+one `claim` object rather than one flat parameter per dimension. `$$` escapes a
+literal `$`; any other string starting with `$` is refused when the policy
+loads, since a mistyped reference that quietly became a literal would be a
+predicate matching nothing behind a policy that looks like it works.
 
 ```toml
 [tables.orders]
@@ -605,6 +609,9 @@ where = { user_id = { _eq = "$principal" } }
 
 [tables.samples]
 where = { order = { user_id = { _eq = "$principal" } } }   # relation chain
+
+[tables.courses]
+where = { school_id = { _eq = "$claim.school_id" } }       # Principal::new().set("claim", json!({...}))
 
 [tables.adverts]
 unrestricted = true
