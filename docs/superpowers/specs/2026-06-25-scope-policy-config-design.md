@@ -181,9 +181,15 @@ Pipeline: parse TOML → for each table, parse the `where` string to JSON → sw
    Principal is missing a param the policy references. `validate(&schema)` (run
    once at build) already covers table/column/relation existence.
 3. **TOML placeholder syntax** → in a where **value position**, a string fully
-   matching `^\$[A-Za-z_][A-Za-z0-9_]*$` is a param reference (`"$tenant_id"` →
-   `Param("tenant_id")`). `$$` escapes a literal leading `$` (`"$$5.00"` → literal
-   `"$5.00"`); a `$` elsewhere in a string (`"a$b"`) is literal. Placeholders are
+   matching `^\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$` is a param
+   reference (`"$tenant_id"` → `Param("tenant_id")`; `"$claim.school_id"` →
+   `Param("claim.school_id")`, resolved by `Principal::get` as a field path into
+   the bound `claim` object). `$$` escapes a literal leading `$` (`"$$5.00"` →
+   literal `"$5.00"`); a `$` elsewhere in a string (`"a$b"`) is literal. Any
+   other string starting with `$` is refused at load (revised 2026-09-08: it
+   used to pass through as a literal, which made a mistyped reference a
+   predicate that matched nothing). The same grammar is enforced on DSL
+   `param(...)` names by `validate`. Placeholders are
    recognized only in `_eq`/`_neq`/…/`_in` value slots — never column, operator,
    or relation names. `lower_where` does not type-check values (coercion is
    deferred to render via `json_to_bind`), so placeholder strings pass through

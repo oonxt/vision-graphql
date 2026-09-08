@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use vision_graphql::ast::{BoolExpr, CmpOp};
-use vision_graphql::predicate::{col, principal, rel};
+use vision_graphql::predicate::{col, principal, rel, Principal};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, Mutation, Query, ScopePolicy, ScopeSet};
 
@@ -765,6 +765,98 @@ async fn scope_policy_from_toml_enforces() {
         .await;
     // orders IS in the policy, so this succeeds; a genuinely absent table fails:
     assert!(err.is_ok());
+}
+
+/// A policy may read a field of an object-valued parameter (`$claim.school_id`)
+/// instead of needing one flat parameter per dimension. The reference must
+/// resolve identically on the eager path (bind, then query) and on the compiled
+/// path (compile once, supply the principal per execute) — the second is the one
+/// a scoped endpoint actually runs, and the one where the name is only looked up
+/// at execute time.
+#[tokio::test]
+async fn scope_policy_dotted_reference_reads_object_param_on_both_paths() {
+    let (engine, _db) = setup().await;
+    let toml = r#"
+        [tables.orders]
+        where = { user_id = { _eq = "$claim.user_id" } }
+
+        [tables.samples]
+        where = { order = { user_id = { _eq = "$claim.user_id" } } }
+    "#;
+    let policy = ScopePolicy::from_toml(toml, &schema()).expect("toml policy");
+    let bob = Principal::new().set("claim", json!({"user_id": 2, "role": "staff"}));
+
+    // Eager: bob sees his one order and, through the relation chain, one sample.
+    let v: Value = engine
+        .scoped(policy.bind(&bob).expect("bind"))
+        .query("query { orders { title } samples { serial } }", None)
+        .await
+        .expect("query ok");
+    assert_eq!(v["orders"], json!([{"title": "b-order-1"}]));
+    assert_eq!(v["samples"], json!([{"serial": "S-B1"}]));
+
+    // Compiled: one statement, the field read out of the principal per
+    // request — at the root and inside the relation-chain subquery alike.
+    let compiled = engine
+        .compile_scoped("query { orders { title } samples { serial } }", &policy)
+        .expect("compile");
+    let v = engine
+        .execute_scoped(&compiled, None, &bob)
+        .await
+        .expect("execute as bob");
+    assert_eq!(v["orders"], json!([{"title": "b-order-1"}]));
+    assert_eq!(v["samples"], json!([{"serial": "S-B1"}]));
+    let alice = Principal::new().set("claim", json!({"user_id": 1}));
+    let v = engine
+        .execute_scoped(&compiled, None, &alice)
+        .await
+        .expect("execute as alice");
+    assert_eq!(v["orders"].as_array().expect("array").len(), 2);
+    assert_eq!(v["samples"].as_array().expect("array").len(), 2);
+
+    // A field that is there but null is handed on as null, and the predicate
+    // refuses it as it refuses any null in a comparison — not `= NULL`, which
+    // would be no rows behind a 200.
+    let null_field = Principal::new().set("claim", json!({"user_id": null}));
+    let err = engine
+        .execute_scoped(&compiled, None, &null_field)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+    let err = engine
+        .scoped(policy.bind(&null_field).expect("bind carries the null"))
+        .query("query { orders { title } }", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+
+    // The bound object lacking the field fails closed on both paths — never a
+    // comparison against null that returns no rows behind a 200.
+    let no_field = Principal::new().set("claim", json!({"role": "staff"}));
+    assert!(matches!(
+        policy.bind(&no_field).unwrap_err(),
+        Error::Validate { .. }
+    ));
+    let err = engine
+        .execute_scoped(&compiled, None, &no_field)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Validate { ref path, .. } if path == "principal.claim.user_id"),
+        "{err:?}"
+    );
+
+    // And a reference that cannot be a parameter is refused when the policy
+    // loads, not matched as the string it is spelled with.
+    let err = ScopePolicy::from_toml(
+        r#"
+            [tables.orders]
+            where = { user_id = { _eq = "$claim user_id" } }
+        "#,
+        &schema(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Scope(_)), "{err:?}");
 }
 
 // ===== order_by through an object relation reads the target table, so it is
