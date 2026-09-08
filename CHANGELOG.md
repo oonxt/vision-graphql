@@ -3,6 +3,25 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **A policy can say which parameters it references.**
+  `scope_config::referenced_params(toml)` returns the set of `$name` /
+  `$name.field` references in a TOML policy, without a schema. It runs the
+  loader's own lowering with names resolved by syntax, so everything the
+  loader refuses short of a schema check — a malformed reference, a reference
+  inside a json literal, an unknown operator, a non-list under `_in` — is
+  refused here too, with the same error. `ScopePolicy::params()` answers the
+  same for a built policy. (A dotted name is satisfied by a parameter bound
+  under its first segment or under the whole name; compare on that.) A host that binds a known set of
+  parameters (a project's declared claims) could not, until now, refuse a
+  well-formed reference to a name it never binds — `$claim.schools_id` for a
+  project that declares `school_id` — before the first request failed closed
+  on it; the alternative was to parse the policy itself and carry a copy of
+  the reference grammar, which is the grammar 0.18 changed the meaning of.
+
 ## 0.18.0 — 2026-09-08
 
 ### Breaking

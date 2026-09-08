@@ -133,6 +133,29 @@ impl ScopePolicy {
     pub fn tables(&self) -> impl Iterator<Item = &str> {
         self.tables.keys().map(String::as_str)
     }
+
+    /// Every parameter name this policy's rules reference, spelled as it
+    /// resolves (`"principal"`, `"claim.school_id"`), sorted.
+    ///
+    /// What [`bind`](Self::bind) will look up on the principal — so a host can
+    /// check a policy against the parameters it binds once, when the policy is
+    /// built, rather than discover a reference it never binds on the first
+    /// request that fails closed. A dotted name is satisfied by a parameter
+    /// bound under its first segment (`claim.school_id` by an object bound as
+    /// `claim`) or under the whole name verbatim, nothing in between — that is
+    /// [`Principal::get`]'s rule, so compare the segment before the first dot
+    /// or the whole name. For the same question asked of TOML text before
+    /// there is a schema to validate it against, see
+    /// [`referenced_params`](crate::scope_config::referenced_params).
+    pub fn params(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for rule in self.tables.values() {
+            if let ScopeRule::Allow(expr) = rule {
+                expr.collect_params(&mut out);
+            }
+        }
+        out
+    }
 }
 
 impl ScopePolicyBuilder {
@@ -392,6 +415,35 @@ mod tests {
             )
             .validate(&schema())
             .unwrap();
+    }
+
+    #[test]
+    fn params_lists_every_reference_once() {
+        let policy = ScopePolicy::builder()
+            .allow(
+                "orders",
+                crate::predicate::and([
+                    col("user_id").eq(crate::predicate::param("claim.user_id")),
+                    rel(
+                        "user",
+                        col("id").in_([principal(), crate::predicate::param("other")]),
+                    ),
+                    col("id").is_not_null(),
+                ]),
+            )
+            .allow("users", col("id").eq(principal()))
+            .validate(&schema())
+            .unwrap();
+        assert_eq!(
+            policy.params().into_iter().collect::<Vec<_>>(),
+            vec!["claim.user_id", "other", "principal"]
+        );
+        // Unrestricted and deny rules reference nothing.
+        let policy = ScopePolicy::builder()
+            .unrestricted("users")
+            .validate(&schema())
+            .unwrap();
+        assert!(policy.params().is_empty());
     }
 
     #[test]

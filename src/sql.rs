@@ -362,22 +362,6 @@ fn render_where(
 }
 
 /// The operator's name in a document, for error messages.
-fn cmp_gql_name(op: crate::ast::CmpOp) -> &'static str {
-    use crate::ast::CmpOp::*;
-    match op {
-        Eq => "_eq",
-        Neq => "_neq",
-        Gt => "_gt",
-        Gte => "_gte",
-        Lt => "_lt",
-        Lte => "_lte",
-        Like => "_like",
-        ILike => "_ilike",
-        NLike => "_nlike",
-        NILike => "_nilike",
-    }
-}
-
 /// Refuse a comparison the schema does not publish for the column's type.
 ///
 /// The same predicate the type system builds the comparison inputs from
@@ -393,7 +377,7 @@ fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Resu
         path: format!("where.{}", col.exposed_name),
         message: format!(
             "operator '{}' does not apply to '{}': {}",
-            cmp_gql_name(op),
+            op.gql_name(),
             col.exposed_name,
             crate::type_system::why_cmp_inapplicable(op, &col.pg_type)
         ),

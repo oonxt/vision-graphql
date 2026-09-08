@@ -667,6 +667,45 @@ pub enum CmpOp {
     NILike,
 }
 
+impl CmpOp {
+    /// The operator's name in a `where` object (`_eq`, `_ilike`, …).
+    pub fn gql_name(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "_eq",
+            CmpOp::Neq => "_neq",
+            CmpOp::Gt => "_gt",
+            CmpOp::Gte => "_gte",
+            CmpOp::Lt => "_lt",
+            CmpOp::Lte => "_lte",
+            CmpOp::Like => "_like",
+            CmpOp::ILike => "_ilike",
+            CmpOp::NLike => "_nlike",
+            CmpOp::NILike => "_nilike",
+        }
+    }
+
+    /// The operator a `where` key names, if it names one. The inverse of
+    /// [`gql_name`](Self::gql_name), and the one place the spelling is
+    /// decided: the lowering asks this, so an operator cannot be lowered under
+    /// a name the type system does not publish or vice versa.
+    pub fn from_gql_name(name: &str) -> Option<CmpOp> {
+        [
+            CmpOp::Eq,
+            CmpOp::Neq,
+            CmpOp::Gt,
+            CmpOp::Gte,
+            CmpOp::Lt,
+            CmpOp::Lte,
+            CmpOp::Like,
+            CmpOp::ILike,
+            CmpOp::NLike,
+            CmpOp::NILike,
+        ]
+        .into_iter()
+        .find(|op| op.gql_name() == name)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum MutationField {

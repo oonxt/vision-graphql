@@ -1271,8 +1271,7 @@ fn lower_mutation_field(
                 if aname == "where" {
                     where_ = Some(lower_where(
                         v,
-                        table,
-                        schema,
+                        Names::Schema { table, schema },
                         vars,
                         &format!("{alias}.where"),
                     )?);
@@ -1801,12 +1800,11 @@ fn parse_on_conflict(
         .map(|w| {
             lower_where(
                 &json_to_gql(w),
-                table,
                 // The real schema: an empty one made a relation predicate here
                 // fail with "relation target table missing", which named the
                 // wrong cause and made `on_conflict: { where: { rel: … } }`
                 // impossible to write.
-                schema,
+                Names::Schema { table, schema },
                 // `w` came from `gql_to_json`, so every variable in it is
                 // already substituted and the mode cannot matter.
                 Bindings::eager(&Value::Null),
@@ -1841,8 +1839,7 @@ fn parse_update_args(
             "where" => {
                 where_ = Some(lower_where(
                     v,
-                    table,
-                    schema,
+                    Names::Schema { table, schema },
                     vars,
                     &format!("{parent_path}.where"),
                 )?);
@@ -2322,8 +2319,7 @@ fn lower_args(
             "where" => {
                 out.where_ = Some(lower_where(
                     v,
-                    table,
-                    schema,
+                    Names::Schema { table, schema },
                     vars,
                     &format!("{parent_path}.where"),
                 )?);
@@ -2371,6 +2367,86 @@ fn lower_args(
     Ok(out)
 }
 
+/// Where [`lower_where`] resolves the keys of a `where` object.
+#[derive(Clone, Copy)]
+pub(crate) enum Names<'a> {
+    /// Against the schema: a key is a relation of `table`, else a column of
+    /// it, else an error. The mode every query runs under.
+    Schema {
+        table: &'a Table,
+        schema: &'a Schema,
+    },
+    /// By syntax alone, for reading a policy before there is a schema to check
+    /// it against ([`crate::scope_config::referenced_params`]). A key whose
+    /// value is an object of comparison operators is taken for a column, any
+    /// other object for a relation — the only two things a key can be, told
+    /// apart by the one difference visible without a schema. Every check that
+    /// needs no schema still runs; whatever this accepts can still fail under
+    /// [`Names::Schema`], and nothing it refuses would have passed there.
+    Syntactic,
+}
+
+/// What a `where` key names, once resolved.
+enum Key<'a> {
+    Relation { target: Names<'a> },
+    Column { exposed_name: String },
+}
+
+impl<'a> Names<'a> {
+    fn classify(self, key: &str, value: &GqlValue, path: &str) -> Result<Key<'a>> {
+        match self {
+            Names::Schema { table, schema } => {
+                if let Some(rel) = table.find_relation(key) {
+                    let target =
+                        schema
+                            .table(&rel.target_table)
+                            .ok_or_else(|| Error::Validate {
+                                path: path.to_string(),
+                                message: format!(
+                                    "relation target table '{}' missing",
+                                    rel.target_table
+                                ),
+                            })?;
+                    return Ok(Key::Relation {
+                        target: Names::Schema {
+                            table: target,
+                            schema,
+                        },
+                    });
+                }
+                let col = table.find_column(key).ok_or_else(|| Error::Validate {
+                    path: path.to_string(),
+                    message: format!("unknown column '{key}' on '{}'", table.exposed_name),
+                })?;
+                Ok(Key::Column {
+                    exposed_name: col.exposed_name.clone(),
+                })
+            }
+            Names::Syntactic => {
+                let is_relation = match value {
+                    GqlValue::Object(inner) => !inner.keys().all(|k| is_cmp_operator(k)),
+                    _ => false,
+                };
+                if is_relation {
+                    Ok(Key::Relation {
+                        target: Names::Syntactic,
+                    })
+                } else {
+                    Ok(Key::Column {
+                        exposed_name: key.to_string(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Whether `key` is one of the operator names a column's operator object
+/// takes. `_and` / `_or` / `_not` are not: they combine predicates.
+fn is_cmp_operator(key: &str) -> bool {
+    matches!(key, "_is_null" | "_in" | "_nin") || CmpOp::from_gql_name(key).is_some()
+}
+
 /// Lower a Hasura-style `where` argument.
 ///
 /// Walks the GraphQL value rather than a pre-substituted JSON one, because that
@@ -2380,8 +2456,7 @@ fn lower_args(
 /// when its value is already known.
 pub(crate) fn lower_where(
     value: &GqlValue,
-    table: &Table,
-    schema: &Schema,
+    names: Names<'_>,
     vars: Bindings<'_>,
     path: &str,
 ) -> Result<BoolExpr> {
@@ -2407,9 +2482,7 @@ pub(crate) fn lower_where(
                 let inner: Result<Vec<BoolExpr>> = items
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| {
-                        lower_where(x, table, schema, vars, &format!("{path}.{key}[{i}]"))
-                    })
+                    .map(|(i, x)| lower_where(x, names, vars, &format!("{path}.{key}[{i}]")))
                     .collect();
                 parts.push(if key == "_and" {
                     BoolExpr::And(inner?)
@@ -2420,41 +2493,28 @@ pub(crate) fn lower_where(
             "_not" => {
                 parts.push(BoolExpr::Not(Box::new(lower_where(
                     v,
-                    table,
-                    schema,
+                    names,
                     vars,
                     &format!("{path}._not"),
                 )?)));
             }
             col_name => {
-                if let Some(rel) = table.find_relation(col_name) {
-                    let target =
-                        schema
-                            .table(&rel.target_table)
-                            .ok_or_else(|| Error::Validate {
-                                path: format!("{path}.{col_name}"),
-                                message: format!(
-                                    "relation target table '{}' missing",
-                                    rel.target_table
-                                ),
-                            })?;
-                    let inner =
-                        lower_where(v, target, schema, vars, &format!("{path}.{col_name}"))?;
-                    parts.push(BoolExpr::Relation {
-                        name: col_name.to_string(),
-                        inner: Box::new(inner),
-                    });
-                    continue;
-                }
-
-                let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-                    path: format!("{path}.{col_name}"),
-                    message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
-                })?;
-                let ops = structural(v, vars, &format!("{path}.{col_name}"))?;
+                let col_path = format!("{path}.{col_name}");
+                let ops = structural(v, vars, &col_path)?;
+                let exposed_name = match names.classify(col_name, ops.as_ref(), &col_path)? {
+                    Key::Relation { target } => {
+                        let inner = lower_where(ops.as_ref(), target, vars, &col_path)?;
+                        parts.push(BoolExpr::Relation {
+                            name: col_name.to_string(),
+                            inner: Box::new(inner),
+                        });
+                        continue;
+                    }
+                    Key::Column { exposed_name } => exposed_name,
+                };
                 let GqlValue::Object(op_obj) = ops.as_ref() else {
                     return Err(Error::Validate {
-                        path: format!("{path}.{col_name}"),
+                        path: col_path,
                         message: "expected operator object".into(),
                     });
                 };
@@ -2485,7 +2545,7 @@ pub(crate) fn lower_where(
                         let (value, optional) = operand(v)?;
                         Ok(wrap(
                             BoolExpr::Compare {
-                                column: col.exposed_name.clone(),
+                                column: exposed_name.clone(),
                                 op,
                                 value,
                             },
@@ -2507,7 +2567,7 @@ pub(crate) fn lower_where(
                         }
                         Ok(wrap(
                             BoolExpr::InList {
-                                column: col.exposed_name.clone(),
+                                column: exposed_name.clone(),
                                 values,
                                 negated,
                             },
@@ -2515,16 +2575,6 @@ pub(crate) fn lower_where(
                         ))
                     };
                     let part = match op_name.as_str() {
-                        "_eq" => cmp(CmpOp::Eq, op_val)?,
-                        "_neq" => cmp(CmpOp::Neq, op_val)?,
-                        "_gt" => cmp(CmpOp::Gt, op_val)?,
-                        "_gte" => cmp(CmpOp::Gte, op_val)?,
-                        "_lt" => cmp(CmpOp::Lt, op_val)?,
-                        "_lte" => cmp(CmpOp::Lte, op_val)?,
-                        "_like" => cmp(CmpOp::Like, op_val)?,
-                        "_ilike" => cmp(CmpOp::ILike, op_val)?,
-                        "_nlike" => cmp(CmpOp::NLike, op_val)?,
-                        "_nilike" => cmp(CmpOp::NILike, op_val)?,
                         // `_is_null` picks between `IS NULL` and `IS NOT NULL`,
                         // so its value is structure, not a bound parameter.
                         "_is_null" => {
@@ -2536,18 +2586,21 @@ pub(crate) fn lower_where(
                                 });
                             };
                             BoolExpr::IsNull {
-                                column: col.exposed_name.clone(),
+                                column: exposed_name.clone(),
                                 negated: !b,
                             }
                         }
                         "_in" => in_list(false, op_val)?,
                         "_nin" => in_list(true, op_val)?,
-                        other => {
-                            return Err(Error::Validate {
-                                path: format!("{path}.{col_name}"),
-                                message: format!("unsupported operator '{other}'"),
-                            });
-                        }
+                        other => match CmpOp::from_gql_name(other) {
+                            Some(op) => cmp(op, op_val)?,
+                            None => {
+                                return Err(Error::Validate {
+                                    path: col_path,
+                                    message: format!("unsupported operator '{other}'"),
+                                });
+                            }
+                        },
                     };
                     parts.push(part);
                 }
