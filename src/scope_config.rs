@@ -126,7 +126,7 @@ fn lower_rule(where_toml: &toml::Value, names: Names<'_>, table_name: &str) -> R
     let lowered = lower_where(
         &crate::parser::json_to_gql(&json),
         names,
-        crate::parser::Bindings::Eager(&Value::Null),
+        crate::parser::Bindings::eager(&Value::Null),
         &path,
     )?;
     to_template(lowered, &path)
@@ -176,6 +176,13 @@ fn to_template(expr: BoolExpr, path: &str) -> Result<ScopeExpr> {
             ScopeExpr::Compare { column, op, value }
         }
         BoolExpr::IsNull { column, negated } => ScopeExpr::IsNull { column, negated },
+        // Only an `@optional` GraphQL variable produces one, and a TOML policy
+        // has no variables.
+        BoolExpr::Optional(_) => {
+            return Err(Error::Scope(format!(
+                "{path}: internal: optional comparison in a TOML policy"
+            )))
+        }
         BoolExpr::InList {
             column,
             values,

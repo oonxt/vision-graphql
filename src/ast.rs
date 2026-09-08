@@ -638,6 +638,19 @@ pub enum BoolExpr {
         name: String,
         inner: Box<BoolExpr>,
     },
+    /// `inner` — a [`Compare`](BoolExpr::Compare) or
+    /// [`InList`](BoolExpr::InList) — when its operand has a value; `TRUE` when
+    /// the operand is null.
+    ///
+    /// This is a filter the request may leave out: `_eq: $creator` with
+    /// `$creator: uuid @optional`. A null operand anywhere else is refused
+    /// (comparing against null matches nothing and reads as an empty result),
+    /// so leaving a filter out has to be said in the document, not inferred
+    /// from a value. A literal operand decides at render time and the wrapper
+    /// costs nothing; a variable decides per request inside one statement,
+    /// `($n IS NULL OR column = $n)`, which is what lets a compiled statement
+    /// serve both the request that filters and the one that does not.
+    Optional(Box<BoolExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

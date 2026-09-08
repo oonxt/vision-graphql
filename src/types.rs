@@ -115,7 +115,16 @@ pub enum BindSpec {
         reject_null: bool,
     },
     /// An `_in` / `_nin` list, resolving to a JSON array.
-    Array { val: Val, pg: PgType, path: String },
+    Array {
+        val: Val,
+        pg: PgType,
+        path: String,
+        /// Whether a null here is refused. Set for a plain `_in`, where a null
+        /// is not a list and `= ANY(NULL)` would match nothing; not set for an
+        /// `@optional` operand, where a null is the request leaving the filter
+        /// out and binds as SQL NULL.
+        reject_null: bool,
+    },
     /// A `limit` / `offset` supplied as a variable.
     Count {
         val: crate::ast::Count,
@@ -166,6 +175,25 @@ impl BindSpec {
 
     /// Same as [`BindSpec::scalar`] for an `_in` / `_nin` list.
     pub(crate) fn array(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+        Self::array_inner(val, pg, path, true)
+    }
+
+    /// An `_in` / `_nin` list that may be null. See
+    /// [`BindSpec::Array::reject_null`].
+    pub(crate) fn optional_array(
+        val: Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+    ) -> Result<Self> {
+        Self::array_inner(val, pg, path, false)
+    }
+
+    fn array_inner(
+        val: Val,
+        pg: &PgType,
+        path: impl FnOnce() -> String,
+        reject_null: bool,
+    ) -> Result<Self> {
         if val.is_lit() {
             let path = path();
             let no_inputs = Inputs::none();
@@ -173,12 +201,16 @@ impl BindSpec {
                 path: path.clone(),
                 message: format!("{e}"),
             })?;
+            if !reject_null && resolved.is_null() {
+                return Ok(BindSpec::Fixed(Bind::Null(NullOf::array(pg))));
+            }
             return bind_array(&resolved, pg, &path).map(BindSpec::Fixed);
         }
         Ok(BindSpec::Array {
             val,
             pg: pg.clone(),
             path: path(),
+            reject_null,
         })
     }
 
@@ -204,8 +236,16 @@ impl BindSpec {
                     message: format!("{e}"),
                 })
             }
-            BindSpec::Array { val, pg, path } => {
+            BindSpec::Array {
+                val,
+                pg,
+                path,
+                reject_null,
+            } => {
                 let v = val.resolve(inputs)?;
+                if !*reject_null && v.is_null() {
+                    return Ok(Bind::Null(NullOf::array(pg)));
+                }
                 bind_array(&v, pg, path)
             }
             BindSpec::Count { val, path } => {
@@ -254,7 +294,15 @@ pub fn resolve_binds(specs: &[BindSpec], inputs: &Inputs<'_>) -> Result<Vec<Bind
 /// rendered SQL casts it (`$1::uuid`) so the server performs the conversion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bind {
-    Null,
+    /// A SQL NULL, declared as the type a value in this position would be.
+    ///
+    /// The type matters even though the value is null. sqlx prepares a
+    /// statement on its first execution with the types of *that* execution's
+    /// parameters and reuses it, by SQL text, for every later one on the
+    /// connection; a null sent as text where the next request sends an
+    /// `int4[]` leaves the server decoding array bytes as text. A compiled
+    /// statement that is first run with a null variable is exactly that case.
+    Null(NullOf),
     Bool(bool),
     Int4(i32),
     Int8(i64),
@@ -267,9 +315,84 @@ pub enum Bind {
     TextArray(Vec<Option<String>>),
 }
 
+/// The type a [`Bind::Null`] stands in for: the [`Bind`] variant a non-null
+/// value in the same position would use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOf {
+    Bool,
+    Int4,
+    Int8,
+    Float8,
+    Text,
+    BoolArray,
+    Int4Array,
+    Int8Array,
+    Float8Array,
+    TextArray,
+}
+
+impl NullOf {
+    /// The bind type of a scalar value of `pg` — the one [`json_to_bind`]
+    /// produces for a non-null value.
+    pub fn scalar(pg: &PgType) -> Self {
+        match pg {
+            PgType::Bool => NullOf::Bool,
+            PgType::Int2 | PgType::Int4 => NullOf::Int4,
+            PgType::Int8 => NullOf::Int8,
+            PgType::Float4 | PgType::Float8 => NullOf::Float8,
+            PgType::Numeric
+            | PgType::Text
+            | PgType::Varchar
+            | PgType::Uuid
+            | PgType::Timestamp
+            | PgType::TimestampTz
+            | PgType::Date
+            | PgType::Time
+            | PgType::Enum { .. }
+            | PgType::Json
+            | PgType::Jsonb => NullOf::Text,
+        }
+    }
+
+    /// The bind type of a list of `pg` — the one [`json_to_bind_array`]
+    /// produces.
+    pub fn array(pg: &PgType) -> Self {
+        match NullOf::scalar(pg) {
+            NullOf::Bool => NullOf::BoolArray,
+            NullOf::Int4 => NullOf::Int4Array,
+            NullOf::Int8 => NullOf::Int8Array,
+            NullOf::Float8 => NullOf::Float8Array,
+            NullOf::Text => NullOf::TextArray,
+            array => array,
+        }
+    }
+}
+
+/// Whether two JSON values would bind the same way: numbers compare by value,
+/// so `1` and `1.0` are one value, as they are to [`json_to_bind`] — a
+/// `@choices` list written `[1, 2]` must admit a client whose serialiser sends
+/// `1.0`. Everything else compares structurally.
+pub(crate) fn json_equiv(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => x.as_f64() == y.as_f64(),
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_equiv(a, b))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, a)| y.get(k).is_some_and(|b| json_equiv(a, b)))
+        }
+        _ => a == b,
+    }
+}
+
 pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
     if v.is_null() {
-        return Ok(Bind::Null);
+        return Ok(Bind::Null(NullOf::scalar(pg)));
     }
     match pg {
         PgType::Bool => v
@@ -438,7 +561,22 @@ mod tests {
     #[test]
     fn convert_null_value() {
         let bind = json_to_bind(&json!(null), &PgType::Int4).unwrap();
-        assert!(matches!(bind, Bind::Null));
+        assert_eq!(bind, Bind::Null(NullOf::Int4));
+        // Declared as what a value would be, per type — see `Bind::Null`.
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Uuid).unwrap(),
+            Bind::Null(NullOf::Text)
+        );
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Bool).unwrap(),
+            Bind::Null(NullOf::Bool)
+        );
+        assert_eq!(
+            json_to_bind(&json!(null), &PgType::Int8).unwrap(),
+            Bind::Null(NullOf::Int8)
+        );
+        assert_eq!(NullOf::array(&PgType::Int2), NullOf::Int4Array);
+        assert_eq!(NullOf::array(&PgType::Jsonb), NullOf::TextArray);
     }
 
     /// `int2` has no bind of its own: it goes out as int4 and the cast narrows
@@ -475,6 +613,67 @@ mod tests {
         }
         let err = json_to_bind(&json!(true), &PgType::Numeric).unwrap_err();
         assert!(format!("{err}").contains("number or a string"), "{err}");
+    }
+
+    /// `NullOf::scalar` / `array` must name the variant a value would bind
+    /// as, or a statement prepared on a null disagrees with the next request.
+    #[test]
+    fn null_of_matches_what_a_value_binds_as() {
+        use crate::schema::PgType::*;
+        let cases: Vec<(PgType, Value)> = vec![
+            (Bool, json!(true)),
+            (Int2, json!(1)),
+            (Int4, json!(1)),
+            (Int8, json!(1)),
+            (Float4, json!(1.5)),
+            (Float8, json!(1.5)),
+            (Numeric, json!("1.5")),
+            (Text, json!("x")),
+            (Varchar, json!("x")),
+            (Uuid, json!("x")),
+            (Timestamp, json!("x")),
+            (TimestampTz, json!("x")),
+            (Date, json!("x")),
+            (Time, json!("x")),
+            (Json, json!({})),
+            (Jsonb, json!({})),
+            (
+                Enum {
+                    schema: "public".into(),
+                    name: "mood".into(),
+                },
+                json!("x"),
+            ),
+        ];
+        for (pg, sample) in cases {
+            let want = match json_to_bind(&sample, &pg).unwrap() {
+                Bind::Bool(_) => NullOf::Bool,
+                Bind::Int4(_) => NullOf::Int4,
+                Bind::Int8(_) => NullOf::Int8,
+                Bind::Float8(_) => NullOf::Float8,
+                Bind::Text(_) => NullOf::Text,
+                other => panic!("{pg:?}: unexpected {other:?}"),
+            };
+            assert_eq!(NullOf::scalar(&pg), want, "{pg:?}");
+            let want = match json_to_bind_array(std::slice::from_ref(&sample), &pg).unwrap() {
+                Bind::BoolArray(_) => NullOf::BoolArray,
+                Bind::Int4Array(_) => NullOf::Int4Array,
+                Bind::Int8Array(_) => NullOf::Int8Array,
+                Bind::Float8Array(_) => NullOf::Float8Array,
+                Bind::TextArray(_) => NullOf::TextArray,
+                other => panic!("{pg:?}: unexpected {other:?}"),
+            };
+            assert_eq!(NullOf::array(&pg), want, "{pg:?}");
+        }
+    }
+
+    #[test]
+    fn json_equiv_compares_numbers_by_value() {
+        assert!(json_equiv(&json!(1), &json!(1.0)));
+        assert!(json_equiv(&json!([{"a": 2.0}]), &json!([{"a": 2}])));
+        assert!(!json_equiv(&json!(1), &json!("1")));
+        assert!(!json_equiv(&json!({"a": 1}), &json!({"a": 1, "b": 2})));
+        assert!(json_equiv(&json!(null), &json!(null)));
     }
 
     #[test]

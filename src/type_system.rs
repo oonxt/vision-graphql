@@ -179,12 +179,28 @@ impl TypeDef {
     }
 }
 
+/// A directive the engine implements, as `__schema.directives` and the SDL
+/// publish it.
+///
+/// Only what is implemented is published, and everything published is
+/// implemented: the lowering refuses any directive not in this list, and a
+/// test holds the list to the names the lowering accepts.
+#[derive(Debug, Clone)]
+pub struct DirectiveDef {
+    pub name: String,
+    pub description: Option<String>,
+    /// `__DirectiveLocation` names — `VARIABLE_DEFINITION` and so on.
+    pub locations: Vec<&'static str>,
+    pub args: Vec<InputValue>,
+}
+
 /// Every type the API exposes, plus its root type names.
 #[derive(Debug, Clone)]
 pub struct TypeSystem {
     types: BTreeMap<String, TypeDef>,
     query_root: String,
     mutation_root: Option<String>,
+    directives: Vec<DirectiveDef>,
 }
 
 impl TypeSystem {
@@ -212,6 +228,51 @@ impl TypeSystem {
     pub fn mutation_root(&self) -> Option<&str> {
         self.mutation_root.as_deref()
     }
+
+    /// The directives the engine implements, in a stable order.
+    pub fn directives(&self) -> &[DirectiveDef] {
+        &self.directives
+    }
+}
+
+/// The directives the lowering implements, for publication.
+///
+/// Both go on a variable definition and describe how the engine treats the
+/// variable; neither changes the meaning of a document that does not use it.
+/// `@choices` takes its values as `jsonb` because they are values of the
+/// variable's own type, which no argument type can say; a client validating
+/// the document accepts any literal for a custom scalar.
+fn directive_defs() -> Vec<DirectiveDef> {
+    vec![
+        DirectiveDef {
+            name: crate::parser::CHOICES.into(),
+            description: Some(
+                "The values this variable may take, as literals of its type. A request \
+                 supplying any other value is refused. A compiled statement is compiled \
+                 once per value, so a variable that decides the shape of the SQL \
+                 (`order_by`, `where`, `_is_null`) can be compiled when it is bounded \
+                 this way. On this engine the directive goes before the default value."
+                    .into(),
+            ),
+            locations: vec!["VARIABLE_DEFINITION"],
+            args: vec![InputValue::new(
+                "values",
+                TypeRef::named("jsonb").non_null().list().non_null(),
+            )],
+        },
+        DirectiveDef {
+            name: crate::parser::OPTIONAL.into(),
+            description: Some(
+                "A null for this variable drops the comparison it is the operand of \
+                 (`_eq: $x`, `_in: $x`, …) instead of being refused. The variable may \
+                 only be used as the whole value of a comparison operator, and must be \
+                 declared nullable."
+                    .into(),
+            ),
+            locations: vec!["VARIABLE_DEFINITION"],
+            args: Vec::new(),
+        },
+    ]
 }
 
 /// GraphQL scalar name for a column type.
@@ -457,7 +518,22 @@ impl<'a> Builder<'a> {
             types: self.types,
             query_root,
             mutation_root,
+            directives: directive_defs(),
         };
+        // The scalars the directives' arguments name are published whether or
+        // not a column uses them, for the same reason `Int` is below: a client
+        // resolving the argument's type has to find it.
+        for d in &ts.directives {
+            for a in &d.args {
+                let name = a.ty.base_name().to_string();
+                if !BUILT_IN_SCALARS.contains(&name.as_str()) {
+                    ts.types.entry(name.clone()).or_insert(TypeDef::Scalar {
+                        name,
+                        description: None,
+                    });
+                }
+            }
+        }
 
         // Built-in scalars are types like any other as far as a client is
         // concerned: it resolves `Int` when it walks an argument's type. Adding
@@ -1168,6 +1244,11 @@ pub fn dangling_references(ts: &TypeSystem) -> BTreeSet<String> {
             TypeDef::Scalar { .. } | TypeDef::Enum { .. } => {}
         }
     }
+    for d in ts.directives() {
+        for a in &d.args {
+            check(&a.ty);
+        }
+    }
     missing
 }
 
@@ -1205,6 +1286,22 @@ mod tests {
 
     fn ts() -> TypeSystem {
         TypeSystem::build(&schema())
+    }
+
+    #[test]
+    fn published_directives_are_the_ones_the_lowering_accepts() {
+        let ts = ts();
+        let published: Vec<&str> = ts.directives().iter().map(|d| d.name.as_str()).collect();
+        let mut implemented = crate::parser::KNOWN_VARIABLE_DIRECTIVES.to_vec();
+        implemented.sort();
+        let mut published_sorted = published.clone();
+        published_sorted.sort();
+        assert_eq!(published_sorted, implemented);
+        for d in ts.directives() {
+            assert_eq!(d.locations, vec!["VARIABLE_DEFINITION"], "{}", d.name);
+        }
+        // The argument's scalar is published even though no column here is jsonb.
+        assert!(matches!(ts.get("jsonb"), Some(TypeDef::Scalar { .. })));
     }
 
     #[test]

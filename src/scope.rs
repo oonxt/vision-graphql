@@ -697,7 +697,9 @@ fn scope_bool_expr(
             }
             Ok(())
         }
-        BoolExpr::Not(inner) => scope_bool_expr(inner, table, scope, schema),
+        BoolExpr::Not(inner) | BoolExpr::Optional(inner) => {
+            scope_bool_expr(inner, table, scope, schema)
+        }
         BoolExpr::Relation { name, inner } => {
             let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
                 path: format!("{}.where.{name}", table.exposed_name),

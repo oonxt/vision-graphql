@@ -69,7 +69,7 @@ fn bench(c: &mut Criterion) {
 
     // All that is left of a request once the query is compiled.
     let doc = parse_document(Q).unwrap();
-    let op = lower_with(&doc, Bindings::Symbolic, None, &schema).unwrap();
+    let op = lower_with(&doc, Bindings::symbolic(), None, &schema).unwrap();
     let (_sql, specs) = render(&op, &schema).unwrap();
     c.bench_function("compiled_request", |b| {
         b.iter(|| {
