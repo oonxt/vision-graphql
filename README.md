@@ -620,10 +620,13 @@ unrestricted = true
 A host that binds a known set of parameters can check a policy against that
 set before it is saved: `scope_config::referenced_params(toml)` returns the
 names the text references (`{"claim.school_id", "principal"}`) without a
-schema, applying the same reference grammar the loader does; a built
-`ScopePolicy` answers the same question with `params()`. A well-formed
-reference to a name the host never binds (`$claim.schools_id`) otherwise
-surfaces on the first request that fails closed.
+schema, through the loader's own lowering with names resolved by syntax, so it
+refuses what the loader refuses for any reason short of a schema check; a built
+`ScopePolicy` answers the same question with `params()`. A dotted name is
+satisfied by a parameter bound under its first segment (`claim`) or under the
+whole name verbatim, so compare on that. A well-formed reference to a name the
+host never binds (`$claim.schools_id`) otherwise surfaces on the first request
+that fails closed.
 
 Scoped `delete` (and its `_by_pk` form) injects the predicate as a filter — it
 is AND-ed into the statement's `WHERE`, so a scoped caller can only remove rows

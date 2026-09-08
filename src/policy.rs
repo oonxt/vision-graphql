@@ -140,8 +140,12 @@ impl ScopePolicy {
     /// What [`bind`](Self::bind) will look up on the principal — so a host can
     /// check a policy against the parameters it binds once, when the policy is
     /// built, rather than discover a reference it never binds on the first
-    /// request that fails closed. For the same question asked of TOML text
-    /// before there is a schema to validate it against, see
+    /// request that fails closed. A dotted name is satisfied by a parameter
+    /// bound under its first segment (`claim.school_id` by an object bound as
+    /// `claim`) or under the whole name verbatim, nothing in between — that is
+    /// [`Principal::get`]'s rule, so compare the segment before the first dot
+    /// or the whole name. For the same question asked of TOML text before
+    /// there is a schema to validate it against, see
     /// [`referenced_params`](crate::scope_config::referenced_params).
     pub fn params(&self) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
