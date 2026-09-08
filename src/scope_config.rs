@@ -32,8 +32,13 @@
 //!
 //! The result is an ordinary [`ScopePolicy`], validated against the schema and
 //! bound per request exactly like a programmatically built one.
+//!
+//! [`referenced_params`] reads the same text without a schema and reports which
+//! parameter names it references, for a host that wants to check a policy
+//! against the parameters it will bind before it has a schema to validate the
+//! policy against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -198,25 +203,43 @@ fn to_operand(v: Val, path: &str) -> Result<Operand> {
         return Err(non_literal(path, &v));
     };
     if let Value::String(s) = &v {
-        if let Some(rest) = s.strip_prefix("$$") {
-            return Ok(Operand::Lit(Value::String(format!("${rest}"))));
-        }
-        if let Some(name) = s.strip_prefix('$') {
-            if is_param_ref(name) {
-                return Ok(Operand::Param(name.to_string()));
-            }
-            return Err(Error::Scope(format!(
-                "{path}: '{s}' is not a parameter reference; expected `$name` or \
-                 `$name.field` (identifiers: [A-Za-z_][A-Za-z0-9_]*), or `$$` for \
-                 a literal '$'"
-            )));
-        }
+        return Ok(match classify_string(s, path)? {
+            StringLeaf::Param(name) => Operand::Param(name.to_string()),
+            StringLeaf::Lit(text) => Operand::Lit(Value::String(text)),
+        });
     }
     // A json/jsonb column takes an object or array literal, whose strings get
     // the same treatment: `$$` unescapes, and a `$…` is refused — an operand
     // is one literal or one parameter, so a reference inside a composite has
     // nothing to resolve it and would otherwise ship as text.
     Ok(Operand::Lit(unescape_composite(v, path)?))
+}
+
+/// What a string in an operand position is: a parameter reference, or the
+/// literal it spells (with `$$` unescaped).
+enum StringLeaf<'a> {
+    Param(&'a str),
+    Lit(String),
+}
+
+/// The one reading of a `$` in an operand position, shared by the schema-checked
+/// loader and [`referenced_params`]. Two copies of this rule is how a host ends
+/// up validating a reference the engine then reads as something else.
+fn classify_string<'a>(s: &'a str, path: &str) -> Result<StringLeaf<'a>> {
+    if let Some(rest) = s.strip_prefix("$$") {
+        return Ok(StringLeaf::Lit(format!("${rest}")));
+    }
+    if let Some(name) = s.strip_prefix('$') {
+        if is_param_ref(name) {
+            return Ok(StringLeaf::Param(name));
+        }
+        return Err(Error::Scope(format!(
+            "{path}: '{s}' is not a parameter reference; expected `$name` or \
+             `$name.field` (identifiers: [A-Za-z_][A-Za-z0-9_]*), or `$$` for \
+             a literal '$'"
+        )));
+    }
+    Ok(StringLeaf::Lit(s.to_string()))
 }
 
 fn unescape_composite(v: Value, path: &str) -> Result<Value> {
@@ -256,6 +279,115 @@ fn non_literal(path: &str, v: &Val) -> Error {
     Error::Scope(format!(
         "{path}: internal: non-literal value {v:?} in a TOML policy"
     ))
+}
+
+/// The parameter names a TOML policy references, without a schema.
+///
+/// Returns every distinct `$name` / `$name.field` reference in `source`, spelled
+/// as it resolves (`"claim.school_id"`), in sorted order. The grammar is the one
+/// [`ScopePolicy::from_toml`] applies: `$$` is a literal, a `$` that is not a
+/// well-formed reference is refused, and so is a reference inside an object or
+/// array literal. The policy's shape — one rule per table, known operators,
+/// booleans under `_is_null` — is checked the same way too. What is *not*
+/// checked is anything that needs the schema: table, column and relation names,
+/// or whether an operator applies to a column.
+///
+/// This exists for a host that validates a policy when it is saved, before it
+/// has a schema to validate against, and wants to refuse a reference it will
+/// never bind (`$claim.schools_id` for a project that declares `school_id`). A
+/// reference like that is well-formed, so [`ScopePolicy::from_toml`] accepts
+/// it, and only the host knows the set it binds. Without this the host would
+/// have to parse the policy itself and carry its own copy of the reference
+/// grammar — which is how a policy comes to pass the host's check and mean
+/// something else to the engine.
+///
+/// A policy this accepts can still fail [`ScopePolicy::from_toml`] on a schema
+/// check; a policy that fails here fails there too.
+pub fn referenced_params(source: &str) -> Result<BTreeSet<String>> {
+    let cfg: ScopeConfig =
+        toml::from_str(source).map_err(|e| Error::Scope(format!("TOML parse error: {e}")))?;
+    let mut out = BTreeSet::new();
+    for (table_name, tr) in &cfg.tables {
+        let set = tr.where_.is_some() as u8 + tr.unrestricted as u8 + tr.deny as u8;
+        if set != 1 {
+            return Err(Error::Scope(format!(
+                "tables.{table_name}: set exactly one of 'where', 'unrestricted', 'deny'"
+            )));
+        }
+        if let Some(where_toml) = &tr.where_ {
+            let json = toml_to_json(where_toml);
+            collect_params(&json, &format!("scope.{table_name}.where"), &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Walk a `where` object the way `lower_where` does, but keyed on syntax alone.
+///
+/// The value under a comparison operator is an operand position; the value
+/// under `_and` / `_or` / `_not` or any other key is a predicate again — a
+/// column's operator object or a relation's nested predicate, which this walk
+/// need not tell apart since it treats both as "keys with predicates under
+/// them". Operator names are the fixed set `lower_where` accepts, so an unknown
+/// `_op` is refused here as it would be there.
+fn collect_params(v: &Value, path: &str, out: &mut BTreeSet<String>) -> Result<()> {
+    let Value::Object(obj) = v else {
+        return Err(Error::Scope(format!("{path}: expected object")));
+    };
+    for (key, val) in obj {
+        let here = format!("{path}.{key}");
+        match key.as_str() {
+            "_and" | "_or" => {
+                let Value::Array(items) = val else {
+                    return Err(Error::Scope(format!("{here}: expected array")));
+                };
+                for (i, item) in items.iter().enumerate() {
+                    collect_params(item, &format!("{here}[{i}]"), out)?;
+                }
+            }
+            "_not" => collect_params(val, &here, out)?,
+            "_is_null" => {
+                if !val.is_boolean() {
+                    return Err(Error::Scope(format!("{here}: expected boolean")));
+                }
+            }
+            "_in" | "_nin" => {
+                let Value::Array(items) = val else {
+                    return Err(Error::Scope(format!("{here}: expected array")));
+                };
+                for item in items {
+                    collect_operand(item, path, out)?;
+                }
+            }
+            "_eq" | "_neq" | "_gt" | "_gte" | "_lt" | "_lte" | "_like" | "_ilike" | "_nlike"
+            | "_nilike" => collect_operand(val, path, out)?,
+            other if other.starts_with('_') => {
+                return Err(Error::Scope(format!(
+                    "{path}: unsupported operator '{other}'"
+                )));
+            }
+            _ => collect_params(val, &here, out)?,
+        }
+    }
+    Ok(())
+}
+
+/// One operand at `path` (the column's path, which is what the loader reports
+/// too). Mirrors [`to_operand`]: a string is classified, a composite is checked
+/// for references it cannot carry.
+fn collect_operand(v: &Value, path: &str, out: &mut BTreeSet<String>) -> Result<()> {
+    match v {
+        Value::String(s) => {
+            if let StringLeaf::Param(name) = classify_string(s, path)? {
+                out.insert(name.to_string());
+            }
+        }
+        composite @ (Value::Array(_) | Value::Object(_)) => {
+            unescape_composite(composite.clone(), path)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -463,6 +595,130 @@ mod tests {
         assert!(
             matches!(&err, Error::Scope(m) if m.starts_with("scope.orders.where.user.id:")),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn referenced_params_reports_every_reference_without_a_schema() {
+        // Tables and columns that no schema here knows: the walk is syntactic.
+        let toml = r#"
+            [tables.courses]
+            where = { _and = [
+                { school_id = { _eq = "$claim.school_id" } },
+                { _or = [
+                    { owner_id = { _eq = "$principal" } },
+                    { school = { region = { tenant = { _in = ["$tenant", "$$literal", 3] } } } },
+                ] },
+                { _not = { status = { _in = ["archived"] } } },
+                { deleted_at = { _is_null = true } },
+                { code = { _like = "$$%" } },
+            ] }
+
+            [tables.adverts]
+            unrestricted = true
+
+            [tables.secrets]
+            deny = true
+        "#;
+        let params = referenced_params(toml).unwrap();
+        assert_eq!(
+            params.into_iter().collect::<Vec<_>>(),
+            vec!["claim.school_id", "principal", "tenant"]
+        );
+
+        // The same reference in two places is reported once.
+        let params = referenced_params(
+            r#"
+                [tables.a]
+                where = { x = { _eq = "$p" } }
+                [tables.b]
+                where = { y = { _eq = "$p" }, z = { _neq = "$p" } }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(params.into_iter().collect::<Vec<_>>(), vec!["p"]);
+    }
+
+    #[test]
+    fn referenced_params_applies_the_loaders_grammar() {
+        // What `from_toml` refuses on syntax, this refuses too, so a host
+        // checking a policy at save time sees the same verdict the engine
+        // gives when it loads.
+        for (toml, expect) in [
+            (
+                r#"[tables.orders]
+                   where = { title = { _eq = "$claim." } }"#,
+                "scope.orders.where.title:",
+            ),
+            (
+                r#"[tables.orders]
+                   where = { user = { id = { _in = [1, "$acc ount"] } } }"#,
+                "scope.orders.where.user.id:",
+            ),
+            (
+                r#"[tables.docs]
+                   where = { meta = { _eq = { owner = "$principal" } } }"#,
+                "scope.docs.where.meta:",
+            ),
+            (
+                r#"[tables.docs]
+                   where = { meta = { _in = [{ owner = "$principal" }] } }"#,
+                "scope.docs.where.meta:",
+            ),
+            (
+                r#"[tables.orders]
+                   where = { title = { _regex = "$p" } }"#,
+                "unsupported operator '_regex'",
+            ),
+            (
+                r#"[tables.orders]
+                   where = { title = { _is_null = "$p" } }"#,
+                "expected boolean",
+            ),
+            (
+                r#"[tables.orders]
+                   where = { user_id = { _eq = "$principal" } }
+                   deny = true"#,
+                "set exactly one",
+            ),
+            (
+                r#"[tables.orders]
+                   where = { _and = { x = { _eq = 1 } } }"#,
+                "expected array",
+            ),
+        ] {
+            let err = referenced_params(toml).unwrap_err();
+            let Error::Scope(msg) = &err else {
+                panic!("{toml}: expected Error::Scope, got {err:?}");
+            };
+            assert!(msg.contains(expect), "{toml}: {msg}");
+        }
+
+        // A relation predicate that itself uses `_and` is a predicate, not an
+        // operator object: no schema is needed to tell them apart.
+        let params = referenced_params(
+            r#"[tables.orders]
+               where = { user = { _and = [{ id = { _eq = "$a" } }, { role = { _eq = "$$x" } }] } }"#,
+        )
+        .unwrap();
+        assert_eq!(params.into_iter().collect::<Vec<_>>(), vec!["a"]);
+
+        // And on a policy the loader accepts, both agree on the set.
+        let toml = r#"
+            [tables.orders]
+            where = { _or = [
+                { user = { id = { _eq = "$claim.user_id" } } },
+                { title = { _in = ["$$lit", "$tag"] } },
+            ] }
+            [tables.users]
+            where = { id = { _eq = "$principal" } }
+        "#;
+        let syntactic = referenced_params(toml).unwrap();
+        let loaded = parse(toml, &schema()).unwrap().params();
+        assert_eq!(syntactic, loaded);
+        assert_eq!(
+            loaded.into_iter().collect::<Vec<_>>(),
+            vec!["claim.user_id", "principal", "tag"]
         );
     }
 

@@ -617,6 +617,14 @@ where = { school_id = { _eq = "$claim.school_id" } }       # Principal::new().se
 unrestricted = true
 ```
 
+A host that binds a known set of parameters can check a policy against that
+set before it is saved: `scope_config::referenced_params(toml)` returns the
+names the text references (`{"claim.school_id", "principal"}`) without a
+schema, applying the same reference grammar the loader does; a built
+`ScopePolicy` answers the same question with `params()`. A well-formed
+reference to a name the host never binds (`$claim.schools_id`) otherwise
+surfaces on the first request that fails closed.
+
 Scoped `delete` (and its `_by_pk` form) injects the predicate as a filter — it
 is AND-ed into the statement's `WHERE`, so a scoped caller can only remove rows
 already in scope. A `_by_pk` row failing the predicate simply does not match, so
