@@ -419,19 +419,13 @@ fn render_bool_expr(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
-        BoolExpr::IsNull { column, negated } => {
+        BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let pred = if *negated { "IS NOT NULL" } else { "IS NULL" };
-            write!(
-                ctx.sql,
-                "{table_alias}.{} {pred}",
-                quote_ident(&col.physical_name)
-            )
-            .unwrap();
-            Ok(())
+            let qualified = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+            render_is_null(&qualified, column, is_null, ctx)
         }
         BoolExpr::InList {
             column,
@@ -1147,25 +1141,90 @@ fn render_optional(
             .unwrap();
             Ok(())
         }
+        BoolExpr::IsNull { column, is_null } => {
+            // The column is resolved before the null shortcut for the same
+            // reason as above — and it is the reason this is an `IsNull` with
+            // a null operand rather than no predicate at all: the scope
+            // rewrite has already seen the column by now.
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("where.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
+            match is_null.as_lit() {
+                Some(v) if v.is_null() => {
+                    ctx.sql.push_str("TRUE");
+                    return Ok(());
+                }
+                Some(_) => return render_plain(ctx),
+                None => {}
+            }
+            let n = ctx.push_scalar(is_null, &PgType::Bool, || is_null_path(column))?;
+            write!(
+                ctx.sql,
+                "(${n}::boolean IS NULL OR ({} IS NULL) = ${n}::boolean)",
+                qualified(col)
+            )
+            .unwrap();
+            Ok(())
+        }
         // The lowering only ever wraps a comparison; the typed builder could
         // wrap anything. There is no reading of "optional" for a conjunction
         // that is not a guess, so it is refused rather than guessed.
         other => Err(Error::Validate {
             path: "where".into(),
             message: format!(
-                "Optional wraps a single comparison (`_eq`, `_in`, …), not {}",
+                "Optional wraps a single comparison (`_eq`, `_in`, `_is_null`, …), not {}",
                 match other {
                     BoolExpr::And(_) => "`_and`",
                     BoolExpr::Or(_) => "`_or`",
                     BoolExpr::Not(_) => "`_not`",
                     BoolExpr::Relation { .. } => "a relation predicate",
-                    BoolExpr::IsNull { .. } => "`_is_null`",
                     BoolExpr::Optional(_) => "another Optional",
-                    BoolExpr::Compare { .. } | BoolExpr::InList { .. } => unreachable!(),
+                    BoolExpr::Compare { .. }
+                    | BoolExpr::InList { .. }
+                    | BoolExpr::IsNull { .. } => unreachable!(),
                 }
             ),
         }),
     }
+}
+
+/// Error path for an `_is_null` operand: the suffix is what tells
+/// [`crate::types`]' null refusal to say something other than "use `_is_null`".
+fn is_null_path(column: &str) -> String {
+    format!("where.{column}._is_null")
+}
+
+/// [`BoolExpr::IsNull`] on an already-resolved, already-quoted column.
+///
+/// A literal decides the predicate here: `IS NULL` or `IS NOT NULL`, as a
+/// reader expects to see it. A variable cannot, so it binds — `(col IS NULL)
+/// = $n::boolean` — the same statement for both requests, which is what lets
+/// `_is_null: $b` compile without the document bounding `$b`. A null is
+/// refused as a null comparison is: neither predicate is what it asks for.
+fn render_is_null(qualified: &str, column: &str, is_null: &Val, ctx: &mut RenderCtx) -> Result<()> {
+    match is_null.as_lit() {
+        Some(serde_json::Value::Bool(true)) => ctx.sql.push_str(&format!("{qualified} IS NULL")),
+        Some(serde_json::Value::Bool(false)) => {
+            ctx.sql.push_str(&format!("{qualified} IS NOT NULL"))
+        }
+        Some(_) => {
+            // A null gets the refusal a null comparison gets, in `_is_null`'s
+            // words (see `types::null_comparison`), so a literal and a
+            // variable that turns out null say the same; anything else is
+            // simply not a boolean.
+            BindSpec::comparison(is_null.clone(), &PgType::Bool, || is_null_path(column))?;
+            return Err(Error::Validate {
+                path: is_null_path(column),
+                message: "expected boolean".into(),
+            });
+        }
+        None => {
+            let n = ctx.push_comparison(is_null, &PgType::Bool, || is_null_path(column))?;
+            write!(ctx.sql, "({qualified} IS NULL) = ${n}::boolean").unwrap();
+        }
+    }
+    Ok(())
 }
 
 /// An `_in` list that is literally empty, and so can collapse to TRUE/FALSE.
@@ -3218,14 +3277,12 @@ fn render_bool_expr_no_alias(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
-        BoolExpr::IsNull { column, negated } => {
+        BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let pred = if *negated { "IS NOT NULL" } else { "IS NULL" };
-            write!(ctx.sql, "{} {pred}", quote_ident(&col.physical_name)).unwrap();
-            Ok(())
+            render_is_null(&quote_ident(&col.physical_name), column, is_null, ctx)
         }
         BoolExpr::InList {
             column,

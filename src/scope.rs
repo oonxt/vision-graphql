@@ -1237,6 +1237,39 @@ mod column_tests {
         denied("{ users_aggregate { aggregate { count(columns: [salary]) } } }");
     }
 
+    /// A filter the request left out still names its column. A dropped
+    /// `@optional` comparison used to be lowered away — for `_is_null` into
+    /// an empty conjunction — so whether this document was valid depended on
+    /// the value the request sent: `{b: true}` denied, `{b: null}` ran.
+    #[test]
+    fn a_dropped_optional_filter_on_a_withheld_column_is_still_refused() {
+        for (q, vars) in [
+            (
+                "query($b: Boolean @optional) { users(where: {salary: {_is_null: $b}}) { id } }",
+                json!({"b": null}),
+            ),
+            (
+                "query($b: Boolean @optional) { users(where: {salary: {_is_null: $b}}) { id } }",
+                json!({"b": true}),
+            ),
+            (
+                "query($n: Int @optional) { users(where: {salary: {_eq: $n}}) { id } }",
+                json!({"n": null}),
+            ),
+            (
+                "query($n: [Int!] @optional) { users(where: {salary: {_in: $n}}) { id } }",
+                json!({"n": null}),
+            ),
+        ] {
+            let mut op = crate::parser::parse_and_lower(q, &vars, None, &schema()).unwrap();
+            let err = apply_scope(&mut op, &scope(), &schema()).unwrap_err();
+            assert!(
+                matches!(err, Error::ScopeColumnDenied { .. }),
+                "{q} with {vars}: expected a column denial, got {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_withheld_column_cannot_be_written() {
         denied(r#"mutation { insert_users(objects: [{salary: 1}]) { affected_rows } }"#);

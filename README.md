@@ -214,12 +214,13 @@ the shape the request's value names; a value outside the list is refused, under
 
 ```graphql
 query List($sort: [courses_order_by!]! @choices(values: [[{created_at: desc}], [{title: asc}], [{title: desc}]]),
-           $archived: Boolean! @choices(values: [true, false])) {
-  courses(order_by: $sort, where: {archived_at: {_is_null: $archived}}) { id title }
+           $status: [String!]! @choices(values: [["draft"], ["published", "archived"]])) {
+  courses(order_by: $sort, where: {status: {_in: $status}}) { id title }
 }
 ```
 
 Several `@choices` variables multiply out (six shapes here), capped at 256.
+`_is_null: $b` needs none of this: it binds as `(col IS NULL) = $1::boolean`.
 `CompiledQuery::shapes()` lists every shape with its values; `sql()` is the
 first. On this engine's parser the directive goes *before* a default value
 (`$sort: T @choices(values: […]) = […]`), the reverse of the spec's order.
@@ -237,19 +238,19 @@ un-optional. Leaving the
 variable out of the request is still an error: null is "no filter", absence is
 a mistake.
 
-The two compose. A shape-deciding filter the request may also leave out — the
-three-state `roots`: only top-level, only nested, or all — is one variable
-with both directives, and one more shape than values:
+That includes `_is_null`, which makes the three-state filter — only
+top-level, only nested, or all — one variable in one statement:
 
 ```graphql
-query Categories($roots: Boolean @choices(values: [true, false]) @optional = null) {
+query Categories($roots: Boolean @optional = null) {
   categories(where: {parent_id: {_is_null: $roots}}) { id name }
 }
 ```
 
-`true` and `false` are the two `_is_null` shapes; null — sent, or defaulted
-as here — is the third, with no predicate. Anything else is refused as it
-would be without `@optional`.
+The two directives compose: `$t: String @choices(values: ["a", "b"]) @optional`
+admits `"a"`, `"b"` and null, and compiles to one more shape than values — the
+one with the comparison dropped. A null default is legal for exactly that
+shape.
 
 Both directives are published by `__schema` and the SDL, and are the only
 directives the engine accepts.

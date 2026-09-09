@@ -5,31 +5,47 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ## Unreleased
 
+### Breaking
+
+- `BoolExpr::IsNull` carries its operand as a `Val` (`is_null: Val`, true for
+  `IS NULL`) in place of `negated: bool`. See the first item below. The
+  builder's `where_is_null` / `where_is_not_null` are unchanged.
+
 ### Added
 
-- **`@optional` and `@choices` compose.** A three-state optional filter — a
-  `roots` argument that is "only top-level" (`parent_id IS NULL`), "only
-  nested", or unset — had no single-document spelling: the two directives on
-  one variable were refused as contradicting each other, and the refusal
-  pointed at listing null among the `@choices` values, which `_is_null` then
-  rejected as not a boolean (field report). A variable may now carry both:
-  `$roots: Boolean @choices(values: [true, false]) @optional = null` compiles
-  to one shape per value plus one with the comparison dropped, picked by a
-  null the way any other shape is picked by its value; a null default is
-  legal for exactly that reason. `CompiledQuery::optional()` lists the
-  variables so declared, `choices()` is unchanged. The null shape counts
-  toward the 256-shape bound. Listing null among the values *and* declaring
-  `@optional` is refused, since both would mean the same thing.
-- **`@optional` applies at `_is_null`.** It was refused there as "not a
-  comparison operator"; a null now leaves the filter out, as it does for
-  `_eq` or `_in`. Under `Engine::compile` the variable still decides the
-  shape, so it needs `@choices` beside it — the `NotCompilable` error says so,
-  as it does for any structural variable.
+- **`_is_null: $b` binds instead of deciding the statement's shape.** It was
+  the one comparison operator whose variable was structural, so it could not
+  compile without `@choices`, and an `@optional` there was refused as "not a
+  comparison operator" — which left a three-state optional filter (`roots`:
+  only top-level, only nested, unset) with no single-document spelling (field
+  report). It now renders `(col IS NULL) = $1::boolean`, one statement for
+  both values, and `$roots: Boolean @optional` on `parent_id: {_is_null:
+  $roots}` drops the predicate on null exactly as `_eq` does:
+  `($1::boolean IS NULL OR (col IS NULL) = $1::boolean)`. A literal still
+  renders `IS NULL` / `IS NOT NULL`. A null for a non-optional variable is
+  refused at execution, as a null comparison is, in words that name
+  `@optional` as the fix rather than `_is_null`.
+- **`@optional` and `@choices` compose.** They were refused together as
+  contradicting, and the refusal pointed at listing null among the values,
+  which `_is_null` then rejected as not a boolean. A variable may now carry
+  both: the values plus null, compiled to one shape per value and one with
+  the comparison dropped, picked by a null the way any other shape is picked;
+  a null default is legal for exactly that reason. `CompiledQuery::optional()`
+  lists the variables so declared. The null shape counts toward the 256-shape
+  bound, and the bound's error says so. Listing null among the values *and*
+  declaring `@optional` is refused, since both would mean the same thing.
 
 ### Fixed
 
+- **A dropped `@optional` filter keeps its column in the IR.** The first cut
+  of the change above lowered a dropped `_is_null` to nothing, so a scope
+  policy withholding the column never saw it: the same document was refused
+  with `{b: true}` and ran with `{b: null}`. A dropped comparison is now an
+  `Optional` around the predicate it would have been, which the scope rewrite
+  walks into; `scope.rs` has the regression test.
 - `_is_null: $x` with `x` null said only "expected boolean". It now names
-  `@optional` as the way to let a null leave the filter out.
+  `@optional` as the way to let a null leave the filter out; a literal
+  `_is_null: null`, which has no variable to declare, keeps the short message.
 
 ## 0.19.0 — 2026-09-08
 

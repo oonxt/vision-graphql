@@ -35,7 +35,6 @@
 //!
 //! - `where: $w` — a whole filter object, and likewise `order_by: $o`,
 //!   `distinct_on: $d`; these decide which predicates and clauses exist.
-//! - `_is_null: $b` — picks between `IS NULL` and `IS NOT NULL`.
 //! - any variable inside an `insert` argument. A VALUES list's row count and
 //!   column set come from the argument itself, so `objects: $rows` could never
 //!   compile; this first cut does not thread variables into written-out rows
@@ -66,15 +65,13 @@
 //! refused, on this path and under `Engine::query` alike, so the document asks
 //! the same question however it is run. Several `@choices` variables multiply
 //! out; the product is capped at [`MAX_SHAPES`](crate::parser::MAX_SHAPES).
-//! `_is_null: $b @choices(values: [true, false])` is the same idea for a
-//! boolean. This is what makes a sortable list with a handful of orderings
-//! one persisted statement rather than one per ordering.
+//! This is what makes a sortable list with a handful of orderings one
+//! persisted statement rather than one per ordering. (`_is_null: $b` needs
+//! none of this: it binds, as `(col IS NULL) = $1::boolean`.)
 //!
-//! A shape-deciding filter the request may also leave out carries both
-//! directives: `$roots: Boolean @choices(values: [true, false]) @optional =
-//! null` on `parent_id: {_is_null: $roots}` is three shapes — `IS NULL`,
-//! `IS NOT NULL`, and no predicate — and the request picks the third with a
-//! null, as the default here does.
+//! `@choices` composes with `@optional` below: `$t: String @choices(values:
+//! ["a", "b"]) @optional` admits `"a"`, `"b"` and null — one more shape,
+//! with the comparison dropped — and a null default picks that shape.
 //!
 //! On this engine's parser the directive goes *before* a default value
 //! (`$sort: T @choices(values: […]) = […]`), the reverse of the spec's order;
@@ -99,11 +96,12 @@
 //! not; run eagerly, a null leaves the comparison out and a value renders it
 //! exactly as it would without the directive. The variable must be nullable
 //! and may only stand as the whole value of a comparison operator — `_is_null`
-//! included, where it needs `@choices` beside it to compile, since the value
-//! decides the SQL's shape; anywhere else (`limit`, `_set`, an element of a
-//! list) it is refused rather than silently un-optional. Leaving the variable
-//! out of the request is still an error: null is the request saying "no
-//! filter", absence is the request forgetting.
+//! included, which makes `$roots: Boolean @optional` on `parent_id:
+//! {_is_null: $roots}` the three-state filter (only null, only non-null, all)
+//! in one statement; anywhere else (`limit`, `_set`, an element of a list) it
+//! is refused rather than silently un-optional. Leaving the variable out of
+//! the request is still an error: null is the request saying "no filter",
+//! absence is the request forgetting.
 //!
 //! Both directives are published by `__schema` and the SDL, and are the only
 //! directives this engine accepts.
@@ -113,6 +111,7 @@
 //! transaction still go through [`TxClient`](crate::TxClient).
 
 use crate::error::{Error, Result};
+use crate::parser::VariableContract;
 use crate::types::{json_equiv, BindSpec};
 use serde_json::{Map, Value};
 
@@ -130,13 +129,11 @@ pub struct CompiledQuery {
     /// enumerate (first declared variable slowest). Exactly one, pinned to
     /// nothing, when the operation declares no `@choices`.
     pub(crate) shapes: Vec<Shape>,
-    /// The `@choices` declarations, in declaration order: what the shapes are
-    /// keyed by, and the set a request's value is checked against.
-    pub(crate) choices: Vec<(String, Vec<Value>)>,
-    /// The `@optional` declarations. A `@choices` variable among them has one
-    /// more shape than values — the one compiled for null, with its comparison
-    /// dropped — and a request may pick it with a null.
-    pub(crate) optional: Vec<String>,
+    /// What the operation declared about its variables: the `@choices` lists
+    /// the shapes are keyed by and a request's value is checked against, and
+    /// the `@optional` names, for which null is one more admitted value — the
+    /// shape with the comparison dropped.
+    pub(crate) contract: VariableContract,
     /// Response key when the operation has exactly one root field, so typed
     /// execution can unwrap the data envelope.
     pub(crate) root_alias: Option<String>,
@@ -198,13 +195,13 @@ impl CompiledQuery {
     /// the values a request may supply for it. One that is also `@optional`
     /// (see [`optional`](Self::optional)) takes null as well.
     pub fn choices(&self) -> &[(String, Vec<Value>)] {
-        &self.choices
+        &self.contract.choices
     }
 
     /// The variables the operation declared `@optional`, in declaration order:
     /// a null for any of them drops the comparison it is the operand of.
     pub fn optional(&self) -> &[String] {
-        &self.optional
+        &self.contract.optional
     }
 
     /// Whether this was compiled against a scope policy, and so must be run
@@ -227,7 +224,7 @@ impl CompiledQuery {
     /// they are needed even where the chosen shape has no placeholder for
     /// them.
     pub fn variables(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.choices.iter().map(|(n, _)| n.clone()).collect();
+        let mut out: Vec<String> = self.choices().iter().map(|(n, _)| n.clone()).collect();
         for shape in &self.shapes {
             for spec in &shape.specs {
                 let mut found = Vec::new();
@@ -259,15 +256,15 @@ impl CompiledQuery {
     /// predicate the document never offered, and answering with another would
     /// be answering a different question.
     pub(crate) fn shape_for(&self, variables: &Value) -> Result<&Shape> {
-        if self.choices.is_empty() {
+        let choices = self.choices();
+        if choices.is_empty() {
             return Ok(&self.shapes[0]);
         }
         let inputs = crate::types::Inputs::variables(variables).with_defaults(&self.defaults);
-        let mut wanted: Vec<(&str, &Value)> = Vec::with_capacity(self.choices.len());
-        for (name, values) in &self.choices {
+        let mut wanted: Vec<(&str, &Value)> = Vec::with_capacity(choices.len());
+        for (name, values) in choices {
             let v = inputs.variable(name)?;
-            let dropped = v.is_null() && self.optional.contains(name);
-            if !dropped && !values.iter().any(|c| json_equiv(c, v)) {
+            if !self.contract.admits(name, values, v) {
                 return Err(Error::Variable {
                     name: name.clone(),
                     message: format!("{v} is not one of the values declared by @choices"),
@@ -325,8 +322,7 @@ pub(crate) fn compile(
     }
     Ok(CompiledQuery {
         shapes,
-        choices: contract.choices,
-        optional: contract.optional,
+        contract,
         root_alias,
         defaults: crate::parser::variable_defaults(doc, operation_name)?,
         scoped: policy.is_some(),
@@ -342,19 +338,11 @@ pub(crate) fn compile(
 /// The product is bounded by [`crate::parser::MAX_SHAPES`]: each combination
 /// is a full lowering held for the life of the statement, and a document whose
 /// lists multiply past the bound is asking for a different design.
-fn choice_combinations(
-    contract: &crate::parser::VariableContract,
-) -> Result<Vec<Map<String, Value>>> {
-    let choices: Vec<(&str, Vec<Value>)> = contract
+fn choice_combinations(contract: &VariableContract) -> Result<Vec<Map<String, Value>>> {
+    let choices: Vec<(&str, Vec<&Value>)> = contract
         .choices
         .iter()
-        .map(|(name, values)| {
-            let mut values = values.clone();
-            if contract.optional.contains(name) {
-                values.push(Value::Null);
-            }
-            (name.as_str(), values)
-        })
+        .map(|(name, values)| (name.as_str(), contract.admitted(name, values).collect()))
         .collect();
     let total = choices
         .iter()
@@ -362,12 +350,20 @@ fn choice_combinations(
         .filter(|n| *n <= crate::parser::MAX_SHAPES);
     if total.is_none() {
         let names: Vec<String> = choices.iter().map(|(n, _)| format!("${n}")).collect();
+        let with_null = choices
+            .iter()
+            .any(|(name, _)| contract.optional.iter().any(|n| n == name));
         return Err(Error::NotCompilable {
             path: names.join(", "),
             message: format!(
-                "@choices multiply out to more than {} shapes; a compiled statement holds \
+                "@choices multiply out to more than {} shapes{}; a compiled statement holds \
                  one per combination",
-                crate::parser::MAX_SHAPES
+                crate::parser::MAX_SHAPES,
+                if with_null {
+                    " (an @optional one counts its null as a value)"
+                } else {
+                    ""
+                }
             ),
         });
     }
@@ -377,7 +373,7 @@ fn choice_combinations(
         for base in &out {
             for v in values {
                 let mut m = base.clone();
-                m.insert(name.to_string(), v.clone());
+                m.insert(name.to_string(), (*v).clone());
                 next.push(m);
             }
         }
@@ -396,7 +392,7 @@ mod tests {
     use crate::schema::{PgType, Relation, Schema, Table};
     use crate::scope::apply_scope;
     use crate::sql::render;
-    use crate::types::{resolve_binds, Bind, Inputs};
+    use crate::types::{resolve_binds, Bind, Inputs, NullOf};
     use serde_json::{json, Value};
 
     fn schema() -> Schema {
@@ -775,24 +771,18 @@ mod tests {
             "{err:?}"
         );
 
-        // The eager path agrees: same three answers, same refusal.
+        // The eager path renders the same three statements, and refuses the
+        // same value.
         let doc = parse_document(source).unwrap();
-        for (vars, negated) in [
-            (json!({"roots": true}), false),
-            (json!({"roots": false}), true),
+        for (vars, shape) in [
+            (json!({"roots": true}), is_null),
+            (json!({"roots": false}), not_null),
+            (json!({"roots": null}), dropped),
+            (json!({}), dropped),
         ] {
             let op = lower_with(&doc, Bindings::eager(&vars), None, &schema()).unwrap();
-            let found = format!("{op:?}");
-            assert!(
-                found.contains(&format!(
-                    "IsNull {{ column: \"title\", negated: {negated} }}"
-                )),
-                "{vars}: {found}"
-            );
-        }
-        for vars in [json!({"roots": null}), json!({})] {
-            let op = lower_with(&doc, Bindings::eager(&vars), None, &schema()).unwrap();
-            assert!(!format!("{op:?}").contains("IsNull"), "{vars}: {op:?}");
+            let (sql, _) = render(&op, &schema()).unwrap();
+            assert_eq!(sql, shape.sql, "{vars}");
         }
         let err = lower_with(
             &doc,
@@ -806,8 +796,8 @@ mod tests {
             "{err:?}"
         );
 
-        // A value operand composes the same way, and the null shape has no
-        // placeholder to bind.
+        // A value operand composes the same way: the pinned value is a
+        // parameter of its shape, and the null shape has none.
         let q = compile_doc(
             r#"query($t: String @choices(values: ["a", "b"]) @optional) {
                  orders(where: {title: {_eq: $t}}) { id }
@@ -818,20 +808,14 @@ mod tests {
         let dropped = q.shape_for(&json!({"t": null})).unwrap();
         assert!(!dropped.sql.contains("title"), "{}", dropped.sql);
         assert!(dropped.specs.is_empty(), "{:?}", dropped.specs);
-        assert!(
-            q.shape_for(&json!({"t": "a"}))
-                .unwrap()
-                .sql
-                .contains(r#""title" = 'a'"#)
-                || q.shape_for(&json!({"t": "a"}))
-                    .unwrap()
-                    .sql
-                    .contains(r#""title" = $"#),
-            "{}",
-            q.shape_for(&json!({"t": "a"})).unwrap().sql
+        let a = q.shape_for(&json!({"t": "a"})).unwrap();
+        assert!(a.sql.contains(r#""title" = $1::text"#), "{}", a.sql);
+        assert_eq!(
+            binds(&a.specs, json!({"t": "a"})).unwrap(),
+            vec![Bind::Text("a".into())]
         );
         // The null shape counts toward the bound: 256 values plus the dropped
-        // shape is one over.
+        // shape is one over, and the error says which value that was.
         let values: Vec<String> = (0..256).map(|n| n.to_string()).collect();
         let err = compile_doc(&format!(
             "query($n: Int @choices(values: [{}]) @optional) {{ orders(where: {{id: {{_eq: $n}}}}) {{ id }} }}",
@@ -839,32 +823,76 @@ mod tests {
         ))
         .unwrap_err();
         assert!(
-            matches!(&err, Error::NotCompilable { message, .. } if message.contains("256")),
+            matches!(&err, Error::NotCompilable { message, .. } if message.contains("256") && message.contains("@optional")),
             "{err:?}"
         );
     }
 
     #[test]
-    fn optional_alone_on_is_null_runs_eagerly_and_asks_for_choices_to_compile() {
-        // Without @choices the value still decides the shape, so the compiled
-        // path refuses it the way it refuses any structural variable — naming
-        // the directive that would fix it. Eagerly the value is in hand.
-        let source =
-            "query($b: Boolean @optional) { orders(where: {title: {_is_null: $b}}) { id } }";
-        let err = compile_doc(source).unwrap_err();
+    fn is_null_binds_a_variable_instead_of_deciding_the_shape() {
+        // `_is_null: $b` is one statement, `(col IS NULL) = $1`, not a
+        // shape per value — so it compiles without @choices, and a null at
+        // execution is refused in `_is_null`'s own words.
+        let (sql, specs) =
+            compile("query($b: Boolean!) { orders(where: {title: {_is_null: $b}}) { id } }")
+                .unwrap();
+        assert!(sql.contains(r#"."title" IS NULL) = $1::boolean"#), "{sql}");
+        assert_eq!(
+            binds(&specs, json!({"b": true})).unwrap(),
+            vec![Bind::Bool(true)]
+        );
+        let err = binds(&specs, json!({"b": null})).unwrap_err();
         assert!(
-            matches!(&err, Error::NotCompilable { message, .. } if message.contains("@choices")),
+            matches!(&err, Error::Validate { path, message } if path.ends_with("._is_null") && message.contains("@optional")),
             "{err:?}"
         );
-        let doc = parse_document(source).unwrap();
-        let op = lower_with(&doc, Bindings::eager(&json!({"b": true})), None, &schema()).unwrap();
-        assert!(format!("{op:?}").contains("IsNull"), "{op:?}");
-        let op = lower_with(&doc, Bindings::eager(&json!({"b": null})), None, &schema()).unwrap();
-        assert!(!format!("{op:?}").contains("IsNull"), "{op:?}");
+
+        // With @optional the null is the request leaving the filter out,
+        // decided by the parameter inside the same statement.
+        let (sql, specs) = compile(
+            "query($b: Boolean @optional) { orders(where: {title: {_is_null: $b}}) { id } }",
+        )
+        .unwrap();
+        assert!(
+            sql.contains(r#"($1::boolean IS NULL OR (t0."title" IS NULL) = $1::boolean)"#),
+            "{sql}"
+        );
+        assert_eq!(
+            binds(&specs, json!({"b": false})).unwrap(),
+            vec![Bind::Bool(false)]
+        );
+        assert_eq!(
+            binds(&specs, json!({"b": null})).unwrap(),
+            vec![Bind::Null(NullOf::Bool)]
+        );
+
+        // Eagerly the value is in hand and the predicate is spelled out, or
+        // left out; a non-boolean is refused before anything is rendered.
+        let doc = parse_document(
+            "query($b: Boolean @optional) { orders(where: {title: {_is_null: $b}}) { id } }",
+        )
+        .unwrap();
+        for (vars, expect) in [
+            (json!({"b": true}), r#""title" IS NULL"#),
+            (json!({"b": false}), r#""title" IS NOT NULL"#),
+            (json!({"b": null}), "TRUE"),
+        ] {
+            let op = lower_with(&doc, Bindings::eager(&vars), None, &schema()).unwrap();
+            let (sql, specs) = render(&op, &schema()).unwrap();
+            assert!(sql.contains(expect), "{vars}: {sql}");
+            assert!(specs.is_empty(), "{vars}: {specs:?}");
+        }
         let err =
             lower_with(&doc, Bindings::eager(&json!({"b": "x"})), None, &schema()).unwrap_err();
         assert!(
             matches!(&err, Error::Validate { message, .. } if message.contains("expected boolean")),
+            "{err:?}"
+        );
+        // A literal null has no variable to declare, so the hint is not
+        // offered for it.
+        let err = compile("{ orders(where: {title: {_is_null: null}}) { id } }").unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { message, .. } if message == "expected boolean"),
             "{err:?}"
         );
     }
@@ -1163,10 +1191,6 @@ mod tests {
                 "where",
             ),
             (
-                "query($b: Boolean!) { users(where: {name: {_is_null: $b}}) { id } }",
-                "_is_null",
-            ),
-            (
                 "query($o: [users_order_by!]) { users(order_by: $o) { id } }",
                 "order_by",
             ),
@@ -1309,8 +1333,7 @@ mod tests {
                 sql,
                 specs,
             }],
-            choices: Vec::new(),
-            optional: Vec::new(),
+            contract: super::VariableContract::default(),
             root_alias: None,
             defaults: Default::default(),
             scoped: true,

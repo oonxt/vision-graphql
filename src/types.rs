@@ -263,11 +263,18 @@ impl BindSpec {
 
 /// The one error this refusal produces, in both places it can happen.
 fn null_comparison(path: &str) -> Error {
+    // `_is_null` is the operator the general message points at, so a null
+    // *there* needs its own words: the fix is `@optional`, not `_is_null`.
+    let message = if path.ends_with("._is_null") {
+        "expected boolean; a null cannot render `IS NULL` or `IS NOT NULL` — to let a \
+         null leave the filter out, declare the variable @optional"
+    } else {
+        "comparing against null matches no rows, which is unlikely to be what was \
+         meant; use `_is_null` to ask whether the column is null"
+    };
     Error::Validate {
         path: path.to_string(),
-        message: "comparing against null matches no rows, which is unlikely to be \
-                  what was meant; use `_is_null` to ask whether the column is null"
-            .into(),
+        message: message.into(),
     }
 }
 

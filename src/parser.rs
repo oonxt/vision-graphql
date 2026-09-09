@@ -115,8 +115,7 @@ pub fn lower_with(
             Mode::Symbolic { pinned } => pinned.get(name),
         };
         if let Some(v) = v {
-            let dropped = v.is_null() && contract.optional.contains(name);
-            if !dropped && !values.iter().any(|c| json_equiv(c, v)) {
+            if !contract.admits(name, values, v) {
                 return Err(Error::Variable {
                     name: name.clone(),
                     message: format!("{v} is not one of the values declared by @choices"),
@@ -581,6 +580,30 @@ pub struct VariableContract {
     pub choices: Vec<(String, Vec<Value>)>,
 }
 
+impl VariableContract {
+    /// The values a `@choices` variable may hold: its list, plus null when it
+    /// is also `@optional` — the value that drops its comparison. Every
+    /// place that checks or enumerates a bounded variable's values reads this
+    /// one list, so the eager check, the compiled check and the set of
+    /// compiled shapes cannot disagree on whether null is among them.
+    pub fn admitted<'a>(
+        &'a self,
+        name: &str,
+        values: &'a [Value],
+    ) -> impl Iterator<Item = &'a Value> {
+        static NULL: Value = Value::Null;
+        values
+            .iter()
+            .chain(self.optional.iter().any(|n| n == name).then_some(&NULL))
+    }
+
+    /// Whether `value` is one a request may send for the `@choices` variable
+    /// `name`, whose declared values are `values`.
+    pub fn admits(&self, name: &str, values: &[Value], value: &Value) -> bool {
+        self.admitted(name, values).any(|c| json_equiv(c, value))
+    }
+}
+
 /// The [`VariableContract`] of an operation in `doc`.
 pub fn variable_contract(
     doc: &ExecutableDocument,
@@ -693,8 +716,7 @@ fn contract_of(
                 let default = default.node.clone().into_json().map_err(|e| {
                     refuse(format!("default value is not representable as JSON: {e}"))
                 })?;
-                let dropped = optional && default.is_null();
-                if !dropped && !items.iter().any(|v| json_equiv(v, &default)) {
+                if !out.admits(name, &items, &default) {
                     return Err(refuse(format!(
                         "default value {default} is not one of the values declared by \
                          @choices{}",
@@ -2591,25 +2613,9 @@ pub(crate) fn lower_where(
                     // whole operand: inside a composite (`_in: [1, $x]`) a null
                     // element does not make the list null, and `gql_to_val`
                     // refuses it there.
-                    let optional_here = |name: &str| -> Result<bool> {
-                        if !vars.is_optional(name) {
-                            return Ok(false);
-                        }
-                        if vars.disjunctive {
-                            return Err(Error::Validate {
-                                path: op_path(),
-                                message: format!(
-                                    "'${name}' is declared @optional, which cannot apply \
-                                     under `_or` or `_not`: a dropped comparison is TRUE, \
-                                     which would admit every row there or none"
-                                ),
-                            });
-                        }
-                        Ok(true)
-                    };
                     let operand = |v: &GqlValue| -> Result<(Val, bool)> {
                         if let GqlValue::Variable(name) = v {
-                            if optional_here(name.as_str())? {
+                            if vars.optional_operand(name.as_str(), &op_path())? {
                                 return Ok((vars.value_of(name.as_str(), &op_path())?, true));
                             }
                         }
@@ -2656,52 +2662,41 @@ pub(crate) fn lower_where(
                         ))
                     };
                     let part = match op_name.as_str() {
-                        // `_is_null` picks between `IS NULL` and `IS NOT NULL`,
-                        // so its value is structure, not a bound parameter.
+                        // `_is_null` is an operand like the others: a literal
+                        // renders `IS NULL` / `IS NOT NULL`, a variable binds
+                        // as a boolean, and an `@optional` null drops it — with
+                        // the column still in the IR for the scope rewrite to
+                        // check. What a literal may be is settled here rather
+                        // than at render, so the eager path and a pinned shape
+                        // refuse a bad one before anything is built.
                         "_is_null" => {
-                            // An `@optional` variable makes it three-state:
-                            // a null leaves the filter out. The value is
-                            // always in hand here — eagerly, or pinned by
-                            // `@choices` — so the drop is decided now: an
-                            // empty conjunction, which renders as the `TRUE`
-                            // an `Optional` comparison renders for null.
-                            let optional = match op_val {
-                                GqlValue::Variable(name) => optional_here(name.as_str())?,
-                                _ => false,
-                            };
-                            let b = if optional {
-                                let GqlValue::Variable(name) = op_val else {
-                                    unreachable!("optional_here only admits a variable")
+                            let (value, optional) = operand(op_val)?;
+                            if let Val::Lit(lit) = &value {
+                                let message = match (lit, op_val) {
+                                    (Value::Bool(_), _) => None,
+                                    (Value::Null, _) if optional => None,
+                                    (Value::Null, GqlValue::Variable(name)) => Some(format!(
+                                        "expected boolean; a null cannot render `IS NULL` or \
+                                         `IS NOT NULL` — to let a null leave the filter out, \
+                                         declare `${name}` @optional (and leave null out of \
+                                         its @choices, if it has one)"
+                                    )),
+                                    _ => Some("expected boolean".into()),
                                 };
-                                std::borrow::Cow::Owned(json_to_gql(
-                                    vars.value_now(name.as_str(), &op_path())?,
-                                ))
-                            } else {
-                                structural(op_val, vars, &op_path())?
-                            };
-                            match b.as_ref() {
-                                GqlValue::Boolean(b) => BoolExpr::IsNull {
-                                    column: exposed_name.clone(),
-                                    negated: !b,
-                                },
-                                GqlValue::Null if optional => BoolExpr::And(Vec::new()),
-                                GqlValue::Null => {
+                                if let Some(message) = message {
                                     return Err(Error::Validate {
                                         path: op_path(),
-                                        message: "expected boolean; a null cannot render \
-                                                  `IS NULL` or `IS NOT NULL` — to let a null \
-                                                  leave the filter out, declare the variable \
-                                                  @optional"
-                                            .into(),
-                                    });
-                                }
-                                _ => {
-                                    return Err(Error::Validate {
-                                        path: op_path(),
-                                        message: "expected boolean".into(),
+                                        message,
                                     });
                                 }
                             }
+                            wrap(
+                                BoolExpr::IsNull {
+                                    column: exposed_name.clone(),
+                                    is_null: value,
+                                },
+                                optional,
+                            )
                         }
                         "_in" => in_list(false, op_val)?,
                         "_nin" => in_list(true, op_val)?,
@@ -3049,6 +3044,28 @@ impl<'a> Bindings<'a> {
                 None => Val::Var(name.to_string()),
             }),
         }
+    }
+
+    /// Whether `$name`, standing as the whole operand of a comparison, is
+    /// `@optional` — the one place the declaration applies. Refused under
+    /// `_or` / `_not` (see [`Bindings::disjunctive`]); the complement,
+    /// [`refuse_optional`](Self::refuse_optional), covers every other
+    /// position.
+    fn optional_operand(&self, name: &str, path: &str) -> Result<bool> {
+        if !self.is_optional(name) {
+            return Ok(false);
+        }
+        if self.disjunctive {
+            return Err(Error::Validate {
+                path: path.to_string(),
+                message: format!(
+                    "'${name}' is declared @optional, which cannot apply under `_or` or \
+                     `_not`: a dropped comparison is TRUE, which would admit every row \
+                     there or none"
+                ),
+            });
+        }
+        Ok(true)
     }
 
     /// An `@optional` variable is only meaningful as the whole value of a
@@ -3959,9 +3976,9 @@ mod tests {
             panic!("expected Query")
         };
         match roots[0].args.where_.as_ref().unwrap() {
-            crate::ast::BoolExpr::IsNull { column, negated } => {
+            crate::ast::BoolExpr::IsNull { column, is_null } => {
                 assert_eq!(column, "name");
-                assert!(!negated);
+                assert_eq!(is_null.as_lit(), Some(&Value::Bool(true)));
             }
             _ => panic!("expected IsNull"),
         }

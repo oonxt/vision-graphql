@@ -344,7 +344,7 @@ impl ScopeExpr {
             },
             ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
                 column: column.clone(),
-                negated: *negated,
+                is_null: Val::Lit(Value::Bool(!*negated)),
             },
             ScopeExpr::InList {
                 column,
@@ -386,7 +386,7 @@ impl ScopeExpr {
             },
             ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
                 column: column.clone(),
-                negated: *negated,
+                is_null: Val::Lit(Value::Bool(!*negated)),
             },
             ScopeExpr::InList {
                 column,
