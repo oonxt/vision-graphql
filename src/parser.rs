@@ -581,6 +581,11 @@ pub struct VariableContract {
 }
 
 impl VariableContract {
+    /// Whether `$name` is declared `@optional`.
+    pub fn is_optional(&self, name: &str) -> bool {
+        self.optional.iter().any(|n| n == name)
+    }
+
     /// The values a `@choices` variable may hold: its list, plus null when it
     /// is also `@optional` — the value that drops its comparison. Every
     /// place that checks or enumerates a bounded variable's values reads this
@@ -591,10 +596,9 @@ impl VariableContract {
         name: &str,
         values: &'a [Value],
     ) -> impl Iterator<Item = &'a Value> {
-        static NULL: Value = Value::Null;
         values
             .iter()
-            .chain(self.optional.iter().any(|n| n == name).then_some(&NULL))
+            .chain(self.is_optional(name).then_some(&Value::Null))
     }
 
     /// Whether `value` is one a request may send for the `@choices` variable
@@ -2538,7 +2542,7 @@ fn is_cmp_operator(key: &str) -> bool {
 /// Walks the GraphQL value rather than a pre-substituted JSON one, because that
 /// is where variables still exist: a variable in a *value* position becomes a
 /// [`Val::Var`], while a variable standing in for structure (`where: $w`,
-/// `_is_null: $b`) is resolved through [`structural`] and so is only allowed
+/// `order_by: $o`) is resolved through [`structural`] and so is only allowed
 /// when its value is already known.
 pub(crate) fn lower_where(
     value: &GqlValue,
@@ -2666,29 +2670,22 @@ pub(crate) fn lower_where(
                         // renders `IS NULL` / `IS NOT NULL`, a variable binds
                         // as a boolean, and an `@optional` null drops it — with
                         // the column still in the IR for the scope rewrite to
-                        // check. What a literal may be is settled here rather
-                        // than at render, so the eager path and a pinned shape
-                        // refuse a bad one before anything is built.
+                        // check. A null is left for the renderer to refuse,
+                        // where a null in any comparison is refused, in the
+                        // one wording; only the shape is checked here, since a
+                        // composite (`_is_null: [$x]`) would otherwise bind.
                         "_is_null" => {
                             let (value, optional) = operand(op_val)?;
-                            if let Val::Lit(lit) = &value {
-                                let message = match (lit, op_val) {
-                                    (Value::Bool(_), _) => None,
-                                    (Value::Null, _) if optional => None,
-                                    (Value::Null, GqlValue::Variable(name)) => Some(format!(
-                                        "expected boolean; a null cannot render `IS NULL` or \
-                                         `IS NOT NULL` — to let a null leave the filter out, \
-                                         declare `${name}` @optional (and leave null out of \
-                                         its @choices, if it has one)"
-                                    )),
-                                    _ => Some("expected boolean".into()),
-                                };
-                                if let Some(message) = message {
-                                    return Err(Error::Validate {
-                                        path: op_path(),
-                                        message,
-                                    });
-                                }
+                            let ok = match &value {
+                                Val::Lit(lit) => lit.is_boolean() || lit.is_null(),
+                                Val::Var(_) => true,
+                                Val::Array(_) | Val::Object(_) | Val::ScopeParam(_) => false,
+                            };
+                            if !ok {
+                                return Err(Error::Validate {
+                                    path: op_path(),
+                                    message: "expected boolean".into(),
+                                });
                             }
                             wrap(
                                 BoolExpr::IsNull {

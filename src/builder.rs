@@ -217,19 +217,13 @@ impl QueryBuilder {
     }
 
     pub fn where_is_null(mut self, col: impl Into<String>) -> Self {
-        let e = BoolExpr::IsNull {
-            column: col.into(),
-            is_null: Val::Lit(Value::Bool(true)),
-        };
+        let e = BoolExpr::is_null(col, true);
         self.args.where_ = Some(merge_and(self.args.where_.take(), e));
         self
     }
 
     pub fn where_is_not_null(mut self, col: impl Into<String>) -> Self {
-        let e = BoolExpr::IsNull {
-            column: col.into(),
-            is_null: Val::Lit(Value::Bool(false)),
-        };
+        let e = BoolExpr::is_null(col, false);
         self.args.where_ = Some(merge_and(self.args.where_.take(), e));
         self
     }

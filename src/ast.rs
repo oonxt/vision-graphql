@@ -663,6 +663,16 @@ pub enum BoolExpr {
     Optional(Box<BoolExpr>),
 }
 
+impl BoolExpr {
+    /// `column IS NULL` (`is_null` true) or `column IS NOT NULL` (false).
+    pub fn is_null(column: impl Into<String>, is_null: bool) -> Self {
+        BoolExpr::IsNull {
+            column: column.into(),
+            is_null: Val::Lit(serde_json::Value::Bool(is_null)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,

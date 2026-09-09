@@ -394,8 +394,12 @@ fn render_bool_expr(
     use crate::ast::BoolExpr;
     match expr {
         BoolExpr::And(parts) => render_bool_list(parts, "AND", table, table_alias, schema, ctx),
-        BoolExpr::Or(parts) => render_bool_list(parts, "OR", table, table_alias, schema, ctx),
+        BoolExpr::Or(parts) => {
+            refuse_optional_under(parts, "`_or`")?;
+            render_bool_list(parts, "OR", table, table_alias, schema, ctx)
+        }
         BoolExpr::Not(inner) => {
+            refuse_optional_under(std::iter::once(inner.as_ref()), "`_not`")?;
             ctx.sql.push_str("(NOT ");
             render_bool_expr(inner, table, table_alias, schema, ctx)?;
             ctx.sql.push(')');
@@ -1064,6 +1068,11 @@ fn cmp_sql(op: crate::ast::CmpOp) -> &'static str {
 /// constant, so this form is what the compiled path needs and the only one
 /// that keeps one statement for both requests.
 ///
+/// The column is resolved before the null shortcut: whether the document is
+/// valid must not depend on which value this request sent. It is also why a
+/// dropped comparison is still a comparison with a null operand rather than
+/// no predicate — the scope rewrite has to see the column.
+///
 /// `alias` is `None` for the unaliased contexts (`render_bool_expr_no_alias`).
 fn render_optional(
     inner: &crate::ast::BoolExpr,
@@ -1073,126 +1082,126 @@ fn render_optional(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::BoolExpr;
+    let (column, operand) = match inner {
+        BoolExpr::Compare { column, value, .. } => (column, value),
+        BoolExpr::InList { column, values, .. } => (column, values),
+        BoolExpr::IsNull { column, is_null } => (column, is_null),
+        // The lowering only ever wraps a comparison; the typed builder could
+        // wrap anything. There is no reading of "optional" for a conjunction
+        // that is not a guess, so it is refused rather than guessed.
+        other => {
+            return Err(Error::Validate {
+                path: "where".into(),
+                message: format!(
+                    "Optional wraps a single comparison (`_eq`, `_in`, `_is_null`, …), not {}",
+                    match other {
+                        BoolExpr::And(_) => "`_and`",
+                        BoolExpr::Or(_) => "`_or`",
+                        BoolExpr::Not(_) => "`_not`",
+                        BoolExpr::Relation { .. } => "a relation predicate",
+                        BoolExpr::Optional(_) => "another Optional",
+                        BoolExpr::Compare { .. }
+                        | BoolExpr::InList { .. }
+                        | BoolExpr::IsNull { .. } => unreachable!(),
+                    }
+                ),
+            })
+        }
+    };
+    let col = table.find_column(column).ok_or_else(|| Error::Validate {
+        path: format!("where.{column}"),
+        message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+    })?;
+    if let BoolExpr::Compare { op, .. } = inner {
+        check_cmp_applies(*op, col)?;
+    }
     let render_plain = |ctx: &mut RenderCtx| match alias {
         Some(a) => render_bool_expr(inner, table, a, schema, ctx),
         None => render_bool_expr_no_alias(inner, table, schema, ctx),
     };
-    let qualified = |col: &crate::schema::Column| match alias {
+    match operand.as_lit() {
+        Some(v) if v.is_null() => {
+            ctx.sql.push_str("TRUE");
+            return Ok(());
+        }
+        Some(_) => return render_plain(ctx),
+        None => {}
+    }
+    let qualified = match alias {
         Some(a) => format!("{a}.{}", quote_ident(&col.physical_name)),
         None => quote_ident(&col.physical_name),
     };
+    let path = || format!("where.{column}");
     match inner {
-        BoolExpr::Compare { column, op, value } => {
-            // Checked before the null shortcut: whether the document is valid
-            // must not depend on which value this request sent.
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            check_cmp_applies(*op, col)?;
-            match value.as_lit() {
-                Some(v) if v.is_null() => {
-                    ctx.sql.push_str("TRUE");
-                    return Ok(());
-                }
-                Some(_) => return render_plain(ctx),
-                None => {}
-            }
-            let n = ctx.push_scalar(value, &col.pg_type, || format!("where.{column}"))?;
+        BoolExpr::Compare { op, value, .. } => {
+            let n = ctx.push_scalar(value, &col.pg_type, path)?;
             let cast = pg_type_cast(&col.pg_type);
             write!(
                 ctx.sql,
-                "(${n}::{cast} IS NULL OR {} {} ${n}::{cast})",
-                qualified(col),
+                "(${n}::{cast} IS NULL OR {qualified} {} ${n}::{cast})",
                 cmp_sql(*op)
             )
             .unwrap();
-            Ok(())
         }
         BoolExpr::InList {
-            column,
-            values,
-            negated,
+            values, negated, ..
         } => {
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            match values.as_lit() {
-                Some(v) if v.is_null() => {
-                    ctx.sql.push_str("TRUE");
-                    return Ok(());
-                }
-                Some(_) => return render_plain(ctx),
-                None => {}
-            }
             if values.is_lit() {
                 // A composite with no variables left: same as a literal list.
                 return render_plain(ctx);
             }
-            let n = ctx.push_optional_array(values, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_optional_array(values, &col.pg_type, path)?;
             let cast = pg_type_cast(&col.pg_type);
             let pred = if *negated { "<> ALL" } else { "= ANY" };
             write!(
                 ctx.sql,
-                "(${n}::{cast}[] IS NULL OR {} {pred} (${n}::{cast}[]))",
-                qualified(col)
+                "(${n}::{cast}[] IS NULL OR {qualified} {pred} (${n}::{cast}[]))"
             )
             .unwrap();
-            Ok(())
         }
-        BoolExpr::IsNull { column, is_null } => {
-            // The column is resolved before the null shortcut for the same
-            // reason as above — and it is the reason this is an `IsNull` with
-            // a null operand rather than no predicate at all: the scope
-            // rewrite has already seen the column by now.
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            match is_null.as_lit() {
-                Some(v) if v.is_null() => {
-                    ctx.sql.push_str("TRUE");
-                    return Ok(());
-                }
-                Some(_) => return render_plain(ctx),
-                None => {}
-            }
-            let n = ctx.push_scalar(is_null, &PgType::Bool, || is_null_path(column))?;
+        BoolExpr::IsNull { is_null, .. } => {
+            let n = ctx.push_scalar(is_null, &PgType::Bool, path)?;
             write!(
                 ctx.sql,
-                "(${n}::boolean IS NULL OR ({} IS NULL) = ${n}::boolean)",
-                qualified(col)
+                "(${n}::boolean IS NULL OR ({qualified} IS NULL) = ${n}::boolean)"
             )
             .unwrap();
-            Ok(())
         }
-        // The lowering only ever wraps a comparison; the typed builder could
-        // wrap anything. There is no reading of "optional" for a conjunction
-        // that is not a guess, so it is refused rather than guessed.
-        other => Err(Error::Validate {
-            path: "where".into(),
-            message: format!(
-                "Optional wraps a single comparison (`_eq`, `_in`, `_is_null`, …), not {}",
-                match other {
-                    BoolExpr::And(_) => "`_and`",
-                    BoolExpr::Or(_) => "`_or`",
-                    BoolExpr::Not(_) => "`_not`",
-                    BoolExpr::Relation { .. } => "a relation predicate",
-                    BoolExpr::Optional(_) => "another Optional",
-                    BoolExpr::Compare { .. }
-                    | BoolExpr::InList { .. }
-                    | BoolExpr::IsNull { .. } => unreachable!(),
-                }
-            ),
-        }),
+        _ => unreachable!("matched above"),
     }
+    Ok(())
 }
 
-/// Error path for an `_is_null` operand: the suffix is what tells
-/// [`crate::types`]' null refusal to say something other than "use `_is_null`".
-fn is_null_path(column: &str) -> String {
-    format!("where.{column}._is_null")
+/// [`BoolExpr::Optional`] under `_or` or `_not` is refused: a dropped
+/// comparison is `TRUE`, which under `_or` admits every row and under `_not`
+/// none — neither is what leaving a filter out means. The lowering refuses
+/// the document before it gets here; this is for the typed builder, which
+/// can put an `Optional` anywhere. Walks through `_and` and relation
+/// predicates, as the lowering's own check does.
+fn refuse_optional_under<'a>(
+    parts: impl IntoIterator<Item = &'a crate::ast::BoolExpr>,
+    what: &str,
+) -> Result<()> {
+    use crate::ast::BoolExpr;
+    for part in parts {
+        match part {
+            BoolExpr::Optional(_) => {
+                return Err(Error::Validate {
+                    path: "where".into(),
+                    message: format!(
+                        "an Optional comparison cannot apply under {what}: a dropped \
+                         comparison is TRUE, which would admit every row there or none"
+                    ),
+                })
+            }
+            BoolExpr::And(inner) => refuse_optional_under(inner, what)?,
+            BoolExpr::Relation { inner, .. } => {
+                refuse_optional_under(std::iter::once(inner.as_ref()), what)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// [`BoolExpr::IsNull`] on an already-resolved, already-quoted column.
@@ -1204,23 +1213,19 @@ fn is_null_path(column: &str) -> String {
 /// refused as a null comparison is: neither predicate is what it asks for.
 fn render_is_null(qualified: &str, column: &str, is_null: &Val, ctx: &mut RenderCtx) -> Result<()> {
     match is_null.as_lit() {
-        Some(serde_json::Value::Bool(true)) => ctx.sql.push_str(&format!("{qualified} IS NULL")),
-        Some(serde_json::Value::Bool(false)) => {
-            ctx.sql.push_str(&format!("{qualified} IS NOT NULL"))
+        Some(serde_json::Value::Bool(true)) => write!(ctx.sql, "{qualified} IS NULL").unwrap(),
+        Some(serde_json::Value::Bool(false)) => write!(ctx.sql, "{qualified} IS NOT NULL").unwrap(),
+        Some(v) if v.is_null() => {
+            return Err(crate::types::null_comparison(&format!("where.{column}")));
         }
         Some(_) => {
-            // A null gets the refusal a null comparison gets, in `_is_null`'s
-            // words (see `types::null_comparison`), so a literal and a
-            // variable that turns out null say the same; anything else is
-            // simply not a boolean.
-            BindSpec::comparison(is_null.clone(), &PgType::Bool, || is_null_path(column))?;
             return Err(Error::Validate {
-                path: is_null_path(column),
+                path: format!("where.{column}"),
                 message: "expected boolean".into(),
             });
         }
         None => {
-            let n = ctx.push_comparison(is_null, &PgType::Bool, || is_null_path(column))?;
+            let n = ctx.push_comparison(is_null, &PgType::Bool, || format!("where.{column}"))?;
             write!(ctx.sql, "({qualified} IS NULL) = ${n}::boolean").unwrap();
         }
     }
@@ -3239,6 +3244,7 @@ fn render_bool_expr_no_alias(
             Ok(())
         }
         BoolExpr::Or(parts) => {
+            refuse_optional_under(parts, "`_or`")?;
             if parts.is_empty() {
                 ctx.sql.push_str("FALSE");
                 return Ok(());
@@ -3254,6 +3260,7 @@ fn render_bool_expr_no_alias(
             Ok(())
         }
         BoolExpr::Not(inner) => {
+            refuse_optional_under(std::iter::once(inner.as_ref()), "`_not`")?;
             ctx.sql.push_str("(NOT ");
             render_bool_expr_no_alias(inner, table, schema, ctx)?;
             ctx.sql.push(')');

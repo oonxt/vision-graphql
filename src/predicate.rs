@@ -342,10 +342,7 @@ impl ScopeExpr {
                 op: *op,
                 value: Val::Lit(value.resolve(p)?),
             },
-            ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
-                column: column.clone(),
-                is_null: Val::Lit(Value::Bool(!*negated)),
-            },
+            ScopeExpr::IsNull { column, negated } => BoolExpr::is_null(column.clone(), !*negated),
             ScopeExpr::InList {
                 column,
                 values,
@@ -384,10 +381,7 @@ impl ScopeExpr {
                 op: *op,
                 value: value.symbolic(),
             },
-            ScopeExpr::IsNull { column, negated } => BoolExpr::IsNull {
-                column: column.clone(),
-                is_null: Val::Lit(Value::Bool(!*negated)),
-            },
+            ScopeExpr::IsNull { column, negated } => BoolExpr::is_null(column.clone(), !*negated),
             ScopeExpr::InList {
                 column,
                 values,

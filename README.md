@@ -197,7 +197,7 @@ queries.
 
 **What cannot be compiled.** A variable that decides the *shape* of the SQL
 rather than a value in it returns `Error::NotCompilable` naming the position:
-`where: $w`, `order_by: $o`, `distinct_on: $d`, `_is_null: $b`, and any
+`where: $w`, `order_by: $o`, `distinct_on: $d`, and any
 variable inside an `insert` argument (a VALUES list's row count and column set
 come from the argument itself, so `objects: $rows` could never compile, and
 this first cut does not thread variables into written-out rows either).

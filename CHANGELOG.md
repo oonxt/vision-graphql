@@ -32,8 +32,13 @@ release commits; entries from 0.13.0 on are written as the work lands.
   the comparison dropped, picked by a null the way any other shape is picked;
   a null default is legal for exactly that reason. `CompiledQuery::optional()`
   lists the variables so declared. The null shape counts toward the 256-shape
-  bound, and the bound's error says so. Listing null among the values *and*
-  declaring `@optional` is refused, since both would mean the same thing.
+  bound, and the bound's error says so when the null is what crossed it.
+  Listing null among the values *and* declaring `@optional` is refused, since
+  both would mean the same thing. `parser::VariableContract` gains
+  `is_optional`, `admitted` and `admits` — the one rule for what a request may
+  send — and the two directives' `__schema` / SDL descriptions say that null
+  is admitted alongside `@choices`.
+- `BoolExpr::is_null(column, bool)` builds the literal form.
 
 ### Fixed
 
@@ -43,9 +48,15 @@ release commits; entries from 0.13.0 on are written as the work lands.
   with `{b: true}` and ran with `{b: null}`. A dropped comparison is now an
   `Optional` around the predicate it would have been, which the scope rewrite
   walks into; `scope.rs` has the regression test.
-- `_is_null: $x` with `x` null said only "expected boolean". It now names
-  `@optional` as the way to let a null leave the filter out; a literal
-  `_is_null: null`, which has no variable to declare, keeps the short message.
+- `_is_null: $x` with `x` null said only "expected boolean". A null there is
+  now refused where every null comparison is, by the bind step, in one
+  message that names `_is_null: true` and `@optional` as the two things a
+  caller might have meant — the old message pointed at `_is_null` from
+  inside `_is_null`.
+- **The typed builder could put an `Optional` under `Not` or `Or`** and get
+  `NOT TRUE` / `(TRUE OR …)` rendered without complaint — zero rows or every
+  row, silently. The renderer now refuses the shape the lowering already
+  refused for documents.
 
 ## 0.19.0 — 2026-09-08
 

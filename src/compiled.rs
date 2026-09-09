@@ -339,27 +339,35 @@ pub(crate) fn compile(
 /// is a full lowering held for the life of the statement, and a document whose
 /// lists multiply past the bound is asking for a different design.
 fn choice_combinations(contract: &VariableContract) -> Result<Vec<Map<String, Value>>> {
-    let choices: Vec<(&str, Vec<&Value>)> = contract
-        .choices
-        .iter()
-        .map(|(name, values)| (name.as_str(), contract.admitted(name, values).collect()))
-        .collect();
-    let total = choices
-        .iter()
-        .try_fold(1usize, |n, (_, values)| n.checked_mul(values.len()))
-        .filter(|n| *n <= crate::parser::MAX_SHAPES);
-    if total.is_none() {
-        let names: Vec<String> = choices.iter().map(|(n, _)| format!("${n}")).collect();
-        let with_null = choices
+    let product = |with_null: bool| {
+        contract
+            .choices
             .iter()
-            .any(|(name, _)| contract.optional.iter().any(|n| n == name));
+            .try_fold(1usize, |n, (name, values)| {
+                let count = if with_null {
+                    contract.admitted(name, values).count()
+                } else {
+                    values.len()
+                };
+                n.checked_mul(count)
+            })
+            .filter(|n| *n <= crate::parser::MAX_SHAPES)
+    };
+    if product(true).is_none() {
+        let names: Vec<String> = contract
+            .choices
+            .iter()
+            .map(|(n, _)| format!("${n}"))
+            .collect();
+        // Blame the null shape only when it is what crossed the bound.
+        let null_tipped = product(false).is_some();
         return Err(Error::NotCompilable {
             path: names.join(", "),
             message: format!(
                 "@choices multiply out to more than {} shapes{}; a compiled statement holds \
                  one per combination",
                 crate::parser::MAX_SHAPES,
-                if with_null {
+                if null_tipped {
                     " (an @optional one counts its null as a value)"
                 } else {
                     ""
@@ -368,12 +376,12 @@ fn choice_combinations(contract: &VariableContract) -> Result<Vec<Map<String, Va
         });
     }
     let mut out = vec![Map::new()];
-    for (name, values) in &choices {
-        let mut next = Vec::with_capacity(out.len() * values.len());
+    for (name, values) in &contract.choices {
+        let mut next = Vec::new();
         for base in &out {
-            for v in values {
+            for v in contract.admitted(name, values) {
                 let mut m = base.clone();
-                m.insert(name.to_string(), (*v).clone());
+                m.insert(name.clone(), v.clone());
                 next.push(m);
             }
         }
@@ -843,7 +851,7 @@ mod tests {
         );
         let err = binds(&specs, json!({"b": null})).unwrap_err();
         assert!(
-            matches!(&err, Error::Validate { path, message } if path.ends_with("._is_null") && message.contains("@optional")),
+            matches!(&err, Error::Validate { path, message } if path == "where.title" && message.contains("@optional")),
             "{err:?}"
         );
 
@@ -888,13 +896,87 @@ mod tests {
             matches!(&err, Error::Validate { message, .. } if message.contains("expected boolean")),
             "{err:?}"
         );
-        // A literal null has no variable to declare, so the hint is not
-        // offered for it.
+        // A literal null is the same refusal, from the same place.
         let err = compile("{ orders(where: {title: {_is_null: null}}) { id } }").unwrap_err();
         assert!(
-            matches!(&err, Error::Validate { message, .. } if message == "expected boolean"),
+            matches!(&err, Error::Validate { path, message } if path == "where.title" && message.contains("@optional")),
             "{err:?}"
         );
+        // A composite is not a boolean, and must not bind as one on the
+        // compiled path while the eager path refuses it.
+        for source in [
+            "query($x: Boolean) { orders(where: {title: {_is_null: [$x]}}) { id } }",
+            "query($x: Boolean) { orders(where: {title: {_is_null: {a: $x}}}) { id } }",
+            "{ orders(where: {title: {_is_null: [true]}}) { id } }",
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message == "expected boolean"),
+                "{source}: {err:?}"
+            );
+            let doc = parse_document(source).unwrap();
+            let err = lower_with(&doc, Bindings::eager(&json!({"x": true})), None, &schema())
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message == "expected boolean"),
+                "{source} (eager): {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_builder_cannot_put_an_optional_under_or_or_not() {
+        // The lowering refuses `@optional` under `_or` / `_not`; the typed
+        // builder never meets the lowering, so the renderer refuses the IR
+        // shape itself rather than emitting `NOT TRUE`.
+        use crate::ast::{BoolExpr, CmpOp, Field, Operation, QueryArgs, RootBody, RootField};
+        let optional = |inner: BoolExpr| BoolExpr::Optional(Box::new(inner));
+        let is_null = BoolExpr::IsNull {
+            column: "title".into(),
+            is_null: Val::Var("b".into()),
+        };
+        let eq = BoolExpr::Compare {
+            column: "title".into(),
+            op: CmpOp::Eq,
+            value: Val::Lit(Value::Null),
+        };
+        let root = |where_: BoolExpr| {
+            Operation::Query(vec![RootField {
+                table: "orders".into(),
+                alias: "orders".into(),
+                args: QueryArgs {
+                    where_: Some(where_),
+                    ..Default::default()
+                },
+                body: RootBody::List {
+                    selection: vec![Field::Column {
+                        column: "id".into(),
+                        alias: "id".into(),
+                    }],
+                },
+            }])
+        };
+        for (what, where_) in [
+            ("not", BoolExpr::Not(Box::new(optional(is_null.clone())))),
+            ("or", BoolExpr::Or(vec![optional(eq.clone()), eq.clone()])),
+            (
+                "not-and",
+                BoolExpr::Not(Box::new(BoolExpr::And(vec![optional(is_null.clone())]))),
+            ),
+        ] {
+            let err = render(&root(where_), &schema()).unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message.contains("Optional") && message.contains("TRUE")),
+                "{what}: {err:?}"
+            );
+        }
+        // Under a conjunction it renders.
+        let (sql, _) = render(
+            &root(BoolExpr::And(vec![optional(is_null), optional(eq)])),
+            &schema(),
+        )
+        .unwrap();
+        assert!(sql.contains("IS NULL OR") && sql.contains("TRUE"), "{sql}");
     }
 
     #[test]
