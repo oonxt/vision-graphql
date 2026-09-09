@@ -574,6 +574,47 @@ async fn optional_filters_apply_when_supplied_and_drop_when_null() {
     );
 }
 
+/// The three-state filter from the field report: a list endpoint whose
+/// `roots` argument is "only top-level", "only nested", or unset. Before the
+/// two directives composed, that was two documents.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_choices_variable_that_is_also_optional_has_a_shape_with_the_filter_dropped() {
+    let (engine, _db) = setup().await;
+    let source = r#"query($roots: Boolean @choices(values: [true, false]) @optional = null) {
+        orders(where: {ref: {_is_null: $roots}}, order_by: {id: asc}) { title }
+    }"#;
+    let q = engine.compile(source).expect("compile");
+    assert_eq!(q.shape_count(), 3);
+
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (json!({"roots": true}), vec!["a-2"]),
+        (json!({"roots": false}), vec!["a-1", "b-1"]),
+        (json!({"roots": null}), vec!["a-1", "a-2", "b-1"]),
+        // The default is null: the request that says nothing gets no filter.
+        (json!({}), vec!["a-1", "a-2", "b-1"]),
+    ];
+    for (vars, expect) in cases {
+        let compiled = engine.execute(&q, Some(vars.clone())).await.unwrap();
+        assert_eq!(titles(&compiled, "orders"), expect, "{vars}");
+        let eager = engine.query(source, Some(vars)).await.unwrap();
+        assert_eq!(compiled, eager);
+    }
+
+    // Null is the one value @optional adds; the list still bounds the rest.
+    for vars in [json!({"roots": "yes"}), json!({"roots": 1})] {
+        let err = engine.execute(&q, Some(vars.clone())).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "roots"),
+            "{vars}: {err:?}"
+        );
+        let err = engine.query(source, Some(vars.clone())).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "roots"),
+            "{vars} (eager): {err:?}"
+        );
+    }
+}
+
 /// A statement is prepared on the connection with the types of the request
 /// that first ran it and reused, by SQL text, for every later one. A null
 /// used to go out as text whatever the column, so a compiled statement first

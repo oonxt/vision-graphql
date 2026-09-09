@@ -3,6 +3,34 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **`@optional` and `@choices` compose.** A three-state optional filter — a
+  `roots` argument that is "only top-level" (`parent_id IS NULL`), "only
+  nested", or unset — had no single-document spelling: the two directives on
+  one variable were refused as contradicting each other, and the refusal
+  pointed at listing null among the `@choices` values, which `_is_null` then
+  rejected as not a boolean (field report). A variable may now carry both:
+  `$roots: Boolean @choices(values: [true, false]) @optional = null` compiles
+  to one shape per value plus one with the comparison dropped, picked by a
+  null the way any other shape is picked by its value; a null default is
+  legal for exactly that reason. `CompiledQuery::optional()` lists the
+  variables so declared, `choices()` is unchanged. The null shape counts
+  toward the 256-shape bound. Listing null among the values *and* declaring
+  `@optional` is refused, since both would mean the same thing.
+- **`@optional` applies at `_is_null`.** It was refused there as "not a
+  comparison operator"; a null now leaves the filter out, as it does for
+  `_eq` or `_in`. Under `Engine::compile` the variable still decides the
+  shape, so it needs `@choices` beside it — the `NotCompilable` error says so,
+  as it does for any structural variable.
+
+### Fixed
+
+- `_is_null: $x` with `x` null said only "expected boolean". It now names
+  `@optional` as the way to let a null leave the filter out.
+
 ## 0.19.0 — 2026-09-08
 
 ### Breaking

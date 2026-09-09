@@ -264,9 +264,11 @@ fn directive_defs() -> Vec<DirectiveDef> {
             name: crate::parser::OPTIONAL.into(),
             description: Some(
                 "A null for this variable drops the comparison it is the operand of \
-                 (`_eq: $x`, `_in: $x`, …) instead of being refused. The variable may \
-                 only be used as the whole value of a comparison operator, and must be \
-                 declared nullable."
+                 (`_eq: $x`, `_in: $x`, `_is_null: $x`, …) instead of being refused. \
+                 The variable may only be used as the whole value of a comparison \
+                 operator, and must be declared nullable. Combined with @choices, null \
+                 is one more value the variable may take: a compiled statement gains the \
+                 shape with the comparison dropped."
                     .into(),
             ),
             locations: vec!["VARIABLE_DEFINITION"],

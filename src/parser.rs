@@ -103,7 +103,9 @@ pub fn lower_with(
     // would change what a request is allowed to ask. Eagerly the request must
     // supply it — even one the operation never reads, since the compiled
     // statement needs it to pick a shape and the two must agree on what a
-    // request has to carry; pinned, the pin must be one of the values.
+    // request has to carry; pinned, the pin must be one of the values. An
+    // `@optional` one may also be null: that is the shape with the comparison
+    // dropped.
     for (name, values) in &contract.choices {
         let v = match variables.mode {
             Mode::Eager(vars) => Some(vars.get(name).ok_or_else(|| Error::Variable {
@@ -113,7 +115,8 @@ pub fn lower_with(
             Mode::Symbolic { pinned } => pinned.get(name),
         };
         if let Some(v) = v {
-            if !values.iter().any(|c| json_equiv(c, v)) {
+            let dropped = v.is_null() && contract.optional.contains(name);
+            if !dropped && !values.iter().any(|c| json_equiv(c, v)) {
                 return Err(Error::Variable {
                     name: name.clone(),
                     message: format!("{v} is not one of the values declared by @choices"),
@@ -597,6 +600,7 @@ fn contract_of(
             message,
         };
         let mut seen: Vec<&str> = Vec::new();
+        let mut choices: Option<Vec<Value>> = None;
         for d in &def.node.directives {
             let dname = d.node.name.node.as_str();
             if seen.contains(&dname) {
@@ -663,18 +667,7 @@ fn contract_of(
                             return Err(refuse(format!("@choices lists {item} twice")));
                         }
                     }
-                    if let Some(default) = &def.node.default_value {
-                        let default = default.node.clone().into_json().map_err(|e| {
-                            refuse(format!("default value is not representable as JSON: {e}"))
-                        })?;
-                        if !items.iter().any(|v| json_equiv(v, &default)) {
-                            return Err(refuse(format!(
-                                "default value {default} is not one of the values \
-                                 declared by @choices"
-                            )));
-                        }
-                    }
-                    out.choices.push((name.to_string(), items));
+                    choices = Some(items);
                 }
                 // The same refusal `reject_directives` gives, so the two entry
                 // points — which reach the two checks in opposite orders —
@@ -682,12 +675,34 @@ fn contract_of(
                 other => return Err(unsupported_directive(other, "a variable definition")),
             }
         }
-        if seen.contains(&OPTIONAL) && seen.contains(&CHOICES) {
-            return Err(refuse(
-                "@optional and @choices on one variable contradict each other: list \
-                 null among the values instead"
-                    .into(),
-            ));
+        // The two directives compose: `@choices` bounds the values, `@optional`
+        // adds the null that drops the comparison. Checked once both have been
+        // read, since either may be written first.
+        let optional = seen.contains(&OPTIONAL);
+        if let Some(items) = choices {
+            if optional && items.iter().any(Value::is_null) {
+                // Both spellings would mean "dropped", and a reader would
+                // wonder which one a null request picked.
+                return Err(refuse(
+                    "@choices lists null, which is what @optional already says; \
+                     leave it out of the values"
+                        .into(),
+                ));
+            }
+            if let Some(default) = &def.node.default_value {
+                let default = default.node.clone().into_json().map_err(|e| {
+                    refuse(format!("default value is not representable as JSON: {e}"))
+                })?;
+                let dropped = optional && default.is_null();
+                if !dropped && !items.iter().any(|v| json_equiv(v, &default)) {
+                    return Err(refuse(format!(
+                        "default value {default} is not one of the values declared by \
+                         @choices{}",
+                        if optional { ", nor null" } else { "" }
+                    )));
+                }
+            }
+            out.choices.push((name.to_string(), items));
         }
     }
     Ok(out)
@@ -2576,19 +2591,25 @@ pub(crate) fn lower_where(
                     // whole operand: inside a composite (`_in: [1, $x]`) a null
                     // element does not make the list null, and `gql_to_val`
                     // refuses it there.
+                    let optional_here = |name: &str| -> Result<bool> {
+                        if !vars.is_optional(name) {
+                            return Ok(false);
+                        }
+                        if vars.disjunctive {
+                            return Err(Error::Validate {
+                                path: op_path(),
+                                message: format!(
+                                    "'${name}' is declared @optional, which cannot apply \
+                                     under `_or` or `_not`: a dropped comparison is TRUE, \
+                                     which would admit every row there or none"
+                                ),
+                            });
+                        }
+                        Ok(true)
+                    };
                     let operand = |v: &GqlValue| -> Result<(Val, bool)> {
                         if let GqlValue::Variable(name) = v {
-                            if vars.is_optional(name.as_str()) {
-                                if vars.disjunctive {
-                                    return Err(Error::Validate {
-                                        path: op_path(),
-                                        message: format!(
-                                            "'${name}' is declared @optional, which cannot apply \
-                                             under `_or` or `_not`: a dropped comparison is TRUE, \
-                                             which would admit every row there or none"
-                                        ),
-                                    });
-                                }
+                            if optional_here(name.as_str())? {
                                 return Ok((vars.value_of(name.as_str(), &op_path())?, true));
                             }
                         }
@@ -2638,16 +2659,48 @@ pub(crate) fn lower_where(
                         // `_is_null` picks between `IS NULL` and `IS NOT NULL`,
                         // so its value is structure, not a bound parameter.
                         "_is_null" => {
-                            let b = structural(op_val, vars, &op_path())?;
-                            let GqlValue::Boolean(b) = b.as_ref() else {
-                                return Err(Error::Validate {
-                                    path: op_path(),
-                                    message: "expected boolean".into(),
-                                });
+                            // An `@optional` variable makes it three-state:
+                            // a null leaves the filter out. The value is
+                            // always in hand here — eagerly, or pinned by
+                            // `@choices` — so the drop is decided now: an
+                            // empty conjunction, which renders as the `TRUE`
+                            // an `Optional` comparison renders for null.
+                            let optional = match op_val {
+                                GqlValue::Variable(name) => optional_here(name.as_str())?,
+                                _ => false,
                             };
-                            BoolExpr::IsNull {
-                                column: exposed_name.clone(),
-                                negated: !b,
+                            let b = if optional {
+                                let GqlValue::Variable(name) = op_val else {
+                                    unreachable!("optional_here only admits a variable")
+                                };
+                                std::borrow::Cow::Owned(json_to_gql(
+                                    vars.value_now(name.as_str(), &op_path())?,
+                                ))
+                            } else {
+                                structural(op_val, vars, &op_path())?
+                            };
+                            match b.as_ref() {
+                                GqlValue::Boolean(b) => BoolExpr::IsNull {
+                                    column: exposed_name.clone(),
+                                    negated: !b,
+                                },
+                                GqlValue::Null if optional => BoolExpr::And(Vec::new()),
+                                GqlValue::Null => {
+                                    return Err(Error::Validate {
+                                        path: op_path(),
+                                        message: "expected boolean; a null cannot render \
+                                                  `IS NULL` or `IS NOT NULL` — to let a null \
+                                                  leave the filter out, declare the variable \
+                                                  @optional"
+                                            .into(),
+                                    });
+                                }
+                                _ => {
+                                    return Err(Error::Validate {
+                                        path: op_path(),
+                                        message: "expected boolean".into(),
+                                    });
+                                }
                             }
                         }
                         "_in" => in_list(false, op_val)?,
@@ -3010,7 +3063,8 @@ impl<'a> Bindings<'a> {
                 path: path.to_string(),
                 message: format!(
                     "'${name}' is declared @optional, which only applies as the value \
-                     of a comparison operator (`_eq: ${name}`, `_in: ${name}`, …)"
+                     of a comparison operator (`_eq: ${name}`, `_in: ${name}`, \
+                     `_is_null: ${name}`, …)"
                 ),
             });
         }

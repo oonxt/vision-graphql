@@ -237,6 +237,20 @@ un-optional. Leaving the
 variable out of the request is still an error: null is "no filter", absence is
 a mistake.
 
+The two compose. A shape-deciding filter the request may also leave out — the
+three-state `roots`: only top-level, only nested, or all — is one variable
+with both directives, and one more shape than values:
+
+```graphql
+query Categories($roots: Boolean @choices(values: [true, false]) @optional = null) {
+  categories(where: {parent_id: {_is_null: $roots}}) { id name }
+}
+```
+
+`true` and `false` are the two `_is_null` shapes; null — sent, or defaulted
+as here — is the third, with no predicate. Anything else is refused as it
+would be without `@optional`.
+
 Both directives are published by `__schema` and the SDL, and are the only
 directives the engine accepts.
 
