@@ -3,6 +3,61 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Breaking
+
+- `BoolExpr::IsNull` carries its operand as a `Val` (`is_null: Val`, true for
+  `IS NULL`) in place of `negated: bool`. See the first item below. The
+  builder's `where_is_null` / `where_is_not_null` are unchanged.
+
+### Added
+
+- **`_is_null: $b` binds instead of deciding the statement's shape.** It was
+  the one comparison operator whose variable was structural, so it could not
+  compile without `@choices`, and an `@optional` there was refused as "not a
+  comparison operator" — which left a three-state optional filter (`roots`:
+  only top-level, only nested, unset) with no single-document spelling (field
+  report). It now renders `(col IS NULL) = $1::boolean`, one statement for
+  both values, and `$roots: Boolean @optional` on `parent_id: {_is_null:
+  $roots}` drops the predicate on null exactly as `_eq` does:
+  `($1::boolean IS NULL OR (col IS NULL) = $1::boolean)`. A literal still
+  renders `IS NULL` / `IS NOT NULL`. A null for a non-optional variable is
+  refused at execution, as a null comparison is, in words that name
+  `@optional` as the fix rather than `_is_null`.
+- **`@optional` and `@choices` compose.** They were refused together as
+  contradicting, and the refusal pointed at listing null among the values,
+  which `_is_null` then rejected as not a boolean. A variable may now carry
+  both: the values plus null, compiled to one shape per value and one with
+  the comparison dropped, picked by a null the way any other shape is picked;
+  a null default is legal for exactly that reason. `CompiledQuery::optional()`
+  lists the variables so declared. The null shape counts toward the 256-shape
+  bound, and the bound's error says so when the null is what crossed it.
+  Listing null among the values *and* declaring `@optional` is refused, since
+  both would mean the same thing. `parser::VariableContract` gains
+  `is_optional`, `admitted` and `admits` — the one rule for what a request may
+  send — and the two directives' `__schema` / SDL descriptions say that null
+  is admitted alongside `@choices`.
+- `BoolExpr::is_null(column, bool)` builds the literal form.
+
+### Fixed
+
+- **A dropped `@optional` filter keeps its column in the IR.** The first cut
+  of the change above lowered a dropped `_is_null` to nothing, so a scope
+  policy withholding the column never saw it: the same document was refused
+  with `{b: true}` and ran with `{b: null}`. A dropped comparison is now an
+  `Optional` around the predicate it would have been, which the scope rewrite
+  walks into; `scope.rs` has the regression test.
+- `_is_null: $x` with `x` null said only "expected boolean". A null there is
+  now refused where every null comparison is, by the bind step, in one
+  message that names `_is_null: true` and `@optional` as the two things a
+  caller might have meant — the old message pointed at `_is_null` from
+  inside `_is_null`.
+- **The typed builder could put an `Optional` under `Not` or `Or`** and get
+  `NOT TRUE` / `(TRUE OR …)` rendered without complaint — zero rows or every
+  row, silently. The renderer now refuses the shape the lowering already
+  refused for documents.
+
 ## 0.19.0 — 2026-09-08
 
 ### Breaking

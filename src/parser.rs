@@ -103,7 +103,9 @@ pub fn lower_with(
     // would change what a request is allowed to ask. Eagerly the request must
     // supply it — even one the operation never reads, since the compiled
     // statement needs it to pick a shape and the two must agree on what a
-    // request has to carry; pinned, the pin must be one of the values.
+    // request has to carry; pinned, the pin must be one of the values. An
+    // `@optional` one may also be null: that is the shape with the comparison
+    // dropped.
     for (name, values) in &contract.choices {
         let v = match variables.mode {
             Mode::Eager(vars) => Some(vars.get(name).ok_or_else(|| Error::Variable {
@@ -113,7 +115,7 @@ pub fn lower_with(
             Mode::Symbolic { pinned } => pinned.get(name),
         };
         if let Some(v) = v {
-            if !values.iter().any(|c| json_equiv(c, v)) {
+            if !contract.admits(name, values, v) {
                 return Err(Error::Variable {
                     name: name.clone(),
                     message: format!("{v} is not one of the values declared by @choices"),
@@ -578,6 +580,34 @@ pub struct VariableContract {
     pub choices: Vec<(String, Vec<Value>)>,
 }
 
+impl VariableContract {
+    /// Whether `$name` is declared `@optional`.
+    pub fn is_optional(&self, name: &str) -> bool {
+        self.optional.iter().any(|n| n == name)
+    }
+
+    /// The values a `@choices` variable may hold: its list, plus null when it
+    /// is also `@optional` — the value that drops its comparison. Every
+    /// place that checks or enumerates a bounded variable's values reads this
+    /// one list, so the eager check, the compiled check and the set of
+    /// compiled shapes cannot disagree on whether null is among them.
+    pub fn admitted<'a>(
+        &'a self,
+        name: &str,
+        values: &'a [Value],
+    ) -> impl Iterator<Item = &'a Value> {
+        values
+            .iter()
+            .chain(self.is_optional(name).then_some(&Value::Null))
+    }
+
+    /// Whether `value` is one a request may send for the `@choices` variable
+    /// `name`, whose declared values are `values`.
+    pub fn admits(&self, name: &str, values: &[Value], value: &Value) -> bool {
+        self.admitted(name, values).any(|c| json_equiv(c, value))
+    }
+}
+
 /// The [`VariableContract`] of an operation in `doc`.
 pub fn variable_contract(
     doc: &ExecutableDocument,
@@ -597,6 +627,7 @@ fn contract_of(
             message,
         };
         let mut seen: Vec<&str> = Vec::new();
+        let mut choices: Option<Vec<Value>> = None;
         for d in &def.node.directives {
             let dname = d.node.name.node.as_str();
             if seen.contains(&dname) {
@@ -663,18 +694,7 @@ fn contract_of(
                             return Err(refuse(format!("@choices lists {item} twice")));
                         }
                     }
-                    if let Some(default) = &def.node.default_value {
-                        let default = default.node.clone().into_json().map_err(|e| {
-                            refuse(format!("default value is not representable as JSON: {e}"))
-                        })?;
-                        if !items.iter().any(|v| json_equiv(v, &default)) {
-                            return Err(refuse(format!(
-                                "default value {default} is not one of the values \
-                                 declared by @choices"
-                            )));
-                        }
-                    }
-                    out.choices.push((name.to_string(), items));
+                    choices = Some(items);
                 }
                 // The same refusal `reject_directives` gives, so the two entry
                 // points — which reach the two checks in opposite orders —
@@ -682,12 +702,33 @@ fn contract_of(
                 other => return Err(unsupported_directive(other, "a variable definition")),
             }
         }
-        if seen.contains(&OPTIONAL) && seen.contains(&CHOICES) {
-            return Err(refuse(
-                "@optional and @choices on one variable contradict each other: list \
-                 null among the values instead"
-                    .into(),
-            ));
+        // The two directives compose: `@choices` bounds the values, `@optional`
+        // adds the null that drops the comparison. Checked once both have been
+        // read, since either may be written first.
+        let optional = seen.contains(&OPTIONAL);
+        if let Some(items) = choices {
+            if optional && items.iter().any(Value::is_null) {
+                // Both spellings would mean "dropped", and a reader would
+                // wonder which one a null request picked.
+                return Err(refuse(
+                    "@choices lists null, which is what @optional already says; \
+                     leave it out of the values"
+                        .into(),
+                ));
+            }
+            if let Some(default) = &def.node.default_value {
+                let default = default.node.clone().into_json().map_err(|e| {
+                    refuse(format!("default value is not representable as JSON: {e}"))
+                })?;
+                if !out.admits(name, &items, &default) {
+                    return Err(refuse(format!(
+                        "default value {default} is not one of the values declared by \
+                         @choices{}",
+                        if optional { ", nor null" } else { "" }
+                    )));
+                }
+            }
+            out.choices.push((name.to_string(), items));
         }
     }
     Ok(out)
@@ -2501,7 +2542,7 @@ fn is_cmp_operator(key: &str) -> bool {
 /// Walks the GraphQL value rather than a pre-substituted JSON one, because that
 /// is where variables still exist: a variable in a *value* position becomes a
 /// [`Val::Var`], while a variable standing in for structure (`where: $w`,
-/// `_is_null: $b`) is resolved through [`structural`] and so is only allowed
+/// `order_by: $o`) is resolved through [`structural`] and so is only allowed
 /// when its value is already known.
 pub(crate) fn lower_where(
     value: &GqlValue,
@@ -2578,17 +2619,7 @@ pub(crate) fn lower_where(
                     // refuses it there.
                     let operand = |v: &GqlValue| -> Result<(Val, bool)> {
                         if let GqlValue::Variable(name) = v {
-                            if vars.is_optional(name.as_str()) {
-                                if vars.disjunctive {
-                                    return Err(Error::Validate {
-                                        path: op_path(),
-                                        message: format!(
-                                            "'${name}' is declared @optional, which cannot apply \
-                                             under `_or` or `_not`: a dropped comparison is TRUE, \
-                                             which would admit every row there or none"
-                                        ),
-                                    });
-                                }
+                            if vars.optional_operand(name.as_str(), &op_path())? {
                                 return Ok((vars.value_of(name.as_str(), &op_path())?, true));
                             }
                         }
@@ -2635,20 +2666,34 @@ pub(crate) fn lower_where(
                         ))
                     };
                     let part = match op_name.as_str() {
-                        // `_is_null` picks between `IS NULL` and `IS NOT NULL`,
-                        // so its value is structure, not a bound parameter.
+                        // `_is_null` is an operand like the others: a literal
+                        // renders `IS NULL` / `IS NOT NULL`, a variable binds
+                        // as a boolean, and an `@optional` null drops it — with
+                        // the column still in the IR for the scope rewrite to
+                        // check. A null is left for the renderer to refuse,
+                        // where a null in any comparison is refused, in the
+                        // one wording; only the shape is checked here, since a
+                        // composite (`_is_null: [$x]`) would otherwise bind.
                         "_is_null" => {
-                            let b = structural(op_val, vars, &op_path())?;
-                            let GqlValue::Boolean(b) = b.as_ref() else {
+                            let (value, optional) = operand(op_val)?;
+                            let ok = match &value {
+                                Val::Lit(lit) => lit.is_boolean() || lit.is_null(),
+                                Val::Var(_) => true,
+                                Val::Array(_) | Val::Object(_) | Val::ScopeParam(_) => false,
+                            };
+                            if !ok {
                                 return Err(Error::Validate {
                                     path: op_path(),
                                     message: "expected boolean".into(),
                                 });
-                            };
-                            BoolExpr::IsNull {
-                                column: exposed_name.clone(),
-                                negated: !b,
                             }
+                            wrap(
+                                BoolExpr::IsNull {
+                                    column: exposed_name.clone(),
+                                    is_null: value,
+                                },
+                                optional,
+                            )
                         }
                         "_in" => in_list(false, op_val)?,
                         "_nin" => in_list(true, op_val)?,
@@ -2998,6 +3043,28 @@ impl<'a> Bindings<'a> {
         }
     }
 
+    /// Whether `$name`, standing as the whole operand of a comparison, is
+    /// `@optional` — the one place the declaration applies. Refused under
+    /// `_or` / `_not` (see [`Bindings::disjunctive`]); the complement,
+    /// [`refuse_optional`](Self::refuse_optional), covers every other
+    /// position.
+    fn optional_operand(&self, name: &str, path: &str) -> Result<bool> {
+        if !self.is_optional(name) {
+            return Ok(false);
+        }
+        if self.disjunctive {
+            return Err(Error::Validate {
+                path: path.to_string(),
+                message: format!(
+                    "'${name}' is declared @optional, which cannot apply under `_or` or \
+                     `_not`: a dropped comparison is TRUE, which would admit every row \
+                     there or none"
+                ),
+            });
+        }
+        Ok(true)
+    }
+
     /// An `@optional` variable is only meaningful as the whole value of a
     /// comparison operator, where a null drops the comparison. Anywhere else —
     /// a count, a `_set` value, an element of a written-out list, a structural
@@ -3010,7 +3077,8 @@ impl<'a> Bindings<'a> {
                 path: path.to_string(),
                 message: format!(
                     "'${name}' is declared @optional, which only applies as the value \
-                     of a comparison operator (`_eq: ${name}`, `_in: ${name}`, …)"
+                     of a comparison operator (`_eq: ${name}`, `_in: ${name}`, \
+                     `_is_null: ${name}`, …)"
                 ),
             });
         }
@@ -3905,9 +3973,9 @@ mod tests {
             panic!("expected Query")
         };
         match roots[0].args.where_.as_ref().unwrap() {
-            crate::ast::BoolExpr::IsNull { column, negated } => {
+            crate::ast::BoolExpr::IsNull { column, is_null } => {
                 assert_eq!(column, "name");
-                assert!(!negated);
+                assert_eq!(is_null.as_lit(), Some(&Value::Bool(true)));
             }
             _ => panic!("expected IsNull"),
         }

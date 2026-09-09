@@ -619,9 +619,19 @@ pub enum BoolExpr {
         op: CmpOp,
         value: Val,
     },
+    /// `column IS NULL` when `is_null` is true, `IS NOT NULL` when false.
+    ///
+    /// A [`Val`] rather than a `bool` so that `_is_null: $b` binds like any
+    /// other comparison operand — `(column IS NULL) = $n::bool` — instead of
+    /// deciding the statement's shape, and so that an `@optional` one keeps
+    /// its column in the IR when dropped: the scope rewrite checks a column
+    /// it can see, and a filter the request left out must not make a document
+    /// valid that a request filtering on it would have had refused. A null
+    /// is refused where a null comparison is, unless wrapped in
+    /// [`Optional`](BoolExpr::Optional).
     IsNull {
         column: String,
-        negated: bool,
+        is_null: Val,
     },
     /// `column = ANY($n)` over a single bound array (`<> ALL($n)` when
     /// negated). NULL elements keep SQL `IN` semantics: they never match.
@@ -651,6 +661,16 @@ pub enum BoolExpr {
     /// `($n IS NULL OR column = $n)`, which is what lets a compiled statement
     /// serve both the request that filters and the one that does not.
     Optional(Box<BoolExpr>),
+}
+
+impl BoolExpr {
+    /// `column IS NULL` (`is_null` true) or `column IS NOT NULL` (false).
+    pub fn is_null(column: impl Into<String>, is_null: bool) -> Self {
+        BoolExpr::IsNull {
+            column: column.into(),
+            is_null: Val::Lit(serde_json::Value::Bool(is_null)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

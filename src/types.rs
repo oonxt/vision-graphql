@@ -262,11 +262,16 @@ impl BindSpec {
 }
 
 /// The one error this refusal produces, in both places it can happen.
-fn null_comparison(path: &str) -> Error {
+/// One message for every null in a comparison position, `_is_null` included
+/// (`(col IS NULL) = NULL` matches no rows as surely as `col = NULL`), so
+/// the parser, the renderer and the bind step cannot drift apart — and so
+/// the fix for a null the request may legitimately send is named here, once.
+pub(crate) fn null_comparison(path: &str) -> Error {
     Error::Validate {
         path: path.to_string(),
-        message: "comparing against null matches no rows, which is unlikely to be \
-                  what was meant; use `_is_null` to ask whether the column is null"
+        message: "comparing against null matches no rows, which is unlikely to be what \
+                  was meant; `_is_null: true` asks whether the column is null, and a \
+                  variable declared @optional lets a null leave the filter out"
             .into(),
     }
 }

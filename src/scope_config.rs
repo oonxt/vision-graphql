@@ -175,7 +175,20 @@ fn to_template(expr: BoolExpr, path: &str) -> Result<ScopeExpr> {
             let value = to_operand(value, &format!("{path}.{column}"))?;
             ScopeExpr::Compare { column, op, value }
         }
-        BoolExpr::IsNull { column, negated } => ScopeExpr::IsNull { column, negated },
+        // A policy's `_is_null` is a literal: a parameter there would make the
+        // predicate's shape depend on the principal, which a template cannot
+        // hold. The lowering has already refused a `"$name"` string here.
+        BoolExpr::IsNull { column, is_null } => match is_null.as_lit().and_then(Value::as_bool) {
+            Some(b) => ScopeExpr::IsNull {
+                column,
+                negated: !b,
+            },
+            None => {
+                return Err(Error::Scope(format!(
+                    "{path}.{column}._is_null: expected true or false"
+                )))
+            }
+        },
         // Only an `@optional` GraphQL variable produces one, and a TOML policy
         // has no variables.
         BoolExpr::Optional(_) => {

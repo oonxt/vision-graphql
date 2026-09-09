@@ -574,6 +574,90 @@ async fn optional_filters_apply_when_supplied_and_drop_when_null() {
     );
 }
 
+/// The three-state filter from the field report: a list endpoint whose
+/// `roots` argument is "only top-level", "only nested", or unset. It was two
+/// documents; it is one statement.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_optional_is_null_is_three_states_in_one_statement() {
+    let (engine, _db) = setup().await;
+    let source = r#"query($roots: Boolean @optional = null) {
+        orders(where: {ref: {_is_null: $roots}}, order_by: {id: asc}) { title }
+    }"#;
+    let q = engine.compile(source).expect("compile");
+    assert_eq!(q.shape_count(), 1);
+
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (json!({"roots": true}), vec!["a-2"]),
+        (json!({"roots": false}), vec!["a-1", "b-1"]),
+        (json!({"roots": null}), vec!["a-1", "a-2", "b-1"]),
+        (json!({}), vec!["a-1", "a-2", "b-1"]),
+    ];
+    for (vars, expect) in cases {
+        let compiled = engine.execute(&q, Some(vars.clone())).await.unwrap();
+        assert_eq!(titles(&compiled, "orders"), expect, "{vars}");
+        let eager = engine.query(source, Some(vars)).await.unwrap();
+        assert_eq!(compiled, eager);
+    }
+
+    // Without @optional the variable still binds — one statement — but a
+    // null is refused rather than matching nothing.
+    let source = "query($b: Boolean!) { orders(where: {ref: {_is_null: $b}}, order_by: {id: asc}) { title } }";
+    let q = engine.compile(source).expect("compile");
+    let rows = engine.execute(&q, Some(json!({"b": true}))).await.unwrap();
+    assert_eq!(titles(&rows, "orders"), vec!["a-2"]);
+    let rows = engine.execute(&q, Some(json!({"b": false}))).await.unwrap();
+    assert_eq!(titles(&rows, "orders"), vec!["a-1", "b-1"]);
+    let err = engine
+        .execute(&q, Some(json!({"b": null})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Validate { message, .. } if message.contains("@optional")),
+        "{err:?}"
+    );
+}
+
+/// `@choices` bounds what the request may send; `@optional` adds null. One
+/// shape per value and one with the comparison dropped, on both paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_choices_variable_that_is_also_optional_has_a_shape_with_the_filter_dropped() {
+    let (engine, _db) = setup().await;
+    let source = r#"query($t: String @choices(values: ["a-1", "b-1"]) @optional = null) {
+        orders(where: {title: {_eq: $t}}, order_by: {id: asc}) { title }
+    }"#;
+    let q = engine.compile(source).expect("compile");
+    assert_eq!(q.shape_count(), 3);
+
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (json!({"t": "a-1"}), vec!["a-1"]),
+        (json!({"t": "b-1"}), vec!["b-1"]),
+        (json!({"t": null}), vec!["a-1", "a-2", "b-1"]),
+        // The default is null: the request that says nothing gets no filter.
+        (json!({}), vec!["a-1", "a-2", "b-1"]),
+    ];
+    for (vars, expect) in cases {
+        let compiled = engine.execute(&q, Some(vars.clone())).await.unwrap();
+        assert_eq!(titles(&compiled, "orders"), expect, "{vars}");
+        let eager = engine.query(source, Some(vars)).await.unwrap();
+        assert_eq!(compiled, eager);
+    }
+
+    // Null is the one value @optional adds; the list still bounds the rest —
+    // a title that exists but was not declared is refused, not answered.
+    for vars in [json!({"t": "a-2"}), json!({"t": 1})] {
+        let err = engine.execute(&q, Some(vars.clone())).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "t"),
+            "{vars}: {err:?}"
+        );
+        let err = engine.query(source, Some(vars.clone())).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Variable { name, .. } if name == "t"),
+            "{vars} (eager): {err:?}"
+        );
+    }
+}
+
 /// A statement is prepared on the connection with the types of the request
 /// that first ran it and reused, by SQL text, for every later one. A null
 /// used to go out as text whatever the column, so a compiled statement first

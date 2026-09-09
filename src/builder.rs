@@ -217,19 +217,13 @@ impl QueryBuilder {
     }
 
     pub fn where_is_null(mut self, col: impl Into<String>) -> Self {
-        let e = BoolExpr::IsNull {
-            column: col.into(),
-            negated: false,
-        };
+        let e = BoolExpr::is_null(col, true);
         self.args.where_ = Some(merge_and(self.args.where_.take(), e));
         self
     }
 
     pub fn where_is_not_null(mut self, col: impl Into<String>) -> Self {
-        let e = BoolExpr::IsNull {
-            column: col.into(),
-            negated: true,
-        };
+        let e = BoolExpr::is_null(col, false);
         self.args.where_ = Some(merge_and(self.args.where_.take(), e));
         self
     }
@@ -971,7 +965,9 @@ mod tests {
     fn query_builder_where_is_null() {
         let rf = Query::from("users").where_is_null("name").build();
         match rf.args.where_.as_ref().unwrap() {
-            BoolExpr::IsNull { negated, .. } => assert!(!negated),
+            BoolExpr::IsNull { is_null, .. } => {
+                assert_eq!(is_null.as_lit(), Some(&Value::Bool(true)))
+            }
             _ => panic!("expected IsNull"),
         }
     }
