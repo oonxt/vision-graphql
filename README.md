@@ -255,9 +255,10 @@ shape.
 Both directives are published by `__schema` and the SDL, and are the only
 directives the engine accepts.
 
-A `CompiledQuery` runs on the pool through `execute` / `execute_scoped`, or
-on a transaction's connection through the same two methods on `TxClient`
-(see [Transactions](#transactions)).
+A `CompiledQuery` runs on the pool through `execute` / `execute_scoped`, on
+a transaction's connection through the same two methods on `TxClient`, or on
+a connection you supply through `execute_on` / `execute_scoped_on` (see
+[Transactions](#transactions)).
 
 ## Column types
 
@@ -1135,6 +1136,36 @@ compiled statements (`execute`, and `execute_scoped` with a principal for one
 compiled against a policy). A host whose documents are compiled statements can
 run several inside one transaction — rebuild a join table by deleting and
 re-inserting, say — with every one of them still bound by its policy.
+
+### A transaction the host holds
+
+Every executing method on `Engine` has an `_on` twin that takes the
+connection to run on — `query_on`, `run_on`, `execute_on`,
+`execute_scoped_on`, and their `_as` forms — and so do `ScopedEngine`'s text
+and builder methods (`query_on`, `run_on`, `_as` forms; a scoped handle runs
+no compiled statements). The pool method is the twin bound to the engine's
+own pool. Hand it `&mut *tx` from a transaction you began, and
+the engine's statements join whatever else that transaction carries — native
+SQL included — while the engine still does the executing: the policy's
+predicates, the post-insert check and the principal binding are all its, only
+the connection is yours. Its lifetime, its timeout and its commit are yours
+too; the engine begins and ends nothing here.
+
+```rust
+# async fn example(engine: vision_graphql::Engine, pool: sqlx::PgPool,
+#     compiled: vision_graphql::CompiledQuery, principal: vision_graphql::predicate::Principal)
+#     -> Result<(), Box<dyn std::error::Error>> {
+let mut tx = pool.begin().await?;
+sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+    .bind("…").bind(7).execute(&mut *tx).await?;
+engine.execute_scoped_on(&mut *tx, &compiled, None, &principal).await?;
+tx.commit().await?;
+# Ok(()) }
+```
+
+Build the engine on the same `PgPool` the native SQL uses and the two share
+connections as a matter of course. On `ScopedEngine` the `_on` twins keep the
+handle's `ScopeSet`: the rewrite is the same, only the connection differs.
 
 For a transaction that must stay inside one `ScopeSet` no matter what the
 closure runs, `engine.scoped(set).transaction(…)` hands it a `ScopedTxClient`

@@ -108,9 +108,12 @@
 //!
 //! A [`CompiledQuery`] runs on the pool through
 //! [`Engine::execute`](crate::Engine::execute) /
-//! [`execute_scoped`](crate::Engine::execute_scoped), or on a transaction's
-//! connection through the same two methods on [`TxClient`](crate::TxClient),
-//! inside [`Engine::transaction`](crate::Engine::transaction). A
+//! [`execute_scoped`](crate::Engine::execute_scoped), on a transaction's
+//! connection through the same two methods on [`TxClient`](crate::TxClient)
+//! inside [`Engine::transaction`](crate::Engine::transaction), or on a
+//! connection the caller supplies — its own transaction, typically — through
+//! [`execute_on`](crate::Engine::execute_on) /
+//! [`execute_scoped_on`](crate::Engine::execute_scoped_on). A
 //! [`ScopedTxClient`](crate::ScopedTxClient) does not run compiled
 //! statements; see its docs for why.
 
