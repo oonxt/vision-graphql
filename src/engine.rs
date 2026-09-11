@@ -313,7 +313,7 @@ impl Engine {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, None)?;
+        let (sql, binds) = compiled_statement(compiled, variables, None, false)?;
         crate::executor::execute(&self.pool, sql, &binds).await
     }
 
@@ -329,7 +329,7 @@ impl Engine {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, Some(principal))?;
+        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), false)?;
         crate::executor::execute(&self.pool, sql, &binds).await
     }
 
@@ -366,9 +366,11 @@ impl Engine {
         }
     }
 
-    /// Run a closure inside a single PostgreSQL transaction. Every call to
-    /// [`TxClient::query`] / [`TxClient::run`] inside the closure uses the
-    /// same connection and the same tx. `Ok` commits; `Err` rolls back and
+    /// Run a closure inside a single PostgreSQL transaction. Every call on
+    /// the [`TxClient`] inside the closure — [`query`](TxClient::query),
+    /// [`run`](TxClient::run), [`execute`](TxClient::execute) and
+    /// [`execute_scoped`](TxClient::execute_scoped) — uses the same
+    /// connection and the same tx. `Ok` commits; `Err` rolls back and
     /// the error is returned verbatim. Panics unwind; sqlx's `Drop` impl on
     /// the tx will roll back.
     #[tracing::instrument(level = "debug", skip_all)]
@@ -408,6 +410,7 @@ fn compiled_statement<'q>(
     compiled: &'q CompiledQuery,
     variables: Option<Value>,
     principal: Option<&Principal>,
+    in_tx: bool,
 ) -> Result<(&'q str, Vec<crate::types::Bind>)> {
     match (compiled.scoped, principal) {
         (true, None) => {
@@ -436,6 +439,7 @@ fn compiled_statement<'q>(
         sql = %shape.sql,
         binds = binds.len(),
         scoped = compiled.scoped,
+        in_tx,
         "executing compiled"
     );
     Ok((shape.sql.as_str(), binds))
@@ -531,7 +535,7 @@ impl TxClient {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, None)?;
+        let (sql, binds) = compiled_statement(compiled, variables, None, true)?;
         crate::executor::execute_on(&mut *self.tx, sql, &binds).await
     }
 
@@ -547,7 +551,7 @@ impl TxClient {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, Some(principal))?;
+        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), true)?;
         crate::executor::execute_on(&mut *self.tx, sql, &binds).await
     }
 
@@ -685,12 +689,13 @@ impl ScopedEngine<'_> {
 /// Scoped counterpart of [`TxClient`], obtained via
 /// [`ScopedEngine::transaction`]. Cannot be constructed directly.
 ///
-/// No `execute` here: a statement compiled against a policy carries that
-/// policy and binds a principal per run, which is a different mechanism from
-/// the [`ScopeSet`] this handle applies to every operation. Run compiled
-/// statements through [`TxClient::execute_scoped`], where the principal is
-/// explicit, or through this handle's text and builder surface, which rewrites
-/// under its set.
+/// This handle runs text and builder operations only — no compiled
+/// statements. Its guarantee is that nothing the closure runs can leave the
+/// [`ScopeSet`] it was opened with; a statement compiled against a policy
+/// binds a principal per run, and letting the closure choose that principal
+/// would be a way out. A transaction over compiled statements is
+/// [`Engine::transaction`] with [`TxClient::execute_scoped`], where the
+/// caller — not the closure's author — supplies the principal each time.
 pub struct ScopedTxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,

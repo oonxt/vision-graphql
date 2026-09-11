@@ -16,9 +16,12 @@ release commits; entries from 0.13.0 on are written as the work lands.
   leaving the policy behind: the transaction surface had text and builder
   entry points only, so "rebuild a join table, delete then insert" fell back
   to hand-written SQL outside the scope policy (field report). The report
-  also asked for a scoped transaction handle; that has existed since 0.5.0 as
-  `ScopedEngine::transaction` / `ScopedTxClient`, and the docs for
-  `TxClient` and the README's transaction section now point at it.
+  also asked for a transaction handle bound to a `ScopeSet`; that already
+  exists as `ScopedEngine::transaction` / `ScopedTxClient` (text and builder
+  operations only — a compiled statement's principal is chosen per run, which
+  a no-escape handle cannot allow), and the docs for `TxClient`, the
+  `compiled` module and the README's transaction section now say which handle
+  does what.
 
 ## 0.20.0 — 2026-09-09
 

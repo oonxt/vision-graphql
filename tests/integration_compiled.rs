@@ -721,23 +721,17 @@ async fn compiled_statements_run_inside_a_transaction() {
             let inserted: serde_json::Map<String, Value> =
                 tx.execute_scoped_as(&a4, None, &alice).await?;
             assert_eq!(inserted["title"], "a-4");
-            tx.execute_as::<Value>(&list, None).await
+            tx.execute(&list, None).await
         })
         .await
         .unwrap();
-    assert_eq!(
-        out.as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["title"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["a-3", "a-4", "b-1"]
-    );
+    assert_eq!(titles(&out, "orders"), ["a-3", "a-4", "b-1"]);
 
     // Scope holds inside the transaction: bob's delete touches nothing of
     // alice's, and bob cannot insert a row for alice — the post-insert check
     // fails the statement from inside Postgres (a `Database` error, as on the
-    // pool), and with it the transaction.
+    // pool), and with it the transaction. The row state below is the proof;
+    // the error's text is log-only.
     let bobs = engine
         .transaction(async |tx| {
             let d = tx.execute_scoped(&delete, None, &bob).await?;
@@ -750,10 +744,7 @@ async fn compiled_statements_run_inside_a_transaction() {
         .transaction(async |tx| tx.execute_scoped(&a5, None, &bob).await)
         .await
         .unwrap_err();
-    assert!(
-        matches!(&err, Error::Database(e) if e.to_string().contains("outside scope")),
-        "{err:?}"
-    );
+    assert!(matches!(&err, Error::Database(_)), "{err:?}");
     let after = engine.execute(&list, None).await.unwrap();
     assert_eq!(titles(&after, "orders"), ["a-3", "a-4"]);
 

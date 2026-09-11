@@ -1138,8 +1138,10 @@ re-inserting, say — with every one of them still bound by its policy.
 
 For a transaction that must stay inside one `ScopeSet` no matter what the
 closure runs, `engine.scoped(set).transaction(…)` hands it a `ScopedTxClient`
-instead: the same text and builder surface, every operation rewritten under
-the set, and no way out of it. See [Scoped execution](#scoped-execution).
+instead: the text and builder surface only, every operation rewritten under
+the set, and no way out of it — which is why it does not run compiled
+statements, whose principal is chosen per run. See
+[Scoped execution](#scoped-execution).
 
 ## Running the tests
 
