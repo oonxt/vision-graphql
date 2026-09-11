@@ -3,6 +3,26 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **Every executing method has an `_on` twin that runs on a connection the
+  caller supplies.** `Engine::query_on` / `run_on` / `execute_on` /
+  `execute_scoped_on` and their `_as` forms, and the same on `ScopedEngine`,
+  take any `sqlx::PgExecutor` — `&mut *tx` from a transaction the caller
+  began, or the pool. The pool methods are now these twins bound to the
+  engine's own pool, so each kind of statement has one execution path. A
+  host that must run native SQL and policy-bound statements in one
+  transaction, and own that transaction's lifetime and timeout, had no way
+  to lend the engine its connection (field report); `Engine::transaction`
+  puts the engine in charge of the connection, which is the wrong side for
+  that host. The engine begins, commits and rolls back nothing on an `_on`
+  call, and the policy's predicates, post-insert check and principal binding
+  are still its own — the caller lends the connection, the engine executes.
+  On `ScopedEngine` the twins keep the handle's `ScopeSet`. `TxClient` and
+  `ScopedTxClient` are unchanged.
+
 ## 0.21.0 — 2026-09-11
 
 ### Added

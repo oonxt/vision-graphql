@@ -767,6 +767,130 @@ async fn compiled_statements_run_inside_a_transaction() {
     );
 }
 
+/// The host holds the transaction; the engine runs its statements in it.
+/// What the field report's second shape needs: native SQL and policy-bound
+/// statements on one connection the host begins, times out and commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_holding_its_own_transaction_runs_scoped_statements_in_it() {
+    let (engine, db) = setup().await;
+    let pool = db.pool.clone();
+    let policy = ScopePolicy::builder()
+        .allow("orders", col("user_id").eq(principal()))
+        .validate(&schema())
+        .expect("policy");
+    let alice = Principal::new().set("principal", 1);
+    let bob = Principal::new().set("principal", 2);
+    let delete = engine
+        .compile_scoped(
+            "mutation { delete_orders(where: {}) { affected_rows } }",
+            &policy,
+        )
+        .expect("compile delete");
+    let a3 = engine
+        .compile_scoped(
+            r#"mutation { insert_orders_one(object: {user_id: 1, title: "a-3"}) { title } }"#,
+            &policy,
+        )
+        .expect("compile insert");
+    let list = engine
+        .compile("{ orders(order_by: {title: asc}) { title } }")
+        .expect("compile list");
+
+    // Rolled back by the host. The engine's statements see the host's
+    // uncommitted native insert — same connection — and the pool sees none
+    // of it.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("INSERT INTO orders (user_id, title) VALUES (1, 'raw-1')")
+        .execute(&mut *tx)
+        .await
+        .expect("native insert");
+    let d = engine
+        .execute_scoped_on(&mut *tx, &delete, None, &alice)
+        .await
+        .unwrap();
+    assert_eq!(d["delete_orders"]["affected_rows"], 3, "a-1, a-2 and raw-1");
+    engine
+        .execute_scoped_on(&mut *tx, &a3, None, &alice)
+        .await
+        .unwrap();
+    let inside = engine.execute_on(&mut *tx, &list, None).await.unwrap();
+    assert_eq!(titles(&inside, "orders"), ["a-3", "b-1"]);
+    let outside = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&outside, "orders"), ["a-1", "a-2", "b-1"]);
+    tx.rollback().await.expect("rollback");
+    let after = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&after, "orders"), ["a-1", "a-2", "b-1"]);
+
+    // Committed by the host, with the scoped text surface on the same
+    // connection: bob's delete under his set touches only his row.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("INSERT INTO orders (user_id, title) VALUES (2, 'raw-2')")
+        .execute(&mut *tx)
+        .await
+        .expect("native insert");
+    let bobs = engine
+        .scoped(policy.bind(&bob).expect("bind"))
+        .query_on(
+            &mut *tx,
+            "mutation { delete_orders(where: {}) { affected_rows } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bobs["delete_orders"]["affected_rows"], 2, "b-1 and raw-2");
+    let inserted: serde_json::Map<String, Value> = engine
+        .execute_scoped_as_on(&mut *tx, &a3, None, &alice)
+        .await
+        .unwrap();
+    assert_eq!(inserted["title"], "a-3");
+    let seen = engine
+        .query_on(
+            &mut *tx,
+            "{ orders(order_by: {title: asc}) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles(&seen, "orders"), ["a-1", "a-2", "a-3"]);
+    tx.commit().await.expect("commit");
+    let after = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&after, "orders"), ["a-1", "a-2", "a-3"]);
+
+    // The guards are the pool's: pairing, and the set's denial.
+    let mut tx = pool.begin().await.expect("begin");
+    let err = engine
+        .execute_on(&mut *tx, &delete, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Scope(m) if m.contains("execute_scoped")),
+        "{err:?}"
+    );
+    let err = engine
+        .execute_scoped_on(&mut *tx, &list, None, &alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Scope(m) if m.contains("compile_scoped")),
+        "{err:?}"
+    );
+    let err = engine
+        .scoped(vision_graphql::ScopeSet::new())
+        .query_on(&mut *tx, "{ orders { id } }", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::ScopeDenied { .. }), "{err:?}");
+    // bob cannot insert a row for alice through the host's connection either.
+    let err = engine
+        .execute_scoped_on(&mut *tx, &a3, None, &bob)
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Database(_)), "{err:?}");
+    tx.rollback().await.expect("rollback");
+    let after = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&after, "orders"), ["a-1", "a-2", "a-3"]);
+}
+
 /// A statement is prepared on the connection with the types of the request
 /// that first ran it and reused, by SQL text, for every later one. A null
 /// used to go out as text whatever the column, so a compiled statement first

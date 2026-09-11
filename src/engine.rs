@@ -182,9 +182,33 @@ impl Engine {
     ///
     /// A document holding more than one operation needs
     /// [`Engine::query_with`] to say which.
+    ///
+    /// Every executing method on this engine has an `_on` twin that runs on
+    /// a caller-supplied connection instead of the pool — see
+    /// [`Engine::query_on`] — and the pool method is that twin bound to the
+    /// engine's own pool.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
+    }
+
+    /// [`Engine::query`] on a caller-supplied executor: the engine's pool
+    /// (`&pool`), a connection borrowed from a transaction the caller holds
+    /// (`&mut *tx`), or any other [`sqlx::PgExecutor`].
+    ///
+    /// The engine begins, commits and rolls back nothing here. This is the
+    /// entry point for a host that owns the transaction — because its
+    /// lifetime, its timeout and the other statements in it are the host's
+    /// business — and wants this engine's statements to run in it. A
+    /// statement sees what the connection sees, uncommitted rows included.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+    ) -> Result<Value> {
+        self.query_with_on(executor, source, variables, None).await
     }
 
     /// [`Engine::query`] naming the operation to run.
@@ -200,20 +224,46 @@ impl Engine {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
+        self.query_with_on(&self.pool, source, variables, operation_name)
+            .await
+    }
+
+    /// [`Engine::query_with`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let mut op = self.lower(source, &vars, operation_name)?;
-        let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
-        crate::executor::execute(&self.pool, &sql, &binds).await
+        let op = self.lower(source, &vars, operation_name)?;
+        run_operation_on(executor, op, &self.schema, &self.limits, "executing").await
     }
 
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let mut operation = op.into_operation();
-        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
-        crate::executor::execute(&self.pool, &sql, &binds).await
+        self.run_on(&self.pool, op).await
+    }
+
+    /// [`Engine::run`] on a caller-supplied executor; see [`Engine::query_on`].
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn run_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        op: impl crate::builder::IntoOperation,
+    ) -> Result<Value> {
+        run_operation_on(
+            executor,
+            op.into_operation(),
+            &self.schema,
+            &self.limits,
+            "executing",
+        )
+        .await
     }
 
     /// Same as [`Engine::query`], but deserializes the whole Hasura `data`
@@ -234,7 +284,34 @@ impl Engine {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<T> {
-        let data = self.query_with(source, variables, operation_name).await?;
+        self.query_as_with_on(&self.pool, source, variables, operation_name)
+            .await
+    }
+
+    /// [`Engine::query_as`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    pub async fn query_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+    ) -> Result<T> {
+        self.query_as_with_on(executor, source, variables, None)
+            .await
+    }
+
+    /// [`Engine::query_as_with`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    pub async fn query_as_with_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self
+            .query_with_on(executor, source, variables, operation_name)
+            .await?;
         unwrap_and_deserialize(data, None)
     }
 
@@ -249,11 +326,20 @@ impl Engine {
         &self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        let mut operation = op.into_operation();
+        self.run_as_on(&self.pool, op).await
+    }
+
+    /// [`Engine::run_as`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    pub async fn run_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        op: impl crate::builder::IntoOperation,
+    ) -> Result<T> {
+        let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing");
-        let data = crate::executor::execute(&self.pool, &sql, &binds).await?;
+        let data =
+            run_operation_on(executor, operation, &self.schema, &self.limits, "executing").await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -313,8 +399,20 @@ impl Engine {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, None, false)?;
-        crate::executor::execute(&self.pool, sql, &binds).await
+        self.execute_on(&self.pool, compiled, variables).await
+    }
+
+    /// [`Engine::execute`] on a caller-supplied executor; see
+    /// [`Engine::query_on`]. The same guard applies: a statement compiled
+    /// against a policy is refused without a principal.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<Value> {
+        execute_compiled_on(executor, compiled, variables, None, "executing compiled").await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -329,8 +427,35 @@ impl Engine {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), false)?;
-        crate::executor::execute(&self.pool, sql, &binds).await
+        self.execute_scoped_on(&self.pool, compiled, variables, principal)
+            .await
+    }
+
+    /// [`Engine::execute_scoped`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    ///
+    /// This is how a host that holds its own transaction runs a
+    /// policy-compiled statement inside it, beside whatever else the
+    /// transaction carries, with the policy's predicates, the post-insert
+    /// check and the principal binding all still the engine's: the host
+    /// lends the connection, the engine executes. The principal is the
+    /// caller's to supply per call, as on the pool.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute_scoped_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<Value> {
+        execute_compiled_on(
+            executor,
+            compiled,
+            variables,
+            Some(principal),
+            "executing compiled",
+        )
+        .await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and
@@ -353,6 +478,33 @@ impl Engine {
         principal: &Principal,
     ) -> Result<T> {
         let data = self.execute_scoped(compiled, variables, principal).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+    }
+
+    /// [`Engine::execute_as`] on a caller-supplied executor; see
+    /// [`Engine::query_on`].
+    pub async fn execute_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<T> {
+        let data = self.execute_on(executor, compiled, variables).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+    }
+
+    /// [`Engine::execute_scoped_as`] on a caller-supplied executor; see
+    /// [`Engine::execute_scoped_on`].
+    pub async fn execute_scoped_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<T> {
+        let data = self
+            .execute_scoped_on(executor, compiled, variables, principal)
+            .await?;
         unwrap_and_deserialize(data, compiled.root_alias.as_deref())
     }
 
@@ -410,7 +562,7 @@ fn compiled_statement<'q>(
     compiled: &'q CompiledQuery,
     variables: Option<Value>,
     principal: Option<&Principal>,
-    in_tx: bool,
+    what: &'static str,
 ) -> Result<(&'q str, Vec<crate::types::Bind>)> {
     match (compiled.scoped, principal) {
         (true, None) => {
@@ -439,10 +591,38 @@ fn compiled_statement<'q>(
         sql = %shape.sql,
         binds = binds.len(),
         scoped = compiled.scoped,
-        in_tx,
-        "executing compiled"
+        "{what}"
     );
     Ok((shape.sql.as_str(), binds))
+}
+
+/// Run a compiled statement on `executor`. The one execution path for
+/// compiled statements: the pool, the engine's own transaction and a caller's
+/// connection all come through here.
+async fn execute_compiled_on<'c, E: sqlx::PgExecutor<'c>>(
+    executor: E,
+    compiled: &CompiledQuery,
+    variables: Option<Value>,
+    principal: Option<&Principal>,
+    what: &'static str,
+) -> Result<Value> {
+    let (sql, binds) = compiled_statement(compiled, variables, principal, what)?;
+    crate::executor::execute_on(executor, sql, &binds).await
+}
+
+/// Prepare an already-lowered (and, for a scoped handle, already-rewritten)
+/// operation and run it on `executor`. The one execution path for text and
+/// builder operations, as [`execute_compiled_on`] is for compiled ones.
+async fn run_operation_on<'c, E: sqlx::PgExecutor<'c>>(
+    executor: E,
+    mut op: Operation,
+    schema: &Schema,
+    limits: &ExecutionLimits,
+    what: &'static str,
+) -> Result<Value> {
+    let (sql, binds) = prepare(&mut op, schema, limits)?;
+    tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "{what}");
+    crate::executor::execute_on(executor, &sql, &binds).await
 }
 
 /// A handle to an open PostgreSQL transaction that exposes the same query
@@ -479,19 +659,28 @@ impl TxClient {
     ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let doc = self.parse_cache.get(source)?;
-        let mut op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
-        let (sql, binds) = prepare(&mut op, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
+        let op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
+        run_operation_on(
+            &mut *self.tx,
+            op,
+            &self.schema,
+            &self.limits,
+            "executing in tx",
+        )
+        .await
     }
 
     /// Same as [`Engine::run`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let mut operation = op.into_operation();
-        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
+        run_operation_on(
+            &mut *self.tx,
+            op.into_operation(),
+            &self.schema,
+            &self.limits,
+            "executing in tx",
+        )
+        .await
     }
 
     /// Same as [`Engine::query_as`], but runs on the transaction's connection.
@@ -519,11 +708,16 @@ impl TxClient {
         &mut self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        let mut operation = op.into_operation();
+        let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = prepare(&mut operation, &self.schema, &self.limits)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
-        let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
+        let data = run_operation_on(
+            &mut *self.tx,
+            operation,
+            &self.schema,
+            &self.limits,
+            "executing in tx",
+        )
+        .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -535,8 +729,14 @@ impl TxClient {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, None, true)?;
-        crate::executor::execute_on(&mut *self.tx, sql, &binds).await
+        execute_compiled_on(
+            &mut *self.tx,
+            compiled,
+            variables,
+            None,
+            "executing compiled in tx",
+        )
+        .await
     }
 
     /// Same as [`Engine::execute_scoped`], but runs on the transaction's
@@ -551,8 +751,14 @@ impl TxClient {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), true)?;
-        crate::executor::execute_on(&mut *self.tx, sql, &binds).await
+        execute_compiled_on(
+            &mut *self.tx,
+            compiled,
+            variables,
+            Some(principal),
+            "executing compiled in tx",
+        )
+        .await
     }
 
     /// Same as [`TxClient::execute`], unwrapping the single root field and
@@ -590,15 +796,46 @@ pub struct ScopedEngine<'e> {
 }
 
 impl ScopedEngine<'_> {
-    fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
+    /// The scope rewrite, then execution on `executor`. Every method on this
+    /// handle comes through here, so none can reach the renderer unscoped.
+    async fn run_scoped_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        mut op: Operation,
+    ) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.engine.schema)?;
-        prepare(&mut op, &self.engine.schema, &self.engine.limits)
+        run_operation_on(
+            executor,
+            op,
+            &self.engine.schema,
+            &self.engine.limits,
+            "executing scoped",
+        )
+        .await
     }
 
     /// Same as [`Engine::query`], with the scope rewrite applied.
+    ///
+    /// As on [`Engine`], every executing method here has an `_on` twin that
+    /// runs on a caller-supplied executor ([`ScopedEngine::query_on`]); the
+    /// rewrite is the same either way, so the set holds on the caller's
+    /// connection exactly as on the pool.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
+    }
+
+    /// [`ScopedEngine::query`] on a caller-supplied executor; see
+    /// [`Engine::query_on`] for what that means. The [`ScopeSet`] is this
+    /// handle's, fixed when it was made; the connection is the caller's.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+    ) -> Result<Value> {
+        self.query_with_on(executor, source, variables, None).await
     }
 
     /// [`ScopedEngine::query`] naming the operation to run.
@@ -609,19 +846,40 @@ impl ScopedEngine<'_> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
+        self.query_with_on(&self.engine.pool, source, variables, operation_name)
+            .await
+    }
+
+    /// [`ScopedEngine::query_with`] on a caller-supplied executor; see
+    /// [`ScopedEngine::query_on`].
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn query_with_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let op = self.engine.lower(source, &vars, operation_name)?;
-        let (sql, binds) = self.prepare(op)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped");
-        crate::executor::execute(&self.engine.pool, &sql, &binds).await
+        self.run_scoped_on(executor, op).await
     }
 
     /// Same as [`Engine::run`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let (sql, binds) = self.prepare(op.into_operation())?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped");
-        crate::executor::execute(&self.engine.pool, &sql, &binds).await
+        self.run_on(&self.engine.pool, op).await
+    }
+
+    /// [`ScopedEngine::run`] on a caller-supplied executor; see
+    /// [`ScopedEngine::query_on`].
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn run_on<'c, E: sqlx::PgExecutor<'c>>(
+        &self,
+        executor: E,
+        op: impl crate::builder::IntoOperation,
+    ) -> Result<Value> {
+        self.run_scoped_on(executor, op.into_operation()).await
     }
 
     /// Same as [`Engine::query_as`], with the scope rewrite applied.
@@ -640,7 +898,34 @@ impl ScopedEngine<'_> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<T> {
-        let data = self.query_with(source, variables, operation_name).await?;
+        self.query_as_with_on(&self.engine.pool, source, variables, operation_name)
+            .await
+    }
+
+    /// [`ScopedEngine::query_as`] on a caller-supplied executor; see
+    /// [`ScopedEngine::query_on`].
+    pub async fn query_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+    ) -> Result<T> {
+        self.query_as_with_on(executor, source, variables, None)
+            .await
+    }
+
+    /// [`ScopedEngine::query_as_with`] on a caller-supplied executor; see
+    /// [`ScopedEngine::query_on`].
+    pub async fn query_as_with_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<T> {
+        let data = self
+            .query_with_on(executor, source, variables, operation_name)
+            .await?;
         unwrap_and_deserialize(data, None)
     }
 
@@ -649,11 +934,19 @@ impl ScopedEngine<'_> {
         &self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
+        self.run_as_on(&self.engine.pool, op).await
+    }
+
+    /// [`ScopedEngine::run_as`] on a caller-supplied executor; see
+    /// [`ScopedEngine::query_on`].
+    pub async fn run_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+        &self,
+        executor: E,
+        op: impl crate::builder::IntoOperation,
+    ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = self.prepare(operation)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped");
-        let data = crate::executor::execute(&self.engine.pool, &sql, &binds).await?;
+        let data = self.run_scoped_on(executor, operation).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -705,9 +998,16 @@ pub struct ScopedTxClient {
 }
 
 impl ScopedTxClient {
-    fn prepare(&self, mut op: Operation) -> Result<(String, Vec<crate::types::Bind>)> {
+    async fn run_scoped(&mut self, mut op: Operation) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        prepare(&mut op, &self.schema, &self.limits)
+        run_operation_on(
+            &mut *self.tx,
+            op,
+            &self.schema,
+            &self.limits,
+            "executing scoped in tx",
+        )
+        .await
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.
@@ -727,17 +1027,13 @@ impl ScopedTxClient {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let doc = self.parse_cache.get(source)?;
         let op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
-        let (sql, binds) = self.prepare(op)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped in tx");
-        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
+        self.run_scoped(op).await
     }
 
     /// Same as [`TxClient::run`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        let (sql, binds) = self.prepare(op.into_operation())?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped in tx");
-        crate::executor::execute_on(&mut *self.tx, &sql, &binds).await
+        self.run_scoped(op.into_operation()).await
     }
 
     /// Same as [`TxClient::query_as`], with the scope rewrite applied.
@@ -767,9 +1063,7 @@ impl ScopedTxClient {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let (sql, binds) = self.prepare(operation)?;
-        tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing scoped in tx");
-        let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
+        let data = self.run_scoped(operation).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 }
