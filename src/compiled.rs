@@ -106,9 +106,13 @@
 //! Both directives are published by `__schema` and the SDL, and are the only
 //! directives this engine accepts.
 //!
-//! A [`CompiledQuery`] runs on the pool, not inside
-//! [`Engine::transaction`](crate::Engine::transaction); mutations that need a
-//! transaction still go through [`TxClient`](crate::TxClient).
+//! A [`CompiledQuery`] runs on the pool through
+//! [`Engine::execute`](crate::Engine::execute) /
+//! [`execute_scoped`](crate::Engine::execute_scoped), or on a transaction's
+//! connection through the same two methods on [`TxClient`](crate::TxClient),
+//! inside [`Engine::transaction`](crate::Engine::transaction). A
+//! [`ScopedTxClient`](crate::ScopedTxClient) does not run compiled
+//! statements; see its docs for why.
 
 use crate::error::{Error, Result};
 use crate::parser::VariableContract;

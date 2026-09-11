@@ -658,6 +658,115 @@ async fn a_choices_variable_that_is_also_optional_has_a_shape_with_the_filter_dr
     }
 }
 
+/// Compiled statements run inside `Engine::transaction` like text and builder
+/// operations do — the host whose documents are all compiled statements can
+/// make several of them atomic without leaving the policy behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn compiled_statements_run_inside_a_transaction() {
+    let (engine, _db) = setup().await;
+    let policy = ScopePolicy::builder()
+        .allow("orders", col("user_id").eq(principal()))
+        .validate(&schema())
+        .expect("policy");
+    let alice = Principal::new().set("principal", 1);
+    let bob = Principal::new().set("principal", 2);
+
+    // Rebuild alice's orders: delete, then insert — one transaction.
+    let delete = engine
+        .compile_scoped(
+            "mutation { delete_orders(where: {}) { affected_rows } }",
+            &policy,
+        )
+        .expect("compile delete");
+    // Written out: an insert's rows are its shape, so they cannot be
+    // variables (see the crate docs). One compiled statement per row here.
+    let insert = |title: &str| {
+        engine
+            .compile_scoped(
+                &format!(
+                    r#"mutation {{ insert_orders_one(object: {{user_id: 1, title: "{title}"}}) {{ title }} }}"#
+                ),
+                &policy,
+            )
+            .expect("compile insert")
+    };
+    let (a3, a4, a5) = (insert("a-3"), insert("a-4"), insert("a-5"));
+    let list = engine
+        .compile("{ orders(order_by: {title: asc}) { title } }")
+        .expect("compile list");
+
+    // Rolled back: the delete inside is undone with the closure's Err.
+    let err = engine
+        .transaction(async |tx| {
+            let d = tx.execute_scoped(&delete, None, &alice).await?;
+            assert_eq!(d["delete_orders"]["affected_rows"], 2);
+            let seen = tx.execute(&list, None).await?;
+            assert_eq!(titles(&seen, "orders"), ["b-1"], "deleted inside the tx");
+            Err::<(), _>(Error::Validate {
+                path: "test".into(),
+                message: "abort".into(),
+            })
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+    let after = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&after, "orders"), ["a-1", "a-2", "b-1"]);
+
+    // Committed: both statements land together, each under alice's scope.
+    let out: Value = engine
+        .transaction(async |tx| {
+            tx.execute_scoped(&delete, None, &alice).await?;
+            tx.execute_scoped(&a3, None, &alice).await?;
+            let inserted: serde_json::Map<String, Value> =
+                tx.execute_scoped_as(&a4, None, &alice).await?;
+            assert_eq!(inserted["title"], "a-4");
+            tx.execute(&list, None).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&out, "orders"), ["a-3", "a-4", "b-1"]);
+
+    // Scope holds inside the transaction: bob's delete touches nothing of
+    // alice's, and bob cannot insert a row for alice — the post-insert check
+    // fails the statement from inside Postgres (a `Database` error, as on the
+    // pool), and with it the transaction. The row state below is the proof;
+    // the error's text is log-only.
+    let bobs = engine
+        .transaction(async |tx| {
+            let d = tx.execute_scoped(&delete, None, &bob).await?;
+            Ok::<_, Error>(d["delete_orders"]["affected_rows"].as_i64().unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(bobs, 1, "bob deletes bob's row only");
+    let err = engine
+        .transaction(async |tx| tx.execute_scoped(&a5, None, &bob).await)
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Database(_)), "{err:?}");
+    let after = engine.execute(&list, None).await.unwrap();
+    assert_eq!(titles(&after, "orders"), ["a-3", "a-4"]);
+
+    // The pairing guard is the same one the pool applies.
+    let err = engine
+        .transaction(async |tx| tx.execute(&delete, None).await)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Scope(m) if m.contains("execute_scoped")),
+        "{err:?}"
+    );
+    let err = engine
+        .transaction(async |tx| tx.execute_scoped(&list, None, &alice).await)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Scope(m) if m.contains("compile_scoped")),
+        "{err:?}"
+    );
+}
+
 /// A statement is prepared on the connection with the types of the request
 /// that first ran it and reused, by SQL text, for every later one. A null
 /// used to go out as text whatever the column, so a compiled statement first

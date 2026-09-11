@@ -313,17 +313,8 @@ impl Engine {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        if compiled.scoped {
-            return Err(Error::Scope(
-                "this query was compiled against a policy; run it with execute_scoped".into(),
-            ));
-        }
-        let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let shape = compiled.shape_for(&vars)?;
-        let inputs = Inputs::variables(&vars).with_defaults(&compiled.defaults);
-        let binds = crate::types::resolve_binds(&shape.specs, &inputs)?;
-        tracing::debug!(target: "vision_graphql::engine", sql = %shape.sql, binds = binds.len(), "executing compiled");
-        crate::executor::execute(&self.pool, &shape.sql, &binds).await
+        let (sql, binds) = compiled_statement(compiled, variables, None, false)?;
+        crate::executor::execute(&self.pool, sql, &binds).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -338,21 +329,8 @@ impl Engine {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        if !compiled.scoped {
-            return Err(Error::Scope(
-                "this query was compiled without a policy, so a principal would not restrict it; \
-                 compile it with compile_scoped"
-                    .into(),
-            ));
-        }
-        let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let shape = compiled.shape_for(&vars)?;
-        let inputs = Inputs::variables(&vars)
-            .with_defaults(&compiled.defaults)
-            .with_principal(principal);
-        let binds = crate::types::resolve_binds(&shape.specs, &inputs)?;
-        tracing::debug!(target: "vision_graphql::engine", sql = %shape.sql, binds = binds.len(), "executing compiled scoped");
-        crate::executor::execute(&self.pool, &shape.sql, &binds).await
+        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), false)?;
+        crate::executor::execute(&self.pool, sql, &binds).await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and
@@ -388,9 +366,11 @@ impl Engine {
         }
     }
 
-    /// Run a closure inside a single PostgreSQL transaction. Every call to
-    /// [`TxClient::query`] / [`TxClient::run`] inside the closure uses the
-    /// same connection and the same tx. `Ok` commits; `Err` rolls back and
+    /// Run a closure inside a single PostgreSQL transaction. Every call on
+    /// the [`TxClient`] inside the closure — [`query`](TxClient::query),
+    /// [`run`](TxClient::run), [`execute`](TxClient::execute) and
+    /// [`execute_scoped`](TxClient::execute_scoped) — uses the same
+    /// connection and the same tx. `Ok` commits; `Err` rolls back and
     /// the error is returned verbatim. Panics unwind; sqlx's `Drop` impl on
     /// the tx will roll back.
     #[tracing::instrument(level = "debug", skip_all)]
@@ -418,10 +398,63 @@ impl Engine {
     }
 }
 
+/// The SQL and parameters a compiled statement runs for one request: the
+/// shape its `@choices` pick, with variables, defaults and — for a statement
+/// compiled against a policy — the principal resolved into binds.
+///
+/// One place for the guard that pairs a statement with the right entry point:
+/// a scoped statement without a principal would run unscoped, and an unscoped
+/// one with a principal would look restricted while restricting nothing. The
+/// pool and the transaction share it so the two cannot drift.
+fn compiled_statement<'q>(
+    compiled: &'q CompiledQuery,
+    variables: Option<Value>,
+    principal: Option<&Principal>,
+    in_tx: bool,
+) -> Result<(&'q str, Vec<crate::types::Bind>)> {
+    match (compiled.scoped, principal) {
+        (true, None) => {
+            return Err(Error::Scope(
+                "this query was compiled against a policy; run it with execute_scoped".into(),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(Error::Scope(
+                "this query was compiled without a policy, so a principal would not restrict it; \
+                 compile it with compile_scoped"
+                    .into(),
+            ))
+        }
+        _ => {}
+    }
+    let vars = variables.unwrap_or(Value::Object(Default::default()));
+    let shape = compiled.shape_for(&vars)?;
+    let mut inputs = Inputs::variables(&vars).with_defaults(&compiled.defaults);
+    if let Some(principal) = principal {
+        inputs = inputs.with_principal(principal);
+    }
+    let binds = crate::types::resolve_binds(&shape.specs, &inputs)?;
+    tracing::debug!(
+        target: "vision_graphql::engine",
+        sql = %shape.sql,
+        binds = binds.len(),
+        scoped = compiled.scoped,
+        in_tx,
+        "executing compiled"
+    );
+    Ok((shape.sql.as_str(), binds))
+}
+
 /// A handle to an open PostgreSQL transaction that exposes the same query
-/// surface as [`Engine`]. Obtained via [`Engine::transaction`]; cannot be
-/// constructed directly. Methods take `&mut self` because the underlying
-/// connection is exclusively borrowed per statement.
+/// surface as [`Engine`] — text, builder and compiled statements alike.
+/// Obtained via [`Engine::transaction`]; cannot be constructed directly.
+/// Methods take `&mut self` because the underlying connection is exclusively
+/// borrowed per statement.
+///
+/// A scoped statement runs here with its principal, as it does on the pool
+/// ([`TxClient::execute_scoped`]). For a transaction that must stay inside
+/// one [`ScopeSet`] whatever the closure does, see
+/// [`ScopedEngine::transaction`].
 pub struct TxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
@@ -492,6 +525,57 @@ impl TxClient {
         tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "executing in tx");
         let data = crate::executor::execute_on(&mut *self.tx, &sql, &binds).await?;
         unwrap_and_deserialize(data, alias.as_deref())
+    }
+
+    /// Same as [`Engine::execute`], but runs on the transaction's connection.
+    /// A statement compiled against a policy is refused here as there.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute(
+        &mut self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<Value> {
+        let (sql, binds) = compiled_statement(compiled, variables, None, true)?;
+        crate::executor::execute_on(&mut *self.tx, sql, &binds).await
+    }
+
+    /// Same as [`Engine::execute_scoped`], but runs on the transaction's
+    /// connection: a statement compiled against a policy, with `principal`
+    /// bound into its predicates. This is what lets a host whose documents
+    /// are compiled statements run several of them atomically without
+    /// giving up the policy for the duration.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn execute_scoped(
+        &mut self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let (sql, binds) = compiled_statement(compiled, variables, Some(principal), true)?;
+        crate::executor::execute_on(&mut *self.tx, sql, &binds).await
+    }
+
+    /// Same as [`TxClient::execute`], unwrapping the single root field and
+    /// deserializing into `T`.
+    pub async fn execute_as<T: DeserializeOwned>(
+        &mut self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+    ) -> Result<T> {
+        let data = self.execute(compiled, variables).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+    }
+
+    /// Same as [`TxClient::execute_scoped`], unwrapping the single root field
+    /// and deserializing into `T`.
+    pub async fn execute_scoped_as<T: DeserializeOwned>(
+        &mut self,
+        compiled: &CompiledQuery,
+        variables: Option<Value>,
+        principal: &Principal,
+    ) -> Result<T> {
+        let data = self.execute_scoped(compiled, variables, principal).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
     }
 }
 
@@ -604,6 +688,14 @@ impl ScopedEngine<'_> {
 
 /// Scoped counterpart of [`TxClient`], obtained via
 /// [`ScopedEngine::transaction`]. Cannot be constructed directly.
+///
+/// This handle runs text and builder operations only — no compiled
+/// statements. Its guarantee is that nothing the closure runs can leave the
+/// [`ScopeSet`] it was opened with; a statement compiled against a policy
+/// binds a principal per run, and letting the closure choose that principal
+/// would be a way out. A transaction over compiled statements is
+/// [`Engine::transaction`] with [`TxClient::execute_scoped`], where the
+/// caller — not the closure's author — supplies the principal each time.
 pub struct ScopedTxClient {
     tx: sqlx::Transaction<'static, Postgres>,
     schema: Arc<Schema>,
