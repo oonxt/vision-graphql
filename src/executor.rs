@@ -48,7 +48,12 @@ where
     Ok(json)
 }
 
-/// Execute against the pool. Preserves the pre-transaction-API call signature.
+/// Execute against the pool. [`execute_on`] takes a pool as it takes any
+/// executor; nothing in the crate calls this any more.
+#[deprecated(
+    since = "0.22.0",
+    note = "use `execute_on`, which takes a pool as it takes any executor"
+)]
 pub async fn execute(pool: &sqlx::PgPool, sql: &str, binds: &[Bind]) -> Result<Value> {
     execute_on(pool, sql, binds).await
 }

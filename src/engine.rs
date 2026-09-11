@@ -173,8 +173,13 @@ impl Engine {
 
     /// Parse (via the cache) and lower `source` against this engine's schema.
     fn lower(&self, source: &str, vars: &Value, operation_name: Option<&str>) -> Result<Operation> {
-        let doc = self.parse_cache.get(source)?;
-        crate::parser::lower(&doc, vars, operation_name, &self.schema)
+        lower_source(
+            &self.parse_cache,
+            &self.schema,
+            source,
+            vars,
+            operation_name,
+        )
     }
 
     /// Parse a GraphQL query string, execute against PostgreSQL, return the
@@ -187,7 +192,6 @@ impl Engine {
     /// a caller-supplied connection instead of the pool — see
     /// [`Engine::query_on`] — and the pool method is that twin bound to the
     /// engine's own pool.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
     }
@@ -201,7 +205,6 @@ impl Engine {
     /// lifetime, its timeout and the other statements in it are the host's
     /// business — and wants this engine's statements to run in it. A
     /// statement sees what the connection sees, uncommitted rows included.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
         &self,
         executor: E,
@@ -217,7 +220,6 @@ impl Engine {
     /// `variables`: a client that ships one document holding every operation it
     /// might send picks one per request by name. Without it such a document can
     /// only be run through [`Engine::compile_with`], which has always taken one.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_with(
         &self,
         source: &str,
@@ -240,11 +242,10 @@ impl Engine {
     ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
         let op = self.lower(source, &vars, operation_name)?;
-        run_operation_on(executor, op, &self.schema, &self.limits, "executing").await
+        run_operation_on(executor, op, &self.schema, &self.limits, false).await
     }
 
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         self.run_on(&self.pool, op).await
     }
@@ -261,7 +262,7 @@ impl Engine {
             op.into_operation(),
             &self.schema,
             &self.limits,
-            "executing",
+            false,
         )
         .await
     }
@@ -338,8 +339,7 @@ impl Engine {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data =
-            run_operation_on(executor, operation, &self.schema, &self.limits, "executing").await?;
+        let data = run_operation_on(executor, operation, &self.schema, &self.limits, false).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -393,7 +393,6 @@ impl Engine {
     /// Refuses a statement compiled against a policy: that one needs a
     /// principal, and running it without one would mean running a scoped query
     /// unscoped.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute(
         &self,
         compiled: &CompiledQuery,
@@ -412,7 +411,7 @@ impl Engine {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled_on(executor, compiled, variables, None, "executing compiled").await
+        execute_compiled_on(executor, compiled, variables, None).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -420,7 +419,6 @@ impl Engine {
     ///
     /// Refuses a statement that was compiled without a policy, since its SQL
     /// carries no predicates and the principal would silently have no effect.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute_scoped(
         &self,
         compiled: &CompiledQuery,
@@ -448,14 +446,7 @@ impl Engine {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled_on(
-            executor,
-            compiled,
-            variables,
-            Some(principal),
-            "executing compiled",
-        )
-        .await
+        execute_compiled_on(executor, compiled, variables, Some(principal)).await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and
@@ -465,8 +456,7 @@ impl Engine {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<T> {
-        let data = self.execute(compiled, variables).await?;
-        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+        self.execute_as_on(&self.pool, compiled, variables).await
     }
 
     /// Same as [`Engine::execute_scoped`], unwrapping the single root field and
@@ -477,8 +467,8 @@ impl Engine {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<T> {
-        let data = self.execute_scoped(compiled, variables, principal).await?;
-        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
+        self.execute_scoped_as_on(&self.pool, compiled, variables, principal)
+            .await
     }
 
     /// [`Engine::execute_as`] on a caller-supplied executor; see
@@ -550,20 +540,20 @@ impl Engine {
     }
 }
 
-/// The SQL and parameters a compiled statement runs for one request: the
-/// shape its `@choices` pick, with variables, defaults and — for a statement
-/// compiled against a policy — the principal resolved into binds.
-///
-/// One place for the guard that pairs a statement with the right entry point:
-/// a scoped statement without a principal would run unscoped, and an unscoped
-/// one with a principal would look restricted while restricting nothing. The
-/// pool and the transaction share it so the two cannot drift.
-fn compiled_statement<'q>(
-    compiled: &'q CompiledQuery,
+/// Run a compiled statement on `executor`: the shape its `@choices` pick,
+/// with variables, defaults and — for a statement compiled against a policy —
+/// the principal resolved into binds. The one execution path for compiled
+/// statements: the pool, the engine's own transaction and a caller's
+/// connection all come through here, and so does the guard that pairs a
+/// statement with the right entry point — a scoped statement without a
+/// principal would run unscoped, and an unscoped one with a principal would
+/// look restricted while restricting nothing.
+async fn execute_compiled_on<'c, E: sqlx::PgExecutor<'c>>(
+    executor: E,
+    compiled: &CompiledQuery,
     variables: Option<Value>,
     principal: Option<&Principal>,
-    what: &'static str,
-) -> Result<(&'q str, Vec<crate::types::Bind>)> {
+) -> Result<Value> {
     match (compiled.scoped, principal) {
         (true, None) => {
             return Err(Error::Scope(
@@ -591,38 +581,51 @@ fn compiled_statement<'q>(
         sql = %shape.sql,
         binds = binds.len(),
         scoped = compiled.scoped,
-        "{what}"
+        executor = std::any::type_name::<E>(),
+        "executing compiled"
     );
-    Ok((shape.sql.as_str(), binds))
+    crate::executor::execute_on(executor, &shape.sql, &binds).await
 }
 
-/// Run a compiled statement on `executor`. The one execution path for
-/// compiled statements: the pool, the engine's own transaction and a caller's
-/// connection all come through here.
-async fn execute_compiled_on<'c, E: sqlx::PgExecutor<'c>>(
-    executor: E,
-    compiled: &CompiledQuery,
-    variables: Option<Value>,
-    principal: Option<&Principal>,
-    what: &'static str,
-) -> Result<Value> {
-    let (sql, binds) = compiled_statement(compiled, variables, principal, what)?;
-    crate::executor::execute_on(executor, sql, &binds).await
-}
-
-/// Prepare an already-lowered (and, for a scoped handle, already-rewritten)
+/// Prepare an already-lowered (and, when `scoped`, already-rewritten)
 /// operation and run it on `executor`. The one execution path for text and
 /// builder operations, as [`execute_compiled_on`] is for compiled ones.
+///
+/// `executor` is logged by type, which is what tells a pool run
+/// (`&Pool<Postgres>`) from one on a borrowed connection (`&mut
+/// PgConnection`) — the distinction an operator needs when a statement did
+/// not see a row the transaction beside it just wrote.
 async fn run_operation_on<'c, E: sqlx::PgExecutor<'c>>(
     executor: E,
     mut op: Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
-    what: &'static str,
+    scoped: bool,
 ) -> Result<Value> {
     let (sql, binds) = prepare(&mut op, schema, limits)?;
-    tracing::debug!(target: "vision_graphql::engine", %sql, binds = binds.len(), "{what}");
+    tracing::debug!(
+        target: "vision_graphql::engine",
+        %sql,
+        binds = binds.len(),
+        scoped,
+        executor = std::any::type_name::<E>(),
+        "executing"
+    );
     crate::executor::execute_on(executor, &sql, &binds).await
+}
+
+/// Parse (via the cache) and lower `source`. The one lowering step for every
+/// text entry point — engine, transaction, scoped or not — so a pre-lowering
+/// hook or a cache change reaches all of them.
+fn lower_source(
+    parse_cache: &ParseCache,
+    schema: &Schema,
+    source: &str,
+    vars: &Value,
+    operation_name: Option<&str>,
+) -> Result<Operation> {
+    let doc = parse_cache.get(source)?;
+    crate::parser::lower(&doc, vars, operation_name, schema)
 }
 
 /// A handle to an open PostgreSQL transaction that exposes the same query
@@ -644,7 +647,6 @@ pub struct TxClient {
 
 impl TxClient {
     /// Same as [`Engine::query`], but runs on the transaction's connection.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
     }
@@ -658,16 +660,14 @@ impl TxClient {
         operation_name: Option<&str>,
     ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let doc = self.parse_cache.get(source)?;
-        let op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
-        run_operation_on(
-            &mut *self.tx,
-            op,
+        let op = lower_source(
+            &self.parse_cache,
             &self.schema,
-            &self.limits,
-            "executing in tx",
-        )
-        .await
+            source,
+            &vars,
+            operation_name,
+        )?;
+        run_operation_on(&mut *self.tx, op, &self.schema, &self.limits, false).await
     }
 
     /// Same as [`Engine::run`], but runs on the transaction's connection.
@@ -678,7 +678,7 @@ impl TxClient {
             op.into_operation(),
             &self.schema,
             &self.limits,
-            "executing in tx",
+            false,
         )
         .await
     }
@@ -710,14 +710,8 @@ impl TxClient {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = run_operation_on(
-            &mut *self.tx,
-            operation,
-            &self.schema,
-            &self.limits,
-            "executing in tx",
-        )
-        .await?;
+        let data =
+            run_operation_on(&mut *self.tx, operation, &self.schema, &self.limits, false).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -729,14 +723,7 @@ impl TxClient {
         compiled: &CompiledQuery,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled_on(
-            &mut *self.tx,
-            compiled,
-            variables,
-            None,
-            "executing compiled in tx",
-        )
-        .await
+        execute_compiled_on(&mut *self.tx, compiled, variables, None).await
     }
 
     /// Same as [`Engine::execute_scoped`], but runs on the transaction's
@@ -751,14 +738,7 @@ impl TxClient {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled_on(
-            &mut *self.tx,
-            compiled,
-            variables,
-            Some(principal),
-            "executing compiled in tx",
-        )
-        .await
+        execute_compiled_on(&mut *self.tx, compiled, variables, Some(principal)).await
     }
 
     /// Same as [`TxClient::execute`], unwrapping the single root field and
@@ -796,22 +776,17 @@ pub struct ScopedEngine<'e> {
 }
 
 impl ScopedEngine<'_> {
-    /// The scope rewrite, then execution on `executor`. Every method on this
-    /// handle comes through here, so none can reach the renderer unscoped.
+    /// The scope rewrite, then execution on `executor`. Every executing
+    /// method on this handle comes through here, so none can reach the
+    /// renderer unscoped. ([`ScopedEngine::transaction`] hands out a
+    /// [`ScopedTxClient`], which has its own copy of the same two steps.)
     async fn run_scoped_on<'c, E: sqlx::PgExecutor<'c>>(
         &self,
         executor: E,
         mut op: Operation,
     ) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.engine.schema)?;
-        run_operation_on(
-            executor,
-            op,
-            &self.engine.schema,
-            &self.engine.limits,
-            "executing scoped",
-        )
-        .await
+        run_operation_on(executor, op, &self.engine.schema, &self.engine.limits, true).await
     }
 
     /// Same as [`Engine::query`], with the scope rewrite applied.
@@ -820,7 +795,6 @@ impl ScopedEngine<'_> {
     /// runs on a caller-supplied executor ([`ScopedEngine::query_on`]); the
     /// rewrite is the same either way, so the set holds on the caller's
     /// connection exactly as on the pool.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
     }
@@ -828,7 +802,6 @@ impl ScopedEngine<'_> {
     /// [`ScopedEngine::query`] on a caller-supplied executor; see
     /// [`Engine::query_on`] for what that means. The [`ScopeSet`] is this
     /// handle's, fixed when it was made; the connection is the caller's.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
         &self,
         executor: E,
@@ -839,7 +812,6 @@ impl ScopedEngine<'_> {
     }
 
     /// [`ScopedEngine::query`] naming the operation to run.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_with(
         &self,
         source: &str,
@@ -866,7 +838,6 @@ impl ScopedEngine<'_> {
     }
 
     /// Same as [`Engine::run`], with the scope rewrite applied.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         self.run_on(&self.engine.pool, op).await
     }
@@ -1000,18 +971,10 @@ pub struct ScopedTxClient {
 impl ScopedTxClient {
     async fn run_scoped(&mut self, mut op: Operation) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        run_operation_on(
-            &mut *self.tx,
-            op,
-            &self.schema,
-            &self.limits,
-            "executing scoped in tx",
-        )
-        .await
+        run_operation_on(&mut *self.tx, op, &self.schema, &self.limits, true).await
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.
-    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
     }
@@ -1025,8 +988,13 @@ impl ScopedTxClient {
         operation_name: Option<&str>,
     ) -> Result<Value> {
         let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let doc = self.parse_cache.get(source)?;
-        let op = crate::parser::lower(&doc, &vars, operation_name, &self.schema)?;
+        let op = lower_source(
+            &self.parse_cache,
+            &self.schema,
+            source,
+            &vars,
+            operation_name,
+        )?;
         self.run_scoped(op).await
     }
 

@@ -1139,10 +1139,12 @@ re-inserting, say — with every one of them still bound by its policy.
 
 ### A transaction the host holds
 
-Every executing method on `Engine` and `ScopedEngine` has an `_on` twin that
-takes the connection to run on — `query_on`, `run_on`, `execute_on`,
-`execute_scoped_on`, and their `_as` forms. The pool method is the twin bound
-to the engine's own pool. Hand it `&mut *tx` from a transaction you began, and
+Every executing method on `Engine` has an `_on` twin that takes the
+connection to run on — `query_on`, `run_on`, `execute_on`,
+`execute_scoped_on`, and their `_as` forms — and so do `ScopedEngine`'s text
+and builder methods (`query_on`, `run_on`, `_as` forms; a scoped handle runs
+no compiled statements). The pool method is the twin bound to the engine's
+own pool. Hand it `&mut *tx` from a transaction you began, and
 the engine's statements join whatever else that transaction carries — native
 SQL included — while the engine still does the executing: the policy's
 predicates, the post-insert check and the principal binding are all its, only
