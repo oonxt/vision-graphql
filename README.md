@@ -255,8 +255,9 @@ shape.
 Both directives are published by `__schema` and the SDL, and are the only
 directives the engine accepts.
 
-A `CompiledQuery` runs on the pool, not inside `Engine::transaction` —
-mutations needing a transaction still go through `TxClient`.
+A `CompiledQuery` runs on the pool through `execute` / `execute_scoped`, or
+on a transaction's connection through the same two methods on `TxClient`
+(see [Transactions](#transactions)).
 
 ## Column types
 
@@ -1128,6 +1129,17 @@ let post: Value = engine.transaction(async |tx| {
 A single GraphQL mutation request is already atomic (one SQL statement per
 request). `transaction` exists for workflows that need atomicity *across*
 multiple requests — most commonly id-chaining between mutations.
+
+`TxClient` carries the whole query surface: text (`query`), builder (`run`) and
+compiled statements (`execute`, and `execute_scoped` with a principal for one
+compiled against a policy). A host whose documents are compiled statements can
+run several inside one transaction — rebuild a join table by deleting and
+re-inserting, say — with every one of them still bound by its policy.
+
+For a transaction that must stay inside one `ScopeSet` no matter what the
+closure runs, `engine.scoped(set).transaction(…)` hands it a `ScopedTxClient`
+instead: the same text and builder surface, every operation rewritten under
+the set, and no way out of it. See [Scoped execution](#scoped-execution).
 
 ## Running the tests
 

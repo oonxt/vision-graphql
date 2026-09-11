@@ -3,6 +3,23 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **Compiled statements run inside a transaction.** `TxClient` gains
+  `execute` / `execute_scoped` and their `_as` forms, running a
+  `CompiledQuery` on the transaction's connection exactly as `Engine` runs it
+  on the pool — same shape selection, same defaults, same pairing guard
+  between a policy-compiled statement and a principal. A host whose documents
+  are all compiled statements could not make two of them atomic without
+  leaving the policy behind: the transaction surface had text and builder
+  entry points only, so "rebuild a join table, delete then insert" fell back
+  to hand-written SQL outside the scope policy (field report). The report
+  also asked for a scoped transaction handle; that has existed since 0.5.0 as
+  `ScopedEngine::transaction` / `ScopedTxClient`, and the docs for
+  `TxClient` and the README's transaction section now point at it.
+
 ## 0.20.0 — 2026-09-09
 
 ### Breaking
