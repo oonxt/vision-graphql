@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 
 use crate::error::{Error, Result};
+use crate::schema::PgType;
 use crate::types::Inputs;
 
 /// A value position in the IR: known when the query was lowered, or a name
@@ -647,6 +648,41 @@ pub enum BoolExpr {
     Relation {
         name: String,
         inner: Box<BoolExpr>,
+    },
+    /// `TRUE` / `FALSE`.
+    ///
+    /// A policy that lowers "this caller sees everything" or "this caller
+    /// sees nothing" needs a leaf that says so. An empty `And` / `Or` renders
+    /// the same, but reads as an accident of the empty case rather than a
+    /// decision, and a reader who "fixes" the empty case breaks it.
+    Const(bool),
+    /// `left op right` with no column on either side: two bound values
+    /// compared in SQL, `$n::pg op $m::pg`.
+    ///
+    /// The leaf of a policy condition that reads the principal alone —
+    /// `$role = 'admin'` — and so has no column to take its type from, which
+    /// is why it carries `pg` itself. Kept as a comparison rather than folded
+    /// by the host so that a statement compiled once against the policy still
+    /// serves every principal; folding would compile one statement per
+    /// caller. Null on either side is refused, as it is for a column
+    /// comparison. Nothing in a document lowers to this: the `where` input
+    /// types publish no spelling for it, so it is reachable only from a
+    /// scope predicate or the typed builder.
+    ValueCompare {
+        left: Val,
+        op: CmpOp,
+        right: Val,
+        pg: PgType,
+    },
+    /// `value = ANY(values)` (`<> ALL` when negated) with no column: a bound
+    /// value tested against a bound list, `$n::pg = ANY($m::pg[])`. The
+    /// membership form of [`ValueCompare`](BoolExpr::ValueCompare):
+    /// `'vip' = ANY($tiers)`. `values` must resolve to a JSON array.
+    ValueInList {
+        value: Val,
+        values: Val,
+        pg: PgType,
+        negated: bool,
     },
     /// `inner` — a [`Compare`](BoolExpr::Compare) or
     /// [`InList`](BoolExpr::InList) — when its operand has a value; `TRUE` when

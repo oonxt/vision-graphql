@@ -34,7 +34,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::predicate::{is_param_ref, Operand, Principal, ScopeExpr};
-use crate::schema::{Schema, Table};
+use crate::schema::{PgType, Schema, Table};
 use crate::scope::{ColumnScope, ScopeSet};
 
 /// Per-table rule in a [`ScopePolicy`], the templated counterpart of
@@ -134,6 +134,33 @@ impl ScopePolicy {
         self.tables.keys().map(String::as_str)
     }
 
+    /// The rule for `table`, if this policy has one.
+    ///
+    /// What a host composing two policies reads: the predicate one source
+    /// gave a table, to AND another's into it. Without this the two could
+    /// only be chosen between, since a policy's rules were otherwise sealed
+    /// once validated.
+    pub fn rule(&self, table: &str) -> Option<&ScopeRule> {
+        self.tables.get(table)
+    }
+
+    /// The column rule for `table`, if this policy has one.
+    pub fn column_scope(&self, table: &str) -> Option<&ColumnScope> {
+        self.columns.get(table)
+    }
+
+    /// Reopen a validated policy as a builder carrying every rule it had, to
+    /// add to or AND into — a TOML policy loaded at startup and a rule set
+    /// derived elsewhere, joined on one table with
+    /// [`and_allow`](ScopePolicyBuilder::and_allow). The result must be
+    /// validated again: what is added has not been checked.
+    pub fn into_builder(self) -> ScopePolicyBuilder {
+        ScopePolicyBuilder {
+            tables: self.tables,
+            columns: self.columns,
+        }
+    }
+
     /// Every parameter name this policy's rules reference, spelled as it
     /// resolves (`"principal"`, `"claim.school_id"`), sorted.
     ///
@@ -159,9 +186,33 @@ impl ScopePolicy {
 }
 
 impl ScopePolicyBuilder {
-    /// Allow `table` under `expr`.
+    /// Allow `table` under `expr`, replacing any rule the table had. Two
+    /// `allow`s on one table keep the second; to require both, see
+    /// [`and_allow`](Self::and_allow).
     pub fn allow(mut self, table: impl Into<String>, expr: ScopeExpr) -> Self {
         self.tables.insert(table.into(), ScopeRule::Allow(expr));
+        self
+    }
+
+    /// Allow `table` under `expr` *and* whatever rule it already has.
+    ///
+    /// Two sources of policy on one table — a resource's TOML and an
+    /// authorization model's rules, say — must both be satisfied, and neither
+    /// should have to know the other's predicate. The rule the table had is
+    /// read as the truth value it stands for: an existing `allow` becomes
+    /// `and([existing, expr])`; `unrestricted` is `TRUE`, so the result is
+    /// `expr` alone; `deny` is `FALSE`, so it stays `deny` — an `and_allow`
+    /// never widens. A table with no rule gets `expr`.
+    pub fn and_allow(mut self, table: impl Into<String>, expr: ScopeExpr) -> Self {
+        let table = table.into();
+        let rule = match self.tables.remove(&table) {
+            None | Some(ScopeRule::Unrestricted) => ScopeRule::Allow(expr),
+            Some(ScopeRule::Allow(existing)) => {
+                ScopeRule::Allow(ScopeExpr::And(vec![existing, expr]))
+            }
+            Some(ScopeRule::Deny) => ScopeRule::Deny,
+        };
+        self.tables.insert(table, rule);
         self
     }
 
@@ -281,7 +332,8 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
         }
         ScopeExpr::Compare { column, .. }
         | ScopeExpr::IsNull { column, .. }
-        | ScopeExpr::InList { column, .. } => {
+        | ScopeExpr::InList { column, .. }
+        | ScopeExpr::InSet { column, .. } => {
             table
                 .find_column(column)
                 .map(|_| ())
@@ -290,30 +342,98 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
                     message: format!("unknown column '{column}' on '{}'", table.exposed_name),
                 })?;
             let operands: &[Operand] = match expr {
-                ScopeExpr::Compare { value, .. } => std::slice::from_ref(value),
+                ScopeExpr::Compare { value, .. } | ScopeExpr::InSet { set: value, .. } => {
+                    std::slice::from_ref(value)
+                }
                 ScopeExpr::InList { values, .. } => values,
                 _ => &[],
             };
+            let path = format!("{path}.{column}");
             for operand in operands {
-                if let Operand::Param(name) = operand {
-                    // A name the grammar refuses can never be looked up, so
-                    // failing it here — once, on the policy — beats failing
-                    // it per request with a message that blames the principal.
-                    if !is_param_ref(name) {
-                        return Err(Error::Validate {
-                            path: format!("{path}.{column}"),
-                            message: format!(
-                                "'{name}' is not a parameter reference; expected \
-                                 `name` or `name.field` (identifiers: \
-                                 [A-Za-z_][A-Za-z0-9_]*)"
-                            ),
-                        });
-                    }
-                }
+                validate_param_ref(operand, &path)?;
+            }
+            Ok(())
+        }
+        ScopeExpr::Const(_) => Ok(()),
+        // No column to look up; the type is the leaf's own, so what a column
+        // comparison checks at render — that the operator applies to the
+        // type, that a literal converts to it — is checked here, once, on
+        // the policy.
+        ScopeExpr::ValueCompare {
+            left,
+            op,
+            right,
+            ty,
+        } => {
+            let path = format!("{path}.<value>");
+            if !crate::type_system::cmp_applies(*op, ty) {
+                return Err(Error::Validate {
+                    path,
+                    message: format!(
+                        "operator '{}' does not apply to {ty:?}: {}",
+                        op.gql_name(),
+                        crate::type_system::why_cmp_inapplicable(*op, ty)
+                    ),
+                });
+            }
+            for operand in [left, right] {
+                validate_param_ref(operand, &path)?;
+                validate_literal(operand, ty, &path)?;
+            }
+            Ok(())
+        }
+        ScopeExpr::ValueInSet { value, set, ty, .. } => {
+            let path = format!("{path}.<value>");
+            validate_param_ref(value, &path)?;
+            validate_literal(value, ty, &path)?;
+            validate_param_ref(set, &path)?;
+            if let Operand::Lit(v) = set {
+                let items = v.as_array().ok_or_else(|| Error::Validate {
+                    path: path.clone(),
+                    message: format!("expected a list, got {v}"),
+                })?;
+                crate::types::json_to_bind_array(items, ty).map_err(|e| Error::Validate {
+                    path: path.clone(),
+                    message: format!("{e}"),
+                })?;
             }
             Ok(())
         }
     }
+}
+
+/// A name the grammar refuses can never be looked up, so failing it here —
+/// once, on the policy — beats failing it per request with a message that
+/// blames the principal.
+fn validate_param_ref(operand: &Operand, path: &str) -> Result<()> {
+    if let Operand::Param(name) = operand {
+        if !is_param_ref(name) {
+            return Err(Error::Validate {
+                path: path.to_string(),
+                message: format!(
+                    "'{name}' is not a parameter reference; expected \
+                     `name` or `name.field` (identifiers: \
+                     [A-Za-z_][A-Za-z0-9_]*)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A literal operand of a typed leaf must bind as that type. A null is
+/// refused as it is in any comparison.
+fn validate_literal(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
+    if let Operand::Lit(v) = operand {
+        if v.is_null() {
+            return Err(crate::types::null_comparison(path));
+        }
+        crate::types::json_to_bind(v, ty).map_err(|e| Error::Validate {
+            path: path.to_string(),
+            message: format!("{e}"),
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -457,5 +577,132 @@ mod tests {
             .unwrap();
         let err = policy.bind_value(7).unwrap_err();
         assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn and_allow_requires_both_and_never_widens() {
+        use crate::predicate::and;
+        let owner = || col("user_id").eq(principal());
+        let extra = || col("id").gt(0);
+        // Allow ∧ expr → And of the two.
+        let b = ScopePolicy::builder()
+            .allow("orders", owner())
+            .and_allow("orders", extra());
+        assert!(matches!(
+            b.tables.get("orders"),
+            Some(ScopeRule::Allow(ScopeExpr::And(parts))) if parts.len() == 2
+        ));
+        // Unrestricted ∧ expr → expr; nothing ∧ expr → expr.
+        let b = ScopePolicy::builder()
+            .unrestricted("orders")
+            .and_allow("orders", extra())
+            .and_allow("users", extra());
+        assert!(matches!(
+            b.tables.get("orders"),
+            Some(ScopeRule::Allow(ScopeExpr::Compare { .. }))
+        ));
+        assert!(matches!(
+            b.tables.get("users"),
+            Some(ScopeRule::Allow(ScopeExpr::Compare { .. }))
+        ));
+        // Deny ∧ expr → deny.
+        let b = ScopePolicy::builder()
+            .deny("orders")
+            .and_allow("orders", extra());
+        assert!(matches!(b.tables.get("orders"), Some(ScopeRule::Deny)));
+        // A plain `allow` still replaces, so the two are distinguishable.
+        let b = ScopePolicy::builder()
+            .allow("orders", and([owner(), extra()]))
+            .allow("orders", extra());
+        assert!(matches!(
+            b.tables.get("orders"),
+            Some(ScopeRule::Allow(ScopeExpr::Compare { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_validated_policy_reopens_with_its_rules_and_columns() {
+        let policy = ScopePolicy::builder()
+            .allow("orders", col("user_id").eq(principal()))
+            .columns("orders", ["id"])
+            .unrestricted("users")
+            .validate(&schema())
+            .unwrap();
+        assert!(matches!(policy.rule("orders"), Some(ScopeRule::Allow(_))));
+        assert!(matches!(
+            policy.rule("users"),
+            Some(ScopeRule::Unrestricted)
+        ));
+        assert!(policy.rule("ghosts").is_none());
+        assert!(matches!(
+            policy.column_scope("orders"),
+            Some(ColumnScope::Only(_))
+        ));
+        let again = policy
+            .clone()
+            .into_builder()
+            .and_allow("orders", col("id").gt(0))
+            .validate(&schema())
+            .unwrap();
+        assert!(matches!(
+            again.rule("orders"),
+            Some(ScopeRule::Allow(ScopeExpr::And(parts))) if parts.len() == 2
+        ));
+        assert!(matches!(again.rule("users"), Some(ScopeRule::Unrestricted)));
+        assert!(matches!(
+            again.column_scope("orders"),
+            Some(ColumnScope::Only(_))
+        ));
+        // What was added is validated like anything else.
+        let err = policy
+            .into_builder()
+            .and_allow("orders", col("nope").eq(1))
+            .validate(&schema())
+            .unwrap_err();
+        assert!(matches!(err, Error::Validate { .. }));
+    }
+
+    #[test]
+    fn typed_leaves_are_checked_when_the_policy_is_built() {
+        use crate::predicate::{constant, param, typed};
+        let ok = ScopePolicy::builder()
+            .allow(
+                "orders",
+                crate::predicate::or([
+                    typed(param("role"), PgType::Text).eq("admin"),
+                    typed("vip", PgType::Text).in_set(param("tiers")),
+                    typed(param("level"), PgType::Int4).gte(3),
+                    col("user_id").in_set(param("ids")),
+                    constant(false),
+                ]),
+            )
+            .validate(&schema())
+            .unwrap();
+        assert_eq!(
+            ok.params().into_iter().collect::<Vec<_>>(),
+            ["ids", "level", "role", "tiers"]
+        );
+        let refused = [
+            // An operator the type does not have.
+            typed(param("level"), PgType::Int4).like("adm%"),
+            // A literal that does not bind as the type.
+            typed(param("level"), PgType::Int4).eq("three"),
+            // A null: comparing against it matches nothing.
+            typed(param("role"), PgType::Text).eq(serde_json::Value::Null),
+            // A parameter name the grammar refuses.
+            typed(param("ro le"), PgType::Text).eq("admin"),
+            // A literal set with a member of the wrong type.
+            typed("vip", PgType::Text).in_set(serde_json::json!(["vip", 1])),
+            // A literal "set" that is not a list.
+            typed("vip", PgType::Text).in_set("vip"),
+            col("user_id").in_set(param("not ok")),
+        ];
+        for expr in refused {
+            let err = ScopePolicy::builder()
+                .allow("orders", expr.clone())
+                .validate(&schema())
+                .unwrap_err();
+            assert!(matches!(err, Error::Validate { .. }), "{expr:?}: {err:?}");
+        }
     }
 }

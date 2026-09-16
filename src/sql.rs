@@ -423,6 +423,22 @@ fn render_bool_expr(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
+        BoolExpr::Const(b) => {
+            ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
+            Ok(())
+        }
+        BoolExpr::ValueCompare {
+            left,
+            op,
+            right,
+            pg,
+        } => render_value_compare(left, *op, right, pg, ctx),
+        BoolExpr::ValueInList {
+            value,
+            values,
+            pg,
+            negated,
+        } => render_value_in_list(value, values, pg, *negated, ctx),
         BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
@@ -1100,6 +1116,10 @@ fn render_optional(
                         BoolExpr::Not(_) => "`_not`",
                         BoolExpr::Relation { .. } => "a relation predicate",
                         BoolExpr::Optional(_) => "another Optional",
+                        BoolExpr::Const(_) => "a constant",
+                        BoolExpr::ValueCompare { .. } | BoolExpr::ValueInList { .. } => {
+                            "a column-less comparison"
+                        }
                         BoolExpr::Compare { .. }
                         | BoolExpr::InList { .. }
                         | BoolExpr::IsNull { .. } => unreachable!(),
@@ -1169,6 +1189,58 @@ fn render_optional(
         }
         _ => unreachable!("matched above"),
     }
+    Ok(())
+}
+
+/// [`BoolExpr::ValueCompare`]: `$n::pg op $m::pg`. No table is involved, so
+/// one renderer serves the aliased and the unaliased forms alike.
+///
+/// The operator is checked against `pg` the way a column comparison's is
+/// checked against the column's type: `_like` over an integer would otherwise
+/// be a cast error from PostgreSQL on the first request, blamed on the
+/// principal.
+fn render_value_compare(
+    left: &Val,
+    op: crate::ast::CmpOp,
+    right: &Val,
+    pg: &PgType,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    if !crate::type_system::cmp_applies(op, pg) {
+        return Err(Error::Validate {
+            path: "where.<value>".into(),
+            message: format!(
+                "operator '{}' does not apply to {pg:?}: {}",
+                op.gql_name(),
+                crate::type_system::why_cmp_inapplicable(op, pg)
+            ),
+        });
+    }
+    let l = ctx.push_comparison(left, pg, || "where.<value>".into())?;
+    let r = ctx.push_comparison(right, pg, || "where.<value>".into())?;
+    let cast = pg_type_cast(pg);
+    write!(ctx.sql, "${l}::{cast} {} ${r}::{cast}", cmp_sql(op)).unwrap();
+    Ok(())
+}
+
+/// [`BoolExpr::ValueInList`]: `$n::pg = ANY($m::pg[])`, or `<> ALL` when
+/// negated. An empty literal list collapses as a column `_in` does.
+fn render_value_in_list(
+    value: &Val,
+    values: &Val,
+    pg: &PgType,
+    negated: bool,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    if is_empty_literal_list(values) {
+        ctx.sql.push_str(if negated { "TRUE" } else { "FALSE" });
+        return Ok(());
+    }
+    let v = ctx.push_comparison(value, pg, || "where.<value>".into())?;
+    let list = ctx.push_array(values, pg, || "where.<value>".into())?;
+    let cast = pg_type_cast(pg);
+    let pred = if negated { "<> ALL" } else { "= ANY" };
+    write!(ctx.sql, "${v}::{cast} {pred} (${list}::{cast}[])").unwrap();
     Ok(())
 }
 
@@ -3284,6 +3356,22 @@ fn render_bool_expr_no_alias(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
+        BoolExpr::Const(b) => {
+            ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
+            Ok(())
+        }
+        BoolExpr::ValueCompare {
+            left,
+            op,
+            right,
+            pg,
+        } => render_value_compare(left, *op, right, pg, ctx),
+        BoolExpr::ValueInList {
+            value,
+            values,
+            pg,
+            negated,
+        } => render_value_in_list(value, values, pg, *negated, ctx),
         BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),

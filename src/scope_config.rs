@@ -196,6 +196,13 @@ fn to_template(expr: BoolExpr, path: &str) -> Result<ScopeExpr> {
                 "{path}: internal: optional comparison in a TOML policy"
             )))
         }
+        // The `where` lowering never produces these: a document has no
+        // spelling for a constant or a column-less comparison.
+        BoolExpr::Const(_) | BoolExpr::ValueCompare { .. } | BoolExpr::ValueInList { .. } => {
+            return Err(Error::Scope(format!(
+                "{path}: internal: column-less predicate in a TOML policy"
+            )))
+        }
         BoolExpr::InList {
             column,
             values,

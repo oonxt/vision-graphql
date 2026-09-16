@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::ast::{BoolExpr, CmpOp, Val};
 use crate::error::{Error, Result};
+use crate::schema::PgType;
 
 /// A value position in a scope template: a literal, or a named parameter
 /// substituted at bind time. `principal` is the conventional default name.
@@ -125,6 +126,31 @@ pub enum ScopeExpr {
         values: Vec<Operand>,
         negated: bool,
     },
+    /// `column` in a list that is one operand: a parameter bound to a JSON
+    /// array (`col("status").in_set(param("states"))`) or a literal array.
+    /// [`InList`](ScopeExpr::InList) lists its members one operand each;
+    /// this is for a list whose members only the principal knows.
+    InSet {
+        column: String,
+        set: Operand,
+        negated: bool,
+    },
+    /// `TRUE` / `FALSE`; see [`constant`].
+    Const(bool),
+    /// A comparison with no column on either side; see [`typed`].
+    ValueCompare {
+        left: Operand,
+        op: CmpOp,
+        right: Operand,
+        ty: PgType,
+    },
+    /// A membership test with no column; see [`Typed::in_set`].
+    ValueInSet {
+        value: Operand,
+        set: Operand,
+        ty: PgType,
+        negated: bool,
+    },
 }
 
 /// Start a column predicate: `col("user_id").eq(principal())`.
@@ -207,6 +233,106 @@ impl Col {
             negated: true,
         }
     }
+    /// `column` is a member of `set`, one operand resolving to a list:
+    /// `col("status").in_set(param("states"))` for a principal that carries
+    /// the list. See [`ScopeExpr::InSet`].
+    pub fn in_set(self, set: impl Into<Operand>) -> ScopeExpr {
+        ScopeExpr::InSet {
+            column: self.0,
+            set: set.into(),
+            negated: false,
+        }
+    }
+    /// `column` is not a member of `set`; see [`Col::in_set`].
+    pub fn nin_set(self, set: impl Into<Operand>) -> ScopeExpr {
+        ScopeExpr::InSet {
+            column: self.0,
+            set: set.into(),
+            negated: true,
+        }
+    }
+}
+
+/// `TRUE` (`constant(true)`) or `FALSE`. The leaf a policy lowers "sees
+/// everything" or "sees nothing" to — the same SQL as `and([])` / `or([])`,
+/// but said rather than implied by an empty list.
+pub fn constant(value: bool) -> ScopeExpr {
+    ScopeExpr::Const(value)
+}
+
+/// Start a predicate over a value that is not a column:
+/// `typed(param("role"), PgType::Text).eq("admin")`.
+///
+/// A column comparison takes its bind type from the column. Here there is no
+/// column — the whole point is a condition on the principal alone, "an admin
+/// sees every row" — so `ty` says what the operands bind as. It is kept in the
+/// SQL as `$n::ty = $m::ty` rather than folded by the host so that one
+/// statement compiled against the policy serves every principal.
+pub fn typed(value: impl Into<Operand>, ty: PgType) -> Typed {
+    Typed(value.into(), ty)
+}
+
+/// Builder returned by [`typed`]; finish with a comparison method.
+pub struct Typed(Operand, PgType);
+
+impl Typed {
+    fn cmp(self, op: CmpOp, v: impl Into<Operand>) -> ScopeExpr {
+        ScopeExpr::ValueCompare {
+            left: self.0,
+            op,
+            right: v.into(),
+            ty: self.1,
+        }
+    }
+    pub fn eq(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Eq, v)
+    }
+    pub fn neq(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Neq, v)
+    }
+    pub fn gt(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Gt, v)
+    }
+    pub fn gte(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Gte, v)
+    }
+    pub fn lt(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Lt, v)
+    }
+    pub fn lte(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Lte, v)
+    }
+    pub fn like(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::Like, v)
+    }
+    pub fn ilike(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::ILike, v)
+    }
+    pub fn nlike(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::NLike, v)
+    }
+    pub fn nilike(self, v: impl Into<Operand>) -> ScopeExpr {
+        self.cmp(CmpOp::NILike, v)
+    }
+    /// The value is a member of `set`, one operand resolving to a list:
+    /// `typed("vip", PgType::Text).in_set(param("tiers"))`.
+    pub fn in_set(self, set: impl Into<Operand>) -> ScopeExpr {
+        ScopeExpr::ValueInSet {
+            value: self.0,
+            set: set.into(),
+            ty: self.1,
+            negated: false,
+        }
+    }
+    /// The value is not a member of `set`; see [`Typed::in_set`].
+    pub fn nin_set(self, set: impl Into<Operand>) -> ScopeExpr {
+        ScopeExpr::ValueInSet {
+            value: self.0,
+            set: set.into(),
+            ty: self.1,
+            negated: true,
+        }
+    }
 }
 
 /// An `EXISTS` relation predicate: `rel("order", col("user_id").eq(principal()))`.
@@ -277,6 +403,12 @@ impl Principal {
 }
 
 impl Operand {
+    fn collect_param(&self, out: &mut std::collections::BTreeSet<String>) {
+        if let Operand::Param(name) = self {
+            out.insert(name.clone());
+        }
+    }
+
     /// This operand as a [`Val`], keeping parameters unresolved.
     fn symbolic(&self) -> Val {
         match self {
@@ -306,18 +438,22 @@ impl ScopeExpr {
                 }
             }
             ScopeExpr::Not(inner) | ScopeExpr::Relation { inner, .. } => inner.collect_params(out),
-            ScopeExpr::Compare { value, .. } => {
-                if let Operand::Param(name) = value {
-                    out.insert(name.clone());
-                }
+            ScopeExpr::Compare { value, .. } | ScopeExpr::InSet { set: value, .. } => {
+                value.collect_param(out);
             }
-            ScopeExpr::IsNull { .. } => {}
+            ScopeExpr::IsNull { .. } | ScopeExpr::Const(_) => {}
             ScopeExpr::InList { values, .. } => {
                 for v in values {
-                    if let Operand::Param(name) = v {
-                        out.insert(name.clone());
-                    }
+                    v.collect_param(out);
                 }
+            }
+            ScopeExpr::ValueCompare { left, right, .. } => {
+                left.collect_param(out);
+                right.collect_param(out);
+            }
+            ScopeExpr::ValueInSet { value, set, .. } => {
+                value.collect_param(out);
+                set.collect_param(out);
             }
         }
     }
@@ -357,6 +493,38 @@ impl ScopeExpr {
                 )),
                 negated: *negated,
             },
+            ScopeExpr::InSet {
+                column,
+                set,
+                negated,
+            } => BoolExpr::InList {
+                column: column.clone(),
+                values: Val::Lit(set.resolve(p)?),
+                negated: *negated,
+            },
+            ScopeExpr::Const(b) => BoolExpr::Const(*b),
+            ScopeExpr::ValueCompare {
+                left,
+                op,
+                right,
+                ty,
+            } => BoolExpr::ValueCompare {
+                left: Val::Lit(left.resolve(p)?),
+                op: *op,
+                right: Val::Lit(right.resolve(p)?),
+                pg: ty.clone(),
+            },
+            ScopeExpr::ValueInSet {
+                value,
+                set,
+                ty,
+                negated,
+            } => BoolExpr::ValueInList {
+                value: Val::Lit(value.resolve(p)?),
+                values: Val::Lit(set.resolve(p)?),
+                pg: ty.clone(),
+                negated: *negated,
+            },
         })
     }
 
@@ -389,6 +557,38 @@ impl ScopeExpr {
             } => BoolExpr::InList {
                 column: column.clone(),
                 values: Val::Array(values.iter().map(Operand::symbolic).collect()).collapse(),
+                negated: *negated,
+            },
+            ScopeExpr::InSet {
+                column,
+                set,
+                negated,
+            } => BoolExpr::InList {
+                column: column.clone(),
+                values: set.symbolic(),
+                negated: *negated,
+            },
+            ScopeExpr::Const(b) => BoolExpr::Const(*b),
+            ScopeExpr::ValueCompare {
+                left,
+                op,
+                right,
+                ty,
+            } => BoolExpr::ValueCompare {
+                left: left.symbolic(),
+                op: *op,
+                right: right.symbolic(),
+                pg: ty.clone(),
+            },
+            ScopeExpr::ValueInSet {
+                value,
+                set,
+                ty,
+                negated,
+            } => BoolExpr::ValueInList {
+                value: value.symbolic(),
+                values: set.symbolic(),
+                pg: ty.clone(),
                 negated: *negated,
             },
         }
@@ -521,5 +721,68 @@ mod tests {
             })
             .collect();
         assert_eq!(vals, vec![json!(1), json!(2)]);
+    }
+
+    #[test]
+    fn typed_leaf_keeps_both_operands_and_its_type() {
+        let expr = typed(param("role"), PgType::Text).eq("admin");
+        // Symbolic: the parameter survives to the request.
+        let BoolExpr::ValueCompare {
+            left, right, pg, ..
+        } = expr.symbolic()
+        else {
+            panic!("expected value compare");
+        };
+        assert!(matches!(left, Val::ScopeParam(ref n) if n == "role"));
+        assert_eq!(right, json!("admin"));
+        assert_eq!(pg, PgType::Text);
+        // Resolved: both sides literal.
+        let p = Principal::new().set("role", "admin");
+        let BoolExpr::ValueCompare { left, .. } = expr.resolve(&p).unwrap() else {
+            panic!("expected value compare");
+        };
+        assert_eq!(left, json!("admin"));
+        assert!(expr.resolve(&Principal::new()).is_err());
+    }
+
+    #[test]
+    fn set_leaves_take_the_whole_list_from_one_operand() {
+        let p = Principal::new().set("tiers", json!(["vip", "gold"]));
+        let BoolExpr::ValueInList { value, values, .. } = typed("vip", PgType::Text)
+            .in_set(param("tiers"))
+            .resolve(&p)
+            .unwrap()
+        else {
+            panic!("expected value in list");
+        };
+        assert_eq!(value, json!("vip"));
+        assert_eq!(values, json!(["vip", "gold"]));
+
+        let BoolExpr::InList { column, values, .. } = col("tier").in_set(param("tiers")).symbolic()
+        else {
+            panic!("expected in list");
+        };
+        assert_eq!(column, "tier");
+        assert!(matches!(values, Val::ScopeParam(ref n) if n == "tiers"));
+    }
+
+    #[test]
+    fn constant_and_typed_leaves_report_their_params() {
+        let expr = and([
+            constant(true),
+            typed(param("role"), PgType::Text).eq(param("wanted")),
+            typed("vip", PgType::Text).in_set(param("tiers")),
+            col("status").in_set(param("states")),
+        ]);
+        let mut out = std::collections::BTreeSet::new();
+        expr.collect_params(&mut out);
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            ["role", "states", "tiers", "wanted"]
+        );
+        assert!(matches!(
+            constant(false).literal().unwrap(),
+            BoolExpr::Const(false)
+        ));
     }
 }

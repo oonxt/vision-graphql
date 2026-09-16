@@ -6,7 +6,9 @@
 
 use serde_json::{json, Value};
 use vision_graphql::ast::{BoolExpr, CmpOp};
-use vision_graphql::predicate::{col, principal, rel, Principal};
+use vision_graphql::predicate::{
+    and, col, constant, not, or, param, principal, rel, typed, Principal,
+};
 use vision_graphql::schema::{PgType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, Mutation, Query, ScopePolicy, ScopeSet};
 
@@ -1038,4 +1040,267 @@ async fn column_scope_holds_on_both_paths() {
         .validate(&schema)
         .unwrap_err();
     assert!(format!("{err}").contains("naem"), "{err}");
+}
+
+// ---- column-less leaves and policy composition ------------------------------
+
+/// A policy of the shape an authorization model lowers to: an admin sees every
+/// row, anyone else their own. The admin test reads the principal alone, so it
+/// has no column to bind against — and stays in the SQL as a parameter, so the
+/// statement is compiled once and serves every caller.
+fn admin_or_owner() -> ScopePolicy {
+    ScopePolicy::builder()
+        .allow(
+            "orders",
+            or([
+                typed(param("role"), PgType::Text).eq("admin"),
+                col("user_id").eq(param("user_id")),
+            ]),
+        )
+        .validate(&schema())
+        .expect("policy")
+}
+
+fn caller(role: &str, user_id: i64) -> Principal {
+    Principal::new().set("role", role).set("user_id", user_id)
+}
+
+fn titles(v: &Value, key: &str) -> Vec<String> {
+    v[key]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|r| r["title"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_principal_only_leaf_decides_per_request_inside_one_compiled_statement() {
+    let (engine, _db) = setup().await;
+    let policy = admin_or_owner();
+    let q = engine
+        .compile_scoped("{ orders(order_by: {id: asc}) { title } }", &policy)
+        .expect("compile");
+
+    let admin = engine
+        .execute_scoped(&q, None, &caller("admin", 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        titles(&admin, "orders"),
+        ["a-order-1", "a-order-2", "b-order-1"]
+    );
+
+    let bob = engine
+        .execute_scoped(&q, None, &caller("user", 2))
+        .await
+        .unwrap();
+    assert_eq!(titles(&bob, "orders"), ["b-order-1"]);
+
+    // The bound path renders the same predicate with both sides literal.
+    let alice: Value = engine
+        .scoped(policy.bind(&caller("user", 1)).unwrap())
+        .query("{ orders(order_by: {id: asc}) { title } }", None)
+        .await
+        .unwrap();
+    assert_eq!(titles(&alice, "orders"), ["a-order-1", "a-order-2"]);
+
+    // A caller that does not carry the parameter fails closed, not open.
+    let err = engine
+        .execute_scoped(&q, None, &Principal::new().set("user_id", 2))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Validate { ref path, .. } if path == "principal.role"),
+        "{err:?}"
+    );
+    // And a null role is a refused comparison, not "nobody is admin".
+    let err = engine
+        .execute_scoped(
+            &q,
+            None,
+            &Principal::new().set("role", Value::Null).set("user_id", 2),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn principal_only_leaf_governs_mutations_too() {
+    // Mutations render their `where` without a table alias, through a second
+    // renderer; the leaf has to be there as well or a delete would be the
+    // path that ignores the policy.
+    let (engine, _db) = setup().await;
+    let policy = admin_or_owner();
+    let upd = engine
+        .compile_scoped(
+            r#"mutation {
+                update_orders(where: {title: {_eq: "a-order-1"}}, _set: {title: "renamed"}) {
+                    affected_rows
+                }
+            }"#,
+            &policy,
+        )
+        .expect("compile");
+    let bob = engine
+        .execute_scoped(&upd, None, &caller("user", 2))
+        .await
+        .unwrap();
+    assert_eq!(bob["update_orders"]["affected_rows"], json!(0));
+    let admin = engine
+        .execute_scoped(&upd, None, &caller("admin", 2))
+        .await
+        .unwrap();
+    assert_eq!(admin["update_orders"]["affected_rows"], json!(1));
+}
+
+#[tokio::test]
+async fn membership_in_a_principal_list_binds_the_whole_list() {
+    let (engine, _db) = setup().await;
+    // `'vip' in $tiers` reads the principal alone; `title in $titles` reads a
+    // column against a list only the principal knows. Both take the list as
+    // one parameter.
+    let policy = ScopePolicy::builder()
+        .allow(
+            "orders",
+            or([
+                typed("vip", PgType::Text).in_set(param("tiers")),
+                col("title").in_set(param("titles")),
+            ]),
+        )
+        .validate(&schema())
+        .expect("policy");
+    let q = engine
+        .compile_scoped("{ orders(order_by: {id: asc}) { title } }", &policy)
+        .expect("compile");
+
+    let vip = Principal::new()
+        .set("tiers", json!(["gold", "vip"]))
+        .set("titles", json!([]));
+    let v = engine.execute_scoped(&q, None, &vip).await.unwrap();
+    assert_eq!(titles(&v, "orders").len(), 3);
+
+    let named = Principal::new()
+        .set("tiers", json!(["basic"]))
+        .set("titles", json!(["b-order-1", "a-order-2"]));
+    let v = engine.execute_scoped(&q, None, &named).await.unwrap();
+    assert_eq!(titles(&v, "orders"), ["a-order-2", "b-order-1"]);
+
+    let nobody = Principal::new()
+        .set("tiers", json!([]))
+        .set("titles", json!([]));
+    let v = engine.execute_scoped(&q, None, &nobody).await.unwrap();
+    assert!(titles(&v, "orders").is_empty());
+
+    // A list parameter bound to a scalar is refused, not treated as a list.
+    let err = engine
+        .execute_scoped(
+            &q,
+            None,
+            &Principal::new()
+                .set("tiers", "vip")
+                .set("titles", json!([])),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Validate { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn constant_leaves_say_everything_or_nothing() {
+    let (engine, _db) = setup().await;
+    let all = ScopePolicy::builder()
+        .allow("orders", constant(true))
+        .validate(&schema())
+        .unwrap();
+    let none = ScopePolicy::builder()
+        .allow("orders", constant(false))
+        .validate(&schema())
+        .unwrap();
+    let v: Value = engine
+        .scoped(all.bind_value(0).unwrap())
+        .query("{ orders { title } }", None)
+        .await
+        .unwrap();
+    assert_eq!(titles(&v, "orders").len(), 3);
+    let v: Value = engine
+        .scoped(none.bind_value(0).unwrap())
+        .query("{ orders { title } }", None)
+        .await
+        .unwrap();
+    assert!(titles(&v, "orders").is_empty());
+    // Composes like any leaf: NOT FALSE ∧ owner.
+    let composed = ScopePolicy::builder()
+        .allow(
+            "orders",
+            and([not(constant(false)), col("user_id").eq(principal())]),
+        )
+        .validate(&schema())
+        .unwrap();
+    let v: Value = engine
+        .scoped(composed.bind_value(2).unwrap())
+        .query("{ orders { title } }", None)
+        .await
+        .unwrap();
+    assert_eq!(titles(&v, "orders"), ["b-order-1"]);
+}
+
+#[tokio::test]
+async fn two_sources_of_policy_compose_on_one_table_with_and_allow() {
+    let (engine, _db) = setup().await;
+    // A resource's TOML says "your own orders"; an authorization model adds
+    // "and only while you hold the role". Both must hold.
+    let toml = r#"
+        [tables.orders]
+        where = { user_id = { _eq = "$user_id" } }
+
+        [tables.adverts]
+        unrestricted = true
+
+        [tables.samples]
+        deny = true
+    "#;
+    let base = ScopePolicy::from_toml(toml, &schema()).expect("toml policy");
+    let policy = base
+        .into_builder()
+        .and_allow("orders", typed(param("role"), PgType::Text).eq("reader"))
+        .and_allow("adverts", col("title").eq("ad-1"))
+        .and_allow("samples", constant(true))
+        .validate(&schema())
+        .expect("composed policy");
+
+    let q = engine
+        .compile_scoped(
+            "{ orders(order_by: {id: asc}) { title } adverts { title } }",
+            &policy,
+        )
+        .expect("compile");
+    let v = engine
+        .execute_scoped(&q, None, &caller("reader", 1))
+        .await
+        .unwrap();
+    assert_eq!(titles(&v, "orders"), ["a-order-1", "a-order-2"]);
+    // Unrestricted ∧ predicate: the predicate now governs.
+    assert_eq!(titles(&v, "adverts"), ["ad-1"]);
+    // Holding the role is necessary but not sufficient: still only own rows.
+    let v = engine
+        .execute_scoped(&q, None, &caller("reader", 2))
+        .await
+        .unwrap();
+    assert_eq!(titles(&v, "orders"), ["b-order-1"]);
+    // Owning rows is necessary but not sufficient either.
+    let v = engine
+        .execute_scoped(&q, None, &caller("guest", 1))
+        .await
+        .unwrap();
+    assert!(titles(&v, "orders").is_empty());
+    // Deny ∧ anything stays denied.
+    let err = engine
+        .compile_scoped("{ samples { serial } }", &policy)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::ScopeDenied { ref table } if table == "samples"),
+        "{err:?}"
+    );
 }
