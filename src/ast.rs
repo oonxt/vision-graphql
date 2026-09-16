@@ -115,6 +115,21 @@ impl Val {
     }
 }
 
+/// The error path for a comparison with no column to name: the first
+/// operand that is a variable or a scope parameter names it (`where.$role`),
+/// so that a value the request supplied is blamed on the request that
+/// supplied it. All-literal leaves — which validation has already checked —
+/// report `where.<value>`.
+pub(crate) fn value_leaf_path<'a>(operands: impl IntoIterator<Item = &'a Val>) -> String {
+    for v in operands {
+        match v {
+            Val::Var(name) | Val::ScopeParam(name) => return format!("where.${name}"),
+            Val::Lit(_) | Val::Array(_) | Val::Object(_) => {}
+        }
+    }
+    "where.<value>".into()
+}
+
 impl<T: Into<Value>> From<T> for Val {
     fn from(v: T) -> Self {
         Val::Lit(v.into())

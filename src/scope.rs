@@ -114,13 +114,20 @@ impl ScopeSet {
     }
 
     /// Allow `table` under `expr` *and* whatever rule it already has: an
-    /// existing `allow` becomes `And([existing, expr])`, `unrestricted`
-    /// becomes `expr` alone, `deny` stays `deny`. Never widens. The bound
-    /// counterpart of [`ScopePolicyBuilder::and_allow`](crate::ScopePolicyBuilder::and_allow).
+    /// existing `allow` becomes `And([existing, expr])` (flattened into an
+    /// existing conjunction), `unrestricted` becomes `expr` alone, `deny`
+    /// stays `deny`, and a table not yet mentioned gets `expr` — the bound
+    /// counterpart of
+    /// [`ScopePolicyBuilder::and_allow`](crate::ScopePolicyBuilder::and_allow),
+    /// which says why the last case is what it is.
     pub fn and_allow(mut self, table: impl Into<String>, expr: BoolExpr) -> Self {
         let table = table.into();
         let rule = match self.tables.remove(&table) {
             None | Some(TableScope::Unrestricted) => TableScope::Allow(expr),
+            Some(TableScope::Allow(BoolExpr::And(mut parts))) => {
+                parts.push(expr);
+                TableScope::Allow(BoolExpr::And(parts))
+            }
             Some(TableScope::Allow(existing)) => {
                 TableScope::Allow(BoolExpr::And(vec![existing, expr]))
             }
@@ -1452,7 +1459,7 @@ mod column_tests {
     }
 
     #[test]
-    fn scope_set_and_allow_requires_both_and_never_widens() {
+    fn scope_set_and_allow_requires_both_and_deny_absorbs() {
         let cmp = |v: i64| BoolExpr::Compare {
             column: "user_id".into(),
             op: CmpOp::Eq,
@@ -1461,6 +1468,7 @@ mod column_tests {
         let set = ScopeSet::new()
             .allow("orders", cmp(1))
             .and_allow("orders", cmp(2))
+            .and_allow("orders", cmp(6))
             .unrestricted("users")
             .and_allow("users", cmp(3))
             .deny("samples")
@@ -1468,7 +1476,7 @@ mod column_tests {
             .and_allow("adverts", cmp(5));
         assert!(matches!(
             set.get("orders"),
-            Some(TableScope::Allow(BoolExpr::And(parts))) if parts.len() == 2
+            Some(TableScope::Allow(BoolExpr::And(parts))) if parts.len() == 3
         ));
         assert!(matches!(
             set.get("users"),

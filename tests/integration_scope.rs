@@ -1193,6 +1193,43 @@ async fn membership_in_a_principal_list_binds_the_whole_list() {
     let v = engine.execute_scoped(&q, None, &nobody).await.unwrap();
     assert!(titles(&v, "orders").is_empty());
 
+    // The negated forms: not in the tiers, and titles not in the list.
+    let excluded = ScopePolicy::builder()
+        .allow(
+            "orders",
+            and([
+                typed("banned", PgType::Text).nin_set(param("tiers")),
+                col("title").nin_set(param("titles")),
+            ]),
+        )
+        .validate(&schema())
+        .expect("policy");
+    let q2 = engine
+        .compile_scoped("{ orders(order_by: {id: asc}) { title } }", &excluded)
+        .expect("compile");
+    let v = engine
+        .execute_scoped(
+            &q2,
+            None,
+            &Principal::new()
+                .set("tiers", json!(["vip"]))
+                .set("titles", json!(["a-order-1"])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles(&v, "orders"), ["a-order-2", "b-order-1"]);
+    let v = engine
+        .execute_scoped(
+            &q2,
+            None,
+            &Principal::new()
+                .set("tiers", json!(["banned"]))
+                .set("titles", json!([])),
+        )
+        .await
+        .unwrap();
+    assert!(titles(&v, "orders").is_empty());
+
     // A list parameter bound to a scalar is refused, not treated as a list.
     let err = engine
         .execute_scoped(

@@ -410,7 +410,7 @@ impl Operand {
     }
 
     /// This operand as a [`Val`], keeping parameters unresolved.
-    fn symbolic(&self) -> Val {
+    pub(crate) fn symbolic(&self) -> Val {
         match self {
             Operand::Lit(v) => Val::Lit(v.clone()),
             Operand::Param(name) => Val::ScopeParam(name.clone()),
@@ -461,71 +461,7 @@ impl ScopeExpr {
     /// Resolve this template against `p`, producing a concrete `BoolExpr`.
     /// Errors only when a referenced parameter is missing from `p`.
     pub fn resolve(&self, p: &Principal) -> Result<BoolExpr> {
-        Ok(match self {
-            ScopeExpr::And(parts) => {
-                BoolExpr::And(parts.iter().map(|e| e.resolve(p)).collect::<Result<_>>()?)
-            }
-            ScopeExpr::Or(parts) => {
-                BoolExpr::Or(parts.iter().map(|e| e.resolve(p)).collect::<Result<_>>()?)
-            }
-            ScopeExpr::Not(inner) => BoolExpr::Not(Box::new(inner.resolve(p)?)),
-            ScopeExpr::Relation { name, inner } => BoolExpr::Relation {
-                name: name.clone(),
-                inner: Box::new(inner.resolve(p)?),
-            },
-            ScopeExpr::Compare { column, op, value } => BoolExpr::Compare {
-                column: column.clone(),
-                op: *op,
-                value: Val::Lit(value.resolve(p)?),
-            },
-            ScopeExpr::IsNull { column, negated } => BoolExpr::is_null(column.clone(), !*negated),
-            ScopeExpr::InList {
-                column,
-                values,
-                negated,
-            } => BoolExpr::InList {
-                column: column.clone(),
-                values: Val::Lit(Value::Array(
-                    values
-                        .iter()
-                        .map(|v| v.resolve(p))
-                        .collect::<Result<Vec<_>>>()?,
-                )),
-                negated: *negated,
-            },
-            ScopeExpr::InSet {
-                column,
-                set,
-                negated,
-            } => BoolExpr::InList {
-                column: column.clone(),
-                values: Val::Lit(set.resolve(p)?),
-                negated: *negated,
-            },
-            ScopeExpr::Const(b) => BoolExpr::Const(*b),
-            ScopeExpr::ValueCompare {
-                left,
-                op,
-                right,
-                ty,
-            } => BoolExpr::ValueCompare {
-                left: Val::Lit(left.resolve(p)?),
-                op: *op,
-                right: Val::Lit(right.resolve(p)?),
-                pg: ty.clone(),
-            },
-            ScopeExpr::ValueInSet {
-                value,
-                set,
-                ty,
-                negated,
-            } => BoolExpr::ValueInList {
-                value: Val::Lit(value.resolve(p)?),
-                values: Val::Lit(set.resolve(p)?),
-                pg: ty.clone(),
-                negated: *negated,
-            },
-        })
+        self.lower(&|o| o.resolve(p).map(Val::Lit))
     }
 
     /// Lower this template *without* a principal, leaving each parameter as a
@@ -536,18 +472,29 @@ impl ScopeExpr {
     /// it selects is still decided per request. Compiling per principal would
     /// give every tenant its own copy of the same statement.
     pub fn symbolic(&self) -> BoolExpr {
-        match self {
-            ScopeExpr::And(parts) => BoolExpr::And(parts.iter().map(Self::symbolic).collect()),
-            ScopeExpr::Or(parts) => BoolExpr::Or(parts.iter().map(Self::symbolic).collect()),
-            ScopeExpr::Not(inner) => BoolExpr::Not(Box::new(inner.symbolic())),
+        self.lower(&|o| Ok(o.symbolic()))
+            .expect("symbolic lowering has no parameter to miss")
+    }
+
+    /// The one walk both lowerings are: the shape is copied, and every
+    /// operand goes through `leaf`.
+    fn lower(&self, leaf: &dyn Fn(&Operand) -> Result<Val>) -> Result<BoolExpr> {
+        Ok(match self {
+            ScopeExpr::And(parts) => {
+                BoolExpr::And(parts.iter().map(|e| e.lower(leaf)).collect::<Result<_>>()?)
+            }
+            ScopeExpr::Or(parts) => {
+                BoolExpr::Or(parts.iter().map(|e| e.lower(leaf)).collect::<Result<_>>()?)
+            }
+            ScopeExpr::Not(inner) => BoolExpr::Not(Box::new(inner.lower(leaf)?)),
             ScopeExpr::Relation { name, inner } => BoolExpr::Relation {
                 name: name.clone(),
-                inner: Box::new(inner.symbolic()),
+                inner: Box::new(inner.lower(leaf)?),
             },
             ScopeExpr::Compare { column, op, value } => BoolExpr::Compare {
                 column: column.clone(),
                 op: *op,
-                value: value.symbolic(),
+                value: leaf(value)?,
             },
             ScopeExpr::IsNull { column, negated } => BoolExpr::is_null(column.clone(), !*negated),
             ScopeExpr::InList {
@@ -556,7 +503,7 @@ impl ScopeExpr {
                 negated,
             } => BoolExpr::InList {
                 column: column.clone(),
-                values: Val::Array(values.iter().map(Operand::symbolic).collect()).collapse(),
+                values: Val::Array(values.iter().map(leaf).collect::<Result<_>>()?).collapse(),
                 negated: *negated,
             },
             ScopeExpr::InSet {
@@ -565,7 +512,7 @@ impl ScopeExpr {
                 negated,
             } => BoolExpr::InList {
                 column: column.clone(),
-                values: set.symbolic(),
+                values: leaf(set)?,
                 negated: *negated,
             },
             ScopeExpr::Const(b) => BoolExpr::Const(*b),
@@ -575,9 +522,9 @@ impl ScopeExpr {
                 right,
                 ty,
             } => BoolExpr::ValueCompare {
-                left: left.symbolic(),
+                left: leaf(left)?,
                 op: *op,
-                right: right.symbolic(),
+                right: leaf(right)?,
                 pg: ty.clone(),
             },
             ScopeExpr::ValueInSet {
@@ -586,12 +533,12 @@ impl ScopeExpr {
                 ty,
                 negated,
             } => BoolExpr::ValueInList {
-                value: value.symbolic(),
-                values: set.symbolic(),
+                value: leaf(value)?,
+                values: leaf(set)?,
                 pg: ty.clone(),
                 negated: *negated,
             },
-        }
+        })
     }
 
     /// Resolve a placeholder-free template. Errors if any parameter remains —

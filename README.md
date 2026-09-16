@@ -694,6 +694,11 @@ let policy = from_toml
 # let _ = policy; Ok(()) }
 ```
 
+`typed`, `constant` and `in_set` are builder-only: the TOML form below uses
+the query `where` syntax, which has no spelling for a column-less condition, a
+constant, or a whole list as one parameter. A policy that needs them is built
+in code, or loaded from TOML and extended with `into_builder`.
+
 The same policy can be loaded from TOML (`ScopePolicy::from_toml`), where `where`
 uses the query `where` object syntax and `"$name"` marks a parameter. A
 `"$name.field"` reads a field of an object-valued parameter, so a host can bind

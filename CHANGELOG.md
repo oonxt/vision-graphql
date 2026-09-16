@@ -21,9 +21,10 @@ release commits; entries from 0.13.0 on are written as the work lands.
   compiled statement, on the query and the mutation paths alike. `validate`
   checks what rendering checks for a column comparison: the operator applies
   to the type, a literal binds as it, a null is refused. `col(…).in_set(param)`
-  is the column form: a whole list as one parameter, where `in_` lists its
-  members. The IR gained `BoolExpr::ValueCompare` and `BoolExpr::ValueInList`
-  for these; a document has no spelling for them.
+  and `nin_set` are the column form: a whole list as one parameter, where
+  `in_` lists its members. The IR gained `BoolExpr::ValueCompare` and
+  `BoolExpr::ValueInList` for these; a document has no spelling for them, and
+  neither has TOML.
 - **`constant(true)` / `constant(false)`.** A policy that lowers "everything"
   or "nothing" had to write `and([])` / `or([])` and rely on the reader
   knowing what the empty case renders as. `ScopeExpr::Const` and
@@ -40,6 +41,20 @@ release commits; entries from 0.13.0 on are written as the work lands.
   overlap (field report). `ScopeSet::allow`'s documentation said it ANDs the
   predicate into every *access*; it now also says two `allow`s on one table
   keep the second.
+
+### Fixed
+
+- **`json` columns published `_eq`, `_neq`, `_in` and `_nin`, none of which
+  work.** PostgreSQL defines no equality over `json` (it does over `jsonb`),
+  so every such comparison failed inside the database on the request that
+  ran it, while `__schema` said it existed. The four are no longer published
+  for `json`, and every path that renders one — a `where`, the typed builder,
+  a scope predicate, a typed leaf — refuses it when the query is compiled,
+  with the reason. `_is_null` stays.
+- **`validate` on a policy now checks literals against the column's type.**
+  `col("user_id").eq("seven")` passed `validate` and failed on the first
+  request; it fails when the policy is built, as a typed leaf's literal does,
+  through the same code that will bind it.
 
 ### Changed
 

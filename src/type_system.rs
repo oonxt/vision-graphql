@@ -374,17 +374,48 @@ fn is_stringish(pg: &PgType) -> bool {
 pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &PgType) -> bool {
     use crate::ast::CmpOp::*;
     match op {
-        Eq | Neq => true,
+        // `json` has no `=`: PostgreSQL keeps it as the text it was given and
+        // defines no equality over that, so `data = $1::json` is an error on
+        // every request. `jsonb` compares structurally. `_in` is `= ANY`, so
+        // it answers to this too.
+        Eq | Neq => !matches!(pg, PgType::Json),
         Gt | Gte | Lt | Lte => pg.is_orderable(),
         Like | ILike | NLike | NILike => is_stringish(pg),
     }
+}
+
+/// Refuse `op` on a value of type `pg`. The one wording for every place that
+/// asks — a column comparison in either renderer, a column-less comparison,
+/// and policy validation — so that what is refused, and how it is explained,
+/// cannot drift between them. `subject` names what is being compared: a
+/// column, or the type of a column-less leaf.
+pub(crate) fn check_cmp(
+    op: crate::ast::CmpOp,
+    pg: &PgType,
+    path: impl FnOnce() -> String,
+    subject: &str,
+) -> crate::error::Result<()> {
+    if cmp_applies(op, pg) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Validate {
+        path: path(),
+        message: format!(
+            "operator '{}' does not apply to {subject}: {}",
+            op.gql_name(),
+            why_cmp_inapplicable(op, pg)
+        ),
+    })
 }
 
 /// Why [`cmp_applies`] said no, in the words of the schema.
 pub(crate) fn why_cmp_inapplicable(op: crate::ast::CmpOp, pg: &PgType) -> &'static str {
     use crate::ast::CmpOp::*;
     match op {
-        Eq | Neq => "always applies",
+        Eq | Neq => {
+            debug_assert!(matches!(pg, PgType::Json));
+            "json has no equality operator (jsonb does)"
+        }
         Gt | Gte | Lt | Lte => {
             debug_assert!(!pg.is_orderable());
             "json/jsonb values have no published ordering"
@@ -929,13 +960,13 @@ impl<'a> Builder<'a> {
 
     fn comparison_exp(&mut self, scalar: &str, pg: &PgType) {
         let named = || TypeRef::named(scalar);
-        let mut fields = vec![
-            InputValue::new("_eq", named()),
-            InputValue::new("_neq", named()),
-            InputValue::new("_in", named().non_null().list()),
-            InputValue::new("_nin", named().non_null().list()),
-            InputValue::new("_is_null", TypeRef::named("Boolean")),
-        ];
+        let mut fields = vec![InputValue::new("_is_null", TypeRef::named("Boolean"))];
+        if cmp_applies(crate::ast::CmpOp::Eq, pg) {
+            fields.push(InputValue::new("_eq", named()));
+            fields.push(InputValue::new("_neq", named()));
+            fields.push(InputValue::new("_in", named().non_null().list()));
+            fields.push(InputValue::new("_nin", named().non_null().list()));
+        }
         if cmp_applies(crate::ast::CmpOp::Gt, pg) {
             for op in ["_gt", "_gte", "_lt", "_lte"] {
                 fields.push(InputValue::new(op, named()));
@@ -1266,6 +1297,7 @@ mod tests {
                     .column("id", "id", PgType::Int4, false)
                     .column("name", "name", PgType::Text, true)
                     .column("data", "data", PgType::Jsonb, true)
+                    .column("meta", "meta", PgType::Json, true)
                     .primary_key(&["id"])
                     .unique_constraint("users_pkey", &["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
@@ -1357,6 +1389,13 @@ mod tests {
         assert!(!names.contains(&"_gt"));
         assert!(!names.contains(&"_like"));
         assert!(names.contains(&"_eq"));
+
+        // json has no equality at all, so only `_is_null` is left.
+        let TypeDef::InputObject { fields, .. } = ts.get("json_comparison_exp").unwrap() else {
+            panic!("expected input object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["_is_null"]);
     }
 
     #[test]

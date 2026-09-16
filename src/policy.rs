@@ -32,10 +32,12 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::ast::{CmpOp, Val};
 use crate::error::{Error, Result};
 use crate::predicate::{is_param_ref, Operand, Principal, ScopeExpr};
 use crate::schema::{PgType, Schema, Table};
 use crate::scope::{ColumnScope, ScopeSet};
+use crate::types::BindSpec;
 
 /// Per-table rule in a [`ScopePolicy`], the templated counterpart of
 /// [`crate::TableScope`].
@@ -200,13 +202,24 @@ impl ScopePolicyBuilder {
     /// authorization model's rules, say — must both be satisfied, and neither
     /// should have to know the other's predicate. The rule the table had is
     /// read as the truth value it stands for: an existing `allow` becomes
-    /// `and([existing, expr])`; `unrestricted` is `TRUE`, so the result is
-    /// `expr` alone; `deny` is `FALSE`, so it stays `deny` — an `and_allow`
-    /// never widens. A table with no rule gets `expr`.
+    /// `and([existing, expr])` (flattened into an existing conjunction);
+    /// `unrestricted` is `TRUE`, so the result is `expr` alone; `deny` is
+    /// `FALSE`, so it stays `deny`.
+    ///
+    /// A table with no rule yet gets `expr`. In a finished policy an absent
+    /// table is denied, but in a builder it is a rule not yet written, and
+    /// the second source is as entitled to write it as the first was — so
+    /// this is the one case where `and_allow` admits what was not admitted
+    /// before. A source that means to refuse a table says `deny`, which
+    /// nothing composed on top of it can undo.
     pub fn and_allow(mut self, table: impl Into<String>, expr: ScopeExpr) -> Self {
         let table = table.into();
         let rule = match self.tables.remove(&table) {
             None | Some(ScopeRule::Unrestricted) => ScopeRule::Allow(expr),
+            Some(ScopeRule::Allow(ScopeExpr::And(mut parts))) => {
+                parts.push(expr);
+                ScopeRule::Allow(ScopeExpr::And(parts))
+            }
             Some(ScopeRule::Allow(existing)) => {
                 ScopeRule::Allow(ScopeExpr::And(vec![existing, expr]))
             }
@@ -334,72 +347,80 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
         | ScopeExpr::IsNull { column, .. }
         | ScopeExpr::InList { column, .. }
         | ScopeExpr::InSet { column, .. } => {
-            table
-                .find_column(column)
-                .map(|_| ())
-                .ok_or_else(|| Error::Validate {
-                    path: format!("{path}.{column}"),
-                    message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-                })?;
-            let operands: &[Operand] = match expr {
-                ScopeExpr::Compare { value, .. } | ScopeExpr::InSet { set: value, .. } => {
-                    std::slice::from_ref(value)
-                }
-                ScopeExpr::InList { values, .. } => values,
-                _ => &[],
-            };
+            let col = table.find_column(column).ok_or_else(|| Error::Validate {
+                path: format!("{path}.{column}"),
+                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
+            })?;
             let path = format!("{path}.{column}");
-            for operand in operands {
-                validate_param_ref(operand, &path)?;
+            let subject = format!("'{}'", col.exposed_name);
+            match expr {
+                ScopeExpr::Compare { op, value, .. } => {
+                    crate::type_system::check_cmp(*op, &col.pg_type, || path.clone(), &subject)?;
+                    validate_scalar(value, &col.pg_type, &path)
+                }
+                ScopeExpr::InList { values, .. } => {
+                    crate::type_system::check_cmp(
+                        CmpOp::Eq,
+                        &col.pg_type,
+                        || path.clone(),
+                        &subject,
+                    )?;
+                    values
+                        .iter()
+                        .try_for_each(|v| validate_scalar(v, &col.pg_type, &path))
+                }
+                ScopeExpr::InSet { set, .. } => {
+                    crate::type_system::check_cmp(
+                        CmpOp::Eq,
+                        &col.pg_type,
+                        || path.clone(),
+                        &subject,
+                    )?;
+                    validate_list(set, &col.pg_type, &path)
+                }
+                _ => Ok(()),
             }
-            Ok(())
         }
         ScopeExpr::Const(_) => Ok(()),
-        // No column to look up; the type is the leaf's own, so what a column
-        // comparison checks at render — that the operator applies to the
-        // type, that a literal converts to it — is checked here, once, on
-        // the policy.
+        // No column to look up; the type is the leaf's own. The checks are
+        // the renderer's, run once here instead of on the first request.
         ScopeExpr::ValueCompare {
             left,
             op,
             right,
             ty,
         } => {
-            let path = format!("{path}.<value>");
-            if !crate::type_system::cmp_applies(*op, ty) {
-                return Err(Error::Validate {
-                    path,
-                    message: format!(
-                        "operator '{}' does not apply to {ty:?}: {}",
-                        op.gql_name(),
-                        crate::type_system::why_cmp_inapplicable(*op, ty)
-                    ),
-                });
-            }
-            for operand in [left, right] {
-                validate_param_ref(operand, &path)?;
-                validate_literal(operand, ty, &path)?;
-            }
-            Ok(())
+            let path = leaf_path(path, [left, right]);
+            crate::type_system::check_cmp(
+                *op,
+                ty,
+                || path.clone(),
+                &crate::sql::value_subject(ty),
+            )?;
+            validate_scalar(left, ty, &path)?;
+            validate_scalar(right, ty, &path)
         }
         ScopeExpr::ValueInSet { value, set, ty, .. } => {
-            let path = format!("{path}.<value>");
-            validate_param_ref(value, &path)?;
-            validate_literal(value, ty, &path)?;
-            validate_param_ref(set, &path)?;
-            if let Operand::Lit(v) = set {
-                let items = v.as_array().ok_or_else(|| Error::Validate {
-                    path: path.clone(),
-                    message: format!("expected a list, got {v}"),
-                })?;
-                crate::types::json_to_bind_array(items, ty).map_err(|e| Error::Validate {
-                    path: path.clone(),
-                    message: format!("{e}"),
-                })?;
-            }
-            Ok(())
+            let path = leaf_path(path, [value, set]);
+            crate::type_system::check_cmp(
+                CmpOp::Eq,
+                ty,
+                || path.clone(),
+                &crate::sql::value_subject(ty),
+            )?;
+            validate_scalar(value, ty, &path)?;
+            validate_list(set, ty, &path)
         }
     }
+}
+
+/// The path a column-less leaf reports under, named for its parameter where
+/// it has one — the same rule the renderer applies, so a policy-time and a
+/// request-time refusal of the same leaf read alike.
+fn leaf_path<'a>(path: &str, operands: impl IntoIterator<Item = &'a Operand>) -> String {
+    let symbolic: Vec<Val> = operands.into_iter().map(Operand::symbolic).collect();
+    let leaf = crate::ast::value_leaf_path(&symbolic);
+    format!("{path}.{}", leaf.trim_start_matches("where."))
 }
 
 /// A name the grammar refuses can never be looked up, so failing it here —
@@ -421,19 +442,20 @@ fn validate_param_ref(operand: &Operand, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// A literal operand of a typed leaf must bind as that type. A null is
-/// refused as it is in any comparison.
-fn validate_literal(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
-    if let Operand::Lit(v) = operand {
-        if v.is_null() {
-            return Err(crate::types::null_comparison(path));
-        }
-        crate::types::json_to_bind(v, ty).map_err(|e| Error::Validate {
-            path: path.to_string(),
-            message: format!("{e}"),
-        })?;
-    }
-    Ok(())
+/// An operand in a comparison position, checked as the renderer will check
+/// it: a parameter must be well-formed, and a literal must bind as `ty` and
+/// not be null. Going through [`BindSpec`] rather than restating its rules
+/// keeps `validate` and rendering one judgement; a parameter comes back as a
+/// deferred spec, which is exactly "checked per request".
+fn validate_scalar(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
+    validate_param_ref(operand, path)?;
+    BindSpec::comparison(operand.symbolic(), ty, || path.to_string()).map(drop)
+}
+
+/// An operand standing for a whole list; see [`validate_scalar`].
+fn validate_list(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
+    validate_param_ref(operand, path)?;
+    BindSpec::array(operand.symbolic(), ty, || path.to_string()).map(drop)
 }
 
 #[cfg(test)]
@@ -455,6 +477,7 @@ mod tests {
                 Table::new("orders", "public", "orders")
                     .column("id", "id", PgType::Int4, false)
                     .column("user_id", "user_id", PgType::Int4, false)
+                    .column("meta", "meta", PgType::Json, true)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -580,17 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn and_allow_requires_both_and_never_widens() {
+    fn and_allow_requires_both_and_deny_absorbs() {
         use crate::predicate::and;
         let owner = || col("user_id").eq(principal());
         let extra = || col("id").gt(0);
-        // Allow ∧ expr → And of the two.
+        // Allow ∧ expr → And of the two; a third joins the same conjunction
+        // rather than nesting, so a rule set added one at a time stays flat.
         let b = ScopePolicy::builder()
             .allow("orders", owner())
+            .and_allow("orders", extra())
             .and_allow("orders", extra());
         assert!(matches!(
             b.tables.get("orders"),
-            Some(ScopeRule::Allow(ScopeExpr::And(parts))) if parts.len() == 2
+            Some(ScopeRule::Allow(ScopeExpr::And(parts))) if parts.len() == 3
         ));
         // Unrestricted ∧ expr → expr; nothing ∧ expr → expr.
         let b = ScopePolicy::builder()
@@ -685,6 +710,17 @@ mod tests {
         let refused = [
             // An operator the type does not have.
             typed(param("level"), PgType::Int4).like("adm%"),
+            // json has no equality; jsonb would.
+            typed(param("claims"), PgType::Json).eq(serde_json::json!({"admin": true})),
+            typed(param("claims"), PgType::Json).in_set(serde_json::json!([])),
+            col("meta").eq(serde_json::json!({})),
+            col("meta").in_set(param("metas")),
+            // A column-side literal set that is not a list, or is mistyped.
+            col("user_id").in_set("seven"),
+            col("user_id").in_set(serde_json::json!(["seven"])),
+            // A column-side literal that does not bind as the column's type.
+            col("user_id").eq("seven"),
+            col("user_id").in_(["seven"]),
             // A literal that does not bind as the type.
             typed(param("level"), PgType::Int4).eq("three"),
             // A null: comparing against it matches nothing.
@@ -704,5 +740,23 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, Error::Validate { .. }), "{expr:?}: {err:?}");
         }
+        // A refusal names the parameter of the leaf it is about, as the
+        // renderer's would, so the two read alike.
+        let err = ScopePolicy::builder()
+            .allow("orders", typed(param("level"), PgType::Int4).eq("three"))
+            .validate(&schema())
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Validate { path, .. } if path == "scope.orders.$level"),
+            "{err:?}"
+        );
+        // jsonb keeps its equality.
+        ScopePolicy::builder()
+            .allow(
+                "orders",
+                typed(param("claims"), PgType::Jsonb).eq(serde_json::json!({"admin": true})),
+            )
+            .validate(&schema())
+            .unwrap();
     }
 }
