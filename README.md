@@ -647,6 +647,58 @@ let scope = policy.bind(&Principal::new().set("tenant_id", tenant).set("user_id"
 # let _ = scope; Ok(()) }
 ```
 
+A condition on the principal alone — "an admin sees every row" — has no
+column to bind against, so it is spelled with `typed`, which names the bind
+type itself. It stays in the SQL as a parameter (`$1::text = 'admin'`) rather
+than being folded by the host, so a statement compiled against the policy
+still serves every caller. `in_set` takes a whole list as one parameter, on a
+column or on a value; `constant(true)` / `constant(false)` are the leaves a
+policy lowers "everything" and "nothing" to:
+
+```rust
+# use vision_graphql::{ScopePolicy, Schema};
+# use vision_graphql::predicate::{col, constant, or, param, typed};
+# use vision_graphql::schema::PgType;
+# fn example(schema: &Schema) -> Result<(), vision_graphql::Error> {
+let policy = ScopePolicy::builder()
+    .allow("orders", or([
+        typed(param("role"), PgType::Text).eq("admin"),        // $role = 'admin'
+        typed("vip", PgType::Text).in_set(param("tiers")),      // 'vip' = ANY($tiers)
+        col("status").in_set(param("states")),                  // status = ANY($states)
+        col("user_id").eq(param("user_id")),
+    ]))
+    .allow("audit_log", constant(false))                        // listed, and empty
+    .validate(schema)?;
+# let _ = policy; Ok(()) }
+```
+
+`validate` checks a typed leaf the way rendering checks a column comparison:
+the operator applies to the type, a literal binds as it, a null is refused.
+
+Two sources of policy on one table — a resource's TOML and rules derived from
+an authorization model, say — compose with `and_allow`, which requires both
+instead of replacing: an existing `allow` becomes the conjunction,
+`unrestricted` gives way to the new predicate, and `deny` stays `deny`. A
+validated policy reopens with `into_builder` for this, and `rule(table)` reads
+what a table has:
+
+```rust
+# use vision_graphql::{ScopePolicy, Schema};
+# use vision_graphql::predicate::{param, typed};
+# use vision_graphql::schema::PgType;
+# fn example(schema: &Schema, from_toml: ScopePolicy) -> Result<(), vision_graphql::Error> {
+let policy = from_toml
+    .into_builder()
+    .and_allow("orders", typed(param("role"), PgType::Text).eq("reader"))
+    .validate(schema)?;                       // what was added is checked too
+# let _ = policy; Ok(()) }
+```
+
+`typed`, `constant` and `in_set` are builder-only: the TOML form below uses
+the query `where` syntax, which has no spelling for a column-less condition, a
+constant, or a whole list as one parameter. A policy that needs them is built
+in code, or loaded from TOML and extended with `into_builder`.
+
 The same policy can be loaded from TOML (`ScopePolicy::from_toml`), where `where`
 uses the query `where` object syntax and `"$name"` marks a parameter. A
 `"$name.field"` reads a field of an object-valued parameter, so a host can bind

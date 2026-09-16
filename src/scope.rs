@@ -103,9 +103,37 @@ impl ScopeSet {
         Self::default()
     }
 
-    /// Allow `table`, AND-ing `expr` into every access of it.
+    /// Allow `table` under `expr`: every access of the table — root selects,
+    /// `_by_pk`, aggregates, relation subqueries, `EXISTS` filters — has
+    /// `expr` AND-ed into it. Replaces any rule the table had; two `allow`s on
+    /// one table keep the second. To require both, see
+    /// [`and_allow`](Self::and_allow).
     pub fn allow(mut self, table: impl Into<String>, expr: BoolExpr) -> Self {
         self.tables.insert(table.into(), TableScope::Allow(expr));
+        self
+    }
+
+    /// Allow `table` under `expr` *and* whatever rule it already has: an
+    /// existing `allow` becomes `And([existing, expr])` (flattened into an
+    /// existing conjunction), `unrestricted` becomes `expr` alone, `deny`
+    /// stays `deny`, and a table not yet mentioned gets `expr` — the bound
+    /// counterpart of
+    /// [`ScopePolicyBuilder::and_allow`](crate::ScopePolicyBuilder::and_allow),
+    /// which says why the last case is what it is.
+    pub fn and_allow(mut self, table: impl Into<String>, expr: BoolExpr) -> Self {
+        let table = table.into();
+        let rule = match self.tables.remove(&table) {
+            None | Some(TableScope::Unrestricted) => TableScope::Allow(expr),
+            Some(TableScope::Allow(BoolExpr::And(mut parts))) => {
+                parts.push(expr);
+                TableScope::Allow(BoolExpr::And(parts))
+            }
+            Some(TableScope::Allow(existing)) => {
+                TableScope::Allow(BoolExpr::And(vec![existing, expr]))
+            }
+            Some(TableScope::Deny) => TableScope::Deny,
+        };
+        self.tables.insert(table, rule);
         self
     }
 
@@ -724,6 +752,8 @@ fn scope_bool_expr(
         BoolExpr::Compare { column, .. }
         | BoolExpr::IsNull { column, .. }
         | BoolExpr::InList { column, .. } => check_column(scope, table, column),
+        // No column is read: a constant, or two bound values compared.
+        BoolExpr::Const(_) | BoolExpr::ValueCompare { .. } | BoolExpr::ValueInList { .. } => Ok(()),
     }
 }
 
@@ -1426,5 +1456,36 @@ mod column_tests {
 
         let mut op = lower("{ users { salary } }");
         assert!(apply_scope(&mut op, &scope, &schema()).is_err());
+    }
+
+    #[test]
+    fn scope_set_and_allow_requires_both_and_deny_absorbs() {
+        let cmp = |v: i64| BoolExpr::Compare {
+            column: "user_id".into(),
+            op: CmpOp::Eq,
+            value: json!(v).into(),
+        };
+        let set = ScopeSet::new()
+            .allow("orders", cmp(1))
+            .and_allow("orders", cmp(2))
+            .and_allow("orders", cmp(6))
+            .unrestricted("users")
+            .and_allow("users", cmp(3))
+            .deny("samples")
+            .and_allow("samples", cmp(4))
+            .and_allow("adverts", cmp(5));
+        assert!(matches!(
+            set.get("orders"),
+            Some(TableScope::Allow(BoolExpr::And(parts))) if parts.len() == 3
+        ));
+        assert!(matches!(
+            set.get("users"),
+            Some(TableScope::Allow(BoolExpr::Compare { .. }))
+        ));
+        assert!(matches!(set.get("samples"), Some(TableScope::Deny)));
+        assert!(matches!(
+            set.get("adverts"),
+            Some(TableScope::Allow(BoolExpr::Compare { .. }))
+        ));
     }
 }

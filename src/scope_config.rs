@@ -31,7 +31,13 @@
 //! ```
 //!
 //! The result is an ordinary [`ScopePolicy`], validated against the schema and
-//! bound per request exactly like a programmatically built one.
+//! bound per request exactly like a programmatically built one. The query
+//! `where` syntax has no spelling for a column-less condition
+//! ([`typed`](crate::predicate::typed)), a constant
+//! ([`constant`](crate::predicate::constant)) or a whole list as one parameter
+//! ([`in_set`](crate::predicate::Col::in_set)); a policy that needs them is
+//! built in code, or loaded here and extended with
+//! [`ScopePolicy::into_builder`].
 //!
 //! [`referenced_params`] reads the same text without a schema and reports which
 //! parameter names it references, for a host that wants to check a policy
@@ -194,6 +200,13 @@ fn to_template(expr: BoolExpr, path: &str) -> Result<ScopeExpr> {
         BoolExpr::Optional(_) => {
             return Err(Error::Scope(format!(
                 "{path}: internal: optional comparison in a TOML policy"
+            )))
+        }
+        // The `where` lowering never produces these: a document has no
+        // spelling for a constant or a column-less comparison.
+        BoolExpr::Const(_) | BoolExpr::ValueCompare { .. } | BoolExpr::ValueInList { .. } => {
+            return Err(Error::Scope(format!(
+                "{path}: internal: column-less predicate in a TOML policy"
             )))
         }
         BoolExpr::InList {
@@ -646,8 +659,9 @@ mod tests {
             (
                 r#"[tables.orders]
                    where = { _or = [
-                       { user = { id = { _in = [1, "$t", "$$l"] } } },
+                       { user = { id = { _in = [1, "$t"] } } },
                        { _not = { title = { _like = "$$%" } } },
+                       { title = { _neq = "$$l" } },
                        { title = { _is_null = true } },
                        { meta = { _eq = { price = "$$5", tags = ["$$x"] } } },
                    ] }

@@ -370,18 +370,12 @@ fn render_where(
 /// PostgreSQL will evaluate and nobody should depend on — while `__schema`
 /// said no such operator existed.
 fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Result<()> {
-    if crate::type_system::cmp_applies(op, &col.pg_type) {
-        return Ok(());
-    }
-    Err(Error::Validate {
-        path: format!("where.{}", col.exposed_name),
-        message: format!(
-            "operator '{}' does not apply to '{}': {}",
-            op.gql_name(),
-            col.exposed_name,
-            crate::type_system::why_cmp_inapplicable(op, &col.pg_type)
-        ),
-    })
+    crate::type_system::check_cmp(
+        op,
+        &col.pg_type,
+        || format!("where.{}", col.exposed_name),
+        &format!("'{}'", col.exposed_name),
+    )
 }
 
 fn render_bool_expr(
@@ -423,6 +417,22 @@ fn render_bool_expr(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
+        BoolExpr::Const(b) => {
+            ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
+            Ok(())
+        }
+        BoolExpr::ValueCompare {
+            left,
+            op,
+            right,
+            pg,
+        } => render_value_compare(left, *op, right, pg, ctx),
+        BoolExpr::ValueInList {
+            value,
+            values,
+            pg,
+            negated,
+        } => render_value_in_list(value, values, pg, *negated, ctx),
         BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
@@ -440,6 +450,7 @@ fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
+            check_cmp_applies(crate::ast::CmpOp::Eq, col)?;
             if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
@@ -1100,6 +1111,10 @@ fn render_optional(
                         BoolExpr::Not(_) => "`_not`",
                         BoolExpr::Relation { .. } => "a relation predicate",
                         BoolExpr::Optional(_) => "another Optional",
+                        BoolExpr::Const(_) => "a constant",
+                        BoolExpr::ValueCompare { .. } | BoolExpr::ValueInList { .. } => {
+                            "a column-less comparison"
+                        }
                         BoolExpr::Compare { .. }
                         | BoolExpr::InList { .. }
                         | BoolExpr::IsNull { .. } => unreachable!(),
@@ -1112,8 +1127,10 @@ fn render_optional(
         path: format!("where.{column}"),
         message: format!("unknown column '{column}' on '{}'", table.exposed_name),
     })?;
-    if let BoolExpr::Compare { op, .. } = inner {
-        check_cmp_applies(*op, col)?;
+    match inner {
+        BoolExpr::Compare { op, .. } => check_cmp_applies(*op, col)?,
+        BoolExpr::InList { .. } => check_cmp_applies(crate::ast::CmpOp::Eq, col)?,
+        _ => {}
     }
     let render_plain = |ctx: &mut RenderCtx| match alias {
         Some(a) => render_bool_expr(inner, table, a, schema, ctx),
@@ -1170,6 +1187,60 @@ fn render_optional(
         _ => unreachable!("matched above"),
     }
     Ok(())
+}
+
+/// [`BoolExpr::ValueCompare`]: `$n::pg op $m::pg`. No table is involved, so
+/// one renderer serves the aliased and the unaliased forms alike.
+///
+/// The operator is checked against `pg` the way a column comparison's is
+/// checked against the column's type: `_like` over an integer would otherwise
+/// be a cast error from PostgreSQL on the first request, blamed on the
+/// principal.
+fn render_value_compare(
+    left: &Val,
+    op: crate::ast::CmpOp,
+    right: &Val,
+    pg: &PgType,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let path = || crate::ast::value_leaf_path([left, right]);
+    crate::type_system::check_cmp(op, pg, path, &value_subject(pg))?;
+    let l = ctx.push_comparison(left, pg, path)?;
+    let r = ctx.push_comparison(right, pg, path)?;
+    let cast = pg_type_cast(pg);
+    write!(ctx.sql, "${l}::{cast} {} ${r}::{cast}", cmp_sql(op)).unwrap();
+    Ok(())
+}
+
+/// [`BoolExpr::ValueInList`]: `$n::pg = ANY($m::pg[])`, or `<> ALL` when
+/// negated. An empty literal list collapses as a column `_in` does — after
+/// the value has been checked, so that a null against an empty list is
+/// refused as a null in any comparison is, not answered.
+fn render_value_in_list(
+    value: &Val,
+    values: &Val,
+    pg: &PgType,
+    negated: bool,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let path = || crate::ast::value_leaf_path([value, values]);
+    crate::type_system::check_cmp(crate::ast::CmpOp::Eq, pg, path, &value_subject(pg))?;
+    if is_empty_literal_list(values) {
+        BindSpec::comparison(value.clone(), pg, path)?;
+        ctx.sql.push_str(if negated { "TRUE" } else { "FALSE" });
+        return Ok(());
+    }
+    let v = ctx.push_comparison(value, pg, path)?;
+    let list = ctx.push_array(values, pg, path)?;
+    let cast = pg_type_cast(pg);
+    let pred = if negated { "<> ALL" } else { "= ANY" };
+    write!(ctx.sql, "${v}::{cast} {pred} (${list}::{cast}[])").unwrap();
+    Ok(())
+}
+
+/// What a column-less comparison is "on", for its refusal message.
+pub(crate) fn value_subject(pg: &PgType) -> String {
+    format!("a {} value", pg_type_cast(pg))
 }
 
 /// [`BoolExpr::Optional`] under `_or` or `_not` is refused: a dropped
@@ -3284,6 +3355,22 @@ fn render_bool_expr_no_alias(
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
+        BoolExpr::Const(b) => {
+            ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
+            Ok(())
+        }
+        BoolExpr::ValueCompare {
+            left,
+            op,
+            right,
+            pg,
+        } => render_value_compare(left, *op, right, pg, ctx),
+        BoolExpr::ValueInList {
+            value,
+            values,
+            pg,
+            negated,
+        } => render_value_in_list(value, values, pg, *negated, ctx),
         BoolExpr::IsNull { column, is_null } => {
             let col = table.find_column(column).ok_or_else(|| Error::Validate {
                 path: format!("where.{column}"),
@@ -3300,6 +3387,7 @@ fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
+            check_cmp_applies(crate::ast::CmpOp::Eq, col)?;
             if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
@@ -3427,6 +3515,72 @@ mod tests {
                     .column("name", "name", PgType::Text, true),
             )
             .build()
+    }
+
+    #[test]
+    fn json_has_no_equality_on_any_path() {
+        use crate::ast::{BoolExpr, CmpOp};
+        let list = |where_: BoolExpr| {
+            Operation::Query(vec![RootField {
+                table: "docs".into(),
+                alias: "docs".into(),
+                args: QueryArgs {
+                    where_: Some(where_),
+                    ..Default::default()
+                },
+                body: RootBody::List {
+                    selection: vec![Field::Column {
+                        column: "id".into(),
+                        alias: "id".into(),
+                    }],
+                },
+            }])
+        };
+        let eq = BoolExpr::Compare {
+            column: "meta".into(),
+            op: CmpOp::Eq,
+            value: serde_json::json!({}).into(),
+        };
+        let in_ = BoolExpr::InList {
+            column: "meta".into(),
+            values: serde_json::json!([{}]).into(),
+            negated: false,
+        };
+        let value = BoolExpr::ValueCompare {
+            left: serde_json::json!({}).into(),
+            op: CmpOp::Eq,
+            right: serde_json::json!({}).into(),
+            pg: PgType::Json,
+        };
+        for where_ in [eq.clone(), in_.clone(), value] {
+            let err = render(&list(where_), &docs_schema()).unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message.contains("json has no equality")),
+                "{err:?}"
+            );
+        }
+        // The mutation renderer answers the same.
+        for where_ in [eq, in_] {
+            let op = Operation::Mutation(vec![crate::ast::MutationField::Delete {
+                alias: "d".into(),
+                table: "docs".into(),
+                where_,
+                returning: vec![],
+                response_typenames: vec![],
+            }]);
+            let err = render(&op, &docs_schema()).unwrap_err();
+            assert!(
+                matches!(&err, Error::Validate { message, .. } if message.contains("json has no equality")),
+                "{err:?}"
+            );
+        }
+        // jsonb compares.
+        let ok = list(BoolExpr::Compare {
+            column: "data".into(),
+            op: CmpOp::Eq,
+            value: serde_json::json!({}).into(),
+        });
+        render(&ok, &docs_schema()).unwrap();
     }
 
     #[test]

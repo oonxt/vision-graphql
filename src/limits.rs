@@ -754,7 +754,12 @@ impl ExecutionLimits {
                 self.check_depth(depth + 1)?;
                 self.bool_expr(inner, reads, depth + 1)?;
             }
-            BoolExpr::Compare { .. } | BoolExpr::IsNull { .. } | BoolExpr::InList { .. } => {}
+            BoolExpr::Compare { .. }
+            | BoolExpr::IsNull { .. }
+            | BoolExpr::InList { .. }
+            | BoolExpr::Const(_)
+            | BoolExpr::ValueCompare { .. }
+            | BoolExpr::ValueInList { .. } => {}
         }
         Ok(())
     }

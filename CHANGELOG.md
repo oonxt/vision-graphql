@@ -3,6 +3,65 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **Predicates with no column: a condition on the principal alone.** A
+  policy lowered from an authorization model has leaves like `$role =
+  'admin'` — "an admin sees every row" — that read the caller and no column.
+  `ScopeExpr` could not hold one: every comparison's left side was a column
+  name, and the bind's type came from that column. A host that wanted the
+  condition had to fold it to a constant per request, giving up compiling
+  once (field report). `typed(operand, PgType)` now starts such a leaf —
+  `typed(param("role"), PgType::Text).eq("admin")`, with every comparison
+  operator, and `in_set` for membership (`typed("vip",
+  PgType::Text).in_set(param("tiers"))`) — carrying its bind type itself. It
+  renders as `$n::text = $m::text` and is decided per request inside the one
+  compiled statement, on the query and the mutation paths alike. `validate`
+  checks what rendering checks for a column comparison: the operator applies
+  to the type, a literal binds as it, a null is refused. `col(…).in_set(param)`
+  and `nin_set` are the column form: a whole list as one parameter, where
+  `in_` lists its members. The IR gained `BoolExpr::ValueCompare` and
+  `BoolExpr::ValueInList` for these; a document has no spelling for them, and
+  neither has TOML.
+- **`constant(true)` / `constant(false)`.** A policy that lowers "everything"
+  or "nothing" had to write `and([])` / `or([])` and rely on the reader
+  knowing what the empty case renders as. `ScopeExpr::Const` and
+  `BoolExpr::Const` say it.
+- **Two policies compose on one table.** `ScopePolicyBuilder::and_allow` and
+  `ScopeSet::and_allow` require the new predicate *and* whatever the table
+  had: an `allow` becomes the conjunction, `unrestricted` gives way to the
+  predicate, `deny` stays `deny`. `ScopePolicy::into_builder` reopens a
+  validated policy — one loaded from TOML, say — to add to, and
+  `ScopePolicy::rule(table)` / `column_scope(table)` read what a table has.
+  Before, a policy's rules were sealed once validated, and `allow` on a table
+  that had a rule replaced it, so a host holding a resource's TOML scope and
+  an authorization model's rules for the same table could only refuse the
+  overlap (field report). `ScopeSet::allow`'s documentation said it ANDs the
+  predicate into every *access*; it now also says two `allow`s on one table
+  keep the second.
+
+### Fixed
+
+- **`json` columns published `_eq`, `_neq`, `_in` and `_nin`, none of which
+  work.** PostgreSQL defines no equality over `json` (it does over `jsonb`),
+  so every such comparison failed inside the database on the request that
+  ran it, while `__schema` said it existed. The four are no longer published
+  for `json`, and every path that renders one — a `where`, the typed builder,
+  a scope predicate, a typed leaf — refuses it when the query is compiled,
+  with the reason. `_is_null` stays.
+- **`validate` on a policy now checks literals against the column's type.**
+  `col("user_id").eq("seven")` passed `validate` and failed on the first
+  request; it fails when the policy is built, as a typed leaf's literal does,
+  through the same code that will bind it.
+
+### Changed
+
+- `ScopeExpr` and `BoolExpr` have new variants (`Const`, `ValueCompare` /
+  `ValueInSet`, `InSet`; `Const`, `ValueCompare`, `ValueInList`). Code
+  matching either exhaustively needs an arm for them.
+
 ## 0.22.0 — 2026-09-11
 
 ### Added
