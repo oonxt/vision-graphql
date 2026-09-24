@@ -3,6 +3,7 @@ mod cmd_diff;
 mod cmd_generate;
 mod cmd_sdl;
 mod cmd_validate;
+mod db;
 mod filter;
 mod log_init;
 mod render;
@@ -43,12 +44,14 @@ enum Cmd {
 
 #[derive(ClapArgs, Debug)]
 struct CommonDb {
-    /// Postgres connection URL. Falls back to $DATABASE_URL if not set.
+    /// Connection URL: `postgres://…`, or `sqlite://path/to/file.db`. Falls
+    /// back to $DATABASE_URL if not set.
     #[arg(long)]
     url: Option<String>,
 
     /// Comma-separated Postgres schemas to introspect. The first one owns the
     /// bare table names; later ones are exposed prefixed (`audit_orders`).
+    /// Not for SQLite, which has one schema.
     #[arg(long = "schema", value_delimiter = ',', default_value = "public")]
     schemas: Vec<String>,
 

@@ -681,3 +681,102 @@ async fn diff_reports_columns_with_no_type_mapping() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("users.tags"), "{text}");
 }
+
+/// A seeded SQLite file, in a directory of its own. The path is the test's;
+/// the CLI opens it by URL like any host would.
+async fn boot_sqlite(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("vg-cli-sqlite-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("app.db");
+    let _ = std::fs::remove_file(&path);
+    let opts = vision_graphql::sqlite::connect_options(&format!("sqlite://{}", path.display()))
+        .unwrap()
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, secret TEXT, price NUMERIC);
+        CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id), views INT NOT NULL DEFAULT 0);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    path
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_generate_diff_and_sdl() {
+    let path = boot_sqlite("gen").await;
+    let url = format!("sqlite://{}", path.display());
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+
+    let out = Command::new(bin)
+        .args(["generate", "--url", &url])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let toml = String::from_utf8(out.stdout).unwrap();
+    assert!(toml.contains("# ── main.users ─"), "{toml}");
+    assert!(toml.contains("# ── main.posts ─"), "{toml}");
+
+    let out = Command::new(bin)
+        .args(["sdl", "--url", &url, "--output", "-"])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sdl = String::from_utf8(out.stdout).unwrap();
+    assert!(sdl.contains("insert_users"), "{sdl}");
+    assert!(sdl.contains("user_id: bigint!"), "{sdl}");
+    assert!(!sdl.contains("stddev"), "{sdl}");
+
+    let overlay = write_temp_toml(
+        "sqlite_clean.toml",
+        r#"
+[tables.users]
+hide_columns = ["secret"]
+"#,
+    );
+    let out = Command::new(bin)
+        .args(["diff", "--url", &url, "--config", overlay.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // NUMERIC has no mapping and is left out — said so, not hidden, and not
+    // counted as drift.
+    let report = String::from_utf8(out.stdout).unwrap();
+    assert!(report.contains("price"), "{report}");
+
+    // --schema is PostgreSQL's; on SQLite it is refused, not ignored.
+    let out = Command::new(bin)
+        .args(["generate", "--url", &url, "--schema", "audit"])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--schema does not apply to SQLite"));
+
+    // A path that does not exist is an error, not an empty schema.
+    let out = Command::new(bin)
+        .args(["generate", "--url", "sqlite:///nonexistent/dir/app.db"])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+}

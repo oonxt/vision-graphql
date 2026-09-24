@@ -14,11 +14,12 @@ name = "vision-gql"
 path = "src/main.rs"
 
 [dependencies]
-vision-graphql      = { path = "../..", version = "0.23.0" }
+vision-graphql      = { path = "../..", version = "0.23.0", features = ["sqlite"] }
 clap                = { version = "4", features = ["derive"] }
 sqlx                = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
+    "sqlite",
     "json",
     "tls-rustls-ring-native-roots",
 ] }

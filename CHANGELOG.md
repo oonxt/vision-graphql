@@ -29,6 +29,10 @@ release commits; entries from 0.13.0 on are written as the work lands.
   the SQL relies on, and introspection refuses a pool without them. See the
   README's *Backends* for the full table, including the column types that are
   left out (`NUMERIC`, `BLOB`) and why.
+- **`vision-gql` on SQLite.** `generate`, `diff` and `sdl` take a
+  `sqlite://` URL and introspect the file; `--schema`, which is PostgreSQL's,
+  is refused for it rather than ignored, and the SDL is the one a SQLite
+  engine publishes.
 - **`Schema::dialect`.** A schema records which database it describes;
   `Engine::new` refuses a schema of another dialect than its backend's.
   `SchemaBuilder::dialect` sets it on a hand-built schema.

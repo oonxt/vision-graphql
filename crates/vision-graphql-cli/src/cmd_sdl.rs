@@ -8,10 +8,8 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use vision_graphql::schema::introspect::introspect_schemas;
 use vision_graphql::schema::merge::build_from_introspection;
 
-use crate::cmd_generate::build_pool_pub;
 use crate::filter::TableFilter;
 use crate::render::redact_url;
 use crate::DriftDetected;
@@ -28,16 +26,16 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let pool = build_pool_pub(&args.url)?;
-    let schemas: Vec<&str> = args.schemas.iter().map(String::as_str).collect();
-    let db = introspect_schemas(&pool, &schemas)
-        .await
-        .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
+    let source = crate::db::connect(&args.url)?;
+    let found = crate::db::introspect(&source, &args.schemas, &args.url).await?;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
     // Filtering happens on the exposed names, the same ones the overlay and the
-    // generated TOML use.
-    let mut builder = build_from_introspection(db).retain_tables(|name| filter.keep(name));
+    // generated TOML use. The dialect decides what the SDL publishes — a
+    // SQLite schema lists no statistical aggregates.
+    let mut builder = build_from_introspection(found.db)
+        .dialect(found.dialect)
+        .retain_tables(|name| filter.keep(name));
 
     if let Some(path) = &args.config {
         builder = builder

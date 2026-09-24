@@ -2,12 +2,9 @@
 
 use anyhow::{Context, Result};
 use vision_graphql::schema::config::parse;
-use vision_graphql::schema::introspect::introspect_schemas;
 
 use crate::analyze::{find_drift, relation_warnings};
-use crate::cmd_generate;
 use crate::filter::TableFilter;
-use crate::render::redact_url;
 use crate::report::{self, Format};
 use crate::DriftDetected;
 
@@ -25,11 +22,10 @@ pub async fn run(args: Args) -> Result<()> {
         .with_context(|| format!("reading {}", args.config.display()))?;
     let cfg = parse(&text).with_context(|| format!("parsing {}", args.config.display()))?;
 
-    let pool = cmd_generate::build_pool_pub(&args.url)?;
-    let schemas: Vec<&str> = args.schemas.iter().map(String::as_str).collect();
-    let db = introspect_schemas(&pool, &schemas)
-        .await
-        .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
+    let source = crate::db::connect(&args.url)?;
+    let db = crate::db::introspect(&source, &args.schemas, &args.url)
+        .await?
+        .db;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
     let mut report = find_drift(&cfg, &db, &filter);
