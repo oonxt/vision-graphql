@@ -201,14 +201,14 @@ fn label(key: &str, e: Error) -> Error {
 mod tests {
     use super::*;
     use crate::predicate::{col, principal};
-    use crate::schema::{PgType, Schema, Table};
+    use crate::schema::{ColumnType, Schema, Table};
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"]),
             )
             .build()

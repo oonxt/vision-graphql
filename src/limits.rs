@@ -878,21 +878,21 @@ mod tests {
 mod exec_tests {
     use super::*;
     use crate::ast::{Count, Operation};
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
     use serde_json::json;
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -1305,8 +1305,8 @@ mod exec_tests {
         let schema = Schema::builder()
             .table(
                 Table::new("t", "public", "t")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("parent_id", "parent_id", PgType::Int4, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("parent_id", "parent_id", ColumnType::Int4, true)
                     .primary_key(&["id"])
                     .relation("children", Relation::array("t").on([("id", "parent_id")])),
             )
@@ -1426,7 +1426,7 @@ mod exec_tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .enable_introspection()

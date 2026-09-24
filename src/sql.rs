@@ -2,7 +2,7 @@
 
 use crate::ast::{Count, Field, Operation, QueryArgs, RootField, Val};
 use crate::error::{Error, Result};
-use crate::schema::{PgType, Schema, Table};
+use crate::schema::{ColumnType, Schema, Table};
 use crate::types::{Bind, BindSpec, Inputs};
 use std::fmt::Write as _;
 
@@ -67,7 +67,7 @@ impl RenderCtx {
     fn push_scalar(
         &mut self,
         val: &Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<usize> {
         self.binds.push(BindSpec::scalar(val.clone(), pg, path)?);
@@ -79,7 +79,7 @@ impl RenderCtx {
     fn push_comparison(
         &mut self,
         val: &Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<usize> {
         self.binds
@@ -91,7 +91,7 @@ impl RenderCtx {
     fn push_array(
         &mut self,
         val: &Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<usize> {
         self.binds.push(BindSpec::array(val.clone(), pg, path)?);
@@ -103,7 +103,7 @@ impl RenderCtx {
     fn push_optional_array(
         &mut self,
         val: &Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<usize> {
         self.binds
@@ -1177,7 +1177,7 @@ fn render_optional(
             .unwrap();
         }
         BoolExpr::IsNull { is_null, .. } => {
-            let n = ctx.push_scalar(is_null, &PgType::Bool, path)?;
+            let n = ctx.push_scalar(is_null, &ColumnType::Bool, path)?;
             write!(
                 ctx.sql,
                 "(${n}::boolean IS NULL OR ({qualified} IS NULL) = ${n}::boolean)"
@@ -1200,7 +1200,7 @@ fn render_value_compare(
     left: &Val,
     op: crate::ast::CmpOp,
     right: &Val,
-    pg: &PgType,
+    pg: &ColumnType,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     let path = || crate::ast::value_leaf_path([left, right]);
@@ -1219,7 +1219,7 @@ fn render_value_compare(
 fn render_value_in_list(
     value: &Val,
     values: &Val,
-    pg: &PgType,
+    pg: &ColumnType,
     negated: bool,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -1239,7 +1239,7 @@ fn render_value_in_list(
 }
 
 /// What a column-less comparison is "on", for its refusal message.
-pub(crate) fn value_subject(pg: &PgType) -> String {
+pub(crate) fn value_subject(pg: &ColumnType) -> String {
     format!("a {} value", pg_type_cast(pg))
 }
 
@@ -1296,7 +1296,8 @@ fn render_is_null(qualified: &str, column: &str, is_null: &Val, ctx: &mut Render
             });
         }
         None => {
-            let n = ctx.push_comparison(is_null, &PgType::Bool, || format!("where.{column}"))?;
+            let n =
+                ctx.push_comparison(is_null, &ColumnType::Bool, || format!("where.{column}"))?;
             write!(ctx.sql, "({qualified} IS NULL) = ${n}::boolean").unwrap();
         }
     }
@@ -1329,8 +1330,8 @@ fn render_json_path_expr(
     err_path: &str,
     ctx: &mut RenderCtx,
 ) -> Result<String> {
-    use crate::schema::PgType;
-    if !matches!(col.pg_type, PgType::Json | PgType::Jsonb) {
+    use crate::schema::ColumnType;
+    if !matches!(col.pg_type, ColumnType::Json | ColumnType::Jsonb) {
         return Err(Error::Validate {
             path: err_path.into(),
             message: format!(
@@ -1349,27 +1350,27 @@ fn render_json_path_expr(
 }
 
 /// Return the PostgreSQL type keyword used in a cast expression (`$1::type`)
-/// for a given schema PgType.
-fn pg_type_cast(pg: &crate::schema::PgType) -> std::borrow::Cow<'static, str> {
-    use crate::schema::PgType;
+/// for a given schema ColumnType.
+fn pg_type_cast(pg: &crate::schema::ColumnType) -> std::borrow::Cow<'static, str> {
+    use crate::schema::ColumnType;
     std::borrow::Cow::Borrowed(match pg {
-        PgType::Bool => "bool",
-        PgType::Int2 => "int2",
-        PgType::Int4 => "int4",
-        PgType::Int8 => "int8",
-        PgType::Float4 => "float4",
-        PgType::Float8 => "float8",
-        PgType::Text => "text",
-        PgType::Varchar => "varchar",
-        PgType::Uuid => "uuid",
-        PgType::Numeric => "numeric",
-        PgType::Timestamp => "timestamp",
-        PgType::TimestampTz => "timestamptz",
-        PgType::Json => "json",
-        PgType::Jsonb => "jsonb",
-        PgType::Date => "date",
-        PgType::Time => "time",
-        PgType::Enum { schema, name } => {
+        ColumnType::Bool => "bool",
+        ColumnType::Int2 => "int2",
+        ColumnType::Int4 => "int4",
+        ColumnType::Int8 => "int8",
+        ColumnType::Float4 => "float4",
+        ColumnType::Float8 => "float8",
+        ColumnType::Text => "text",
+        ColumnType::Varchar => "varchar",
+        ColumnType::Uuid => "uuid",
+        ColumnType::Numeric => "numeric",
+        ColumnType::Timestamp => "timestamp",
+        ColumnType::TimestampTz => "timestamptz",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
+        ColumnType::Date => "date",
+        ColumnType::Time => "time",
+        ColumnType::Enum { schema, name } => {
             return std::borrow::Cow::Owned(format!(
                 "{}.{}",
                 quote_ident(schema),
@@ -3462,7 +3463,7 @@ fn render_bool_expr_no_alias(
 mod tests {
     use super::*;
     use crate::ast::{Field, Operation, QueryArgs, RootBody, RootField};
-    use crate::schema::{PgType, Schema, Table};
+    use crate::schema::{ColumnType, Schema, Table};
 
     /// Tests build fully literal operations, so rendering can resolve the
     /// parameters straight away — the shape every caller of `Engine::query`
@@ -3475,8 +3476,8 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true),
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true),
             )
             .build()
     }
@@ -3509,10 +3510,10 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("docs", "public", "docs")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("data", "data", PgType::Jsonb, true)
-                    .column("meta", "meta", PgType::Json, true)
-                    .column("name", "name", PgType::Text, true),
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("data", "data", ColumnType::Jsonb, true)
+                    .column("meta", "meta", ColumnType::Json, true)
+                    .column("name", "name", ColumnType::Text, true),
             )
             .build()
     }
@@ -3550,7 +3551,7 @@ mod tests {
             left: serde_json::json!({}).into(),
             op: CmpOp::Eq,
             right: serde_json::json!({}).into(),
-            pg: PgType::Json,
+            pg: ColumnType::Json,
         };
         for where_ in [eq.clone(), in_.clone(), value] {
             let err = render(&list(where_), &docs_schema()).unwrap_err();
@@ -3683,17 +3684,17 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .column(
                         "role",
                         "role",
-                        PgType::Enum {
+                        ColumnType::Enum {
                             schema: "public".into(),
                             name: "role_type".into(),
                         },
                         false,
                     )
-                    .column("birthday", "birthday", PgType::Date, true),
+                    .column("birthday", "birthday", ColumnType::Date, true),
             )
             .build()
     }
@@ -3852,15 +3853,15 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
@@ -4748,16 +4749,16 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -4806,16 +4807,16 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -4883,15 +4884,15 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -4960,15 +4961,15 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -5203,8 +5204,8 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("data", "data", PgType::Jsonb, true),
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("data", "data", ColumnType::Jsonb, true),
             )
             .build();
         let compare = |column: &str, op| {

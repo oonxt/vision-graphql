@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 
 use crate::error::{Error, Result};
-use crate::schema::PgType;
+use crate::schema::ColumnType;
 use crate::types::Inputs;
 
 /// A value position in the IR: known when the query was lowered, or a name
@@ -405,7 +405,7 @@ impl AggFunc {
     /// Whether the function only means something for a number.
     ///
     /// `max` and `min` reach further — text, dates, times — though not to
-    /// everything with an ordering (see `PgType::has_max_min`); the rest are
+    /// everything with an ordering (see `ColumnType::has_max_min`); the rest are
     /// arithmetic, and offering `stddev` over a `text` column would be offering
     /// a query that cannot run.
     pub fn numeric_only(self) -> bool {
@@ -687,7 +687,7 @@ pub enum BoolExpr {
         left: Val,
         op: CmpOp,
         right: Val,
-        pg: PgType,
+        pg: ColumnType,
     },
     /// `value = ANY(values)` (`<> ALL` when negated) with no column: a bound
     /// value tested against a bound list, `$n::pg = ANY($m::pg[])`. The
@@ -696,7 +696,7 @@ pub enum BoolExpr {
     ValueInList {
         value: Val,
         values: Val,
-        pg: PgType,
+        pg: ColumnType,
         negated: bool,
     },
     /// `inner` — a [`Compare`](BoolExpr::Compare) or

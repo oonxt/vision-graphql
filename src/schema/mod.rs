@@ -11,8 +11,13 @@ pub mod merge;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The column types the engine knows how to bind, compare, aggregate and
+/// publish. Named after what a column *is* rather than after one backend's
+/// spelling of it: the variants are still PostgreSQL's names, because that is
+/// where the type system was derived from, but the same enum is what a
+/// SQLite column's declared type is mapped onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PgType {
+pub enum ColumnType {
     Int2,
     Int4,
     Int8,
@@ -37,18 +42,22 @@ pub enum PgType {
     },
 }
 
-impl PgType {
+/// The name this enum had while PostgreSQL was the only backend.
+#[deprecated(since = "0.24.0", note = "renamed to `ColumnType`")]
+pub type PgType = ColumnType;
+
+impl ColumnType {
     /// Whether arithmetic applies: `sum`, `avg`, `stddev` and the rest are
     /// only defined over numbers, and PostgreSQL has no `sum(text)` to call.
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            PgType::Int2
-                | PgType::Int4
-                | PgType::Int8
-                | PgType::Float4
-                | PgType::Float8
-                | PgType::Numeric
+            ColumnType::Int2
+                | ColumnType::Int4
+                | ColumnType::Int8
+                | ColumnType::Float4
+                | ColumnType::Float8
+                | ColumnType::Numeric
         )
     }
 
@@ -56,7 +65,7 @@ impl PgType {
     /// comparisons need. Everything but `json`/`jsonb`, which PostgreSQL orders
     /// in a way nobody should depend on.
     pub fn is_orderable(&self) -> bool {
-        !matches!(self, PgType::Json | PgType::Jsonb)
+        !matches!(self, ColumnType::Json | ColumnType::Jsonb)
     }
 
     /// Whether PostgreSQL defines `max`/`min` for this type.
@@ -66,7 +75,11 @@ impl PgType {
     /// `max(boolean)`, `max(uuid)` and `max` of an enum do not exist (verified
     /// against 17.4), so publishing them would publish a query that cannot run.
     pub fn has_max_min(&self) -> bool {
-        self.is_orderable() && !matches!(self, PgType::Bool | PgType::Uuid | PgType::Enum { .. })
+        self.is_orderable()
+            && !matches!(
+                self,
+                ColumnType::Bool | ColumnType::Uuid | ColumnType::Enum { .. }
+            )
     }
 }
 
@@ -74,7 +87,7 @@ impl PgType {
 pub struct Column {
     pub exposed_name: String,
     pub physical_name: String,
-    pub pg_type: PgType,
+    pub pg_type: ColumnType,
     pub nullable: bool,
 }
 
@@ -215,7 +228,7 @@ impl Table {
         mut self,
         exposed: &str,
         physical: &str,
-        pg_type: PgType,
+        pg_type: ColumnType,
         nullable: bool,
     ) -> Self {
         if !self.columns_by_exposed.contains_key(exposed) {
@@ -599,8 +612,8 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"]),
             )
             .build();
@@ -616,16 +629,16 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -647,18 +660,18 @@ mod tests {
     /// relation returns is then up to Postgres.
     fn dict_table() -> Table {
         Table::new("dict", "public", "dict")
-            .column("id", "id", PgType::Int4, false)
-            .column("serial", "serial", PgType::Text, false)
-            .column("type", "type", PgType::Text, false)
+            .column("id", "id", ColumnType::Int4, false)
+            .column("serial", "serial", ColumnType::Text, false)
+            .column("type", "type", ColumnType::Text, false)
             .primary_key(&["id"])
             .unique_constraint("dict_serial_type_key", &["serial", "type"])
     }
 
     fn results_table(mapping: &[(&str, &str)]) -> Table {
         Table::new("results", "public", "results")
-            .column("id", "id", PgType::Int4, false)
-            .column("serial", "serial", PgType::Text, false)
-            .column("type", "type", PgType::Text, false)
+            .column("id", "id", ColumnType::Int4, false)
+            .column("serial", "serial", ColumnType::Text, false)
+            .column("type", "type", ColumnType::Text, false)
             .primary_key(&["id"])
             .relation(
                 "pathogen",
@@ -704,13 +717,13 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -747,7 +760,7 @@ mod tests {
             .table(dict_table())
             .table(
                 Table::new("results", "public", "results")
-                    .column("serial", "serial", PgType::Text, false)
+                    .column("serial", "serial", ColumnType::Text, false)
                     .relation(
                         "entries",
                         Relation::array("dict").on([("serial", "serial")]),
@@ -765,12 +778,12 @@ mod tests {
             .table(Table::new("dict_view", "public", "dict_view").column(
                 "serial",
                 "serial",
-                PgType::Text,
+                ColumnType::Text,
                 false,
             ))
             .table(
                 Table::new("results", "public", "results")
-                    .column("serial", "serial", PgType::Text, false)
+                    .column("serial", "serial", ColumnType::Text, false)
                     .relation(
                         "pathogen",
                         Relation::object("dict_view").on([("serial", "serial")]),
@@ -811,7 +824,7 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("dict", "public", "dict")
-                    .column("serial", "serial", PgType::Text, false)
+                    .column("serial", "serial", ColumnType::Text, false)
                     .unique_index("dict_serial_idx", &["serial"]),
             )
             .table(results_table(&[("serial", "serial")]))
@@ -829,13 +842,13 @@ mod tests {
                 Table::new("dict", "public", "dict")
                     // exposed "code" is physical "serial"; exposed "serial" is
                     // physical "legacy_serial", and carries the unique key.
-                    .column("code", "serial", PgType::Text, false)
-                    .column("serial", "legacy_serial", PgType::Text, false)
+                    .column("code", "serial", ColumnType::Text, false)
+                    .column("serial", "legacy_serial", ColumnType::Text, false)
                     .unique_constraint("dict_serial_key", &["serial"]),
             )
             .table(
                 Table::new("results", "public", "results")
-                    .column("code", "code", PgType::Text, false)
+                    .column("code", "code", ColumnType::Text, false)
                     .relation("pathogen", Relation::object("dict").on([("code", "code")])),
             )
             .build();

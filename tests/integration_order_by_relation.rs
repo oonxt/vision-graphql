@@ -4,7 +4,7 @@
 //! assert the database accepts that SQL and sorts rows the way the query asked.
 
 use serde_json::Value;
-use vision_graphql::schema::{PgType, Relation, Schema, Table};
+use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::Engine;
 
 mod common;
@@ -15,23 +15,23 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("teams", "public", "teams")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
                 .primary_key(&["id"]),
         )
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
-                .column("team_id", "team_id", PgType::Int4, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
+                .column("team_id", "team_id", ColumnType::Int4, true)
                 .primary_key(&["id"])
                 .relation("team", Relation::object("teams").on([("team_id", "id")])),
         )
         .table(
             Table::new("posts", "public", "posts")
-                .column("id", "id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
-                .column("user_id", "user_id", PgType::Int4, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
+                .column("user_id", "user_id", ColumnType::Int4, true)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )

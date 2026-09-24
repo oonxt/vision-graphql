@@ -1,7 +1,7 @@
 //! Schema introspection from a live PostgreSQL connection.
 
 use crate::error::Result;
-use crate::schema::PgType;
+use crate::schema::ColumnType;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 
@@ -62,7 +62,7 @@ pub struct IntrospectedTable {
 #[derive(Debug)]
 pub struct IntrospectedColumn {
     pub name: String,
-    pub pg_type: PgType,
+    pub pg_type: ColumnType,
     pub nullable: bool,
 }
 
@@ -100,26 +100,26 @@ pub struct SkippedColumn {
     pub data_type: String,
 }
 
-pub fn data_type_to_pg_type(data_type: &str) -> Option<PgType> {
+pub fn data_type_to_pg_type(data_type: &str) -> Option<ColumnType> {
     match data_type {
-        "smallint" => Some(PgType::Int2),
-        "integer" => Some(PgType::Int4),
-        "bigint" => Some(PgType::Int8),
-        "text" => Some(PgType::Text),
-        "character varying" => Some(PgType::Varchar),
+        "smallint" => Some(ColumnType::Int2),
+        "integer" => Some(ColumnType::Int4),
+        "bigint" => Some(ColumnType::Int8),
+        "text" => Some(ColumnType::Text),
+        "character varying" => Some(ColumnType::Varchar),
         // `bpchar`. Blank-padded on the server; read and written as text.
-        "character" => Some(PgType::Varchar),
-        "boolean" => Some(PgType::Bool),
-        "real" => Some(PgType::Float4),
-        "double precision" => Some(PgType::Float8),
-        "numeric" => Some(PgType::Numeric),
-        "uuid" => Some(PgType::Uuid),
-        "timestamp without time zone" => Some(PgType::Timestamp),
-        "timestamp with time zone" => Some(PgType::TimestampTz),
-        "json" => Some(PgType::Json),
-        "jsonb" => Some(PgType::Jsonb),
-        "date" => Some(PgType::Date),
-        "time without time zone" => Some(PgType::Time),
+        "character" => Some(ColumnType::Varchar),
+        "boolean" => Some(ColumnType::Bool),
+        "real" => Some(ColumnType::Float4),
+        "double precision" => Some(ColumnType::Float8),
+        "numeric" => Some(ColumnType::Numeric),
+        "uuid" => Some(ColumnType::Uuid),
+        "timestamp without time zone" => Some(ColumnType::Timestamp),
+        "timestamp with time zone" => Some(ColumnType::TimestampTz),
+        "json" => Some(ColumnType::Json),
+        "jsonb" => Some(ColumnType::Jsonb),
+        "date" => Some(ColumnType::Date),
+        "time without time zone" => Some(ColumnType::Time),
         _ => None,
     }
 }
@@ -203,7 +203,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         let udt = udt_name.clone();
         let pg_type = match (&*dtype, udt_schema, udt_name, is_enum) {
             ("USER-DEFINED", Some(schema), Some(name), Some(true)) => {
-                Some(PgType::Enum { schema, name })
+                Some(ColumnType::Enum { schema, name })
             }
             _ => data_type_to_pg_type(&dtype),
         };
@@ -305,7 +305,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         let udt_name: String = row.get(7);
 
         let pg_type = if is_enum {
-            Some(PgType::Enum {
+            Some(ColumnType::Enum {
                 schema: udt_schema,
                 name: udt_name.clone(),
             })
@@ -553,22 +553,22 @@ mod tests {
         // And the stripped spellings are exactly what the mapper understands.
         assert_eq!(
             data_type_to_pg_type(&strip_type_modifier("timestamp(3) with time zone")),
-            Some(PgType::TimestampTz)
+            Some(ColumnType::TimestampTz)
         );
         assert_eq!(
             data_type_to_pg_type(&strip_type_modifier("character varying(50)")),
-            Some(PgType::Varchar)
+            Some(ColumnType::Varchar)
         );
     }
 
     #[test]
     fn maps_known_types() {
-        assert_eq!(data_type_to_pg_type("integer"), Some(PgType::Int4));
-        assert_eq!(data_type_to_pg_type("text"), Some(PgType::Text));
-        assert_eq!(data_type_to_pg_type("boolean"), Some(PgType::Bool));
+        assert_eq!(data_type_to_pg_type("integer"), Some(ColumnType::Int4));
+        assert_eq!(data_type_to_pg_type("text"), Some(ColumnType::Text));
+        assert_eq!(data_type_to_pg_type("boolean"), Some(ColumnType::Bool));
         assert_eq!(
             data_type_to_pg_type("timestamp with time zone"),
-            Some(PgType::TimestampTz)
+            Some(ColumnType::TimestampTz)
         );
     }
 

@@ -404,7 +404,7 @@ mod tests {
     use crate::parser::{lower_with, parse_document, Bindings};
     use crate::policy::ScopePolicy;
     use crate::predicate::{col, principal, Principal};
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
     use crate::scope::apply_scope;
     use crate::sql::render;
     use crate::types::{resolve_binds, Bind, Inputs, NullOf};
@@ -414,16 +414,16 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("orders", Relation::array("orders").on([("id", "user_id")])),
             )
             .table(
                 Table::new("orders", "public", "orders")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
                     .primary_key(&["id"]),
             )
             .build()

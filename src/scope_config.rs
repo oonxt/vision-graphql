@@ -366,26 +366,26 @@ pub fn referenced_params(source: &str) -> Result<BTreeSet<String>> {
 mod tests {
     use super::*;
     use crate::predicate::Principal;
-    use crate::schema::{PgType, Relation, Table};
+    use crate::schema::{ColumnType, Relation, Table};
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("orders", "public", "orders")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("adverts", "public", "adverts")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build()
@@ -513,8 +513,8 @@ mod tests {
         let jsonb = Schema::builder()
             .table(
                 Table::new("docs", "public", "docs")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("meta", "meta", PgType::Jsonb, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("meta", "meta", ColumnType::Jsonb, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -623,19 +623,19 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("orders", "public", "orders")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("_deleted", "_deleted", PgType::Bool, false)
-                    .column("meta", "meta", PgType::Jsonb, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("_deleted", "_deleted", ColumnType::Bool, false)
+                    .column("meta", "meta", ColumnType::Jsonb, true)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")]))
                     .relation("_owner", Relation::object("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("role", "role", PgType::Text, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("role", "role", ColumnType::Text, false)
                     .primary_key(&["id"]),
             )
             .build();

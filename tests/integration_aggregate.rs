@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use vision_graphql::schema::{PgType, Schema, Table};
+use vision_graphql::schema::{ColumnType, Schema, Table};
 use vision_graphql::Engine;
 
 mod common;
@@ -8,9 +8,9 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
-                .column("score", "score", PgType::Int4, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
+                .column("score", "score", ColumnType::Int4, false)
                 .primary_key(&["id"]),
         )
         .build()
@@ -591,17 +591,17 @@ fn schema_with_posts() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
-                .column("score", "score", PgType::Int4, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
+                .column("score", "score", ColumnType::Int4, false)
                 .primary_key(&["id"])
                 .relation("posts", Relation::array("posts").on([("id", "user_id")])),
         )
         .table(
             Table::new("posts", "public", "posts")
-                .column("id", "id", PgType::Int4, false)
-                .column("user_id", "user_id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("user_id", "user_id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )

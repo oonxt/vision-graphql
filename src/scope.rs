@@ -761,23 +761,23 @@ fn scope_bool_expr(
 mod tests {
     use super::*;
     use crate::ast::{CmpOp, QueryArgs, RootField};
-    use crate::schema::{PgType, Relation, Table};
+    use crate::schema::{ColumnType, Relation, Table};
     use serde_json::json;
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
                     .primary_key(&["id"]),
             )
             .build()
@@ -1153,14 +1153,14 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -1187,24 +1187,24 @@ mod tests {
 mod column_tests {
     use super::*;
     use crate::ast::CmpOp;
-    use crate::schema::{PgType, Relation, Table};
+    use crate::schema::{ColumnType, Relation, Table};
     use serde_json::json;
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
-                    .column("salary", "salary", PgType::Int4, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
+                    .column("salary", "salary", ColumnType::Int4, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("draft", "draft", PgType::Bool, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("draft", "draft", ColumnType::Bool, false)
                     .primary_key(&["id"]),
             )
             .build()
@@ -1352,8 +1352,8 @@ mod column_tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("salary", "salary_cents", PgType::Int4, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("salary", "salary_cents", ColumnType::Int4, true)
                     .primary_key(&["id"]),
             )
             .build();

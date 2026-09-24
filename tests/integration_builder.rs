@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use vision_graphql::ast::OrderDir;
-use vision_graphql::schema::{PgType, Relation, Schema, Table};
+use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::{Engine, Mutation, Query};
 
 mod common;
@@ -9,17 +9,17 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, false)
-                .column("age", "age", PgType::Int4, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, false)
+                .column("age", "age", ColumnType::Int4, true)
                 .primary_key(&["id"])
                 .relation("posts", Relation::array("posts").on([("id", "user_id")])),
         )
         .table(
             Table::new("posts", "public", "posts")
-                .column("id", "id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
-                .column("user_id", "user_id", PgType::Int4, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
+                .column("user_id", "user_id", ColumnType::Int4, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )
@@ -152,8 +152,8 @@ async fn builder_aggregate_refuses_what_the_schema_never_published() {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("token", "token", PgType::Uuid, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("token", "token", ColumnType::Uuid, true)
                     .primary_key(&["id"]),
             )
             .build(),

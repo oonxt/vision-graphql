@@ -658,12 +658,12 @@ policy lowers "everything" and "nothing" to:
 ```rust
 # use vision_graphql::{ScopePolicy, Schema};
 # use vision_graphql::predicate::{col, constant, or, param, typed};
-# use vision_graphql::schema::PgType;
+# use vision_graphql::schema::ColumnType;
 # fn example(schema: &Schema) -> Result<(), vision_graphql::Error> {
 let policy = ScopePolicy::builder()
     .allow("orders", or([
-        typed(param("role"), PgType::Text).eq("admin"),        // $role = 'admin'
-        typed("vip", PgType::Text).in_set(param("tiers")),      // 'vip' = ANY($tiers)
+        typed(param("role"), ColumnType::Text).eq("admin"),        // $role = 'admin'
+        typed("vip", ColumnType::Text).in_set(param("tiers")),      // 'vip' = ANY($tiers)
         col("status").in_set(param("states")),                  // status = ANY($states)
         col("user_id").eq(param("user_id")),
     ]))
@@ -685,11 +685,11 @@ what a table has:
 ```rust
 # use vision_graphql::{ScopePolicy, Schema};
 # use vision_graphql::predicate::{param, typed};
-# use vision_graphql::schema::PgType;
+# use vision_graphql::schema::ColumnType;
 # fn example(schema: &Schema, from_toml: ScopePolicy) -> Result<(), vision_graphql::Error> {
 let policy = from_toml
     .into_builder()
-    .and_allow("orders", typed(param("role"), PgType::Text).eq("reader"))
+    .and_allow("orders", typed(param("role"), ColumnType::Text).eq("reader"))
     .validate(schema)?;                       // what was added is checked too
 # let _ = policy; Ok(()) }
 ```

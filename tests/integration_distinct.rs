@@ -1,5 +1,5 @@
 use serde_json::Value;
-use vision_graphql::schema::{PgType, Schema, Table};
+use vision_graphql::schema::{ColumnType, Schema, Table};
 use vision_graphql::Engine;
 
 mod common;
@@ -8,9 +8,9 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("events", "public", "events")
-                .column("id", "id", PgType::Int4, false)
-                .column("kind", "kind", PgType::Text, false)
-                .column("ts", "ts", PgType::Int8, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("kind", "kind", ColumnType::Text, false)
+                .column("ts", "ts", ColumnType::Int8, false)
                 .primary_key(&["id"]),
         )
         .build()

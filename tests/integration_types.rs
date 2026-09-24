@@ -3,7 +3,7 @@
 //! explicit casts so the server converts them.
 
 use serde_json::json;
-use vision_graphql::schema::{PgType, Schema, Table};
+use vision_graphql::schema::{ColumnType, Schema, Table};
 use vision_graphql::Engine;
 
 mod common;
@@ -15,11 +15,11 @@ fn events_schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("events", "public", "events")
-                .column("id", "id", PgType::Int4, false)
-                .column("ext_id", "ext_id", PgType::Uuid, false)
-                .column("amount", "amount", PgType::Numeric, true)
-                .column("created_at", "created_at", PgType::TimestampTz, false)
-                .column("meta", "meta", PgType::Jsonb, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("ext_id", "ext_id", ColumnType::Uuid, false)
+                .column("amount", "amount", ColumnType::Numeric, true)
+                .column("created_at", "created_at", ColumnType::TimestampTz, false)
+                .column("meta", "meta", ColumnType::Jsonb, true)
                 .primary_key(&["id"]),
         )
         .build()

@@ -9,7 +9,7 @@ use vision_graphql::ast::{BoolExpr, CmpOp};
 use vision_graphql::predicate::{
     and, col, constant, not, or, param, principal, rel, typed, Principal,
 };
-use vision_graphql::schema::{PgType, Relation, Schema, Table};
+use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, Mutation, Query, ScopePolicy, ScopeSet};
 
 mod common;
@@ -18,16 +18,16 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, true)
                 .primary_key(&["id"])
                 .relation("orders", Relation::array("orders").on([("id", "user_id")])),
         )
         .table(
             Table::new("orders", "public", "orders")
-                .column("id", "id", PgType::Int4, false)
-                .column("user_id", "user_id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("user_id", "user_id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")]))
                 .relation(
@@ -37,16 +37,16 @@ fn schema() -> Schema {
         )
         .table(
             Table::new("samples", "public", "samples")
-                .column("id", "id", PgType::Int4, false)
-                .column("order_id", "order_id", PgType::Int4, false)
-                .column("serial", "serial", PgType::Text, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("order_id", "order_id", ColumnType::Int4, false)
+                .column("serial", "serial", ColumnType::Text, false)
                 .primary_key(&["id"])
                 .relation("order", Relation::object("orders").on([("order_id", "id")])),
         )
         .table(
             Table::new("adverts", "public", "adverts")
-                .column("id", "id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
                 .primary_key(&["id"]),
         )
         .build()
@@ -1053,7 +1053,7 @@ fn admin_or_owner() -> ScopePolicy {
         .allow(
             "orders",
             or([
-                typed(param("role"), PgType::Text).eq("admin"),
+                typed(param("role"), ColumnType::Text).eq("admin"),
                 col("user_id").eq(param("user_id")),
             ]),
         )
@@ -1165,7 +1165,7 @@ async fn membership_in_a_principal_list_binds_the_whole_list() {
         .allow(
             "orders",
             or([
-                typed("vip", PgType::Text).in_set(param("tiers")),
+                typed("vip", ColumnType::Text).in_set(param("tiers")),
                 col("title").in_set(param("titles")),
             ]),
         )
@@ -1198,7 +1198,7 @@ async fn membership_in_a_principal_list_binds_the_whole_list() {
         .allow(
             "orders",
             and([
-                typed("banned", PgType::Text).nin_set(param("tiers")),
+                typed("banned", ColumnType::Text).nin_set(param("tiers")),
                 col("title").nin_set(param("titles")),
             ]),
         )
@@ -1301,7 +1301,10 @@ async fn two_sources_of_policy_compose_on_one_table_with_and_allow() {
     let base = ScopePolicy::from_toml(toml, &schema()).expect("toml policy");
     let policy = base
         .into_builder()
-        .and_allow("orders", typed(param("role"), PgType::Text).eq("reader"))
+        .and_allow(
+            "orders",
+            typed(param("role"), ColumnType::Text).eq("reader"),
+        )
         .and_allow("adverts", col("title").eq("ad-1"))
         .and_allow("samples", constant(true))
         .validate(&schema())
