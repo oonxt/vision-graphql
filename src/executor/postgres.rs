@@ -1,6 +1,6 @@
 //! Execute a rendered statement against PostgreSQL.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{Bind, NullOf};
 use serde_json::Value;
 use sqlx::postgres::Postgres;
@@ -44,7 +44,14 @@ where
             Bind::TextArray(v) => q.bind(v.clone()),
         };
     }
-    let json = q.fetch_one(executor).await?;
+    let json = q.fetch_one(executor).await.map_err(|e| {
+        if let sqlx::Error::Database(db) = &e {
+            if let Some(v) = Error::scope_violation_in(db.message()) {
+                return v;
+            }
+        }
+        Error::Database(e)
+    })?;
     Ok(json)
 }
 

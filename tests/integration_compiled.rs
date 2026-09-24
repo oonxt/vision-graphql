@@ -744,7 +744,7 @@ async fn compiled_statements_run_inside_a_transaction() {
         .transaction(async |tx| tx.execute_scoped(&a5, None, &bob).await)
         .await
         .unwrap_err();
-    assert!(matches!(&err, Error::Database(_)), "{err:?}");
+    assert!(matches!(&err, Error::ScopeViolation { .. }), "{err:?}");
     let after = engine.execute(&list, None).await.unwrap();
     assert_eq!(titles(&after, "orders"), ["a-3", "a-4"]);
 
@@ -885,7 +885,7 @@ async fn a_host_holding_its_own_transaction_runs_scoped_statements_in_it() {
         .execute_scoped_on(&mut *tx, &a3, None, &bob)
         .await
         .unwrap_err();
-    assert!(matches!(&err, Error::Database(_)), "{err:?}");
+    assert!(matches!(&err, Error::ScopeViolation { .. }), "{err:?}");
     tx.rollback().await.expect("rollback");
     let after = engine.execute(&list, None).await.unwrap();
     assert_eq!(titles(&after, "orders"), ["a-1", "a-2", "a-3"]);

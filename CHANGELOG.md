@@ -17,8 +17,8 @@ release commits; entries from 0.13.0 on are written as the work lands.
   `Schema::introspect_sqlite`. A mutation there is a sequence of statements
   in one transaction rather than one statement of data-modifying CTEs
   (`vision_graphql::plan`), which SQLite does not have; the README's
-  *Backends* table records the two places that shows (later fields see
-  earlier writes; a deleted row's `returning` cannot read its relations). The things SQLite answers differently by
+  *Backends* table records where that shows (later fields see earlier
+  writes; `returning { relation }` sees the whole table). The things SQLite answers differently by
   default are answered PostgreSQL's way: booleans and JSON columns come back
   as JSON booleans and JSON values rather than `0`/`1` and escaped strings,
   NULLs sort last on `asc` and first on `desc`, `_like` is case-sensitive.
@@ -47,6 +47,14 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Changed
 
+- **A scope check violation is `Error::ScopeViolation`.** The post-write
+  guard — a scoped insert that wrote a row outside the scope, an update that
+  moved one out — surfaced as `Error::Database` on PostgreSQL, with the
+  violation text buried in a failed cast's message, and classified as
+  `DATABASE_ERROR`. Both backends now raise `Error::ScopeViolation { table,
+  rows, action }`, code `SCOPE_DENIED`, with the same message as before; a
+  host that matched on the message keeps working, one that matched on the
+  variant sees the denial it is.
 - **The engine is generic over its backend.** `Engine`, `ScopedEngine`,
   `TxClient`, `ScopedTxClient`, `CompiledQuery` and `QueryRegistry` take a
   `DB: Backend` parameter, defaulting to `sqlx::Postgres`, so a program that

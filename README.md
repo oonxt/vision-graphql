@@ -110,7 +110,7 @@ and left, not forgotten.
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
 | Computed fields, subscriptions | Not planned. |
-| `WITHOUT ROWID` tables on SQLite, relations in a delete's `returning` on SQLite | See [Backends](#backends). |
+| `WITHOUT ROWID` tables on SQLite | See [Backends](#backends). |
 
 ## Backends
 
@@ -164,7 +164,7 @@ anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | Foreign keys | Enforcement is per connection (`PRAGMA foreign_keys`); `connect_options` turns it on and introspection refuses a pool where it is off. Relations are derived from the declarations either way. |
 | Multiple schemas | Only `main`; attached databases are not walked. |
 | Mutations | Implemented as a **sequence of statements in one transaction** (`vision_graphql::plan`): SQLite allows no DML inside a CTE, so each object is its own `INSERT … RETURNING`, nested rows follow their parent with its key bound in, scope guards are `SELECT count(*)` over the rows just written, and the response is assembled from what came back. The same `affected_rows` (nested rows counted), the same `returning` (read back after the writes, relations included), the same guard (a violation anywhere undoes everything). Atomic on the pool, in `Engine::transaction`, and inside a caller's transaction through the `_on` twins (a savepoint). |
-| Mutations: what differs | Later fields of one mutation see earlier fields' writes, and `returning { relation }` sees every related row, where PostgreSQL's CTEs share one snapshot. A column an object leaves out gets its default (the one-statement form writes NULL for a column another object in the batch set). Rows are identified by `rowid`: a `WITHOUT ROWID` table cannot be written (SQLite: `no such column: rowid`). A deleted row's `returning` is its columns, `__typename` and JSON path reads; a relation of a deleted row is refused. |
+| Mutations: what differs | Later fields of one mutation see earlier fields' writes, and `returning { relation }` sees every related row, where PostgreSQL's CTEs share one snapshot. A column an object leaves out gets its default (the one-statement form writes NULL for a column another object in the batch set), and an object with no values at all cannot take `on_conflict`. Rows are identified by `rowid`: a `WITHOUT ROWID` table cannot be written (SQLite: `no such column: rowid`). A deleted row's `returning` is read just before the delete, relations included. |
 | `on_conflict` | `constraint` names a unique constraint as on PostgreSQL — SQLite's auto-names (`sqlite_autoindex_t_1`), a `CREATE UNIQUE INDEX` name, or `<table>_pkey` for the primary key — and is resolved to its columns, which is what SQLite's `ON CONFLICT (…)` takes. `update_columns`, `where` and `DO NOTHING` as on PostgreSQL; a nested `DO NOTHING` is a no-op update so the row's key is still returned for its dependants. |
 | `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
 | `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |

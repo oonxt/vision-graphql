@@ -456,8 +456,8 @@ async fn scoped_insert_outside_scope_aborts() {
         .expect_err("out-of-scope insert must abort");
     // Surfaces as a DB error from the deliberate failed cast.
     assert!(
-        matches!(&err, Error::Database(_)),
-        "expected DB-level abort, got {err:?}"
+        matches!(&err, Error::ScopeViolation { .. }),
+        "expected the scope guard, got {err:?}"
     );
 
     // Nothing was written: bob still has exactly his one seeded order.
@@ -538,8 +538,8 @@ async fn scoped_nested_insert_child_violation_aborts_everything() {
         .await
         .expect_err("child out of scope must abort");
     assert!(
-        matches!(&err, Error::Database(_)),
-        "expected DB abort, got {err:?}"
+        matches!(&err, Error::ScopeViolation { .. }),
+        "expected the scope guard, got {err:?}"
     );
 
     // Atomic: the parent user was rolled back too.
@@ -579,8 +579,8 @@ async fn scoped_update_cannot_move_row_out_of_scope() {
         .await
         .expect_err("moving a row out of scope must abort");
     assert!(
-        matches!(&err, Error::Database(_)),
-        "expected DB-level abort, got {err:?}"
+        matches!(&err, Error::ScopeViolation { .. }),
+        "expected the scope guard, got {err:?}"
     );
 
     // Nothing changed: order 1 still belongs to alice.
@@ -619,8 +619,8 @@ async fn scoped_update_by_pk_cannot_move_row_out_of_scope() {
         .await
         .expect_err("by_pk move out of scope must abort");
     assert!(
-        matches!(&err, Error::Database(_)),
-        "expected DB-level abort, got {err:?}"
+        matches!(&err, Error::ScopeViolation { .. }),
+        "expected the scope guard, got {err:?}"
     );
 
     let owner: Value = engine

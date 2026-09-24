@@ -2463,29 +2463,10 @@ fn render_update_cte(
         quote_ident(&table.physical_name),
     )
     .unwrap();
-    for (i, (exposed, value)) in set.iter().enumerate() {
-        if i > 0 {
-            ctx.sql.push_str(", ");
-        }
-        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-            path: format!("{cte}._set.{exposed}"),
-            message: format!("unknown column '{exposed}'"),
-        })?;
-        let n = ctx.push_scalar(value, &col.ty, || format!("{cte}._set.{exposed}"))?;
-        write!(
-            ctx.sql,
-            "{} = {}",
-            quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.ty)
-        )
-        .unwrap();
-    }
+    render_set_clause(table, set, cte, ctx)?;
     ctx.sql.push_str(" WHERE ");
     render_bool_expr_no_alias(where_, table, schema, ctx)?;
     ctx.sql.push_str(" RETURNING *)");
-    // Post-update check: every row left by the UPDATE must still satisfy the
-    // scope predicate, or the guard aborts the statement (so a scoped caller
-    // cannot move a row out of scope).
     if let Some(check) = scope_check {
         emit_scope_guard(cte, table, check, "modified", schema, ctx)?;
     }
@@ -2512,52 +2493,10 @@ fn render_update_by_pk_cte(
         quote_ident(&table.physical_name),
     )
     .unwrap();
-    for (i, (exposed, value)) in set.iter().enumerate() {
-        if i > 0 {
-            ctx.sql.push_str(", ");
-        }
-        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-            path: format!("{cte}._set.{exposed}"),
-            message: format!("unknown column '{exposed}'"),
-        })?;
-        let n = ctx.push_scalar(value, &col.ty, || format!("{cte}._set.{exposed}"))?;
-        write!(
-            ctx.sql,
-            "{} = {}",
-            quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.ty)
-        )
-        .unwrap();
-    }
+    render_set_clause(table, set, cte, ctx)?;
     ctx.sql.push_str(" WHERE ");
-    for (i, (col_name, value)) in pk.iter().enumerate() {
-        if i > 0 {
-            ctx.sql.push_str(" AND ");
-        }
-        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-            path: format!("{cte}.pk.{col_name}"),
-            message: format!("unknown column '{col_name}'"),
-        })?;
-        // A primary key is never null, so a null here matches nothing either.
-        let n = ctx.push_comparison(value, &col.ty, || format!("{cte}.pk.{col_name}"))?;
-        write!(
-            ctx.sql,
-            "{} = {}",
-            quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.ty)
-        )
-        .unwrap();
-    }
-    if let Some(expr) = scope {
-        ctx.sql.push_str(" AND (");
-        render_bool_expr_no_alias(expr, table, schema, ctx)?;
-        ctx.sql.push(')');
-    }
+    render_pk_predicate(table, pk, scope, cte, None, schema, ctx)?;
     ctx.sql.push_str(" RETURNING *)");
-    // Post-update check: the same predicate that gates the PK match is
-    // re-checked over the updated row, so a by_pk update cannot move an
-    // in-scope row out of scope. A row the filter excluded leaves the CTE
-    // empty, so the guard passes (the mutation just returns null).
     if let Some(check) = scope {
         emit_scope_guard(cte, table, check, "modified", schema, ctx)?;
     }
@@ -2606,16 +2545,64 @@ fn render_delete_by_pk_cte(
         quote_ident(&table.physical_name),
     )
     .unwrap();
+    render_pk_predicate(table, pk, scope, cte, None, schema, ctx)?;
+    ctx.sql.push_str(" RETURNING *)");
+    Ok(())
+}
+
+/// `col = $n, …` for an update's `_set`, shared by the one-statement renderer
+/// and the plan builder so a rule about how a value binds lands in both.
+pub(crate) fn render_set_clause(
+    table: &Table,
+    set: &std::collections::BTreeMap<String, Val>,
+    path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    for (i, (exposed, value)) in set.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+            path: format!("{path}._set.{exposed}"),
+            message: format!("unknown column '{exposed}'"),
+        })?;
+        let n = ctx.push_scalar(value, &col.ty, || format!("{path}._set.{exposed}"))?;
+        write!(
+            ctx.sql,
+            "{} = {}",
+            quote_ident(&col.physical_name),
+            ctx.dialect.param(n, &col.ty)
+        )
+        .unwrap();
+    }
+    Ok(())
+}
+
+/// `pk = $n AND … [AND (scope)]` for the `_by_pk` forms, shared as
+/// [`render_set_clause`] is. Unqualified without `alias`, as `UPDATE` and
+/// `DELETE` want it; qualified with one for a read.
+pub(crate) fn render_pk_predicate(
+    table: &Table,
+    pk: &[(String, Val)],
+    scope: Option<&crate::ast::BoolExpr>,
+    path: &str,
+    alias: Option<&str>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
     for (i, (col_name, value)) in pk.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(" AND ");
         }
         let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-            path: format!("{cte}.pk.{col_name}"),
+            path: format!("{path}.pk.{col_name}"),
             message: format!("unknown column '{col_name}'"),
         })?;
         // A primary key is never null, so a null here matches nothing either.
-        let n = ctx.push_comparison(value, &col.ty, || format!("{cte}.pk.{col_name}"))?;
+        let n = ctx.push_comparison(value, &col.ty, || format!("{path}.pk.{col_name}"))?;
+        if let Some(a) = alias {
+            write!(ctx.sql, "{a}.").unwrap();
+        }
         write!(
             ctx.sql,
             "{} = {}",
@@ -2626,10 +2613,12 @@ fn render_delete_by_pk_cte(
     }
     if let Some(expr) = scope {
         ctx.sql.push_str(" AND (");
-        render_bool_expr_no_alias(expr, table, schema, ctx)?;
+        match alias {
+            Some(a) => render_bool_expr(expr, table, a, schema, ctx)?,
+            None => render_bool_expr_no_alias(expr, table, schema, ctx)?,
+        }
         ctx.sql.push(')');
     }
-    ctx.sql.push_str(" RETURNING *)");
     Ok(())
 }
 

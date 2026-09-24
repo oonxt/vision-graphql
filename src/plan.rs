@@ -7,9 +7,9 @@
 //! one snapshot, atomic by construction. SQLite allows no DML inside a CTE
 //! and no `RETURNING` in a subquery, so the same mutation here is a
 //! [`MutationPlan`]: statements run one after another on one connection,
-//! inside a transaction the executor opens, each one's `RETURNING` rows
-//! captured for the ones after it, and the response assembled from those
-//! captures in Rust.
+//! inside a transaction (or, inside a caller's transaction, a savepoint) the
+//! executor opens and closes, each one's `RETURNING` rows captured for the
+//! ones after it, and the response assembled from those captures in Rust.
 //!
 //! # What is the same
 //!
@@ -22,10 +22,15 @@
 //! - `affected_rows` counts every row written under the field, nested rows
 //!   included; `returning` is the parent rows, in the order they were
 //!   given, with the full selection — nested relations included, read after
-//!   the writes.
-//! - A nested `on_conflict` with no `update_columns` is a no-op update
+//!   the writes. A deleted row's `returning` is read just before the delete,
+//!   relations included, as PostgreSQL reads it from the snapshot.
+//! - A parent that inserted no row (`DO NOTHING` on a conflict) gets no
+//!   children: a statement whose parent capture is empty is skipped, as the
+//!   join to an empty parent CTE inserts nothing.
+//! - A *nested* `on_conflict` with no `update_columns` is a no-op update
 //!   rather than `DO NOTHING`, so the row is returned and its key can be
-//!   the child's foreign key.
+//!   the child's foreign key. At the top level it is `DO NOTHING`, as on
+//!   PostgreSQL: nothing returned, nothing counted, no children.
 //!
 //! # What differs
 //!
@@ -36,26 +41,25 @@
 //!   README's *Backends* table records this.
 //! - **Rows are identified by `rowid`.** A `WITHOUT ROWID` table cannot be
 //!   written through this engine (SQLite reports `no such column: rowid`).
-//! - **A deleted row's `returning`** is built from what `DELETE … RETURNING`
-//!   gave back: columns, `__typename` and JSON path reads. A relation of a
-//!   row that no longer exists is refused.
 //! - **One statement per object.** SQLite does not promise the order of
 //!   `RETURNING` rows for a multi-row insert, and a child needs its own
 //!   parent's key, so each object is its own `INSERT`. A column an object
 //!   leaves out gets the column's default, where the one-statement form
 //!   writes an explicit NULL for a column another object in the batch set.
+//!   An object with no values at all cannot take `on_conflict`: SQLite's
+//!   `DEFAULT VALUES` admits no upsert clause.
 
 // The plan is rendered whatever the features — a Schema can say Sqlite without
 // the driver being compiled in — but only the SQLite executor reads it.
 #![cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 
 use crate::ast::{BoolExpr, Field, InsertObject, MutationField, OnConflict, Val};
-use crate::dialect::{escape_string_literal, json_kind, quote_ident, Dialect, JsonKind};
+use crate::dialect::{escape_string_literal, json_kind, quote_ident, Dialect};
 use crate::error::{Error, Result};
 use crate::schema::{ColumnType, Relation, Schema, Table};
 use crate::sql::{
-    ensure_unique_selection_keys, render_bool_expr, render_bool_expr_no_alias,
-    render_json_build_object_for_nodes, RenderCtx,
+    render_bool_expr, render_bool_expr_no_alias, render_json_build_object_for_nodes,
+    render_pk_predicate, render_set_clause, RenderCtx,
 };
 use crate::types::{Bind, BindSpec, NullOf};
 use std::fmt::Write as _;
@@ -71,8 +75,10 @@ pub(crate) const ROWID_KEY: &str = "__rowid";
 pub struct MutationPlan {
     pub(crate) steps: Vec<Step>,
     pub(crate) fields: Vec<FieldResponse>,
-    /// How many captures the steps fill, so the executor can size its store.
+    /// How many captures the writes fill, so the executor can size its store.
     pub(crate) captures: usize,
+    /// How many values the reads fill.
+    pub(crate) reads: usize,
     /// Every statement, one per line, for [`CompiledQuery::sql`] and for
     /// tests; not what is executed.
     ///
@@ -91,7 +97,9 @@ impl MutationPlan {
     /// [`CompiledQuery::variables`]: crate::CompiledQuery::variables
     pub(crate) fn specs(&self) -> impl Iterator<Item = &BindSpec> {
         let in_steps = self.steps.iter().flat_map(|s| match s {
-            Step::Write { binds, .. } | Step::Check { binds, .. } => binds.iter(),
+            Step::Write { binds, .. } | Step::Check { binds, .. } | Step::Read { binds, .. } => {
+                binds.iter()
+            }
         });
         let in_selects = self.fields.iter().flat_map(|f| f.select_binds());
         in_steps.chain(in_selects).filter_map(|b| match b {
@@ -105,8 +113,11 @@ impl MutationPlan {
 #[derive(Debug, Clone)]
 pub(crate) enum Step {
     /// An `INSERT`, `UPDATE` or `DELETE` whose `RETURNING` is one JSON
-    /// object per affected row — every column under its exposed name, plus
-    /// the rowid — stored under `capture`.
+    /// object per affected row — the rowid, and for a row that stays, every
+    /// column under its exposed name — stored under `capture`.
+    ///
+    /// Skipped, leaving the capture empty, when a [`PlanBind::Captured`] it
+    /// binds refers to an empty capture: its parent inserted nothing.
     Write {
         sql: String,
         binds: Vec<PlanBind>,
@@ -119,6 +130,14 @@ pub(crate) enum Step {
         binds: Vec<PlanBind>,
         table: String,
         action: &'static str,
+    },
+    /// A read the response needs from before a write: a delete's
+    /// `returning`, taken while the rows still exist. One JSON value, stored
+    /// under `into`.
+    Read {
+        sql: String,
+        binds: Vec<PlanBind>,
+        into: usize,
     },
 }
 
@@ -176,11 +195,11 @@ pub(crate) enum ResponseShape {
         capture: usize,
         returning: Option<Select>,
     },
-    /// Rows that no longer exist: the selection is read off the captured
-    /// rows.
+    /// Rows that no longer exist: the selection was read before the delete
+    /// ([`Step::Read`]), the count comes from the delete.
     Deleted {
-        captures: Vec<usize>,
-        fields: Vec<CapturedField>,
+        capture: usize,
+        read: Option<usize>,
         typenames: Vec<(String, String)>,
         one: bool,
     },
@@ -193,24 +212,6 @@ pub(crate) enum ResponseShape {
 pub(crate) struct Select {
     pub(crate) sql: String,
     pub(crate) binds: Vec<PlanBind>,
-}
-
-/// A field of a deleted row's `returning`, answered from the captured row.
-#[derive(Debug, Clone)]
-pub(crate) enum CapturedField {
-    Column {
-        key: String,
-        column: String,
-    },
-    Typename {
-        key: String,
-        name: String,
-    },
-    JsonPath {
-        key: String,
-        column: String,
-        path: Vec<String>,
-    },
 }
 
 /// One statement under construction: a render context plus the binds that
@@ -245,11 +246,18 @@ impl Stmt {
     }
 }
 
+/// What picks the rows a delete removes, for the read that precedes it.
+enum Picks<'a> {
+    Where(&'a BoolExpr),
+    Pk(&'a [(String, Val)], Option<&'a BoolExpr>),
+}
+
 struct Builder<'a> {
     schema: &'a Schema,
     dialect: Dialect,
     steps: Vec<Step>,
     captures: usize,
+    reads: usize,
 }
 
 /// Render a mutation as a plan. The IR is already scoped and limited; this
@@ -264,6 +272,7 @@ pub(crate) fn build(
         dialect,
         steps: Vec::new(),
         captures: 0,
+        reads: 0,
     };
     let mut responses = Vec::with_capacity(fields.len());
     for mf in fields {
@@ -272,7 +281,7 @@ pub(crate) fn build(
     let mut text = String::new();
     for step in &b.steps {
         match step {
-            Step::Write { sql, .. } | Step::Check { sql, .. } => {
+            Step::Write { sql, .. } | Step::Check { sql, .. } | Step::Read { sql, .. } => {
                 text.push_str(sql);
                 text.push('\n');
             }
@@ -294,6 +303,7 @@ pub(crate) fn build(
         steps: b.steps,
         fields: responses,
         captures: b.captures,
+        reads: b.reads,
         text,
     })
 }
@@ -315,6 +325,12 @@ impl<'a> Builder<'a> {
         let c = self.captures;
         self.captures += 1;
         c
+    }
+
+    fn read_slot(&mut self) -> usize {
+        let r = self.reads;
+        self.reads += 1;
+        r
     }
 
     fn qualified(table: &Table) -> String {
@@ -340,6 +356,22 @@ impl<'a> Builder<'a> {
             .unwrap();
         }
         sql.push(')');
+    }
+
+    /// `RETURNING json_object('__rowid', rowid)`: all a delete has to say.
+    fn returning_rowid(sql: &mut String) {
+        write!(sql, " RETURNING json_object('{ROWID_KEY}', rowid)").unwrap();
+    }
+
+    fn write(&mut self, s: Stmt) -> usize {
+        let cap = self.capture();
+        let (sql, binds) = s.finish();
+        self.steps.push(Step::Write {
+            sql,
+            binds,
+            capture: cap,
+        });
+        cap
     }
 
     fn field(&mut self, mf: &MutationField) -> Result<FieldResponse> {
@@ -406,17 +438,11 @@ impl<'a> Builder<'a> {
                 let t = self.table(table, &alias)?;
                 let mut s = Stmt::new(self.dialect);
                 write!(s.ctx.sql, "UPDATE {} SET ", Self::qualified(t)).unwrap();
-                self.render_set(t, set, &alias, &mut s)?;
+                render_set_clause(t, set, &alias, &mut s.ctx)?;
                 s.ctx.sql.push_str(" WHERE ");
                 render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
                 self.returning_row(t, &mut s.ctx.sql);
-                let cap = self.capture();
-                let (sql, binds) = s.finish();
-                self.steps.push(Step::Write {
-                    sql,
-                    binds,
-                    capture: cap,
-                });
+                let cap = self.write(s);
                 if let Some(check) = scope_check {
                     self.check(t, check, cap, "modified")?;
                 }
@@ -442,17 +468,11 @@ impl<'a> Builder<'a> {
                 let t = self.table(table, &alias)?;
                 let mut s = Stmt::new(self.dialect);
                 write!(s.ctx.sql, "UPDATE {} SET ", Self::qualified(t)).unwrap();
-                self.render_set(t, set, &alias, &mut s)?;
+                render_set_clause(t, set, &alias, &mut s.ctx)?;
                 s.ctx.sql.push_str(" WHERE ");
-                self.render_pk_match(t, pk, scope.as_ref(), &alias, &mut s)?;
+                render_pk_predicate(t, pk, scope.as_ref(), &alias, None, self.schema, &mut s.ctx)?;
                 self.returning_row(t, &mut s.ctx.sql);
-                let cap = self.capture();
-                let (sql, binds) = s.finish();
-                self.steps.push(Step::Write {
-                    sql,
-                    binds,
-                    capture: cap,
-                });
+                let cap = self.write(s);
                 if let Some(check) = scope {
                     self.check(t, check, cap, "modified")?;
                 }
@@ -474,20 +494,25 @@ impl<'a> Builder<'a> {
                 ..
             } => {
                 let t = self.table(table, &alias)?;
+                let read = if returning.is_empty() {
+                    None
+                } else {
+                    Some(self.read_before_delete(
+                        t,
+                        returning,
+                        Picks::Where(where_),
+                        false,
+                        &alias,
+                    )?)
+                };
                 let mut s = Stmt::new(self.dialect);
                 write!(s.ctx.sql, "DELETE FROM {} WHERE ", Self::qualified(t)).unwrap();
                 render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
-                self.returning_row(t, &mut s.ctx.sql);
-                let cap = self.capture();
-                let (sql, binds) = s.finish();
-                self.steps.push(Step::Write {
-                    sql,
-                    binds,
-                    capture: cap,
-                });
+                Self::returning_rowid(&mut s.ctx.sql);
+                let cap = self.write(s);
                 ResponseShape::Deleted {
-                    captures: vec![cap],
-                    fields: self.captured_fields(t, returning, &alias)?,
+                    capture: cap,
+                    read,
                     typenames: self.typenames(response_typenames, t),
                     one: false,
                 }
@@ -500,20 +525,25 @@ impl<'a> Builder<'a> {
                 ..
             } => {
                 let t = self.table(table, &alias)?;
+                let read = if selection.is_empty() {
+                    None
+                } else {
+                    Some(self.read_before_delete(
+                        t,
+                        selection,
+                        Picks::Pk(pk, scope.as_ref()),
+                        true,
+                        &alias,
+                    )?)
+                };
                 let mut s = Stmt::new(self.dialect);
                 write!(s.ctx.sql, "DELETE FROM {} WHERE ", Self::qualified(t)).unwrap();
-                self.render_pk_match(t, pk, scope.as_ref(), &alias, &mut s)?;
-                self.returning_row(t, &mut s.ctx.sql);
-                let cap = self.capture();
-                let (sql, binds) = s.finish();
-                self.steps.push(Step::Write {
-                    sql,
-                    binds,
-                    capture: cap,
-                });
+                render_pk_predicate(t, pk, scope.as_ref(), &alias, None, self.schema, &mut s.ctx)?;
+                Self::returning_rowid(&mut s.ctx.sql);
+                let cap = self.write(s);
                 ResponseShape::Deleted {
-                    captures: vec![cap],
-                    fields: self.captured_fields(t, selection, &alias)?,
+                    capture: cap,
+                    read,
                     typenames: Vec::new(),
                     one: true,
                 }
@@ -529,73 +559,6 @@ impl<'a> Builder<'a> {
             .collect()
     }
 
-    /// `col = $n, …` for an update's `_set`.
-    fn render_set(
-        &self,
-        table: &Table,
-        set: &std::collections::BTreeMap<String, Val>,
-        path: &str,
-        s: &mut Stmt,
-    ) -> Result<()> {
-        for (i, (exposed, value)) in set.iter().enumerate() {
-            if i > 0 {
-                s.ctx.sql.push_str(", ");
-            }
-            let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-                path: format!("{path}._set.{exposed}"),
-                message: format!("unknown column '{exposed}'"),
-            })?;
-            let n = s
-                .ctx
-                .push_scalar(value, &col.ty, || format!("{path}._set.{exposed}"))?;
-            write!(
-                s.ctx.sql,
-                "{} = {}",
-                quote_ident(&col.physical_name),
-                self.dialect.param(n, &col.ty)
-            )
-            .unwrap();
-        }
-        Ok(())
-    }
-
-    /// `pk = $n AND … [AND (scope)]` for the `_by_pk` forms.
-    fn render_pk_match(
-        &self,
-        table: &Table,
-        pk: &[(String, Val)],
-        scope: Option<&BoolExpr>,
-        path: &str,
-        s: &mut Stmt,
-    ) -> Result<()> {
-        for (i, (col_name, value)) in pk.iter().enumerate() {
-            if i > 0 {
-                s.ctx.sql.push_str(" AND ");
-            }
-            let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-                path: format!("{path}.pk.{col_name}"),
-                message: format!("unknown column '{col_name}'"),
-            })?;
-            // A primary key is never null, so a null here matches nothing.
-            let n = s
-                .ctx
-                .push_comparison(value, &col.ty, || format!("{path}.pk.{col_name}"))?;
-            write!(
-                s.ctx.sql,
-                "{} = {}",
-                quote_ident(&col.physical_name),
-                self.dialect.param(n, &col.ty)
-            )
-            .unwrap();
-        }
-        if let Some(expr) = scope {
-            s.ctx.sql.push_str(" AND (");
-            render_bool_expr_no_alias(expr, table, self.schema, &mut s.ctx)?;
-            s.ctx.sql.push(')');
-        }
-        Ok(())
-    }
-
     /// The scope guard over the rows `capture` holds.
     fn check(
         &mut self,
@@ -605,7 +568,7 @@ impl<'a> Builder<'a> {
         action: &'static str,
     ) -> Result<()> {
         let mut s = Stmt::new(self.dialect);
-        let t = "t";
+        let t = s.ctx.next_alias("t");
         let n = s.captured(PlanBind::Rowids(vec![capture]), NullOf::Int8Array);
         write!(
             s.ctx.sql,
@@ -613,7 +576,7 @@ impl<'a> Builder<'a> {
             Self::qualified(table)
         )
         .unwrap();
-        render_bool_expr(check, table, t, self.schema, &mut s.ctx)?;
+        render_bool_expr(check, table, &t, self.schema, &mut s.ctx)?;
         s.ctx.sql.push(')');
         let (sql, binds) = s.finish();
         self.steps.push(Step::Check {
@@ -690,7 +653,9 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let nested = parent.is_some() || !obj.nested_arrays.is_empty() || depth > 0;
+        // Nested as the one-statement renderer means it: any row but a
+        // top-level object — a child, or a row an object relation points at.
+        let nested = parent.is_some() || depth > 0;
         let mut s = Stmt::new(self.dialect);
         write!(s.ctx.sql, "INSERT INTO {} (", Self::qualified(table)).unwrap();
         let mut values = String::new();
@@ -767,7 +732,17 @@ impl<'a> Builder<'a> {
             write!(values, "{}", self.dialect.param(n, &col.ty)).unwrap();
         }
         if first {
-            // Nothing set at all: a row of defaults.
+            // Nothing set at all: a row of defaults. SQLite's grammar admits
+            // no upsert clause after DEFAULT VALUES, and there is no other
+            // spelling of "a row of defaults" to hang one on.
+            if on_conflict.is_some() {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "{path}: an object with no values cannot take on_conflict on {:?}",
+                        self.dialect
+                    ),
+                });
+            }
             s.ctx.sql.truncate(s.ctx.sql.len() - 2);
             s.ctx.sql.push_str(" DEFAULT VALUES");
         } else {
@@ -777,14 +752,8 @@ impl<'a> Builder<'a> {
             self.render_on_conflict(oc, table, scope_check, nested, path, &mut s)?;
         }
         self.returning_row(table, &mut s.ctx.sql);
-        let cap = self.capture();
+        let cap = self.write(s);
         all.push(cap);
-        let (sql, binds) = s.finish();
-        self.steps.push(Step::Write {
-            sql,
-            binds,
-            capture: cap,
-        });
         if let Some(check) = scope_check {
             self.check(table, check, cap, "inserted")?;
         }
@@ -843,7 +812,19 @@ impl<'a> Builder<'a> {
             if i > 0 {
                 s.ctx.sql.push_str(", ");
             }
-            s.ctx.sql.push_str(&quote_ident(c));
+            // Constraint columns are recorded by exposed name (the type
+            // system resolves them the same way); SQLite wants the physical
+            // one. A constraint over a hidden column has no exposed name to
+            // resolve, and PostgreSQL's `ON CONSTRAINT` sidesteps that where
+            // this cannot.
+            let col = table.find_column(c).ok_or_else(|| Error::Validate {
+                path: format!("{path}.on_conflict.constraint"),
+                message: format!(
+                    "constraint '{}' covers column '{c}', which '{}' does not expose",
+                    oc.constraint, table.exposed_name
+                ),
+            })?;
+            s.ctx.sql.push_str(&quote_ident(&col.physical_name));
         }
         s.ctx.sql.push_str(") ");
         let tref = quote_ident(&table.physical_name);
@@ -923,12 +904,11 @@ impl<'a> Builder<'a> {
         // Taken from the context, not spelled: the relation subqueries in the
         // selection take their aliases from the same counter.
         let alias = s.ctx.next_alias("t");
-        let alias = alias.as_str();
         s.ctx.sql.push_str("SELECT ");
         if !one {
             s.ctx.sql.push_str(self.dialect.json_agg_open());
         }
-        render_json_build_object_for_nodes(fields, alias, table, path, self.schema, &mut s.ctx)?;
+        render_json_build_object_for_nodes(fields, &alias, table, path, self.schema, &mut s.ctx)?;
         if !one {
             s.ctx.sql.push_str(self.dialect.json_agg_close());
         }
@@ -947,89 +927,55 @@ impl<'a> Builder<'a> {
         Ok(Select { sql, binds })
     }
 
-    /// What a deleted row's `returning` can answer from the captured row.
-    fn captured_fields(
-        &self,
+    /// The selection of the rows a delete is about to remove, read while
+    /// they exist — relations included, as PostgreSQL reads them from the
+    /// statement's snapshot. Returns the read slot the executor fills.
+    fn read_before_delete(
+        &mut self,
         table: &Table,
         fields: &[Field],
+        picks: Picks<'_>,
+        one: bool,
         path: &str,
-    ) -> Result<Vec<CapturedField>> {
-        ensure_unique_selection_keys(fields, path)?;
-        fields
-            .iter()
-            .map(|f| match f {
-                Field::Column { column, alias } => {
-                    table.find_column(column).ok_or_else(|| Error::Validate {
-                        path: format!("{path}.{alias}"),
-                        message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-                    })?;
-                    Ok(CapturedField::Column {
-                        key: alias.clone(),
-                        column: column.clone(),
-                    })
-                }
-                Field::Typename { alias } => Ok(CapturedField::Typename {
-                    key: alias.clone(),
-                    name: crate::type_names::row(table).to_string(),
-                }),
-                Field::JsonPath {
-                    column,
-                    alias,
-                    path: jpath,
-                } => {
-                    let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                        path: format!("{path}.{alias}"),
-                        message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-                    })?;
-                    if !matches!(json_kind(&col.ty), JsonKind::Json) {
-                        return Err(Error::Validate {
-                            path: format!("{path}.{alias}"),
-                            message: format!(
-                                "path read requires a json/jsonb column, but '{}' is not",
-                                col.exposed_name
-                            ),
-                        });
-                    }
-                    Ok(CapturedField::JsonPath {
-                        key: alias.clone(),
-                        column: column.clone(),
-                        path: jpath.clone(),
-                    })
-                }
-                Field::Relation { alias, .. } | Field::RelationAggregate { alias, .. } => {
-                    Err(Error::Unsupported {
-                        message: format!(
-                            "{path}.{alias}: a relation in a delete's returning is not available \
-                             on {:?}; the rows are gone by the time it would be read",
-                            self.dialect
-                        ),
-                    })
-                }
-            })
-            .collect()
+    ) -> Result<usize> {
+        let mut s = Stmt::new(self.dialect);
+        let inner = s.ctx.next_alias("t");
+        let outer = s.ctx.next_alias("t");
+        s.ctx.sql.push_str("SELECT ");
+        if !one {
+            s.ctx.sql.push_str(self.dialect.json_agg_open());
+        }
+        render_json_build_object_for_nodes(fields, &outer, table, path, self.schema, &mut s.ctx)?;
+        if !one {
+            s.ctx.sql.push_str(self.dialect.json_agg_close());
+        }
+        write!(
+            s.ctx.sql,
+            " FROM (SELECT {inner}.* FROM {} {inner} WHERE ",
+            Self::qualified(table)
+        )
+        .unwrap();
+        match picks {
+            Picks::Where(expr) => render_bool_expr(expr, table, &inner, self.schema, &mut s.ctx)?,
+            Picks::Pk(pk, scope) => render_pk_predicate(
+                table,
+                pk,
+                scope,
+                path,
+                Some(&inner),
+                self.schema,
+                &mut s.ctx,
+            )?,
+        }
+        write!(s.ctx.sql, " ORDER BY {inner}.rowid) {outer}").unwrap();
+        if one {
+            s.ctx.sql.push_str(" LIMIT 1");
+        }
+        let into = self.read_slot();
+        let (sql, binds) = s.finish();
+        self.steps.push(Step::Read { sql, binds, into });
+        Ok(into)
     }
-}
-
-/// Walk a JSON value along a path the way PostgreSQL's `#>` does: a
-/// component indexes an array when it is a number, and is a key otherwise.
-pub(crate) fn json_path_get<'a>(
-    value: &'a serde_json::Value,
-    path: &[String],
-) -> &'a serde_json::Value {
-    use serde_json::Value;
-    let mut cur = value;
-    for comp in path {
-        cur = match cur {
-            Value::Object(m) => m.get(comp).unwrap_or(&Value::Null),
-            Value::Array(a) => comp
-                .parse::<usize>()
-                .ok()
-                .and_then(|i| a.get(i))
-                .unwrap_or(&Value::Null),
-            _ => &Value::Null,
-        };
-    }
-    cur
 }
 
 #[cfg(test)]
@@ -1063,13 +1009,17 @@ mod tests {
             .build()
     }
 
-    fn plan(source: &str) -> MutationPlan {
+    fn fields_of(source: &str, schema: &Schema) -> Vec<MutationField> {
         let doc = parse_document(source).unwrap();
-        let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
+        let op = lower_with(&doc, Bindings::symbolic(), None, schema).unwrap();
         let crate::ast::Operation::Mutation(fields) = op else {
             panic!("a mutation")
         };
-        build(&fields, &schema(), Dialect::Sqlite).unwrap()
+        fields
+    }
+
+    fn plan(source: &str) -> MutationPlan {
+        build(&fields_of(source, &schema()), &schema(), Dialect::Sqlite).unwrap()
     }
 
     #[test]
@@ -1113,10 +1063,66 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_do_nothing_is_do_nothing() {
+        let p = plan(
+            r#"mutation { insert_users(objects: [{name: "u", posts: {data: [{title: "t"}]}}], on_conflict: {constraint: users_name_key, update_columns: []}) { affected_rows } }"#,
+        );
+        assert!(
+            matches!(&p.steps[0], Step::Write { sql, .. } if sql.contains("DO NOTHING")),
+            "{}",
+            p.text()
+        );
+    }
+
+    #[test]
+    fn on_conflict_names_physical_columns() {
+        let schema = Schema::builder()
+            .dialect(Dialect::Sqlite)
+            .table(
+                Table::new("users", "main", "users")
+                    .column("id", "id", ColumnType::Int8, false)
+                    .column("userName", "user_name", ColumnType::Text, false)
+                    .primary_key(&["id"])
+                    .unique_constraint("users_name_key", &["userName"]),
+            )
+            .build();
+        let fields = fields_of(
+            r#"mutation { insert_users(objects: [{userName: "u"}], on_conflict: {constraint: users_name_key, update_columns: [userName]}) { affected_rows } }"#,
+            &schema,
+        );
+        let p = build(&fields, &schema, Dialect::Sqlite).unwrap();
+        assert!(
+            p.text().contains(
+                r#"ON CONFLICT ("user_name") DO UPDATE SET "user_name" = excluded."user_name""#
+            ),
+            "{}",
+            p.text()
+        );
+    }
+
+    #[test]
+    fn a_row_of_defaults_takes_no_on_conflict() {
+        // The lowering refuses an empty object; the builder does not.
+        use crate::builder::{IntoOperation, Mutation};
+        let op = Mutation::insert("users", vec![Default::default()])
+            .on_conflict(OnConflict {
+                constraint: "users_pkey".into(),
+                update_columns: Vec::new(),
+                where_: None,
+            })
+            .into_operation();
+        let crate::ast::Operation::Mutation(fields) = op else {
+            panic!("a mutation")
+        };
+        let err = build(&fields, &schema(), Dialect::Sqlite).unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    }
+
+    #[test]
     fn update_and_delete_with_scope() {
         let mut op = {
             let doc = parse_document(
-                r#"mutation { update_users(where: {active: {_eq: true}}, _set: {name: "x"}) { affected_rows returning { name } } delete_posts(where: {id: {_eq: 1}}) { affected_rows returning { title } } }"#,
+                r#"mutation { update_users(where: {active: {_eq: true}}, _set: {name: "x"}) { affected_rows returning { name } } delete_posts(where: {id: {_eq: 1}}) { affected_rows returning { title user { name } } } }"#,
             )
             .unwrap();
             lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap()
@@ -1144,31 +1150,17 @@ mod tests {
                 ..
             }
         )));
-    }
-
-    #[test]
-    fn a_relation_in_a_delete_returning_is_refused() {
-        let doc = parse_document(
-            "mutation { delete_users(where: {id: {_eq: 1}}) { returning { posts { title } } } }",
-        )
-        .unwrap();
-        let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
-        let crate::ast::Operation::Mutation(fields) = op else {
-            panic!("a mutation")
-        };
-        let err = build(&fields, &schema(), Dialect::Sqlite).unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }), "{err}");
-    }
-
-    #[test]
-    fn json_paths_walk_like_postgres() {
-        let v = serde_json::json!({"tags": ["a", "b"], "n": {"k": 2}, "0": "zero"});
-        let p = |s: &[&str]| {
-            json_path_get(&v, &s.iter().map(|c| c.to_string()).collect::<Vec<_>>()).clone()
-        };
-        assert_eq!(p(&["tags", "0"]), serde_json::json!("a"));
-        assert_eq!(p(&["n", "k"]), serde_json::json!(2));
-        assert_eq!(p(&["0"]), serde_json::json!("zero"));
-        assert_eq!(p(&["missing"]), serde_json::Value::Null);
+        // The delete's returning is read before the delete, relation included.
+        let read_at = p
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Read { .. }))
+            .unwrap();
+        let delete_at = p
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Write { sql, .. } if sql.starts_with("DELETE")))
+            .unwrap();
+        assert!(read_at < delete_at);
     }
 }

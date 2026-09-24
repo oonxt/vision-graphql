@@ -244,17 +244,36 @@ async fn update_and_update_by_pk() {
 #[tokio::test]
 async fn delete_returns_what_the_rows_were() {
     let e = engine().await;
+    // The selection is read just before the delete — relations included, as
+    // PostgreSQL reads them from the statement's snapshot.
     let v = q(
         &e,
-        r#"mutation { delete_posts(where: {views: {_lte: 20}}) { affected_rows __typename returning { id title __typename } } }"#,
+        r#"mutation { delete_posts(where: {views: {_lte: 20}}) { affected_rows __typename returning { id title __typename user { name } } } }"#,
     )
     .await;
     assert_eq!(
         v["delete_posts"],
         json!({"affected_rows": 2, "__typename": "posts_mutation_response",
-               "returning": [{"id": 1, "title": "zeta", "__typename": "posts"}, {"id": 3, "title": "mid", "__typename": "posts"}]})
+               "returning": [{"id": 1, "title": "zeta", "__typename": "posts", "user": {"name": "Ann"}},
+                             {"id": 3, "title": "mid", "__typename": "posts", "user": {"name": "bob"}}]})
     );
     assert_eq!(count(&e, "posts").await, 1);
+    let v = q(&e, r#"mutation { delete_users_by_pk(id: 2) { name active first: meta(path: "tags.0") posts { title } } }"#).await;
+    assert_eq!(
+        v["delete_users_by_pk"],
+        json!({"name": "bob", "active": false, "first": null, "posts": []})
+    );
+    let v = q(&e, r#"mutation { delete_users_by_pk(id: 2) { name } }"#).await;
+    assert_eq!(v["delete_users_by_pk"], Value::Null);
+    let v = q(
+        &e,
+        r#"mutation { delete_users(where: {id: {_eq: 2}}) { affected_rows returning { name } } }"#,
+    )
+    .await;
+    assert_eq!(
+        v["delete_users"],
+        json!({"affected_rows": 0, "returning": []})
+    );
     // A row something still points at cannot go: the database says so, and
     // the plan's transaction takes the refusal back to nothing.
     let err = e
@@ -266,27 +285,74 @@ async fn delete_returns_what_the_rows_were() {
         .unwrap_err();
     assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
     assert_eq!(count(&e, "posts").await, 1);
+    assert_eq!(count(&e, "users").await, 1);
+}
+
+#[tokio::test]
+async fn a_conflict_that_inserts_nothing_inserts_no_children_either() {
+    let e = engine().await;
+    // Top level: DO NOTHING is DO NOTHING — no row, no count, no child.
     let v = q(
         &e,
-        r#"mutation { delete_users_by_pk(id: 2) { name active first: meta(path: "tags.0") } }"#,
+        r#"mutation { insert_users(objects: [{name: "Ann", posts: {data: [{title: "orphan"}]}}], on_conflict: {constraint: sqlite_autoindex_users_1, update_columns: []}) { affected_rows returning { id } } }"#,
     )
     .await;
     assert_eq!(
-        v["delete_users_by_pk"],
-        json!({"name": "bob", "active": false, "first": null})
+        v["insert_users"],
+        json!({"affected_rows": 0, "returning": []})
     );
-    let v = q(&e, r#"mutation { delete_users_by_pk(id: 2) { name } }"#).await;
-    assert_eq!(v["delete_users_by_pk"], Value::Null);
-    // A relation of a row that is gone cannot be read.
+    assert_eq!(count(&e, "posts").await, 3);
+    // An object relation whose upsert WHERE keeps the existing row out:
+    // no key to point at, so the pointing row is not written.
+    let v = q(
+        &e,
+        r#"mutation { insert_posts_one(object: {title: "t", user: {data: {name: "bob"}, on_conflict: {constraint: sqlite_autoindex_users_1, update_columns: [active], where: {active: {_eq: true}}}}}) { id } }"#,
+    )
+    .await;
+    assert_eq!(v["insert_posts_one"], Value::Null);
+    assert_eq!(count(&e, "posts").await, 3);
+    // A row of defaults cannot carry on_conflict on SQLite. Only the builder
+    // can ask for one; the lowering refuses an empty object outright.
     let err = e
-        .query(
-            r#"mutation { delete_users(where: {id: {_eq: 1}}) { returning { posts { title } } } }"#,
-            None,
+        .run(
+            Mutation::insert("users", vec![Default::default()]).on_conflict(
+                vision_graphql::ast::OnConflict {
+                    constraint: "users_pkey".into(),
+                    update_columns: Vec::new(),
+                    where_: None,
+                },
+            ),
         )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
-    assert_eq!(count(&e, "users").await, 1);
+}
+
+#[tokio::test]
+async fn a_plan_inside_the_engines_transaction_is_a_savepoint() {
+    let e = engine().await;
+    // The closure swallows the failure and commits: the failed plan's own
+    // writes must not be in what commits, while the closure's other work is.
+    let n = e
+        .transaction(async |tx| {
+            tx.query(r#"mutation { insert_users_one(object: {name: "Kept"}) { id } }"#, None)
+                .await?;
+            let err = tx
+                .query(
+                    r#"mutation { insert_users(objects: [{name: "Gone", posts: {data: [{title: "ok"}]}}, {name: "Ann"}]) { affected_rows } }"#,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("UNIQUE"), "{err}");
+            let v = tx.query("{ users_aggregate { aggregate { count } } }", None).await?;
+            Ok(v["users_aggregate"]["aggregate"]["count"].as_i64().unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(count(&e, "users").await, 3);
+    assert_eq!(count(&e, "posts").await, 3);
 }
 
 #[tokio::test]
@@ -357,6 +423,11 @@ async fn scope_guards_every_write() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("scope check violation"), "{err}");
+    assert!(
+        matches!(&err, Error::ScopeViolation { table, rows: 1, .. } if table == "posts"),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), vision_graphql::ErrorCode::ScopeDenied);
     assert_eq!(count(&e, "posts").await, 4);
     // A nested child out of scope fails the whole thing.
     let err = scoped

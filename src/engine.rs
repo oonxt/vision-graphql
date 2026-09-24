@@ -83,9 +83,10 @@ pub(crate) fn prepare_symbolic(
 trait Run<DB: Backend>: Send {
     fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send;
 
-    /// Run a [`MutationPlan`]: several statements, atomically. The pool and a
-    /// caller's target open a transaction for it; a transaction's connection
-    /// is already in one.
+    /// Run a [`MutationPlan`]: several statements, atomically, on a
+    /// connection acquired from the target. The backend opens a transaction
+    /// for them — a savepoint, when the connection is already in one — so a
+    /// failure part-way undoes the plan and nothing else.
     fn run_plan(
         self,
         plan: &MutationPlan,
@@ -125,10 +126,8 @@ impl<DB: Backend> Run<DB> for OnPool<'_, DB> {
 
     async fn run_plan(self, plan: &MutationPlan, inputs: &Inputs<'_>) -> Result<Value> {
         verify_pool_once::<DB>(self.pool, self.verified).await?;
-        let mut tx = self.pool.begin().await?;
-        let out = DB::execute_plan(&mut tx, plan, inputs).await?;
-        tx.commit().await?;
-        Ok(out)
+        let mut conn = self.pool.acquire().await?;
+        DB::execute_plan(&mut conn, plan, inputs).await
     }
 
     fn name(&self) -> &'static str {
@@ -141,8 +140,9 @@ impl<DB: Backend> Run<DB> for &mut DB::Connection {
         DB::execute_conn(self, sql, binds)
     }
 
-    /// The transaction's connection: the plan joins the transaction the
-    /// client holds, and rolls back with it.
+    /// The transaction's connection: the plan runs as a savepoint in the
+    /// transaction the client holds — undone on its own failure, and with
+    /// the transaction if that rolls back.
     fn run_plan(
         self,
         plan: &MutationPlan,
@@ -179,10 +179,8 @@ impl<'c, DB: Backend, A: sqlx::Acquire<'c, Database = DB> + Send> Run<DB> for Ex
     }
 
     async fn run_plan(self, plan: &MutationPlan, inputs: &Inputs<'_>) -> Result<Value> {
-        let mut tx = self.0.begin().await?;
-        let out = DB::execute_plan(&mut tx, plan, inputs).await?;
-        tx.commit().await?;
-        Ok(out)
+        let mut conn = self.0.acquire().await?;
+        DB::execute_plan(&mut conn, plan, inputs).await
     }
 
     fn name(&self) -> &'static str {

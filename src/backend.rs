@@ -44,10 +44,12 @@ pub trait Backend: sqlx::Database + sealed::Sealed {
         binds: &[Bind],
     ) -> impl Future<Output = Result<Value>> + Send;
 
-    /// Run a [`MutationPlan`](crate::plan::MutationPlan) on a connection that
-    /// is inside a transaction, and assemble its response. Only a dialect
-    /// whose mutations are plans ever produces one; the others never see
-    /// this called.
+    /// Run a [`MutationPlan`](crate::plan::MutationPlan) on a connection and
+    /// assemble its response. Atomic: the backend opens a transaction on the
+    /// connection — a savepoint, when it is already in one — and closes it,
+    /// so a failure part-way undoes the plan's statements and nothing else.
+    /// Only a dialect whose mutations are plans ever produces one; the
+    /// others never see this called.
     fn execute_plan(
         conn: &mut Self::Connection,
         plan: &crate::plan::MutationPlan,
