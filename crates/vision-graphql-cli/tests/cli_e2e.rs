@@ -681,3 +681,185 @@ async fn diff_reports_columns_with_no_type_mapping() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("users.tags"), "{text}");
 }
+
+/// A seeded SQLite file in a directory of its own, removed when dropped —
+/// the same discipline as the PostgreSQL helper's `TestDb`, for the same
+/// reason: a run must not leave what it created for the next one.
+struct SqliteFile {
+    dir: std::path::PathBuf,
+    url: String,
+}
+
+impl Drop for SqliteFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn boot_sqlite(name: &str) -> SqliteFile {
+    let dir = std::env::temp_dir().join(format!("vg-cli-sqlite-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("app.db");
+    let url = format!("sqlite://{}", path.display());
+    let opts = vision_graphql::sqlite::connect_options(&url)
+        .unwrap()
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, secret TEXT, price NUMERIC);
+        CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id), views INT NOT NULL DEFAULT 0);
+        CREATE TABLE counters (id INTEGER PRIMARY KEY, n INT) STRICT;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    SqliteFile { dir, url }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_generate_diff_and_sdl() {
+    let db = boot_sqlite("gen").await;
+    let url = db.url.as_str();
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+
+    let out = Command::new(bin)
+        .args(["generate", "--url", url])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let toml = String::from_utf8(out.stdout).unwrap();
+    assert!(toml.contains("# ── main.users ─"), "{toml}");
+    assert!(toml.contains("# ── main.posts ─"), "{toml}");
+    // Columns are labelled with the scalar the engine publishes, not with a
+    // PostgreSQL type name SQLite never had.
+    assert!(toml.contains("id (bigint, PK)"), "{toml}");
+    assert!(!toml.contains("int8"), "{toml}");
+
+    let out = Command::new(bin)
+        .args(["sdl", "--url", url, "--output", "-"])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sdl = String::from_utf8(out.stdout).unwrap();
+    assert!(sdl.contains("insert_users"), "{sdl}");
+    assert!(sdl.contains("user_id: bigint!"), "{sdl}");
+    assert!(!sdl.contains("stddev"), "{sdl}");
+
+    let overlay = write_temp_toml(
+        "sqlite_clean.toml",
+        r#"
+[tables.users]
+hide_columns = ["secret"]
+"#,
+    );
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            url,
+            "--config",
+            overlay.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // NUMERIC has no mapping and is left out — said so, not hidden, and not
+    // counted as drift.
+    assert_eq!(report["skipped_columns"][0]["column"], "price");
+    // Non-STRICT tables are in the report, where filters and --format reach
+    // them; the STRICT one is not.
+    let loose: Vec<&str> = report["table_warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["table"].as_str().unwrap())
+        .collect();
+    assert_eq!(loose, ["posts", "users"]);
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            url,
+            "--config",
+            overlay.to_str().unwrap(),
+            "--format",
+            "json",
+            "--ignore-tables",
+            "posts",
+        ])
+        .output()
+        .expect("run cli");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["table_warnings"].as_array().unwrap().len(), 1);
+
+    // A repoint to a schema SQLite does not have is drift, not "not checked".
+    let overlay = write_temp_toml(
+        "sqlite_repoint.toml",
+        r#"
+[tables.users]
+schema = "audit"
+"#,
+    );
+    let out = Command::new(bin)
+        .args(["diff", "--url", url, "--config", overlay.to_str().unwrap()])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("SQLite has one schema"), "{text}");
+
+    // --schema is PostgreSQL's; on SQLite any value is refused, `public` too.
+    for schema in ["audit", "public"] {
+        let out = Command::new(bin)
+            .args(["generate", "--url", url, "--schema", schema])
+            .output()
+            .expect("run cli");
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--schema does not apply to SQLite"));
+    }
+
+    // A path that does not exist is an error naming the database, not an
+    // empty schema — and nothing gets created.
+    let missing = db.dir.join("typo.db");
+    let out = Command::new(bin)
+        .args([
+            "generate",
+            "--url",
+            &format!("sqlite://{}?mode=rwc", missing.display()),
+        ])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("introspect failed against"));
+    assert!(!missing.exists());
+    let out = Command::new(bin)
+        .args(["generate", "--url", "sqlite::memory:"])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("in-memory"));
+}

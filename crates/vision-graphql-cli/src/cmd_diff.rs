@@ -2,12 +2,9 @@
 
 use anyhow::{Context, Result};
 use vision_graphql::schema::config::parse;
-use vision_graphql::schema::introspect::introspect_schemas;
 
-use crate::analyze::{find_drift, relation_warnings};
-use crate::cmd_generate;
+use crate::analyze::{find_drift, schema_warnings};
 use crate::filter::TableFilter;
-use crate::render::redact_url;
 use crate::report::{self, Format};
 use crate::DriftDetected;
 
@@ -15,7 +12,7 @@ pub struct Args {
     pub url: String,
     pub config: std::path::PathBuf,
     pub format: Format,
-    pub schemas: Vec<String>,
+    pub schemas: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
 }
@@ -25,15 +22,14 @@ pub async fn run(args: Args) -> Result<()> {
         .with_context(|| format!("reading {}", args.config.display()))?;
     let cfg = parse(&text).with_context(|| format!("parsing {}", args.config.display()))?;
 
-    let pool = cmd_generate::build_pool_pub(&args.url)?;
-    let schemas: Vec<&str> = args.schemas.iter().map(String::as_str).collect();
-    let db = introspect_schemas(&pool, &schemas)
-        .await
-        .with_context(|| format!("introspect failed against {}", redact_url(&args.url)))?;
+    let source = crate::db::connect(&args.url)?;
+    let found = source.introspect(args.schemas.as_deref()).await?;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
-    let mut report = find_drift(&cfg, &db, &filter);
-    report.relation_warnings = relation_warnings(db, &cfg, &filter);
+    let mut report = find_drift(&cfg, &found.db, found.dialect, &filter);
+    let warnings = schema_warnings(found.into_builder(), &cfg, &filter);
+    report.relation_warnings = warnings.relations;
+    report.table_warnings = warnings.tables;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

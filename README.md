@@ -158,7 +158,7 @@ anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | `_ilike` / `_nilike` | `lower(x) LIKE lower(y)`: ASCII case folding, where PostgreSQL folds Unicode. |
 | Booleans, JSON columns | Come back as JSON booleans and JSON values. (SQLite holds `0`/`1` and text; the renderer converts at the point the value enters `json_object`.) |
 | Column types | Read from the declared type the way SQLite's affinity rules do: every integer is `bigint` (SQLite integers are 64-bit whatever the declaration), `BOOLEAN` → `Boolean`, `REAL` / `FLOAT` / `DOUBLE` → `Float`, `TEXT` / `CHAR` / `CLOB` → `String`, `JSON` / `JSONB`, `DATE` / `TIME` / `DATETIME` / `TIMESTAMP` and `UUID` as text-backed scalars compared as text — store ISO 8601 or the ordering is not chronological. |
-| `NUMERIC` / `DECIMAL`, `BLOB`, no declared type | Left out of the schema and recorded as skipped columns (`schema::introspect_sqlite::introspect` returns them; the `vision-gql` CLI is PostgreSQL-only for now): SQLite holds a `NUMERIC` as a double, and a sum that is wrong past the fifteenth digit is the wrong kind of wrong. Declare `REAL` to publish a float knowingly. |
+| `NUMERIC` / `DECIMAL`, `BLOB`, no declared type | Left out of the schema and recorded as skipped columns (`vision-gql diff` reports them, `schema::introspect_sqlite::introspect` returns them): SQLite holds a `NUMERIC` as a double, and a sum that is wrong past the fifteenth digit is the wrong kind of wrong. Declare `REAL` to publish a float knowingly. |
 | Tables that are not `STRICT` | Introspected, with a `SchemaWarning::LooselyTypedTable`: the database does not enforce the declared types, so a `'abc'` in an `INTEGER` column reaches the client as a string. A `BOOLEAN` or `JSON` column holding something else is an error (`SQLite reports malformed JSON: …`), not a null. |
 | JSON path components | A component that is all digits indexes an array; PostgreSQL's `#>` would also accept it as an object key. |
 | Foreign keys | Enforcement is per connection (`PRAGMA foreign_keys`); `connect_options` turns it on and introspection refuses a pool where it is off. Relations are derived from the declarations either way. |
@@ -168,7 +168,7 @@ anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | `on_conflict` | `constraint` names a unique constraint as on PostgreSQL — SQLite's auto-names (`sqlite_autoindex_t_1`), a `CREATE UNIQUE INDEX` name, or `<table>_pkey` for the primary key — and is resolved to its columns, which is what SQLite's `ON CONFLICT (…)` takes. `update_columns`, `where` and `DO NOTHING` as on PostgreSQL; a nested `DO NOTHING` is a no-op update so the row's key is still returned for its dependants. |
 | `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
 | `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
-| `vision-gql` CLI | PostgreSQL-only for now. |
+| `vision-gql` CLI | `generate`, `diff` and `sdl` take a `sqlite://` URL. `diff` reports skipped columns (`NUMERIC`, `BLOB`, untyped) as on PostgreSQL; a table that is not `STRICT` is warned about. |
 | Version | 3.38 or later (`->`, built-in JSON functions); checked at introspection and before the engine's first statement. sqlx bundles 3.51. |
 
 ## JSON/JSONB path reads
@@ -438,7 +438,12 @@ cargo install vision-graphql-cli
 vision-gql generate --url postgres://localhost/myapp > schema.toml
 vision-gql diff     --url postgres://localhost/myapp --config schema.toml
 vision-gql validate schema.toml
+vision-gql sdl      --url sqlite://app.db --output schema.graphql
 ```
+
+The URL picks the database: `postgres://…`, or `sqlite://path/to/file.db`
+(the file must exist; `--schema` is PostgreSQL's and is refused for SQLite,
+which has one schema).
 
 `generate` produces a fully-commented starter file; uncomment any stanza to
 override defaults from introspection. `diff` checks the overlay's references

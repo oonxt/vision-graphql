@@ -76,6 +76,11 @@ fn write_drift<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()
                     "  - {}: schema = \"{}\" has no table \"{}\"",
                     r.table, r.schema, r.table
                 )?,
+                RepointProblem::SchemaMissing => writeln!(
+                    out,
+                    "  - {}: schema = \"{}\" — SQLite has one schema, main; there is no \"{}\" to point at",
+                    r.table, r.schema, r.schema
+                )?,
                 RepointProblem::ColumnsMissing => writeln!(
                     out,
                     "  - {}: \"{}\".\"{}\" lacks column(s) {}",
@@ -95,11 +100,14 @@ fn write_drift<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()
 /// the overlay matches the database — but printed on both paths because this
 /// is the only report that can see it before the data goes crooked.
 fn write_warnings<W: Write>(report: &DiffReport, out: &mut W) -> std::io::Result<()> {
-    if report.relation_warnings.is_empty() {
+    if report.relation_warnings.is_empty() && report.table_warnings.is_empty() {
         return Ok(());
     }
     writeln!(out, "warnings (not drift, not counted):")?;
     for w in &report.relation_warnings {
+        writeln!(out, "  - {}", w.message)?;
+    }
+    for w in &report.table_warnings {
         writeln!(out, "  - {}", w.message)?;
     }
     Ok(())
@@ -170,6 +178,7 @@ mod tests {
         DiffReport {
             skipped_columns: Vec::new(),
             relation_warnings: Vec::new(),
+            table_warnings: Vec::new(),
             missing_tables: vec!["ghosts".into()],
             missing_columns: vec![MissingColumn {
                 table: "users".into(),

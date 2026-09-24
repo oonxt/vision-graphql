@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use vision_graphql::schema::config::ConfigOverlay;
 use vision_graphql::schema::introspect::{IntrospectedDb, IntrospectedTable};
+use vision_graphql::Dialect;
 
 #[derive(Debug, Serialize, Default)]
 pub struct DiffReport {
@@ -36,6 +37,25 @@ pub struct DiffReport {
     /// the answer validates, and the wrong row is only noticed downstream — so
     /// it is reported here, structured, for tooling to pass along.
     pub relation_warnings: Vec<RelationWarning>,
+    /// Tables the engine will serve with types it cannot vouch for — today,
+    /// SQLite tables that are not `STRICT`, whose declared column types the
+    /// database does not enforce. Not drift, not counted; reported, and
+    /// filtered by `--include`/`--ignore` like everything else here.
+    pub table_warnings: Vec<TableWarning>,
+}
+
+/// See [`DiffReport::table_warnings`].
+#[derive(Debug, Serialize)]
+pub struct TableWarning {
+    pub table: String,
+    pub message: String,
+}
+
+/// Both kinds of [`vision_graphql::SchemaWarning`] the report carries.
+#[derive(Debug, Default)]
+pub struct Warnings {
+    pub relations: Vec<RelationWarning>,
+    pub tables: Vec<TableWarning>,
 }
 
 /// See [`DiffReport::relation_warnings`]. A flattened
@@ -73,6 +93,9 @@ pub struct BadRepoint {
     pub missing_columns: Vec<String>,
 }
 
+// The variant names are the JSON wire form (`table_missing`, …), which a
+// consumer may branch on; they stay as they are.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepointProblem {
@@ -80,6 +103,8 @@ pub enum RepointProblem {
     TableMissing,
     /// The target exists but is missing columns the exposed table declares.
     ColumnsMissing,
+    /// The database has no such schema to point at: SQLite has one, `main`.
+    SchemaMissing,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,13 +164,13 @@ impl DiffReport {
 ///
 /// Consumes the [`IntrospectedDb`] (the merge does); call after [`find_drift`],
 /// which only borrows it.
-pub fn relation_warnings(
-    db: IntrospectedDb,
+pub fn schema_warnings(
+    builder: vision_graphql::schema::SchemaBuilder,
     cfg: &ConfigOverlay,
     filter: &TableFilter,
-) -> Vec<RelationWarning> {
+) -> Warnings {
     use vision_graphql::schema::merge;
-    let schema = merge::apply_config(merge::build_from_introspection(db), cfg).build();
+    let schema = merge::apply_config(builder, cfg).build();
     // `--include`/`--ignore` are matched against overlay keys — pre-expose_as
     // names — everywhere else in this report, and a warning carries the *final*
     // exposed name. Map it back before filtering, or a renamed table's warning
@@ -156,39 +181,41 @@ pub fn relation_warnings(
         .iter()
         .filter_map(|(k, o)| o.expose_as.as_deref().map(|new| (new, k.as_str())))
         .collect();
-    schema
-        .warnings()
-        .into_iter()
-        .filter_map(|w| {
-            let message = w.to_string();
-            match w {
-                vision_graphql::SchemaWarning::NonDeterministicObjectRelation {
-                    table,
-                    relation,
-                    target,
-                    remote_columns,
-                } => {
-                    let filter_name = source_key.get(table.as_str()).copied();
-                    filter
-                        .keep(filter_name.unwrap_or(&table))
-                        .then_some(RelationWarning {
-                            table,
-                            relation,
-                            target,
-                            remote_columns,
-                            message,
-                        })
-                }
-                // A future warning variant still reaches serving deployments
-                // via the Engine constructor's log; this report only carries
-                // the ones it has fields for.
-                _ => None,
+    let keep = |table: &str| filter.keep(source_key.get(table).copied().unwrap_or(table));
+    let mut out = Warnings::default();
+    for w in schema.warnings() {
+        let message = w.to_string();
+        match w {
+            vision_graphql::SchemaWarning::NonDeterministicObjectRelation {
+                table,
+                relation,
+                target,
+                remote_columns,
+            } if keep(&table) => out.relations.push(RelationWarning {
+                table,
+                relation,
+                target,
+                remote_columns,
+                message,
+            }),
+            vision_graphql::SchemaWarning::LooselyTypedTable { table } if keep(&table) => {
+                out.tables.push(TableWarning { table, message })
             }
-        })
-        .collect()
+            // A future warning variant still reaches serving deployments via
+            // the Engine constructor's log; this report carries the ones it
+            // has fields for.
+            _ => {}
+        }
+    }
+    out
 }
 
-pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter) -> DiffReport {
+pub fn find_drift(
+    cfg: &ConfigOverlay,
+    db: &IntrospectedDb,
+    dialect: Dialect,
+    filter: &TableFilter,
+) -> DiffReport {
     // Index tables under the names the schema actually exposes them as — which
     // is what an overlay key refers to. With one schema that is just the table
     // name; with several, later schemas are prefixed.
@@ -275,7 +302,18 @@ pub fn find_drift(cfg: &ConfigOverlay, db: &IntrospectedDb, filter: &TableFilter
                 || (db.schemas.is_empty()
                     && db.tables.keys().any(|(s, _)| s == target_schema));
 
-            if !introspected {
+            if dialect == Dialect::Sqlite && target_schema != "main" {
+                // A SQLite file has exactly one schema, so there is nothing
+                // that could not be looked at: the repoint names a schema
+                // that does not exist, and the engine would render a table
+                // SQLite has never heard of.
+                report.bad_repoints.push(BadRepoint {
+                    table: key.clone(),
+                    schema: target_schema.clone(),
+                    problem: RepointProblem::SchemaMissing,
+                    missing_columns: Vec::new(),
+                });
+            } else if !introspected {
                 report.unverified_repoints.push(UnverifiedRepoint {
                     table: key.clone(),
                     schema: target_schema.clone(),
@@ -451,7 +489,12 @@ mod tests {
     #[test]
     fn repoint_to_matching_table_is_clean() {
         let db = db_with_archive(vec![col("id"), col("email")]);
-        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        let r = find_drift(
+            &repoint_cfg("archive"),
+            &db,
+            Dialect::Postgres,
+            &no_filter(),
+        );
         assert!(r.is_clean(), "expected clean, got {r:?}");
     }
 
@@ -460,7 +503,12 @@ mod tests {
     #[test]
     fn repoint_to_table_missing_columns_is_reported() {
         let db = db_with_archive(vec![col("id")]);
-        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        let r = find_drift(
+            &repoint_cfg("archive"),
+            &db,
+            Dialect::Postgres,
+            &no_filter(),
+        );
         assert_eq!(r.bad_repoints.len(), 1, "got {r:?}");
         assert_eq!(r.bad_repoints[0].problem, RepointProblem::ColumnsMissing);
         assert_eq!(r.bad_repoints[0].missing_columns, vec!["email".to_string()]);
@@ -472,7 +520,12 @@ mod tests {
     fn repoint_to_absent_table_is_reported() {
         let mut db = db_users_only();
         db.schemas = vec!["public".into(), "archive".into()];
-        let r = find_drift(&repoint_cfg("archive"), &db, &no_filter());
+        let r = find_drift(
+            &repoint_cfg("archive"),
+            &db,
+            Dialect::Postgres,
+            &no_filter(),
+        );
         assert_eq!(r.bad_repoints.len(), 1, "got {r:?}");
         assert_eq!(r.bad_repoints[0].problem, RepointProblem::TableMissing);
         assert!(!r.is_clean());
@@ -484,7 +537,12 @@ mod tests {
     fn repoint_to_uintrospected_schema_is_unverified_not_drift() {
         let mut db = db_users_only();
         db.schemas = vec!["public".into()];
-        let r = find_drift(&repoint_cfg("cold_storage"), &db, &no_filter());
+        let r = find_drift(
+            &repoint_cfg("cold_storage"),
+            &db,
+            Dialect::Postgres,
+            &no_filter(),
+        );
 
         assert!(r.bad_repoints.is_empty(), "got {r:?}");
         assert_eq!(r.unverified_repoints.len(), 1);
@@ -496,7 +554,12 @@ mod tests {
     #[test]
     fn overlay_without_repoint_reports_nothing_new() {
         let db = db_with_archive(vec![col("id")]);
-        let r = find_drift(&ConfigOverlay::default(), &db, &no_filter());
+        let r = find_drift(
+            &ConfigOverlay::default(),
+            &db,
+            Dialect::Postgres,
+            &no_filter(),
+        );
         assert!(r.bad_repoints.is_empty());
         assert!(r.unverified_repoints.is_empty());
         assert!(r.is_clean());
@@ -515,7 +578,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let r = find_drift(&cfg, &db, &no_filter());
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &no_filter());
         assert!(r.is_clean(), "expected clean, got {:?}", r);
     }
 
@@ -524,7 +587,7 @@ mod tests {
         let db = db_users_only();
         let mut cfg = ConfigOverlay::default();
         cfg.tables.insert("ghosts".into(), TableOverlay::default());
-        let r = find_drift(&cfg, &db, &no_filter());
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &no_filter());
         assert_eq!(r.missing_tables, vec!["ghosts".to_string()]);
     }
 
@@ -541,7 +604,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let r = find_drift(&cfg, &db, &no_filter());
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &no_filter());
         assert_eq!(r.missing_columns.len(), 1);
         assert_eq!(r.missing_columns[0].column, "password_hash");
         assert!(matches!(
@@ -568,7 +631,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let r = find_drift(&cfg, &db, &no_filter());
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &no_filter());
         assert_eq!(r.missing_relation_targets.len(), 1);
         assert_eq!(r.missing_relation_targets[0].target, "ghost_table");
     }
@@ -601,7 +664,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let r = find_drift(&cfg, &db, &no_filter());
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &no_filter());
         assert_eq!(r.expose_as_collisions.len(), 1);
         assert_eq!(r.expose_as_collisions[0].exposed_name, "profiles");
     }
@@ -664,7 +727,12 @@ mod tests {
     #[test]
     fn underdetermined_object_relation_is_warned() {
         let cfg = pathogen_cfg(vec![("serial".into(), "serial".into())]);
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &no_filter(),
+        )
+        .relations;
         assert_eq!(warnings.len(), 1, "got {warnings:?}");
         assert_eq!(warnings[0].table, "results");
         assert_eq!(warnings[0].relation, "pathogen");
@@ -678,7 +746,12 @@ mod tests {
             ("serial".into(), "serial".into()),
             ("type".into(), "type".into()),
         ]);
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &no_filter(),
+        )
+        .relations;
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
@@ -687,7 +760,12 @@ mod tests {
         let cfg = pathogen_cfg(vec![("serial".into(), "serial".into())]);
         let ignore = vec!["results".to_string()];
         let f = TableFilter::new(None, Some(&ignore)).unwrap();
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &f,
+        )
+        .relations;
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
@@ -702,13 +780,23 @@ mod tests {
 
         let include = vec!["results".to_string()];
         let f = TableFilter::new(Some(&include), None).unwrap();
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &f,
+        )
+        .relations;
         assert_eq!(warnings.len(), 1, "got {warnings:?}");
         assert_eq!(warnings[0].table, "lab_results");
 
         let ignore = vec!["results".to_string()];
         let f = TableFilter::new(None, Some(&ignore)).unwrap();
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &f);
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &f,
+        )
+        .relations;
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
@@ -718,9 +806,19 @@ mod tests {
     #[test]
     fn drifted_mapping_gets_no_extra_warning() {
         let cfg = pathogen_cfg(vec![("serial".into(), "serial_typo".into())]);
-        let r = find_drift(&cfg, &db_results_and_dict(), &no_filter());
+        let r = find_drift(
+            &cfg,
+            &db_results_and_dict(),
+            Dialect::Postgres,
+            &no_filter(),
+        );
         assert!(!r.is_clean(), "the typo must still be drift");
-        let warnings = relation_warnings(db_results_and_dict(), &cfg, &no_filter());
+        let warnings = schema_warnings(
+            vision_graphql::schema::merge::build_from_introspection(db_results_and_dict()),
+            &cfg,
+            &no_filter(),
+        )
+        .relations;
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
@@ -731,7 +829,7 @@ mod tests {
         cfg.tables.insert("ghosts".into(), TableOverlay::default());
         let ignore = vec!["ghosts".to_string()];
         let f = TableFilter::new(None, Some(&ignore)).unwrap();
-        let r = find_drift(&cfg, &db, &f);
+        let r = find_drift(&cfg, &db, Dialect::Postgres, &f);
         assert!(r.is_clean(), "ignored entry should not surface");
     }
 }

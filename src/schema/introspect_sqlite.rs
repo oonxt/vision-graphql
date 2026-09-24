@@ -48,6 +48,19 @@ pub struct SqliteIntrospection {
     pub loosely_typed: Vec<String>,
 }
 
+impl SqliteIntrospection {
+    /// The schema builder this describes: the tables, with the dialect set
+    /// and the non-`STRICT` ones marked. What
+    /// [`Schema::introspect_sqlite`](crate::Schema::introspect_sqlite)
+    /// returns, and what a tool that wants the [`IntrospectedDb`] as well
+    /// calls after it has read it.
+    pub fn into_builder(self) -> crate::schema::SchemaBuilder {
+        crate::schema::merge::build_from_introspection(self.db)
+            .dialect(crate::dialect::Dialect::Sqlite)
+            .loosely_typed(&self.loosely_typed)
+    }
+}
+
 /// Map a declared column type to the engine's, or `None` for one the engine
 /// leaves out. See the module docs for the rules.
 pub fn declared_type_to_column_type(declared: &str) -> Option<ColumnType> {
