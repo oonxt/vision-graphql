@@ -55,6 +55,7 @@
 //!   ([`parse_cache`]).
 
 pub mod ast;
+pub mod backend;
 pub mod builder;
 pub mod compiled;
 pub mod engine;
@@ -76,6 +77,7 @@ pub mod type_names;
 pub mod type_system;
 pub mod types;
 
+pub use backend::Backend;
 pub use builder::{
     AggregateBuilder, ByPkBuilder, DeleteBuilder, DeleteByPkBuilder, InsertBuilder, IntoOperation,
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,

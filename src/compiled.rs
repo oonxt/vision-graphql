@@ -117,10 +117,13 @@
 //! [`ScopedTxClient`](crate::ScopedTxClient) does not run compiled
 //! statements; see its docs for why.
 
+use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::parser::VariableContract;
 use crate::types::{json_equiv, BindSpec};
 use serde_json::{Map, Value};
+use sqlx::Postgres;
+use std::marker::PhantomData;
 
 /// A rendered statement plus the recipe for its parameters.
 ///
@@ -130,8 +133,7 @@ use serde_json::{Map, Value};
 /// their values — a statement each, lowered and rendered exactly as a
 /// single-shape operation is — and picks one per request by the values the
 /// request supplies. See [`shapes`](Self::shapes).
-#[derive(Debug, Clone)]
-pub struct CompiledQuery {
+pub struct CompiledQuery<DB: Backend = Postgres> {
     /// One per combination of `@choices` values, in the order the combinations
     /// enumerate (first declared variable slowest). Exactly one, pinned to
     /// nothing, when the operation declares no `@choices`.
@@ -155,6 +157,38 @@ pub struct CompiledQuery {
     /// and the unscoped one interchangeably. Executing a scoped statement
     /// without a principal, or an unscoped one with, is refused.
     pub(crate) scoped: bool,
+    /// The backend whose dialect the shapes are rendered in. A statement
+    /// compiled by an engine on one backend is refused, at the type level, by
+    /// an engine on another — the SQL text would not be that backend's.
+    pub(crate) backend: PhantomData<fn() -> DB>,
+}
+
+// By hand rather than derived: a derive would demand `DB: Debug + Clone` of a
+// marker type that is never instantiated.
+impl<DB: Backend> std::fmt::Debug for CompiledQuery<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledQuery")
+            .field("shapes", &self.shapes)
+            .field("contract", &self.contract)
+            .field("root_alias", &self.root_alias)
+            .field("defaults", &self.defaults)
+            .field("scoped", &self.scoped)
+            .field("backend", &std::any::type_name::<DB>())
+            .finish()
+    }
+}
+
+impl<DB: Backend> Clone for CompiledQuery<DB> {
+    fn clone(&self) -> Self {
+        Self {
+            shapes: self.shapes.clone(),
+            contract: self.contract.clone(),
+            root_alias: self.root_alias.clone(),
+            defaults: self.defaults.clone(),
+            scoped: self.scoped,
+            backend: PhantomData,
+        }
+    }
 }
 
 /// One statement of a [`CompiledQuery`]: the SQL for one combination of
@@ -167,7 +201,7 @@ pub(crate) struct Shape {
     pub(crate) specs: Vec<BindSpec>,
 }
 
-impl CompiledQuery {
+impl<DB: Backend> CompiledQuery<DB> {
     /// The rendered SQL. Stable for the life of this value — that is the point
     /// of compiling — so it is what to `EXPLAIN`, log, or diff in review.
     ///
@@ -295,13 +329,13 @@ impl CompiledQuery {
 
 /// Lower, scope, bound and render `doc` once per combination of its
 /// `@choices` values. What [`crate::Engine::compile`] does, minus the pool.
-pub(crate) fn compile(
+pub(crate) fn compile<DB: Backend>(
     doc: &async_graphql_parser::types::ExecutableDocument,
     operation_name: Option<&str>,
     policy: Option<&crate::policy::ScopePolicy>,
     schema: &crate::schema::Schema,
     limits: &crate::limits::ExecutionLimits,
-) -> Result<CompiledQuery> {
+) -> Result<CompiledQuery<DB>> {
     let contract = crate::parser::variable_contract(doc, operation_name)?;
     let combinations = choice_combinations(&contract)?;
     let symbolic_scope = policy.map(|p| p.symbolic());
@@ -328,6 +362,7 @@ pub(crate) fn compile(
         shapes.push(Shape { pinned, sql, specs });
     }
     Ok(CompiledQuery {
+        backend: PhantomData,
         shapes,
         contract,
         root_alias,
@@ -445,7 +480,7 @@ mod tests {
     }
 
     /// The engine's compile, minus the pool: every shape, ready to pick from.
-    fn compile_doc(source: &str) -> crate::error::Result<super::CompiledQuery> {
+    fn compile_doc(source: &str) -> crate::error::Result<super::CompiledQuery<sqlx::Postgres>> {
         let schema = schema();
         let doc = parse_document(source)?;
         super::compile(
@@ -1426,7 +1461,9 @@ mod tests {
             root_alias: None,
             defaults: Default::default(),
             scoped: true,
+            backend: std::marker::PhantomData,
         };
+        let compiled: super::CompiledQuery<sqlx::Postgres> = compiled;
         assert_eq!(compiled.variables(), vec!["t".to_string()]);
     }
 

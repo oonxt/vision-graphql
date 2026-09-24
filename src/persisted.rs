@@ -37,19 +37,45 @@
 //! and a registry keyed on names is easier to read in a log, and neither belongs
 //! to the engine.
 
+use crate::backend::Backend;
 use crate::compiled::CompiledQuery;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::policy::ScopePolicy;
+use sqlx::Postgres;
 use std::collections::HashMap;
 
 /// Compiled queries, addressed by key.
-#[derive(Debug, Default, Clone)]
-pub struct QueryRegistry {
-    queries: HashMap<String, CompiledQuery>,
+pub struct QueryRegistry<DB: Backend = Postgres> {
+    queries: HashMap<String, CompiledQuery<DB>>,
 }
 
-impl QueryRegistry {
+// By hand, as for `CompiledQuery`: the derives would bound the marker type.
+impl<DB: Backend> std::fmt::Debug for QueryRegistry<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryRegistry")
+            .field("queries", &self.queries)
+            .finish()
+    }
+}
+
+impl<DB: Backend> Default for QueryRegistry<DB> {
+    fn default() -> Self {
+        Self {
+            queries: HashMap::new(),
+        }
+    }
+}
+
+impl<DB: Backend> Clone for QueryRegistry<DB> {
+    fn clone(&self) -> Self {
+        Self {
+            queries: self.queries.clone(),
+        }
+    }
+}
+
+impl<DB: Backend> QueryRegistry<DB> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -59,7 +85,7 @@ impl QueryRegistry {
     /// The naming is the point: a compile error reports a path within the
     /// document (`users.where.id`), which says nothing about *which* document
     /// when a hundred are being compiled at once.
-    pub fn compile_all<K, S, I>(engine: &Engine, entries: I) -> Result<Self>
+    pub fn compile_all<K, S, I>(engine: &Engine<DB>, entries: I) -> Result<Self>
     where
         K: Into<String>,
         S: AsRef<str>,
@@ -75,7 +101,7 @@ impl QueryRegistry {
     /// Same, under a scope policy: every query is compiled with the policy
     /// applied, and must then be run with a principal.
     pub fn compile_all_scoped<K, S, I>(
-        engine: &Engine,
+        engine: &Engine<DB>,
         entries: I,
         policy: &ScopePolicy,
     ) -> Result<Self>
@@ -98,7 +124,12 @@ impl QueryRegistry {
     /// came last and serve *that* under the key — the wrong query, silently, in
     /// the one structure whose entire purpose is to be certain which queries can
     /// run. Use [`QueryRegistry::replace`] where overwriting is meant.
-    pub fn insert(&mut self, engine: &Engine, key: impl Into<String>, source: &str) -> Result<()> {
+    pub fn insert(
+        &mut self,
+        engine: &Engine<DB>,
+        key: impl Into<String>,
+        source: &str,
+    ) -> Result<()> {
         let key = key.into();
         self.vacant(&key)?;
         let compiled = engine.compile(source).map_err(|e| label(&key, e))?;
@@ -118,7 +149,7 @@ impl QueryRegistry {
     /// [`QueryRegistry::insert`] under a scope policy.
     pub fn insert_scoped(
         &mut self,
-        engine: &Engine,
+        engine: &Engine<DB>,
         key: impl Into<String>,
         source: &str,
         policy: &ScopePolicy,
@@ -134,7 +165,7 @@ impl QueryRegistry {
 
     /// Store an already-compiled statement. Refuses a key already taken, for the
     /// reason [`QueryRegistry::insert`] gives.
-    pub fn add(&mut self, key: impl Into<String>, compiled: CompiledQuery) -> Result<()> {
+    pub fn add(&mut self, key: impl Into<String>, compiled: CompiledQuery<DB>) -> Result<()> {
         let key = key.into();
         self.vacant(&key)?;
         self.queries.insert(key, compiled);
@@ -144,11 +175,11 @@ impl QueryRegistry {
     /// Store under `key`, replacing whatever was there. For a caller that means
     /// to overwrite — a hot reload, a test — rather than one that collided by
     /// accident.
-    pub fn replace(&mut self, key: impl Into<String>, compiled: CompiledQuery) {
+    pub fn replace(&mut self, key: impl Into<String>, compiled: CompiledQuery<DB>) {
         self.queries.insert(key.into(), compiled);
     }
 
-    pub fn get(&self, key: &str) -> Option<&CompiledQuery> {
+    pub fn get(&self, key: &str) -> Option<&CompiledQuery<DB>> {
         self.queries.get(key)
     }
 
@@ -158,7 +189,7 @@ impl QueryRegistry {
     /// and the message deliberately does not list what *is* registered: the
     /// registry is an allowlist, and enumerating it to whoever asks defeats
     /// half of what it is for.
-    pub fn require(&self, key: &str) -> Result<&CompiledQuery> {
+    pub fn require(&self, key: &str) -> Result<&CompiledQuery<DB>> {
         self.queries.get(key).ok_or_else(|| Error::Validate {
             path: key.to_string(),
             message: "no query is registered under this key".into(),
