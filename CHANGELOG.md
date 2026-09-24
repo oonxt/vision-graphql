@@ -14,9 +14,12 @@ release commits; entries from 0.13.0 on are written as the work lands.
   not general enough", reported at the host's `spawn` rather than at the
   call. The twins now take a sealed `Target`, implemented for `&Pool`, and
   for `&mut` a connection, a pooled connection or a transaction of either
-  backend — the same set of arguments as before, with no lifetime in the
-  bound — and a compile-time test holds every twin to `Send` on both
-  backends, including inside a spawned task.
+  backend — the arguments a caller passes are the same as before, with no
+  lifetime in the bound — and a compile-time test holds every twin to `Send`
+  on every kind of target, on both backends, including inside a spawned
+  task. Code that is itself generic over the target, bounded
+  `A: sqlx::Acquire<'c, Database = DB>` to forward it to a twin, no longer
+  compiles: bound it `A: vision_graphql::Target<DB>` instead.
 
 ## 0.24.0 — 2026-09-24
 
