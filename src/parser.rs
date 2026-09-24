@@ -552,7 +552,7 @@ pub const CHOICES: &str = "choices";
 /// `@optional`: a null drops the comparison the variable is the operand of.
 pub const OPTIONAL: &str = "optional";
 /// The directives a variable definition may carry. Everything else is refused;
-/// see [`reject_directives`]. The type system publishes exactly this list.
+/// see `reject_directives`. The type system publishes exactly this list.
 pub const KNOWN_VARIABLE_DIRECTIVES: [&str; 2] = [CHOICES, OPTIONAL];
 
 /// The most shapes one compiled statement may hold — the product of every

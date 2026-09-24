@@ -72,10 +72,13 @@ its place when a reader would otherwise "fix" the thing it protects.
 3. **Gate before review**, all four, all clean:
    ```
    cargo fmt --all
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo nextest run --workspace --test-threads 4
-   cargo test --workspace --doc
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo nextest run --workspace --all-features --test-threads 4
+   cargo test --workspace --all-features --doc
    ```
+   `--all-features` is the `sqlite` backend: its suite runs in memory and
+   costs nothing, and a seam in `dialect.rs` that only one backend exercises
+   is exactly the kind that rots.
 4. **Review the branch, not each commit.** `/code-review <branch> high` at the
    end. The reviews that found the most here found it by seeing the whole
    surface at once: the worst bug was code from the first commit that only

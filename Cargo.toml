@@ -43,6 +43,12 @@ thiserror = "2"
 tracing = "0.1"
 toml = "1"
 
+[features]
+# PostgreSQL is not a feature: it is the engine's default type parameter, and
+# a build without it would need every default and every doc example gated.
+# SQLite is additive.
+sqlite = ["sqlx/sqlite"]
+
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 testcontainers = "0.27"

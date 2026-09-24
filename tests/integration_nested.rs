@@ -155,3 +155,25 @@ async fn where_relation_exists_filter() {
     assert_eq!(users.len(), 1);
     assert_eq!(users[0]["name"], json!("alice"));
 }
+
+#[tokio::test]
+async fn distinct_on_inside_a_relation_keeps_one_row_per_group() {
+    let (engine, _db) = setup().await;
+    // Every post of a user shares its user_id, so distinct_on it is "the
+    // first post by the order given" — one per user. Dropping the argument,
+    // as the relation subquery once did, hands alice both of hers.
+    let v = engine
+        .query(
+            "{ users(order_by: {id: asc}) { name posts(distinct_on: [user_id], order_by: [{user_id: asc}, {title: desc}]) { title } } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        v["users"],
+        json!([
+            {"name": "alice", "posts": [{"title": "a2"}]},
+            {"name": "bob", "posts": [{"title": "b1"}]}
+        ])
+    );
+}

@@ -224,6 +224,11 @@ fn label(key: &str, e: Error) -> Error {
             path: format!("{key}: {path}"),
             message,
         },
+        // Keeps its code: a persisted mutation on a backend that only reads is
+        // `UNSUPPORTED`, and a host that branches on that must still see it.
+        Error::Unsupported { message } => Error::Unsupported {
+            message: format!("persisted query '{key}': {message}"),
+        },
         other => Error::Schema(format!("persisted query '{key}': {other}")),
     }
 }

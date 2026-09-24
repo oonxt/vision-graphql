@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_object('users_by_pk', (SELECT json_object('__typename', r1."__typename", 'name', r1."name", 'active', CASE WHEN r1."active" IS NULL THEN NULL WHEN r1."active" = 1 THEN json('true') WHEN r1."active" = 0 THEN json('false') ELSE json('not a boolean') END) FROM (SELECT 'users' AS "__typename", t0."name" AS "name", t0."active" AS "active" FROM "main"."users" t0 WHERE t0."id" = ?1 LIMIT 1) r1)) AS result

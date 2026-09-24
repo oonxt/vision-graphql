@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_build_object('users', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."name" AS "name", (SELECT coalesce(json_agg(row_to_json(r3)), '[]'::json) FROM (SELECT DISTINCT ON (t2."user_id") t2."title" AS "title" FROM "main"."posts" t2 WHERE t2."user_id" = t0."id" AND t2."views" > $1::int8 ORDER BY t2."user_id" ASC, t2."views" DESC LIMIT 2) r3) AS "posts" FROM "main"."users" t0) r1)) AS result

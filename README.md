@@ -1,6 +1,6 @@
 # vision-graphql
 
-A Hasura-style GraphQL-to-SQL query engine for PostgreSQL in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via PostgreSQL's `json_agg`/`row_to_json` — no N+1.
+A Hasura-style GraphQL-to-SQL query engine for PostgreSQL — and, for reads, SQLite — in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via the database's JSON aggregation (`json_agg`/`row_to_json`, `json_group_array`/`json_object`) — no N+1. See [Backends](#backends).
 
 ## Quick start
 
@@ -110,6 +110,64 @@ and left, not forgotten.
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
 | Computed fields, subscriptions | Not planned. |
+| Mutations on SQLite | Refused (`UNSUPPORTED`) and not published; see [Backends](#backends). |
+
+## Backends
+
+`Engine<DB>` is generic over the database it runs on; the parameter is inferred
+from the pool and defaults to PostgreSQL, so `Engine::new(pg_pool, schema)` is
+what it always was. SQLite is behind the `sqlite` cargo feature.
+
+```toml
+vision-graphql = { version = "0.24", features = ["sqlite"] }
+```
+
+```rust
+# #[cfg(feature = "sqlite")]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use vision_graphql::{Engine, Schema};
+
+// The pragmas the engine's SQL relies on, on every connection of the pool.
+let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    .connect_with(vision_graphql::sqlite::connect_options("sqlite://app.db")?)
+    .await?;
+let schema = Schema::introspect_sqlite(&pool).await?.build();
+let engine = Engine::new(pool, schema); // Engine<sqlx::Sqlite>
+# Ok(()) }
+```
+
+A schema records which database it describes (`Schema::dialect`); an engine
+refuses one of the other kind at construction, because SQL rendered for the
+wrong dialect does not always fail — a `LIKE` without its escape clause or an
+`ORDER BY` with the other default null order runs, and answers wrongly.
+
+### SQLite
+
+Read-only for now: every query feature below is implemented against a real
+SQLite in `tests/sqlite_read.rs`, and what is not implemented is not published
+— a SQLite schema has no mutation root, its `__schema` lists no `stddev`, and
+a builder that reaches one anyway gets `Error::Unsupported` (`UNSUPPORTED`).
+
+| Area | On SQLite |
+|---|---|
+| Lists, `_by_pk`, nested relations, relation filters, `order_by` at every level, `limit` / `offset`, `distinct_on`, `_aggregate` with `count` / `sum` / `avg` / `min` / `max` and `nodes`, `__typename`, JSON path reads, variables, `@choices` / `@optional`, compiled statements, persisted queries, scoped execution, transactions and the `_on` twins | Implemented. |
+| `distinct_on` | Spelled as `row_number() OVER (PARTITION BY … ORDER BY …) = 1` over a derived table; same rows as PostgreSQL's `DISTINCT ON`. |
+| `order_by` without `nulls_first` / `nulls_last` | PostgreSQL's defaults (`asc` → nulls last, `desc` → nulls first), written out. SQLite's own default is the reverse. |
+| `_in` / `_nin` | One placeholder holding the list as JSON, read by `json_each`; a compiled statement's text is independent of the list's length, as on PostgreSQL. |
+| `_like` / `_nlike` | `LIKE … ESCAPE '\\'`. Case-sensitive only with `PRAGMA case_sensitive_like`, which `sqlite::connect_options` sets; `Schema::introspect_sqlite` checks it, and so does the engine before the first statement on its pool, so a pool without it is refused rather than answering `_like` case-insensitively. |
+| `_ilike` / `_nilike` | `lower(x) LIKE lower(y)`: ASCII case folding, where PostgreSQL folds Unicode. |
+| Booleans, JSON columns | Come back as JSON booleans and JSON values. (SQLite holds `0`/`1` and text; the renderer converts at the point the value enters `json_object`.) |
+| Column types | Read from the declared type the way SQLite's affinity rules do: every integer is `bigint` (SQLite integers are 64-bit whatever the declaration), `BOOLEAN` → `Boolean`, `REAL` / `FLOAT` / `DOUBLE` → `Float`, `TEXT` / `CHAR` / `CLOB` → `String`, `JSON` / `JSONB`, `DATE` / `TIME` / `DATETIME` / `TIMESTAMP` and `UUID` as text-backed scalars compared as text — store ISO 8601 or the ordering is not chronological. |
+| `NUMERIC` / `DECIMAL`, `BLOB`, no declared type | Left out of the schema and recorded as skipped columns (`schema::introspect_sqlite::introspect` returns them; the `vision-gql` CLI is PostgreSQL-only for now): SQLite holds a `NUMERIC` as a double, and a sum that is wrong past the fifteenth digit is the wrong kind of wrong. Declare `REAL` to publish a float knowingly. |
+| Tables that are not `STRICT` | Introspected, with a `SchemaWarning::LooselyTypedTable`: the database does not enforce the declared types, so a `'abc'` in an `INTEGER` column reaches the client as a string. A `BOOLEAN` or `JSON` column holding something else is an error (`SQLite reports malformed JSON: …`), not a null. |
+| JSON path components | A component that is all digits indexes an array; PostgreSQL's `#>` would also accept it as an object key. |
+| Foreign keys | Enforcement is per connection (`PRAGMA foreign_keys`); `connect_options` turns it on and introspection refuses a pool where it is off. Relations are derived from the declarations either way. |
+| Multiple schemas | Only `main`; attached databases are not walked. |
+| Mutations, `on_conflict`, nested insert | Not yet. Refused, not published. SQLite allows no DML inside a CTE, so a mutation is a sequence of statements in one transaction — a different execution model from the one statement of data-modifying CTEs PostgreSQL gets, and it is not built. |
+| `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
+| `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
+| `vision-gql` CLI | PostgreSQL-only for now. |
+| Version | 3.38 or later (`->`, built-in JSON functions); checked at introspection and before the engine's first statement. sqlx bundles 3.51. |
 
 ## JSON/JSONB path reads
 

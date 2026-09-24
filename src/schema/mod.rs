@@ -6,6 +6,8 @@
 
 pub mod config;
 pub mod introspect;
+#[cfg(feature = "sqlite")]
+pub mod introspect_sqlite;
 pub mod merge;
 
 use std::collections::HashMap;
@@ -199,6 +201,13 @@ pub struct Table {
     /// config can override in either direction (a view with INSTEAD OF triggers
     /// is genuinely writable; a base table may be deliberately frozen).
     pub read_only: bool,
+    /// The database does not hold this table's columns to their declared
+    /// types. SQLite outside `STRICT` tables: a column declared `INTEGER` can
+    /// hold `'abc'`, and the schema — derived from the declaration — then
+    /// publishes a type the data does not honour. Nothing fails; a value of
+    /// the wrong JSON type reaches the client. Reported by
+    /// [`Schema::warnings`]; never set by PostgreSQL introspection.
+    pub loosely_typed: bool,
 }
 
 impl Table {
@@ -215,12 +224,20 @@ impl Table {
             relations_by_name: HashMap::new(),
             relation_order: Vec::new(),
             read_only: false,
+            loosely_typed: false,
         }
     }
 
     /// Mark this table read-only: no mutation roots, no nested-insert target.
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
+        self
+    }
+
+    /// Record that the database does not enforce this table's column types.
+    /// See [`Table::loosely_typed`].
+    pub fn loosely_typed(mut self, yes: bool) -> Self {
+        self.loosely_typed = yes;
         self
     }
 
@@ -335,6 +352,13 @@ pub enum SchemaWarning {
         /// The remote columns the mapping filters the target by.
         remote_columns: Vec<String>,
     },
+    /// A table whose declared column types the database does not enforce
+    /// (see [`Table::loosely_typed`]). A value stored against its declared
+    /// type reaches the client as whatever it is.
+    LooselyTypedTable {
+        /// Exposed name of the table.
+        table: String,
+    },
 }
 
 impl std::fmt::Display for SchemaWarning {
@@ -354,12 +378,22 @@ impl std::fmt::Display for SchemaWarning {
                  unique constraint covers",
                 remote_columns.join(", ")
             ),
+            SchemaWarning::LooselyTypedTable { table } => write!(
+                f,
+                "table {table} is not STRICT: the database does not enforce its declared \
+                 column types, so a value stored against them reaches the client as it is; \
+                 declare the table STRICT, or accept that its types are what the writer chose"
+            ),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Schema {
+    /// Which database the physical names, types and constraints describe.
+    /// An [`Engine`](crate::Engine) refuses a schema of another dialect than
+    /// its backend's at construction.
+    dialect: crate::dialect::Dialect,
     tables_by_exposed: HashMap<String, Arc<Table>>,
     /// Whether `__schema` / `__type` may be answered at runtime.
     ///
@@ -374,9 +408,16 @@ pub struct Schema {
 impl Schema {
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder {
+            dialect: crate::dialect::Dialect::Postgres,
             tables: HashMap::new(),
             introspection: false,
         }
+    }
+
+    /// The database this schema describes. PostgreSQL unless the builder
+    /// said otherwise, which introspection does for SQLite.
+    pub fn dialect(&self) -> crate::dialect::Dialect {
+        self.dialect
     }
 
     /// Every exposed table, as `(exposed name, table)`, ordered by name.
@@ -434,6 +475,11 @@ impl Schema {
     pub fn warnings(&self) -> Vec<SchemaWarning> {
         let mut out = Vec::new();
         for (tname, table) in self.tables() {
+            if table.loosely_typed {
+                out.push(SchemaWarning::LooselyTypedTable {
+                    table: tname.clone(),
+                });
+            }
             for (rname, rel) in table.relations() {
                 if rel.kind != RelKind::Object {
                     continue;
@@ -524,14 +570,45 @@ impl Schema {
     ) -> crate::error::Result<SchemaBuilder> {
         crate::schema::merge::introspect_schemas_into_builder(pool, schemas).await
     }
+
+    /// Introspect a SQLite database and return a ready-to-customize builder,
+    /// with [`SchemaBuilder::dialect`] set to SQLite.
+    ///
+    /// Refuses a pool that is not set up the way the engine's SQL assumes —
+    /// see [`crate::sqlite::verify`] for what is checked and
+    /// [`crate::sqlite::connect_options`] for the options that satisfy it.
+    /// The tables are the `main` schema's; attached databases are not
+    /// walked.
+    #[cfg(feature = "sqlite")]
+    pub async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> crate::error::Result<SchemaBuilder> {
+        let found = crate::schema::introspect_sqlite::introspect(pool).await?;
+        let mut sb = crate::schema::merge::build_from_introspection(found.db)
+            .dialect(crate::dialect::Dialect::Sqlite);
+        for name in found.loosely_typed {
+            // The builder holds the only reference this early, so the table
+            // can be marked in place.
+            if let Some(t) = sb.tables.get_mut(&name).and_then(Arc::get_mut) {
+                t.loosely_typed = true;
+            }
+        }
+        Ok(sb)
+    }
 }
 
 pub struct SchemaBuilder {
+    pub(crate) dialect: crate::dialect::Dialect,
     pub(crate) tables: HashMap<String, Arc<Table>>,
     pub(crate) introspection: bool,
 }
 
 impl SchemaBuilder {
+    /// Which database the tables describe. Introspection sets this; a schema
+    /// built by hand for SQLite says so here, or the engine refuses it.
+    pub fn dialect(mut self, dialect: crate::dialect::Dialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
     pub fn table(mut self, t: Table) -> Self {
         self.tables.insert(t.exposed_name.clone(), Arc::new(t));
         self
@@ -559,6 +636,7 @@ impl SchemaBuilder {
     // `Engine` construction instead; tooling calls [`Schema::warnings`].
     pub fn build(self) -> Schema {
         Schema {
+            dialect: self.dialect,
             tables_by_exposed: self.tables,
             introspection: self.introspection,
             type_system: std::sync::OnceLock::new(),

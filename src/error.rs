@@ -54,6 +54,14 @@ pub enum Error {
     /// compiled once and reused. See [`crate::Engine::compile`].
     #[error("not compilable at {path}: {message}")]
     NotCompilable { path: String, message: String },
+
+    /// The request asks for something this engine's backend does not
+    /// implement — a mutation on a backend that only reads, an aggregate
+    /// function the database lacks. Distinct from [`Error::Validate`]: the
+    /// document is well-formed against the schema, and the same document is
+    /// answered on another backend.
+    #[error("unsupported on this backend: {message}")]
+    Unsupported { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -81,8 +89,10 @@ pub enum ErrorCode {
     LimitExceeded,
     /// The query cannot be compiled ahead of its variables.
     NotCompilable,
-    /// PostgreSQL refused the statement.
+    /// The database refused the statement.
     DatabaseError,
+    /// The backend this engine runs on does not implement what was asked.
+    Unsupported,
     /// Something inside the engine — a schema that does not hold together, a
     /// result that would not decode. Not the caller's doing.
     Internal,
@@ -100,6 +110,7 @@ impl ErrorCode {
             ErrorCode::LimitExceeded => "LIMIT_EXCEEDED",
             ErrorCode::NotCompilable => "NOT_COMPILABLE",
             ErrorCode::DatabaseError => "DATABASE_ERROR",
+            ErrorCode::Unsupported => "UNSUPPORTED",
             ErrorCode::Internal => "INTERNAL_ERROR",
         }
     }
@@ -128,6 +139,7 @@ impl Error {
             // bug it had no part in.
             Error::Scope(_) => ErrorCode::Internal,
             Error::NotCompilable { .. } => ErrorCode::NotCompilable,
+            Error::Unsupported { .. } => ErrorCode::Unsupported,
             Error::Database(_) => ErrorCode::DatabaseError,
             Error::Schema(_) | Error::Decode(_) => ErrorCode::Internal,
         }
