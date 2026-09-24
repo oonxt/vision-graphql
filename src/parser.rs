@@ -2360,7 +2360,7 @@ fn lower_scalar_field(
     };
 
     use crate::schema::ColumnType;
-    if !matches!(col.pg_type, ColumnType::Json | ColumnType::Jsonb) {
+    if !matches!(col.ty, ColumnType::Json | ColumnType::Jsonb) {
         return Err(Error::Validate {
             path: format!("{parent_path}.{alias}"),
             message: format!(
@@ -3316,16 +3316,13 @@ fn lower_aggregate_selection(
                                 // cannot exist, and PostgreSQL would answer
                                 // "function sum(text) does not exist" at request
                                 // time.
-                                if !crate::type_system::applies(func, &col.pg_type) {
+                                if !crate::type_system::applies(func, &col.ty) {
                                     return Err(Error::Validate {
                                         path: format!("{path}.{calias}"),
                                         message: format!(
                                             "'{op_name}' does not apply to '{}': {}",
                                             col.exposed_name,
-                                            crate::type_system::why_inapplicable(
-                                                func,
-                                                &col.pg_type
-                                            )
+                                            crate::type_system::why_inapplicable(func, &col.ty)
                                         ),
                                     });
                                 }

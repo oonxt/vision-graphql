@@ -382,12 +382,12 @@ mod tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: ColumnType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "email".into(),
-                        pg_type: ColumnType::Text,
+                        ty: ColumnType::Text,
                         nullable: true,
                     },
                 ],
@@ -408,7 +408,7 @@ mod tests {
     fn col(name: &str) -> IntrospectedColumn {
         IntrospectedColumn {
             name: name.into(),
-            pg_type: ColumnType::Text,
+            ty: ColumnType::Text,
             nullable: true,
         }
     }
@@ -583,7 +583,7 @@ mod tests {
                 name: "profiles".into(),
                 columns: vec![IntrospectedColumn {
                     name: "id".into(),
-                    pg_type: ColumnType::Int4,
+                    ty: ColumnType::Int4,
                     nullable: false,
                 }],
                 primary_key: vec!["id".into()],

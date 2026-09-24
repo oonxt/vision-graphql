@@ -62,7 +62,7 @@ pub struct IntrospectedTable {
 #[derive(Debug)]
 pub struct IntrospectedColumn {
     pub name: String,
-    pub pg_type: ColumnType,
+    pub ty: ColumnType,
     pub nullable: bool,
 }
 
@@ -201,13 +201,13 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         // Kept for the skipped-column record: `data_type` alone says `ARRAY` or
         // `USER-DEFINED`, which names nothing anyone could act on.
         let udt = udt_name.clone();
-        let pg_type = match (&*dtype, udt_schema, udt_name, is_enum) {
+        let ty = match (&*dtype, udt_schema, udt_name, is_enum) {
             ("USER-DEFINED", Some(schema), Some(name), Some(true)) => {
                 Some(ColumnType::Enum { schema, name })
             }
             _ => data_type_to_pg_type(&dtype),
         };
-        let Some(pg_type) = pg_type else {
+        let Some(ty) = ty else {
             tracing::warn!(
                 target: "vision_graphql::introspect",
                 table = %tname,
@@ -238,7 +238,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
             });
         entry.columns.push(IntrospectedColumn {
             name: cname,
-            pg_type,
+            ty,
             nullable: is_nullable == "YES",
         });
     }
@@ -304,7 +304,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         let udt_schema: String = row.get(6);
         let udt_name: String = row.get(7);
 
-        let pg_type = if is_enum {
+        let ty = if is_enum {
             Some(ColumnType::Enum {
                 schema: udt_schema,
                 name: udt_name.clone(),
@@ -312,7 +312,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
         } else {
             data_type_to_pg_type(&strip_type_modifier(&dtype))
         };
-        let Some(pg_type) = pg_type else {
+        let Some(ty) = ty else {
             tracing::warn!(
                 target: "vision_graphql::introspect",
                 table = %tname,
@@ -347,7 +347,7 @@ pub async fn introspect_schemas(pool: &PgPool, schemas: &[&str]) -> Result<Intro
             });
         entry.columns.push(IntrospectedColumn {
             name: cname,
-            pg_type,
+            ty,
             nullable,
         });
     }

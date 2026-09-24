@@ -170,7 +170,7 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
     // never has to be escaped into the SQL text.
     if let crate::ast::RootBody::Introspection(value) = &root.body {
         let n = ctx.push_fixed(crate::types::Bind::Text(value.to_string()));
-        ctx.sql.push_str(&ctx.dialect.json_param(n));
+        write!(ctx.sql, "{}", ctx.dialect.json_param(n)).unwrap();
         return Ok(());
     }
     let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
@@ -213,7 +213,7 @@ fn render_list(
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    ctx.sql.push_str(&ctx.dialect.rows_list_open(&row_alias));
+    write!(ctx.sql, "{}", ctx.dialect.rows_list_open(&row_alias)).unwrap();
     render_inner_select(root, selection, table, &inner_alias, schema, ctx)?;
     ctx.sql.push_str(") ");
     ctx.sql.push_str(&row_alias);
@@ -390,7 +390,7 @@ fn render_where(
 fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Result<()> {
     crate::type_system::check_cmp(
         op,
-        &col.pg_type,
+        &col.ty,
         || format!("where.{}", col.exposed_name),
         &format!("'{}'", col.exposed_name),
     )
@@ -423,8 +423,8 @@ fn render_bool_expr(
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             check_cmp_applies(*op, col)?;
-            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
-            let placeholder = ctx.dialect.param(n, &col.pg_type);
+            let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            let placeholder = ctx.dialect.param(n, &col.ty);
             let op_str = ctx.dialect.cmp(*op);
             write!(
                 ctx.sql,
@@ -473,10 +473,14 @@ fn render_bool_expr(
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
             }
-            let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
             let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
-            ctx.sql
-                .push_str(&ctx.dialect.in_list(&lhs, n, &col.pg_type, *negated));
+            write!(
+                ctx.sql,
+                "{}",
+                ctx.dialect.in_list(&lhs, n, &col.ty, *negated)
+            )
+            .unwrap();
             Ok(())
         }
         BoolExpr::Relation { name, inner } => {
@@ -590,10 +594,10 @@ fn render_relation_subquery(
 
     match rel.kind {
         crate::schema::RelKind::Array => {
-            ctx.sql.push_str(&ctx.dialect.rows_list_open(&row_alias));
+            write!(ctx.sql, "{}", ctx.dialect.rows_list_open(&row_alias)).unwrap();
         }
         crate::schema::RelKind::Object => {
-            ctx.sql.push_str(&ctx.dialect.row_object_open(&row_alias));
+            write!(ctx.sql, "{}", ctx.dialect.row_object_open(&row_alias)).unwrap();
         }
     }
 
@@ -1143,8 +1147,8 @@ fn render_optional(
     let path = || format!("where.{column}");
     match inner {
         BoolExpr::Compare { op, value, .. } => {
-            let n = ctx.push_scalar(value, &col.pg_type, path)?;
-            let p = ctx.dialect.param(n, &col.pg_type);
+            let n = ctx.push_scalar(value, &col.ty, path)?;
+            let p = ctx.dialect.param(n, &col.ty);
             write!(
                 ctx.sql,
                 "({p} IS NULL OR {qualified} {} {p})",
@@ -1159,12 +1163,12 @@ fn render_optional(
                 // A composite with no variables left: same as a literal list.
                 return render_plain(ctx);
             }
-            let n = ctx.push_optional_array(values, &col.pg_type, path)?;
+            let n = ctx.push_optional_array(values, &col.ty, path)?;
             write!(
                 ctx.sql,
                 "({} IS NULL OR {})",
-                ctx.dialect.list_param(n, &col.pg_type),
-                ctx.dialect.in_list(&qualified, n, &col.pg_type, *negated)
+                ctx.dialect.list_param(n, &col.ty),
+                ctx.dialect.in_list(&qualified, n, &col.ty, *negated)
             )
             .unwrap();
         }
@@ -1228,8 +1232,7 @@ fn render_value_in_list(
     let v = ctx.push_comparison(value, pg, path)?;
     let list = ctx.push_array(values, pg, path)?;
     let lhs = ctx.dialect.param(v, pg);
-    ctx.sql
-        .push_str(&ctx.dialect.in_list(&lhs, list, pg, negated));
+    write!(ctx.sql, "{}", ctx.dialect.in_list(&lhs, list, pg, negated)).unwrap();
     Ok(())
 }
 
@@ -1331,7 +1334,7 @@ fn render_json_path_expr(
     ctx: &mut RenderCtx,
 ) -> Result<String> {
     use crate::schema::ColumnType;
-    if !matches!(col.pg_type, ColumnType::Json | ColumnType::Jsonb) {
+    if !matches!(col.ty, ColumnType::Json | ColumnType::Jsonb) {
         return Err(Error::Validate {
             path: err_path.into(),
             message: format!(
@@ -1342,7 +1345,8 @@ fn render_json_path_expr(
     }
     let n = ctx.push_fixed(ctx.dialect.json_path_bind(path));
     let col_sql = format!("{table_alias}.{}", quote_ident(&col.physical_name));
-    Ok(ctx.dialect.json_path(&col_sql, n))
+    let expr = ctx.dialect.json_path(&col_sql, n).to_string();
+    Ok(expr)
 }
 
 /// `__typename` in a SELECT list: a literal of the type this selection set
@@ -1384,7 +1388,7 @@ fn render_by_pk(
     ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    ctx.sql.push_str(&ctx.dialect.row_object_open(&row_alias));
+    write!(ctx.sql, "{}", ctx.dialect.row_object_open(&row_alias)).unwrap();
     ctx.sql.push_str("SELECT ");
     for (i, field) in selection.iter().enumerate() {
         if i > 0 {
@@ -1477,10 +1481,8 @@ fn render_by_pk(
             path: format!("{}.pk.{col_name}", root.alias),
             message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
-        let n = ctx.push_comparison(value, &col.pg_type, || {
-            format!("{}.pk.{col_name}", root.alias)
-        })?;
-        let ph = ctx.dialect.param(n, &col.pg_type);
+        let n = ctx.push_comparison(value, &col.ty, || format!("{}.pk.{col_name}", root.alias))?;
+        let ph = ctx.dialect.param(n, &col.ty);
         write!(
             ctx.sql,
             "{inner_alias}.{} = {ph}",
@@ -1859,11 +1861,11 @@ fn render_insert_cte_recursive(
                 .find_column(exposed)
                 .expect("column should exist — validated at parse");
             match obj.columns.get(exposed) {
-                None => ctx.sql.push_str(&ctx.dialect.null_of(&col.pg_type)),
+                None => write!(ctx.sql, "{}", ctx.dialect.null_of(&col.ty)).unwrap(),
                 Some(v) => {
-                    let n = ctx
-                        .push_scalar(v, &col.pg_type, || format!("{cte}.objects[{r}].{exposed}"))?;
-                    ctx.sql.push_str(&ctx.dialect.param(n, &col.pg_type));
+                    let n =
+                        ctx.push_scalar(v, &col.ty, || format!("{cte}.objects[{r}].{exposed}"))?;
+                    write!(ctx.sql, "{}", ctx.dialect.param(n, &col.ty)).unwrap();
                 }
             }
         }
@@ -2231,12 +2233,12 @@ fn render_update_cte(
             path: format!("{cte}._set.{exposed}"),
             message: format!("unknown column '{exposed}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
+        let n = ctx.push_scalar(value, &col.ty, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
             "{} = {}",
             quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.pg_type)
+            ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
     }
@@ -2280,12 +2282,12 @@ fn render_update_by_pk_cte(
             path: format!("{cte}._set.{exposed}"),
             message: format!("unknown column '{exposed}'"),
         })?;
-        let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
+        let n = ctx.push_scalar(value, &col.ty, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
             "{} = {}",
             quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.pg_type)
+            ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
     }
@@ -2299,12 +2301,12 @@ fn render_update_by_pk_cte(
             message: format!("unknown column '{col_name}'"),
         })?;
         // A primary key is never null, so a null here matches nothing either.
-        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        let n = ctx.push_comparison(value, &col.ty, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = {}",
             quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.pg_type)
+            ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
     }
@@ -2375,12 +2377,12 @@ fn render_delete_by_pk_cte(
             message: format!("unknown column '{col_name}'"),
         })?;
         // A primary key is never null, so a null here matches nothing either.
-        let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
+        let n = ctx.push_comparison(value, &col.ty, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
             "{} = {}",
             quote_ident(&col.physical_name),
-            ctx.dialect.param(n, &col.pg_type)
+            ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
     }
@@ -2953,13 +2955,13 @@ fn render_agg_func(
                 // point both entry points pass through, so the check that keeps
                 // "function sum(text) does not exist" from being PostgreSQL's
                 // answer has to live here too.
-                if !crate::type_system::applies(func, &col.pg_type) {
+                if !crate::type_system::applies(func, &col.ty) {
                     return Err(Error::Validate {
                         path: format!("aggregate.{key}.{}", c.alias),
                         message: format!(
                             "'{pg_func}' does not apply to '{}': {}",
                             col.exposed_name,
-                            crate::type_system::why_inapplicable(func, &col.pg_type)
+                            crate::type_system::why_inapplicable(func, &col.ty)
                         ),
                     });
                 }
@@ -3308,8 +3310,8 @@ fn render_bool_expr_no_alias(
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             check_cmp_applies(*op, col)?;
-            let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
-            let placeholder = ctx.dialect.param(n, &col.pg_type);
+            let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            let placeholder = ctx.dialect.param(n, &col.ty);
             let op_str = ctx.dialect.cmp(*op);
             write!(
                 ctx.sql,
@@ -3357,10 +3359,14 @@ fn render_bool_expr_no_alias(
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
             }
-            let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
+            let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
             let lhs = quote_ident(&col.physical_name);
-            ctx.sql
-                .push_str(&ctx.dialect.in_list(&lhs, n, &col.pg_type, *negated));
+            write!(
+                ctx.sql,
+                "{}",
+                ctx.dialect.in_list(&lhs, n, &col.ty, *negated)
+            )
+            .unwrap();
             Ok(())
         }
         BoolExpr::Relation { name, inner } => {

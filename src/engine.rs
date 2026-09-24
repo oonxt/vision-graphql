@@ -126,6 +126,12 @@ impl<DB: Backend> Run<DB> for &mut DB::Connection {
 /// it.
 struct External<'c, E>(E, std::marker::PhantomData<&'c ()>);
 
+impl<'c, E> External<'c, E> {
+    fn new(executor: E) -> Self {
+        External(executor, std::marker::PhantomData)
+    }
+}
+
 impl<'c, DB: Backend, E: sqlx::Executor<'c, Database = DB>> Run<DB> for External<'c, E> {
     fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send {
         DB::execute(self.0, sql, binds)
@@ -315,13 +321,8 @@ impl<DB: Backend> Engine<DB> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(
-            External(executor, std::marker::PhantomData),
-            source,
-            variables,
-            operation_name,
-        )
-        .await
+        self.text_to(External::new(executor), source, variables, operation_name)
+            .await
     }
 
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
@@ -345,7 +346,7 @@ impl<DB: Backend> Engine<DB> {
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
         run_operation(
-            External(executor, std::marker::PhantomData),
+            External::new(executor),
             op.into_operation(),
             &self.schema,
             &self.limits,
@@ -430,7 +431,7 @@ impl<DB: Backend> Engine<DB> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
         let data = run_operation(
-            External(executor, std::marker::PhantomData),
+            External::new(executor),
             operation,
             &self.schema,
             &self.limits,
@@ -509,13 +510,7 @@ impl<DB: Backend> Engine<DB> {
         compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled(
-            External(executor, std::marker::PhantomData),
-            compiled,
-            variables,
-            None,
-        )
-        .await
+        execute_compiled(External::new(executor), compiled, variables, None).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -551,7 +546,7 @@ impl<DB: Backend> Engine<DB> {
         principal: &Principal,
     ) -> Result<Value> {
         execute_compiled(
-            External(executor, std::marker::PhantomData),
+            External::new(executor),
             compiled,
             variables,
             Some(principal),
@@ -953,13 +948,8 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(
-            External(executor, std::marker::PhantomData),
-            source,
-            variables,
-            operation_name,
-        )
-        .await
+        self.text_to(External::new(executor), source, variables, operation_name)
+            .await
     }
 
     /// Same as [`Engine::run`], with the scope rewrite applied.
@@ -977,11 +967,8 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
         executor: E,
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
-        self.run_scoped_to(
-            External(executor, std::marker::PhantomData),
-            op.into_operation(),
-        )
-        .await
+        self.run_scoped_to(External::new(executor), op.into_operation())
+            .await
     }
 
     /// Same as [`Engine::query_as`], with the scope rewrite applied.
@@ -1052,7 +1039,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
         let data = self
-            .run_scoped_to(External(executor, std::marker::PhantomData), operation)
+            .run_scoped_to(External::new(executor), operation)
             .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }

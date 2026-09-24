@@ -355,28 +355,18 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
             let subject = format!("'{}'", col.exposed_name);
             match expr {
                 ScopeExpr::Compare { op, value, .. } => {
-                    crate::type_system::check_cmp(*op, &col.pg_type, || path.clone(), &subject)?;
-                    validate_scalar(value, &col.pg_type, &path)
+                    crate::type_system::check_cmp(*op, &col.ty, || path.clone(), &subject)?;
+                    validate_scalar(value, &col.ty, &path)
                 }
                 ScopeExpr::InList { values, .. } => {
-                    crate::type_system::check_cmp(
-                        CmpOp::Eq,
-                        &col.pg_type,
-                        || path.clone(),
-                        &subject,
-                    )?;
+                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
                     values
                         .iter()
-                        .try_for_each(|v| validate_scalar(v, &col.pg_type, &path))
+                        .try_for_each(|v| validate_scalar(v, &col.ty, &path))
                 }
                 ScopeExpr::InSet { set, .. } => {
-                    crate::type_system::check_cmp(
-                        CmpOp::Eq,
-                        &col.pg_type,
-                        || path.clone(),
-                        &subject,
-                    )?;
-                    validate_list(set, &col.pg_type, &path)
+                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
+                    validate_list(set, &col.ty, &path)
                 }
                 _ => Ok(()),
             }

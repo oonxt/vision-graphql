@@ -641,13 +641,13 @@ impl<'a> Builder<'a> {
     fn column_fields(&mut self, t: &Table) -> Vec<Field> {
         let mut fields = Vec::new();
         for col in t.columns() {
-            let scalar = self.note_scalar(&col.pg_type);
+            let scalar = self.note_scalar(&col.ty);
             let mut ty = TypeRef::named(&scalar);
             if !col.nullable {
                 ty = ty.non_null();
             }
             let mut f = Field::new(&col.exposed_name, ty);
-            if matches!(col.pg_type, ColumnType::Json | ColumnType::Jsonb) {
+            if matches!(col.ty, ColumnType::Json | ColumnType::Jsonb) {
                 f = f.with_args(vec![InputValue::new("path", TypeRef::named("String"))
                     .described("Dot-separated path extracted with `#>`, e.g. \"a.b.0\".")]);
             }
@@ -741,9 +741,9 @@ impl<'a> Builder<'a> {
         for func in AggFunc::ALL {
             let cols: Vec<Field> = t
                 .columns()
-                .filter(|c| applies(func, &c.pg_type))
+                .filter(|c| applies(func, &c.ty))
                 .map(|c| {
-                    let name = scalar_name(&result_type(func, &c.pg_type));
+                    let name = scalar_name(&result_type(func, &c.ty));
                     self.result_scalars.insert(name.clone());
                     Field::new(&c.exposed_name, TypeRef::named(name))
                 })
@@ -778,7 +778,7 @@ impl<'a> Builder<'a> {
             InputValue::new("_not", TypeRef::named(&name)),
         ];
         for col in t.columns() {
-            let scalar = self.note_scalar(&col.pg_type);
+            let scalar = self.note_scalar(&col.ty);
             fields.push(InputValue::new(
                 &col.exposed_name,
                 TypeRef::named(comparison_exp_name(&scalar)),
@@ -849,7 +849,7 @@ impl<'a> Builder<'a> {
         let row_cols: Vec<InputValue> = t
             .columns()
             .map(|c| {
-                let scalar = scalar_name(&c.pg_type);
+                let scalar = scalar_name(&c.ty);
                 InputValue::new(&c.exposed_name, TypeRef::named(scalar))
             })
             .collect();
@@ -1192,7 +1192,7 @@ fn pk_args(t: &Table) -> Option<Vec<InputValue>> {
         .map(|c| {
             InputValue::new(
                 &c.exposed_name,
-                TypeRef::named(scalar_name(&c.pg_type)).non_null(),
+                TypeRef::named(scalar_name(&c.ty)).non_null(),
             )
         })
         .collect();

@@ -87,7 +87,7 @@ impl ColumnType {
 pub struct Column {
     pub exposed_name: String,
     pub physical_name: String,
-    pub pg_type: ColumnType,
+    pub ty: ColumnType,
     pub nullable: bool,
 }
 
@@ -224,13 +224,7 @@ impl Table {
         self
     }
 
-    pub fn column(
-        mut self,
-        exposed: &str,
-        physical: &str,
-        pg_type: ColumnType,
-        nullable: bool,
-    ) -> Self {
+    pub fn column(mut self, exposed: &str, physical: &str, ty: ColumnType, nullable: bool) -> Self {
         if !self.columns_by_exposed.contains_key(exposed) {
             self.column_order.push(exposed.to_string());
         }
@@ -239,7 +233,7 @@ impl Table {
             Column {
                 exposed_name: exposed.into(),
                 physical_name: physical.into(),
-                pg_type,
+                ty,
                 nullable,
             },
         );

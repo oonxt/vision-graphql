@@ -11,13 +11,24 @@
 //! inherit PostgreSQL's spelling at whichever seam nobody remembered — SQL
 //! that runs and returns the wrong shape, which is the kind of bug this crate
 //! hunts hardest.
+//!
+//! The seams return `impl Display` rather than `String`: the renderer runs
+//! once per request on the uncompiled path and writes each fragment straight
+//! into the statement, so a fragment is formatted in place, not allocated and
+//! copied.
 
 use crate::schema::ColumnType;
 use crate::types::Bind;
 use std::borrow::Cow;
+use std::fmt::{self, Display, Formatter};
 
 /// Which database's SQL the renderer produces. Chosen by the
 /// [`Backend`](crate::Backend) the engine runs on.
+///
+/// Non-exhaustive for code outside this crate: a backend added later must
+/// not break a downstream `match`, while inside the crate every seam still
+/// has to answer for it.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Postgres,
@@ -32,6 +43,19 @@ pub(crate) fn quote_ident(s: &str) -> String {
 /// Escape a string for a single-quoted SQL literal.
 pub(crate) fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Write `s` as a single-quoted SQL literal, escaping as it goes.
+fn write_quoted(f: &mut Formatter<'_>, s: &str) -> fmt::Result {
+    f.write_str("'")?;
+    let mut rest = s;
+    while let Some(i) = rest.find('\'') {
+        f.write_str(&rest[..i])?;
+        f.write_str("''")?;
+        rest = &rest[i + 1..];
+    }
+    f.write_str(rest)?;
+    f.write_str("'")
 }
 
 /// The PostgreSQL type keyword for a [`ColumnType`], as used in a cast
@@ -61,65 +85,80 @@ pub(crate) fn pg_type_name(ty: &ColumnType) -> Cow<'static, str> {
     })
 }
 
+/// A fragment that formats itself on demand.
+struct Fragment<F>(F);
+
+impl<F: Fn(&mut Formatter<'_>) -> fmt::Result> Display for Fragment<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        (self.0)(f)
+    }
+}
+
 impl Dialect {
     /// A placeholder for a value of column type `ty`.
     ///
     /// PostgreSQL gets an explicit cast: sqlx prepares the statement with the
     /// types of its first execution's parameters, and a compiled statement
     /// first run with a null variable would otherwise fix the wrong type.
-    pub(crate) fn param(self, n: usize, ty: &ColumnType) -> String {
-        match self {
-            Dialect::Postgres => format!("${n}::{}", pg_type_name(ty)),
-        }
+    pub(crate) fn param<'a>(self, n: usize, ty: &'a ColumnType) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "${n}::{}", pg_type_name(ty)),
+        })
     }
 
     /// A typed SQL NULL, for an inserted column the object left out.
-    pub(crate) fn null_of(self, ty: &ColumnType) -> String {
-        match self {
-            Dialect::Postgres => format!("NULL::{}", pg_type_name(ty)),
-        }
+    pub(crate) fn null_of<'a>(self, ty: &'a ColumnType) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "NULL::{}", pg_type_name(ty)),
+        })
     }
 
     /// A boolean placeholder (`_is_null: $b`).
-    pub(crate) fn bool_param(self, n: usize) -> String {
-        match self {
-            Dialect::Postgres => format!("${n}::boolean"),
-        }
+    pub(crate) fn bool_param(self, n: usize) -> impl Display {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "${n}::boolean"),
+        })
     }
 
     /// A `limit` / `offset` placeholder.
-    pub(crate) fn count_param(self, n: usize) -> String {
-        match self {
-            Dialect::Postgres => format!("${n}::int8"),
-        }
+    pub(crate) fn count_param(self, n: usize) -> impl Display {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "${n}::int8"),
+        })
     }
 
     /// A placeholder carrying a JSON document the renderer answered itself
     /// (introspection riding along in a data query).
-    pub(crate) fn json_param(self, n: usize) -> String {
-        match self {
-            Dialect::Postgres => format!("${n}::json"),
-        }
+    pub(crate) fn json_param(self, n: usize) -> impl Display {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "${n}::json"),
+        })
     }
 
     /// A placeholder for a bound list of `ty`, as a value: what `IS NULL` is
     /// asked of when the list is optional.
-    pub(crate) fn list_param(self, n: usize, ty: &ColumnType) -> String {
-        match self {
-            Dialect::Postgres => format!("${n}::{}[]", pg_type_name(ty)),
-        }
+    pub(crate) fn list_param<'a>(self, n: usize, ty: &'a ColumnType) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "${n}::{}[]", pg_type_name(ty)),
+        })
     }
 
     /// `lhs` is (or, `negated`, is not) one of the bound list `n`. One
     /// placeholder whatever the list's length, so the SQL text of a compiled
     /// statement does not depend on the request.
-    pub(crate) fn in_list(self, lhs: &str, n: usize, ty: &ColumnType, negated: bool) -> String {
-        match self {
+    pub(crate) fn in_list<'a>(
+        self,
+        lhs: impl Display + 'a,
+        n: usize,
+        ty: &'a ColumnType,
+        negated: bool,
+    ) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
             Dialect::Postgres => {
                 let pred = if negated { "<> ALL" } else { "= ANY" };
-                format!("{lhs} {pred} ({})", self.list_param(n, ty))
+                write!(f, "{lhs} {pred} ({})", self.list_param(n, ty))
             }
-        }
+        })
     }
 
     /// The SQL spelling of a comparison operator.
@@ -150,21 +189,22 @@ impl Dialect {
     /// Opens `(SELECT <rows of the following derived table as a JSON array>
     /// FROM (`; the caller renders the inner select and closes with
     /// `) <row_alias>)`. An empty result is `[]`, not null.
-    pub(crate) fn rows_list_open(self, row_alias: &str) -> String {
-        match self {
-            Dialect::Postgres => {
-                format!("(SELECT coalesce(json_agg(row_to_json({row_alias})), '[]'::json) FROM (")
-            }
-        }
+    pub(crate) fn rows_list_open<'a>(self, row_alias: &'a str) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(
+                f,
+                "(SELECT coalesce(json_agg(row_to_json({row_alias})), '[]'::json) FROM ("
+            ),
+        })
     }
 
     /// As [`rows_list_open`](Self::rows_list_open) for the one row of a
     /// `_by_pk` or an object relation: a JSON object, or null when there is
     /// no row.
-    pub(crate) fn row_object_open(self, row_alias: &str) -> String {
-        match self {
-            Dialect::Postgres => format!("(SELECT row_to_json({row_alias}) FROM ("),
-        }
+    pub(crate) fn row_object_open<'a>(self, row_alias: &'a str) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "(SELECT row_to_json({row_alias}) FROM ("),
+        })
     }
 
     /// Opens an aggregation of the following JSON objects into an array;
@@ -198,19 +238,22 @@ impl Dialect {
     /// A string literal that nests into JSON as a string: `__typename` and
     /// friends. PostgreSQL needs the cast, or `row_to_json` sees an
     /// `unknown`-typed constant.
-    pub(crate) fn text_literal(self, s: &str) -> String {
-        match self {
-            Dialect::Postgres => format!("'{}'::text", escape_string_literal(s)),
-        }
+    pub(crate) fn text_literal<'a>(self, s: &'a str) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => {
+                write_quoted(f, s)?;
+                f.write_str("::text")
+            }
+        })
     }
 
     /// Read inside a JSON column along the path bound as parameter `n` (see
     /// [`json_path_bind`](Self::json_path_bind)). The result keeps its JSON
     /// type so it nests unchanged.
-    pub(crate) fn json_path(self, col: &str, n: usize) -> String {
-        match self {
-            Dialect::Postgres => format!("{col} #> ${n}::text[]"),
-        }
+    pub(crate) fn json_path<'a>(self, col: &'a str, n: usize) -> impl Display + 'a {
+        Fragment(move |f: &mut Formatter<'_>| match self {
+            Dialect::Postgres => write!(f, "{col} #> ${n}::text[]"),
+        })
     }
 
     /// The bind carrying a JSON path's components.
@@ -218,5 +261,19 @@ impl Dialect {
         match self {
             Dialect::Postgres => Bind::TextArray(path.iter().map(|c| Some(c.clone())).collect()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_literal_escapes_embedded_quotes() {
+        assert_eq!(
+            Dialect::Postgres.text_literal("it's 'q'").to_string(),
+            "'it''s ''q'''::text"
+        );
+        assert_eq!(Dialect::Postgres.text_literal("").to_string(), "''::text");
     }
 }

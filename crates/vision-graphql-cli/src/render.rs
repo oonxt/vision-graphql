@@ -126,7 +126,7 @@ fn write_table_stanza(out: &mut String, exposed: &str, t: &IntrospectedTable, db
         out.push_str(&format!(
             "{} ({}{}{})",
             col.name,
-            pg_type_short(&col.pg_type),
+            pg_type_short(&col.ty),
             nullable,
             pk_marker
         ));
@@ -213,12 +213,12 @@ mod render_tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: ColumnType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "email".into(),
-                        pg_type: ColumnType::Text,
+                        ty: ColumnType::Text,
                         nullable: true,
                     },
                 ],
@@ -248,7 +248,7 @@ mod render_tests {
                 name: "users".into(),
                 columns: vec![IntrospectedColumn {
                     name: "id".into(),
-                    pg_type: ColumnType::Int4,
+                    ty: ColumnType::Int4,
                     nullable: false,
                 }],
                 primary_key: vec!["id".into()],
@@ -266,12 +266,12 @@ mod render_tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: ColumnType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "user_id".into(),
-                        pg_type: ColumnType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                 ],
@@ -313,7 +313,7 @@ mod render_tests {
                     name: n.into(),
                     columns: vec![IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: ColumnType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     }],
                     primary_key: vec!["id".into()],

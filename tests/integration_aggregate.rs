@@ -497,7 +497,7 @@ async fn every_aggregate_function_runs_and_is_published_as_its_result_type() {
     }
 
     // …and PostgreSQL agrees.
-    for (func, column, pg_type) in [
+    for (func, column, ty) in [
         ("sum", "whole", "bigint"),
         ("sum", "big", "numeric"),
         ("avg", "whole", "numeric"),
@@ -510,7 +510,7 @@ async fn every_aggregate_function_runs_and_is_published_as_its_result_type() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(actual, pg_type, "{func}({column})");
+        assert_eq!(actual, ty, "{func}({column})");
     }
 }
 

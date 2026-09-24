@@ -15,9 +15,15 @@ release commits; entries from 0.13.0 on are written as the work lands.
   `CompiledQuery` is typed by the backend it was rendered for, so a statement
   compiled on one engine cannot be handed to an engine on another. This is
   the groundwork for a SQLite backend; nothing PostgreSQL-facing behaves
-  differently, and the rendered SQL is unchanged.
-- **`PgType` is `ColumnType`.** The enum names what a column is, not one
-  backend's spelling of it. `PgType` remains as a deprecated alias for this
+  differently, and the rendered SQL is unchanged. One place the default does
+  not reach: a `QueryRegistry::new()` that is never handed an engine or a
+  compiled statement has nothing to infer its backend from and needs the
+  annotation `QueryRegistry<Postgres>` — default type parameters do not take
+  part in inference.
+- **`PgType` is `ColumnType`, and `Column::pg_type` is `Column::ty`.** The
+  enum names what a column is, not one backend's spelling of it; the field on
+  `Column` and `IntrospectedColumn` follows, in the same release rather than
+  as a second break later. `PgType` remains as a deprecated alias for this
   release.
 - **`sql::render` and `sql::render_now` take a `Dialect`.** The renderer no
   longer assumes PostgreSQL by omission; `Backend::DIALECT` is what the
