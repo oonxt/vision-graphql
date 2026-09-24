@@ -162,6 +162,12 @@ pub async fn introspect(pool: &SqlitePool) -> Result<SqliteIntrospection> {
 
         let mut unique_constraints = BTreeMap::new();
         let mut unique_indexes = BTreeMap::new();
+        // SQLite has no name for a primary key. PostgreSQL's default,
+        // `<table>_pkey`, gives `on_conflict` one to say — the same word a
+        // document written against PostgreSQL would use.
+        if !is_view && !primary_key.is_empty() {
+            unique_constraints.insert(format!("{name}_pkey"), primary_key.clone());
+        }
         if !is_view {
             let indexes =
                 sqlx::query("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")

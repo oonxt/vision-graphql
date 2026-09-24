@@ -1,6 +1,6 @@
 # vision-graphql
 
-A Hasura-style GraphQL-to-SQL query engine for PostgreSQL — and, for reads, SQLite — in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via the database's JSON aggregation (`json_agg`/`row_to_json`, `json_group_array`/`json_object`) — no N+1. See [Backends](#backends).
+A Hasura-style GraphQL-to-SQL query engine for PostgreSQL and SQLite, in Rust. Accepts GraphQL query strings (or a typed Rust builder) and returns `serde_json::Value` in Hasura's data shape. Single SQL per request via the database's JSON aggregation (`json_agg`/`row_to_json`, `json_group_array`/`json_object`) — no N+1. See [Backends](#backends).
 
 ## Quick start
 
@@ -110,7 +110,7 @@ and left, not forgotten.
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
 | Computed fields, subscriptions | Not planned. |
-| Mutations on SQLite | Refused (`UNSUPPORTED`) and not published; see [Backends](#backends). |
+| `WITHOUT ROWID` tables on SQLite, relations in a delete's `returning` on SQLite | See [Backends](#backends). |
 
 ## Backends
 
@@ -143,10 +143,10 @@ wrong dialect does not always fail — a `LIKE` without its escape clause or an
 
 ### SQLite
 
-Read-only for now: every query feature below is implemented against a real
-SQLite in `tests/sqlite_read.rs`, and what is not implemented is not published
-— a SQLite schema has no mutation root, its `__schema` lists no `stddev`, and
-a builder that reaches one anyway gets `Error::Unsupported` (`UNSUPPORTED`).
+Everything below is implemented against a real SQLite in `tests/sqlite_read.rs`
+and `tests/sqlite_write.rs`, and what is not implemented is not published — a
+SQLite schema's `__schema` lists no `stddev`, and a builder that reaches one
+anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 
 | Area | On SQLite |
 |---|---|
@@ -163,7 +163,9 @@ a builder that reaches one anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | JSON path components | A component that is all digits indexes an array; PostgreSQL's `#>` would also accept it as an object key. |
 | Foreign keys | Enforcement is per connection (`PRAGMA foreign_keys`); `connect_options` turns it on and introspection refuses a pool where it is off. Relations are derived from the declarations either way. |
 | Multiple schemas | Only `main`; attached databases are not walked. |
-| Mutations, `on_conflict`, nested insert | Not yet. Refused, not published. SQLite allows no DML inside a CTE, so a mutation is a sequence of statements in one transaction — a different execution model from the one statement of data-modifying CTEs PostgreSQL gets, and it is not built. |
+| Mutations | Implemented as a **sequence of statements in one transaction** (`vision_graphql::plan`): SQLite allows no DML inside a CTE, so each object is its own `INSERT … RETURNING`, nested rows follow their parent with its key bound in, scope guards are `SELECT count(*)` over the rows just written, and the response is assembled from what came back. The same `affected_rows` (nested rows counted), the same `returning` (read back after the writes, relations included), the same guard (a violation anywhere undoes everything). Atomic on the pool, in `Engine::transaction`, and inside a caller's transaction through the `_on` twins (a savepoint). |
+| Mutations: what differs | Later fields of one mutation see earlier fields' writes, and `returning { relation }` sees every related row, where PostgreSQL's CTEs share one snapshot. A column an object leaves out gets its default (the one-statement form writes NULL for a column another object in the batch set). Rows are identified by `rowid`: a `WITHOUT ROWID` table cannot be written (SQLite: `no such column: rowid`). A deleted row's `returning` is its columns, `__typename` and JSON path reads; a relation of a deleted row is refused. |
+| `on_conflict` | `constraint` names a unique constraint as on PostgreSQL — SQLite's auto-names (`sqlite_autoindex_t_1`), a `CREATE UNIQUE INDEX` name, or `<table>_pkey` for the primary key — and is resolved to its columns, which is what SQLite's `ON CONFLICT (…)` takes. `update_columns`, `where` and `DO NOTHING` as on PostgreSQL; a nested `DO NOTHING` is a no-op update so the row's key is still returned for its dependants. |
 | `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
 | `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
 | `vision-gql` CLI | PostgreSQL-only for now. |
@@ -1253,8 +1255,10 @@ Every executing method on `Engine` has an `_on` twin that takes the
 connection to run on — `query_on`, `run_on`, `execute_on`,
 `execute_scoped_on`, and their `_as` forms — and so do `ScopedEngine`'s text
 and builder methods (`query_on`, `run_on`, `_as` forms; a scoped handle runs
-no compiled statements). The pool method is the twin bound to the engine's
-own pool. Hand it `&mut *tx` from a transaction you began, and
+no compiled statements). The twin takes anything sqlx can `Acquire` a
+connection from: `&pool`, `&mut conn`, `&mut tx` or `&mut *tx`. The pool
+method is the twin bound to the engine's own pool. Hand it a transaction you
+began, and
 the engine's statements join whatever else that transaction carries — native
 SQL included — while the engine still does the executing: the policy's
 predicates, the post-insert check and the principal binding are all its, only

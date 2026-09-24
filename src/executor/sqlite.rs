@@ -1,7 +1,9 @@
 //! Execute a rendered statement against SQLite.
 
 use crate::error::{Error, Result};
-use crate::types::{Bind, NullOf};
+use crate::plan::json_path_get;
+use crate::plan::{CapturedField, MutationPlan, PlanBind, ResponseShape, Step, ROWID_KEY};
+use crate::types::{json_to_bind, Bind, Inputs, NullOf};
 use serde_json::Value;
 use sqlx::sqlite::Sqlite;
 
@@ -54,7 +56,16 @@ where
     // raise, and it raises exactly when a column holds a value its declared
     // type does not admit (see `Dialect::value_as_json`). SQLite's message is
     // the same for every such case; this one says what it means here.
-    let json = q.fetch_one(executor).await.map_err(|e| match &e {
+    let json = q.fetch_one(executor).await.map_err(map_sqlite_error)?;
+    Ok(json.0)
+}
+
+/// `json('…')` on a non-JSON literal is the one way the rendered SQL can
+/// raise, and it raises exactly when a column holds a value its declared
+/// type does not admit (see `Dialect::value_as_json`). SQLite's message is
+/// the same for every such case; this one says what it means here.
+fn map_sqlite_error(e: sqlx::Error) -> Error {
+    match &e {
         sqlx::Error::Database(db) if db.message().contains("malformed JSON") => Error::Decode(
             "SQLite reports malformed JSON: a column holds a value its declared type does not \
              admit — text in a BOOLEAN column, or a JSON column that is not JSON; the table is \
@@ -62,6 +73,255 @@ where
                 .into(),
         ),
         _ => Error::Database(e),
-    })?;
-    Ok(json.0)
+    }
+}
+
+/// Run a [`MutationPlan`] on a connection inside a transaction and assemble
+/// its response. See [`crate::plan`] for what a plan is.
+///
+/// The caller owns the transaction: a failed step returns the error and the
+/// caller rolls back, which is what makes a scope violation on the third
+/// statement undo the first two.
+pub async fn execute_plan(
+    conn: &mut sqlx::SqliteConnection,
+    plan: &MutationPlan,
+    inputs: &Inputs<'_>,
+) -> Result<Value> {
+    let mut captured: Vec<Vec<Value>> = vec![Vec::new(); plan.captures];
+    for step in &plan.steps {
+        match step {
+            Step::Write {
+                sql,
+                binds,
+                capture,
+            } => {
+                let binds = resolve_plan_binds(binds, inputs, &captured)?;
+                captured[*capture] = fetch_rows(&mut *conn, sql, &binds).await?;
+            }
+            Step::Check {
+                sql,
+                binds,
+                table,
+                action,
+            } => {
+                let binds = resolve_plan_binds(binds, inputs, &captured)?;
+                let outside = fetch_count(&mut *conn, sql, &binds).await?;
+                if outside > 0 {
+                    // The wording PostgreSQL's guard raises with, so a host
+                    // matching on it sees the same text from both.
+                    return Err(Error::Scope(format!(
+                        "vision_graphql: scope check violation on \"{table}\" ({outside} rows) \
+                         {action} outside scope"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    for field in &plan.fields {
+        let value = match &field.shape {
+            ResponseShape::Batch {
+                captures,
+                returning,
+                typenames,
+            } => {
+                let affected: usize = captures.iter().map(|c| captured[*c].len()).sum();
+                let mut obj = serde_json::Map::new();
+                obj.insert("affected_rows".into(), Value::from(affected));
+                let rows = match returning {
+                    Some(select) => {
+                        let binds = resolve_plan_binds(&select.binds, inputs, &captured)?;
+                        fetch_json(&mut *conn, &select.sql, &binds)
+                            .await?
+                            .unwrap_or_else(|| Value::Array(Vec::new()))
+                    }
+                    None => Value::Array(Vec::new()),
+                };
+                obj.insert("returning".into(), rows);
+                for (key, name) in typenames {
+                    obj.insert(key.clone(), Value::String(name.clone()));
+                }
+                Value::Object(obj)
+            }
+            ResponseShape::One { capture, returning } => {
+                if captured[*capture].is_empty() {
+                    Value::Null
+                } else {
+                    match returning {
+                        Some(select) => {
+                            let binds = resolve_plan_binds(&select.binds, inputs, &captured)?;
+                            fetch_json(&mut *conn, &select.sql, &binds)
+                                .await?
+                                .unwrap_or(Value::Null)
+                        }
+                        None => Value::Object(serde_json::Map::new()),
+                    }
+                }
+            }
+            ResponseShape::Deleted {
+                captures,
+                fields,
+                typenames,
+                one,
+            } => {
+                let rows: Vec<Value> = captures
+                    .iter()
+                    .flat_map(|c| captured[*c].iter())
+                    .map(|row| deleted_row(row, fields))
+                    .collect();
+                if *one {
+                    rows.into_iter().next().unwrap_or(Value::Null)
+                } else {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("affected_rows".into(), Value::from(rows.len()));
+                    obj.insert("returning".into(), Value::Array(rows));
+                    for (key, name) in typenames {
+                        obj.insert(key.clone(), Value::String(name.clone()));
+                    }
+                    Value::Object(obj)
+                }
+            }
+        };
+        out.insert(field.alias.clone(), value);
+    }
+    Ok(Value::Object(out))
+}
+
+/// A deleted row's `returning` object, from the captured row.
+fn deleted_row(row: &Value, fields: &[CapturedField]) -> Value {
+    let mut obj = serde_json::Map::new();
+    for f in fields {
+        match f {
+            CapturedField::Column { key, column } => {
+                obj.insert(key.clone(), row.get(column).cloned().unwrap_or(Value::Null));
+            }
+            CapturedField::Typename { key, name } => {
+                obj.insert(key.clone(), Value::String(name.clone()));
+            }
+            CapturedField::JsonPath { key, column, path } => {
+                let value = row.get(column).unwrap_or(&Value::Null);
+                obj.insert(key.clone(), json_path_get(value, path).clone());
+            }
+        }
+    }
+    Value::Object(obj)
+}
+
+/// The parameters of one plan statement, from the request and from what
+/// earlier statements captured.
+fn resolve_plan_binds(
+    binds: &[PlanBind],
+    inputs: &Inputs<'_>,
+    captured: &[Vec<Value>],
+) -> Result<Vec<Bind>> {
+    binds
+        .iter()
+        .map(|b| match b {
+            PlanBind::Spec(spec) => spec.resolve(inputs),
+            PlanBind::Captured {
+                capture,
+                column,
+                ty,
+            } => {
+                let rows = &captured[*capture];
+                let [row] = rows.as_slice() else {
+                    return Err(Error::Schema(format!(
+                        "internal: a nested insert expected one parent row and found {}",
+                        rows.len()
+                    )));
+                };
+                json_to_bind(row.get(column).unwrap_or(&Value::Null), ty)
+            }
+            PlanBind::Rowids(captures) => Ok(Bind::Int8Array(
+                captures
+                    .iter()
+                    .flat_map(|c| captured[*c].iter())
+                    .map(|row| row.get(ROWID_KEY).and_then(Value::as_i64))
+                    .collect(),
+            )),
+        })
+        .collect()
+}
+
+fn bind_all<'q>(
+    mut q: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
+    binds: &'q [Bind],
+) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments> {
+    for b in binds {
+        q = match b {
+            Bind::Null(of) => match of {
+                NullOf::Bool => q.bind(None::<bool>),
+                NullOf::Int4 => q.bind(None::<i32>),
+                NullOf::Int8 => q.bind(None::<i64>),
+                NullOf::Float8 => q.bind(None::<f64>),
+                NullOf::Text
+                | NullOf::BoolArray
+                | NullOf::Int4Array
+                | NullOf::Int8Array
+                | NullOf::Float8Array
+                | NullOf::TextArray => q.bind(None::<String>),
+            },
+            Bind::Bool(v) => q.bind(*v),
+            Bind::Int4(v) => q.bind(*v),
+            Bind::Int8(v) => q.bind(*v),
+            Bind::Float8(v) => q.bind(*v),
+            Bind::Text(v) => q.bind(v.as_str()),
+            Bind::BoolArray(v) => q.bind(json_list(v)),
+            Bind::Int4Array(v) => q.bind(json_list(v)),
+            Bind::Int8Array(v) => q.bind(json_list(v)),
+            Bind::Float8Array(v) => q.bind(json_list(v)),
+            Bind::TextArray(v) => q.bind(json_list(v)),
+        };
+    }
+    q
+}
+
+/// Every row of a `RETURNING json_object(…)`, as JSON.
+async fn fetch_rows(
+    conn: &mut sqlx::SqliteConnection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Vec<Value>> {
+    use sqlx::Row;
+    let rows = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_all(conn)
+        .await
+        .map_err(map_sqlite_error)?;
+    rows.iter()
+        .map(|r| {
+            let json: sqlx::types::Json<Value> = r.try_get(0)?;
+            Ok(json.0)
+        })
+        .collect()
+}
+
+async fn fetch_count(conn: &mut sqlx::SqliteConnection, sql: &str, binds: &[Bind]) -> Result<i64> {
+    use sqlx::Row;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_one(conn)
+        .await
+        .map_err(map_sqlite_error)?;
+    Ok(row.try_get::<i64, _>(0)?)
+}
+
+/// One JSON value, or none when the statement yields no row (`LIMIT 1` over
+/// nothing).
+async fn fetch_json(
+    conn: &mut sqlx::SqliteConnection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Option<Value>> {
+    use sqlx::Row;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_optional(conn)
+        .await
+        .map_err(map_sqlite_error)?;
+    match row {
+        Some(r) => {
+            let json: Option<sqlx::types::Json<Value>> = r.try_get(0)?;
+            Ok(json.map(|j| j.0))
+        }
+        None => Ok(None),
+    }
 }

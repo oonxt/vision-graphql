@@ -197,8 +197,22 @@ impl<DB: Backend> Clone for CompiledQuery<DB> {
 pub(crate) struct Shape {
     /// The `@choices` values this shape was compiled for, by variable name.
     pub(crate) pinned: Map<String, Value>,
-    pub(crate) sql: String,
-    pub(crate) specs: Vec<BindSpec>,
+    /// One statement, or — a mutation on a backend without data-modifying
+    /// CTEs — a plan of several.
+    pub(crate) rendered: crate::sql::Rendered,
+}
+
+impl Shape {
+    /// The SQL, or a plan's statements one per line.
+    pub(crate) fn sql(&self) -> &str {
+        self.rendered.sql()
+    }
+
+    /// The parameter specifications, copied out: what the tests resolve.
+    #[cfg(test)]
+    pub(crate) fn specs(&self) -> Vec<BindSpec> {
+        self.rendered.specs().cloned().collect()
+    }
 }
 
 impl<DB: Backend> CompiledQuery<DB> {
@@ -211,20 +225,20 @@ impl<DB: Backend> CompiledQuery<DB> {
     /// one; [`shape_count`](Self::shape_count) says whether there is more than
     /// one to look at.
     pub fn sql(&self) -> &str {
-        &self.shapes[0].sql
+        self.shapes[0].sql()
     }
 
     /// Number of bound parameters the statement takes — the first shape's,
     /// for an operation with `@choices`.
     pub fn bind_count(&self) -> usize {
-        self.shapes[0].specs.len()
+        self.shapes[0].rendered.specs().count()
     }
 
     /// Every statement this query may run, each with the `@choices` values it
     /// was compiled for. One entry, pinned to nothing, for an operation without
     /// `@choices`.
     pub fn shapes(&self) -> impl Iterator<Item = (&Map<String, Value>, &str)> {
-        self.shapes.iter().map(|s| (&s.pinned, s.sql.as_str()))
+        self.shapes.iter().map(|s| (&s.pinned, s.sql()))
     }
 
     /// How many statements [`shapes`](Self::shapes) holds.
@@ -267,7 +281,7 @@ impl<DB: Backend> CompiledQuery<DB> {
     pub fn variables(&self) -> Vec<String> {
         let mut out: Vec<String> = self.choices().iter().map(|(n, _)| n.clone()).collect();
         for shape in &self.shapes {
-            for spec in &shape.specs {
+            for spec in shape.rendered.specs() {
                 let mut found = Vec::new();
                 match spec {
                     BindSpec::Scalar { val, .. } | BindSpec::Array { val, .. } => {
@@ -358,8 +372,8 @@ pub(crate) fn compile<DB: Backend>(
             crate::scope::apply_scope(&mut op, scope, schema)?;
         }
         root_alias = crate::engine::single_root_alias(&op).map(String::from);
-        let (sql, specs) = crate::engine::prepare_symbolic(&mut op, schema, limits, DB::DIALECT)?;
-        shapes.push(Shape { pinned, sql, specs });
+        let rendered = crate::engine::prepare_symbolic(&mut op, schema, limits, DB::DIALECT)?;
+        shapes.push(Shape { pinned, rendered });
     }
     Ok(CompiledQuery {
         backend: PhantomData,
@@ -522,9 +536,9 @@ mod tests {
         // Picked by value, compared as JSON — key order and spelling of the
         // request's object do not matter, its content does.
         let shape = q.shape_for(&json!({"sort": [{"title": "desc"}]})).unwrap();
-        assert_eq!(shape.sql, sqls[1]);
+        assert_eq!(shape.sql(), sqls[1]);
         let shape = q.shape_for(&json!({"sort": [{"id": "desc"}]})).unwrap();
-        assert_eq!(shape.sql, sqls[2]);
+        assert_eq!(shape.sql(), sqls[2]);
 
         // A value the document never offered is refused, not mapped to the
         // nearest shape.
@@ -549,7 +563,7 @@ mod tests {
         )
         .unwrap();
         let shape = q.shape_for(&json!({})).unwrap();
-        assert!(shape.sql.contains(r#""id" DESC"#), "{}", shape.sql);
+        assert!(shape.sql().contains(r#""id" DESC"#), "{}", shape.sql());
         // A default outside the list is a document error, not a request one.
         let err = compile_doc(
             r#"query($sort: [orders_order_by!] @choices(values: [[{id: asc}]]) = [{title: asc}]) {
@@ -594,9 +608,9 @@ mod tests {
             .shape_for(&json!({"sort": [{"id": "desc"}], "null": false}))
             .unwrap();
         assert!(
-            shape.sql.contains("IS NOT NULL") && shape.sql.contains(r#""id" DESC"#),
+            shape.sql().contains("IS NOT NULL") && shape.sql().contains(r#""id" DESC"#),
             "{}",
-            shape.sql
+            shape.sql()
         );
         assert_eq!(
             shape.pinned,
@@ -632,7 +646,7 @@ mod tests {
         assert_eq!(q.shape_count(), 2);
         for (pinned, _) in q.shapes() {
             let shape = q.shape_for(&Value::Object(pinned.clone())).unwrap();
-            let binds = resolve_binds(&shape.specs, &Inputs::variables(&json!({}))).unwrap();
+            let binds = resolve_binds(&shape.specs(), &Inputs::variables(&json!({}))).unwrap();
             assert_eq!(
                 binds,
                 vec![Bind::Text(pinned["t"].as_str().unwrap().into())]
@@ -677,7 +691,7 @@ mod tests {
         // Leaving them out: nulls, which the SQL turns into TRUE.
         assert_eq!(
             resolve_binds(
-                &shape.specs,
+                &shape.specs(),
                 &Inputs::variables(&json!({"t": null, "ids": null, "not": null}))
             )
             .unwrap(),
@@ -690,7 +704,7 @@ mod tests {
         // Supplying them: the ordinary binds.
         assert_eq!(
             resolve_binds(
-                &shape.specs,
+                &shape.specs(),
                 &Inputs::variables(&json!({"t": "%a%", "ids": [1, 2], "not": [3]}))
             )
             .unwrap(),
@@ -703,7 +717,7 @@ mod tests {
         // Not supplied at all is still not bound: an optional filter is one the
         // request says nothing about *by passing null*, not one it may forget.
         let err = resolve_binds(
-            &shape.specs,
+            &shape.specs(),
             &Inputs::variables(&json!({"t": "x", "not": null})),
         )
         .unwrap_err();
@@ -799,29 +813,29 @@ mod tests {
 
         let is_null = q.shape_for(&json!({"roots": true})).unwrap();
         assert!(
-            is_null.sql.contains(r#""title" IS NULL"#),
+            is_null.sql().contains(r#""title" IS NULL"#),
             "{}",
-            is_null.sql
+            is_null.sql()
         );
         let not_null = q.shape_for(&json!({"roots": false})).unwrap();
         assert!(
-            not_null.sql.contains(r#""title" IS NOT NULL"#),
+            not_null.sql().contains(r#""title" IS NOT NULL"#),
             "{}",
-            not_null.sql
+            not_null.sql()
         );
         let dropped = q.shape_for(&json!({"roots": null})).unwrap();
         assert!(
-            !dropped.sql.contains("IS NULL") && !dropped.sql.contains("IS NOT NULL"),
+            !dropped.sql().contains("IS NULL") && !dropped.sql().contains("IS NOT NULL"),
             "{}",
-            dropped.sql
+            dropped.sql()
         );
-        assert!(dropped.sql.contains(r#""id" > "#), "{}", dropped.sql);
+        assert!(dropped.sql().contains(r#""id" > "#), "{}", dropped.sql());
         assert_eq!(
             dropped.pinned,
             json!({"roots": null}).as_object().cloned().unwrap()
         );
         // The default is the dropped shape.
-        assert_eq!(q.shape_for(&json!({})).unwrap().sql, dropped.sql);
+        assert_eq!(q.shape_for(&json!({})).unwrap().sql(), dropped.sql());
         // Outside the list is still outside the list.
         let err = q.shape_for(&json!({"roots": "yes"})).unwrap_err();
         assert!(
@@ -840,7 +854,7 @@ mod tests {
         ] {
             let op = lower_with(&doc, Bindings::eager(&vars), None, &schema()).unwrap();
             let (sql, _) = render(&op, &schema()).unwrap();
-            assert_eq!(sql, shape.sql, "{vars}");
+            assert_eq!(sql, shape.sql(), "{vars}");
         }
         let err = lower_with(
             &doc,
@@ -864,12 +878,12 @@ mod tests {
         .unwrap();
         assert_eq!(q.shape_count(), 3);
         let dropped = q.shape_for(&json!({"t": null})).unwrap();
-        assert!(!dropped.sql.contains("title"), "{}", dropped.sql);
-        assert!(dropped.specs.is_empty(), "{:?}", dropped.specs);
+        assert!(!dropped.sql().contains("title"), "{}", dropped.sql());
+        assert!(dropped.specs().is_empty(), "{:?}", dropped.specs());
         let a = q.shape_for(&json!({"t": "a"})).unwrap();
-        assert!(a.sql.contains(r#""title" = $1::text"#), "{}", a.sql);
+        assert!(a.sql().contains(r#""title" = $1::text"#), "{}", a.sql());
         assert_eq!(
-            binds(&a.specs, json!({"t": "a"})).unwrap(),
+            binds(&a.specs(), json!({"t": "a"})).unwrap(),
             vec![Bind::Text("a".into())]
         );
         // The null shape counts toward the bound: 256 values plus the dropped
@@ -1462,8 +1476,7 @@ mod tests {
         let compiled = super::CompiledQuery {
             shapes: vec![super::Shape {
                 pinned: Default::default(),
-                sql,
-                specs,
+                rendered: crate::sql::Rendered::Statement { sql, specs },
             }],
             contract: super::VariableContract::default(),
             root_alias: None,

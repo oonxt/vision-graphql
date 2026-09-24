@@ -5,6 +5,7 @@ use crate::dialect::{
     escape_string_literal, json_kind, pg_type_name, quote_ident, Dialect, JsonKind,
 };
 use crate::error::{Error, Result};
+use crate::plan::MutationPlan;
 use crate::schema::{ColumnType, Schema, Table};
 use crate::types::{Bind, BindSpec, Inputs};
 use std::fmt::Write as _;
@@ -22,12 +23,64 @@ pub fn render(
     schema: &Schema,
     dialect: Dialect,
 ) -> Result<(String, Vec<BindSpec>)> {
+    match render_any(op, schema, dialect)? {
+        Rendered::Statement { sql, specs } => Ok((sql, specs)),
+        Rendered::Plan(_) => Err(Error::Unsupported {
+            message: format!(
+                "a mutation on {dialect:?} renders as a sequence of statements, not one; \
+                 use render_any"
+            ),
+        }),
+    }
+}
+
+/// What an operation renders to: one statement, or — a mutation on a backend
+/// without data-modifying CTEs — a [`MutationPlan`] of several.
+#[derive(Debug, Clone)]
+pub enum Rendered {
+    Statement { sql: String, specs: Vec<BindSpec> },
+    Plan(Box<MutationPlan>),
+}
+
+impl Rendered {
+    /// The SQL, or for a plan its statements one per line.
+    pub fn sql(&self) -> &str {
+        match self {
+            Rendered::Statement { sql, .. } => sql,
+            Rendered::Plan(p) => p.text(),
+        }
+    }
+
+    /// Every parameter specification, in the order the statements bind them.
+    pub(crate) fn specs(&self) -> Box<dyn Iterator<Item = &BindSpec> + '_> {
+        match self {
+            Rendered::Statement { specs, .. } => Box::new(specs.iter()),
+            Rendered::Plan(p) => Box::new(p.specs()),
+        }
+    }
+}
+
+/// [`render`], for every operation. A dialect that writes in one statement
+/// renders a mutation as [`Rendered::Statement`]; one that cannot renders it
+/// as a [`Rendered::Plan`] — see [`crate::plan`].
+pub fn render_any(op: &Operation, schema: &Schema, dialect: Dialect) -> Result<Rendered> {
     let mut ctx = RenderCtx::new(dialect);
     match op {
-        Operation::Query(roots) => render_query(roots, schema, &mut ctx),
-        Operation::Mutation(fields) => render_mutation(fields, schema, &mut ctx),
-    }?;
-    Ok((ctx.sql, ctx.binds))
+        Operation::Query(roots) => render_query(roots, schema, &mut ctx)?,
+        Operation::Mutation(fields) if dialect.mutations_by_plan() => {
+            use crate::ast::MutationField;
+            crate::ast::ensure_unique_root_aliases(fields.iter().map(MutationField::alias))?;
+            check_mutable(fields, schema)?;
+            return Ok(Rendered::Plan(Box::new(crate::plan::build(
+                fields, schema, dialect,
+            )?)));
+        }
+        Operation::Mutation(fields) => render_mutation(fields, schema, &mut ctx)?,
+    }
+    Ok(Rendered::Statement {
+        sql: ctx.sql,
+        specs: ctx.binds,
+    })
 }
 
 /// Render and immediately resolve every parameter against `inputs`.
@@ -43,12 +96,12 @@ pub fn render_now(
     Ok((sql, binds))
 }
 
-struct RenderCtx {
+pub(crate) struct RenderCtx {
     /// Whose SQL this is. Not defaulted: a context built without saying is a
     /// PostgreSQL statement handed to whichever backend is listening.
-    dialect: Dialect,
-    sql: String,
-    binds: Vec<BindSpec>,
+    pub(crate) dialect: Dialect,
+    pub(crate) sql: String,
+    pub(crate) binds: Vec<BindSpec>,
     alias_counter: usize,
     /// Maps target-table-name → CTE alias for INSERT CTEs emitted in this
     /// statement. Used by nested-returning render to decide whether to read
@@ -67,7 +120,7 @@ struct RenderCtx {
 }
 
 impl RenderCtx {
-    fn new(dialect: Dialect) -> Self {
+    pub(crate) fn new(dialect: Dialect) -> Self {
         Self {
             dialect,
             sql: String::new(),
@@ -79,14 +132,14 @@ impl RenderCtx {
         }
     }
 
-    fn next_alias(&mut self, prefix: &str) -> String {
+    pub(crate) fn next_alias(&mut self, prefix: &str) -> String {
         let a = format!("{prefix}{}", self.alias_counter);
         self.alias_counter += 1;
         a
     }
 
     /// Append a scalar parameter; returns its 1-based placeholder number.
-    fn push_scalar(
+    pub(crate) fn push_scalar(
         &mut self,
         val: &Val,
         pg: &ColumnType,
@@ -98,7 +151,7 @@ impl RenderCtx {
 
     /// Append a scalar in a comparison position, where a null is refused. See
     /// [`BindSpec::comparison`].
-    fn push_comparison(
+    pub(crate) fn push_comparison(
         &mut self,
         val: &Val,
         pg: &ColumnType,
@@ -134,7 +187,7 @@ impl RenderCtx {
     }
 
     /// Append a parameter the renderer determined on its own.
-    fn push_fixed(&mut self, bind: Bind) -> usize {
+    pub(crate) fn push_fixed(&mut self, bind: Bind) -> usize {
         self.binds.push(BindSpec::Fixed(bind));
         self.binds.len()
     }
@@ -262,7 +315,7 @@ fn row_shape(selection: &[Field], table: &Table, dialect: Dialect) -> Vec<(Strin
 /// here, but the typed builder does not — and both `AS "key"` output columns
 /// and `json_build_object` entries keep the last duplicate silently when the
 /// row decodes.
-fn ensure_unique_selection_keys(fields: &[Field], path: &str) -> Result<()> {
+pub(crate) fn ensure_unique_selection_keys(fields: &[Field], path: &str) -> Result<()> {
     let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
     for f in fields {
         let key = match f {
@@ -483,7 +536,7 @@ fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Resu
     )
 }
 
-fn render_bool_expr(
+pub(crate) fn render_bool_expr(
     expr: &crate::ast::BoolExpr,
     table: &Table,
     table_alias: &str,
@@ -1695,7 +1748,7 @@ fn render_by_pk(
 /// point both paths share, so the guard has to live here as well — a read-only
 /// table is a property of the schema, and no way of reaching the renderer may
 /// write to one.
-fn check_mutable(fields: &[crate::ast::MutationField], schema: &Schema) -> Result<()> {
+pub(crate) fn check_mutable(fields: &[crate::ast::MutationField], schema: &Schema) -> Result<()> {
     use crate::ast::{InsertObject, MutationField};
 
     fn deny(table: &Table, alias: &str) -> Error {
@@ -1760,11 +1813,6 @@ fn render_mutation(
     use crate::ast::MutationField;
     // See render_query: the builder path has no other duplicate-key guard.
     crate::ast::ensure_unique_root_aliases(fields.iter().map(MutationField::alias))?;
-    if !ctx.dialect.supports_mutations() {
-        return Err(Error::Unsupported {
-            message: format!("mutations are not implemented for {:?}", ctx.dialect),
-        });
-    }
     check_mutable(fields, schema)?;
     ctx.sql.push_str("WITH ");
     for (i, mf) in fields.iter().enumerate() {
@@ -3183,7 +3231,7 @@ fn render_agg_func(
     Ok(())
 }
 
-fn render_json_build_object_for_nodes(
+pub(crate) fn render_json_build_object_for_nodes(
     fields: &[Field],
     table_alias: &str,
     table: &Table,
@@ -3469,7 +3517,7 @@ fn render_aggregate_source(
 }
 
 #[allow(clippy::only_used_in_recursion)]
-fn render_bool_expr_no_alias(
+pub(crate) fn render_bool_expr_no_alias(
     expr: &crate::ast::BoolExpr,
     table: &Table,
     schema: &Schema,
