@@ -18,6 +18,7 @@ use serde_json::Value;
 use sqlx::postgres::Postgres;
 use sqlx::Pool;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Typed shape of an `insert` / `update` / `delete` mutation result:
@@ -100,14 +101,33 @@ trait Run<DB: Backend>: Send {
     fn name(&self) -> &'static str;
 }
 
-impl<DB: Backend> Run<DB> for &Pool<DB> {
+/// The engine's own pool, checked by [`Backend::verify_pool`] the first time
+/// it is used. On the pool and not at construction, because constructors are
+/// synchronous; here and not only in introspection, because a schema built
+/// by hand never passes through introspection and would otherwise run on a
+/// pool nobody checked.
+struct OnPool<'a, DB: Backend> {
+    pool: &'a Pool<DB>,
+    verified: &'a AtomicBool,
+}
+
+async fn verify_pool_once<DB: Backend>(pool: &Pool<DB>, verified: &AtomicBool) -> Result<()> {
+    if !verified.load(Ordering::Acquire) {
+        DB::verify_pool(pool).await?;
+        verified.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+impl<DB: Backend> Run<DB> for OnPool<'_, DB> {
     async fn run(self, sql: &str, binds: &[Bind]) -> Result<Value> {
-        let mut conn = self.acquire().await?;
+        verify_pool_once::<DB>(self.pool, self.verified).await?;
+        let mut conn = self.pool.acquire().await?;
         DB::execute_conn(&mut conn, sql, binds).await
     }
 
     fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
+        std::any::type_name::<&Pool<DB>>()
     }
 }
 
@@ -144,6 +164,8 @@ impl<'c, DB: Backend, E: sqlx::Executor<'c, Database = DB>> Run<DB> for External
 
 pub struct Engine<DB: Backend = Postgres> {
     pool: Pool<DB>,
+    /// Whether [`Backend::verify_pool`] has passed on `pool`. See [`OnPool`].
+    pool_verified: AtomicBool,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
     limits: ExecutionLimits,
@@ -189,27 +211,42 @@ impl<DB: Backend> Engine<DB> {
     /// If the schema describes a different database than the pool connects
     /// to — see [`Schema::dialect`].
     pub fn new(pool: Pool<DB>, schema: Schema) -> Self {
+        Self::assemble(pool, schema, Arc::new(ParseCache::default()))
+    }
+
+    /// The one construction site. The dialect check and the warnings log live
+    /// here so that no constructor — including the next one — can leave
+    /// either out.
+    fn assemble(pool: Pool<DB>, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
         check_dialect::<DB>(&schema);
         log_schema_warnings(&schema);
         Self {
             pool,
+            pool_verified: AtomicBool::new(false),
             schema: Arc::new(schema),
-            parse_cache: Arc::new(ParseCache::default()),
+            parse_cache,
             limits: ExecutionLimits::default(),
         }
+    }
+
+    /// The engine's pool as a statement target.
+    fn on_pool(&self) -> OnPool<'_, DB> {
+        OnPool {
+            pool: &self.pool,
+            verified: &self.pool_verified,
+        }
+    }
+
+    /// Begin a transaction on the engine's pool, after the pool check.
+    async fn begin(&self) -> Result<sqlx::Transaction<'static, DB>> {
+        verify_pool_once::<DB>(&self.pool, &self.pool_verified).await?;
+        Ok(self.pool.begin().await?)
     }
 
     /// Same as [`Engine::new`], with an explicit parse-cache capacity.
     /// `capacity == 0` parses every request from scratch.
     pub fn with_parse_cache_capacity(pool: Pool<DB>, schema: Schema, capacity: usize) -> Self {
-        check_dialect::<DB>(&schema);
-        log_schema_warnings(&schema);
-        Self {
-            pool,
-            schema: Arc::new(schema),
-            parse_cache: Arc::new(ParseCache::new(capacity)),
-            limits: ExecutionLimits::default(),
-        }
+        Self::assemble(pool, schema, Arc::new(ParseCache::new(capacity)))
     }
 
     /// Same as [`Engine::new`] on a caller-owned [`ParseCache`].
@@ -220,14 +257,7 @@ impl<DB: Backend> Engine<DB> {
     /// engine per role — the way per-role column visibility is expressed — would
     /// otherwise parse the same document once per role.
     pub fn with_parse_cache(pool: Pool<DB>, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
-        check_dialect::<DB>(&schema);
-        log_schema_warnings(&schema);
-        Self {
-            pool,
-            schema: Arc::new(schema),
-            parse_cache,
-            limits: ExecutionLimits::default(),
-        }
+        Self::assemble(pool, schema, parse_cache)
     }
 
     /// Bound what one request may cost. Unbounded by default — see
@@ -263,6 +293,13 @@ impl<DB: Backend> Engine<DB> {
     /// inspection; every handle spawned from this engine uses the same one.
     pub fn parse_cache(&self) -> &Arc<ParseCache> {
         &self.parse_cache
+    }
+
+    /// The pool this engine runs on. A `Pool` is a handle — cloning it shares
+    /// the connections — so a host that built the engine first can still run
+    /// its own statements beside the engine's, on the same pool.
+    pub fn pool(&self) -> &Pool<DB> {
+        &self.pool
     }
 
     /// Parse (via the cache) and lower `source` against this engine's schema.
@@ -335,7 +372,7 @@ impl<DB: Backend> Engine<DB> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(&self.pool, source, variables, operation_name)
+        self.text_to(self.on_pool(), source, variables, operation_name)
             .await
     }
 
@@ -357,7 +394,7 @@ impl<DB: Backend> Engine<DB> {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         run_operation(
-            &self.pool,
+            self.on_pool(),
             op.into_operation(),
             &self.schema,
             &self.limits,
@@ -445,7 +482,8 @@ impl<DB: Backend> Engine<DB> {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = run_operation(&self.pool, operation, &self.schema, &self.limits, false).await?;
+        let data =
+            run_operation(self.on_pool(), operation, &self.schema, &self.limits, false).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -525,7 +563,7 @@ impl<DB: Backend> Engine<DB> {
         compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled(&self.pool, compiled, variables, None).await
+        execute_compiled(self.on_pool(), compiled, variables, None).await
     }
 
     /// [`Engine::execute`] on a caller-supplied executor; see
@@ -553,7 +591,7 @@ impl<DB: Backend> Engine<DB> {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled(&self.pool, compiled, variables, Some(principal)).await
+        execute_compiled(self.on_pool(), compiled, variables, Some(principal)).await
     }
 
     /// [`Engine::execute_scoped`] on a caller-supplied executor; see
@@ -658,7 +696,7 @@ impl<DB: Backend> Engine<DB> {
     where
         F: AsyncFnOnce(&mut TxClient<DB>) -> Result<T>,
     {
-        let tx = self.pool.begin().await?;
+        let tx = self.begin().await?;
         let mut tc = TxClient {
             tx,
             schema: self.schema.clone(),
@@ -962,7 +1000,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(&self.engine.pool, source, variables, operation_name)
+        self.text_to(self.engine.on_pool(), source, variables, operation_name)
             .await
     }
 
@@ -983,7 +1021,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     /// Same as [`Engine::run`], with the scope rewrite applied.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        self.run_scoped_to(&self.engine.pool, op.into_operation())
+        self.run_scoped_to(self.engine.on_pool(), op.into_operation())
             .await
     }
 
@@ -1053,7 +1091,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = self.run_scoped_to(&self.engine.pool, operation).await?;
+        let data = self.run_scoped_to(self.engine.on_pool(), operation).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -1080,7 +1118,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     where
         F: AsyncFnOnce(&mut ScopedTxClient<DB>) -> Result<T>,
     {
-        let tx = self.engine.pool.begin().await?;
+        let tx = self.engine.begin().await?;
         let mut tc = ScopedTxClient {
             tx,
             schema: self.engine.schema.clone(),

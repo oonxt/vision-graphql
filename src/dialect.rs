@@ -313,9 +313,15 @@ impl Dialect {
         Fragment(move |f: &mut Formatter<'_>| match (self, kind) {
             (Dialect::Postgres, _) | (Dialect::Sqlite, JsonKind::Plain) => write!(f, "{expr}"),
             (Dialect::Sqlite, JsonKind::Json) => write!(f, "json({expr})"),
+            // Anything but 0, 1 and NULL is a value the column's declared
+            // type does not admit — text in a BOOLEAN column, say. Not null,
+            // not a guess at truthiness ('true' is falsy to SQLite): an
+            // error, raised the one way SQLite has outside a trigger,
+            // which the executor recognises and names.
             (Dialect::Sqlite, JsonKind::Bool) => write!(
                 f,
-                "CASE {expr} WHEN 1 THEN json('true') WHEN 0 THEN json('false') END"
+                "CASE WHEN {expr} IS NULL THEN NULL WHEN {expr} = 1 THEN json('true') \
+                 WHEN {expr} = 0 THEN json('false') ELSE json('not a boolean') END"
             ),
         })
     }
@@ -475,6 +481,26 @@ impl Dialect {
             (OrderDir::Asc, Some(NullsOrder::Last), _) => " ASC NULLS LAST",
             (OrderDir::Desc, Some(NullsOrder::First), _) => " DESC NULLS FIRST",
             (OrderDir::Desc, Some(NullsOrder::Last), _) => " DESC NULLS LAST",
+        }
+    }
+
+    /// Whether a row wrapper builds the row's JSON object by hand and so
+    /// needs the row's shape ([`rows_list_open`](Self::rows_list_open)).
+    pub(crate) fn builds_row_objects(self) -> bool {
+        match self {
+            Dialect::Postgres => false,
+            Dialect::Sqlite => true,
+        }
+    }
+
+    /// Whether `count((a, b))` — a row constructor as the counted value — is
+    /// SQL here. SQLite has row values but rejects one as an aggregate's
+    /// argument, and has no other one-expression spelling of "distinct
+    /// pairs", so `count(columns: [a, b])` is refused there.
+    pub(crate) fn counts_tuples(self) -> bool {
+        match self {
+            Dialect::Postgres => true,
+            Dialect::Sqlite => false,
         }
     }
 

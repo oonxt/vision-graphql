@@ -253,10 +253,18 @@ pub async fn introspect(pool: &SqlitePool) -> Result<SqliteIntrospection> {
         );
     }
 
-    // Fill in the implicit `REFERENCES t` targets now that every primary key
-    // is known. A reference to a table with no primary key is a schema error
-    // SQLite itself reports at write time; here it is left dangling and the
-    // merge skips the relation.
+    // SQLite matches table names without regard to case: `REFERENCES users`
+    // finds `CREATE TABLE Users`. The merge matches by exact string, so the
+    // target is spelled here the way the table was created.
+    let canonical: BTreeMap<String, String> = db
+        .tables
+        .values()
+        .map(|t| (t.name.to_lowercase(), t.name.clone()))
+        .collect();
+    // Then the implicit `REFERENCES t` targets, now that every primary key is
+    // known. A reference that names no columns to a table with no primary key
+    // of matching width is refused: SQLite would refuse the write, and the
+    // relation it would derive could not be right.
     let pks: BTreeMap<String, Vec<String>> = db
         .tables
         .values()
@@ -264,6 +272,9 @@ pub async fn introspect(pool: &SqlitePool) -> Result<SqliteIntrospection> {
         .collect();
     for t in db.tables.values_mut() {
         for fk in &mut t.foreign_keys {
+            if let Some(real) = canonical.get(&fk.to_table.to_lowercase()) {
+                fk.to_table = real.clone();
+            }
             if fk.to_columns.is_empty() {
                 match pks.get(&fk.to_table) {
                     Some(pk) if pk.len() == fk.from_columns.len() => {

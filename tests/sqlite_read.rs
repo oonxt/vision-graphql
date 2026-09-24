@@ -578,3 +578,161 @@ async fn a_schema_of_the_other_dialect_is_refused() {
     let schema = Schema::builder().build();
     let _ = Engine::new(pool, schema);
 }
+
+#[tokio::test]
+async fn distinct_on_inside_a_relation() {
+    let e = engine().await;
+    // Without distinct_on Ann has two posts; with it, the highest-viewed one.
+    let v = q(
+        &e,
+        "{ users(order_by: {id: asc}) { name posts(distinct_on: [user_id], order_by: [{user_id: asc}, {views: desc}]) { title tags { label } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["users"],
+        json!([
+            {"name": "Ann", "posts": [{"title": "alpha", "tags": [{"label": "x"}, {"label": "y"}]}]},
+            {"name": "bob", "posts": [{"title": "mid", "tags": []}]},
+            {"name": "Cara", "posts": [{"title": "omega", "tags": [{"label": "z"}]}]}
+        ])
+    );
+    // The relation's own filter applies before the numbering.
+    let v = q(
+        &e,
+        "{ users(where: {id: {_eq: 1}}) { posts(distinct_on: [user_id], where: {views: {_lt: 30}}) { title } } }",
+    )
+    .await;
+    assert_eq!(v["users"][0]["posts"], json!([{"title": "zeta"}]));
+}
+
+#[tokio::test]
+async fn counting_several_columns_is_refused_and_one_is_counted() {
+    let e = engine().await;
+    let err = e
+        .query(
+            "{ posts_aggregate { aggregate { count(columns: [title, views]) } } }",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    let v = q(
+        &e,
+        "{ posts_aggregate { aggregate { count(columns: [views], distinct: true) } } }",
+    )
+    .await;
+    assert_eq!(v["posts_aggregate"]["aggregate"]["count"], json!(3));
+    let v = q(
+        &e,
+        "{ posts_aggregate { aggregate { count(columns: [published]) } } }",
+    )
+    .await;
+    assert_eq!(v["posts_aggregate"]["aggregate"]["count"], json!(3));
+}
+
+#[tokio::test]
+async fn foreign_keys_find_their_table_whatever_the_case() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options("sqlite::memory:").unwrap())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE Users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users, title TEXT);
+         CREATE TABLE likes (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES USERS(id));
+         INSERT INTO Users VALUES (1, 'Ann'); INSERT INTO posts VALUES (1, 1, 'p'); INSERT INTO likes VALUES (1, 1);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect_sqlite(&pool).await.unwrap().build();
+    assert!(schema
+        .table("posts")
+        .unwrap()
+        .find_relation("User")
+        .is_some());
+    assert!(schema
+        .table("likes")
+        .unwrap()
+        .find_relation("User")
+        .is_some());
+    let e = Engine::new(pool, schema);
+    let v = q(&e, "{ posts { User { name } } likes { User { name } } }").await;
+    assert_eq!(v["posts"][0]["User"]["name"], json!("Ann"));
+    assert_eq!(v["likes"][0]["User"]["name"], json!("Ann"));
+}
+
+#[tokio::test]
+async fn a_hand_built_schema_still_gets_its_pool_checked() {
+    use vision_graphql::schema::{ColumnType, Table};
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'Ann');")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let schema = Schema::builder()
+        .dialect(Dialect::Sqlite)
+        .table(
+            Table::new("users", "main", "users")
+                .column("id", "id", ColumnType::Int8, false)
+                .column("name", "name", ColumnType::Text, true)
+                .primary_key(&["id"]),
+        )
+        .build();
+    let e = Engine::new(pool, schema);
+    let err = e
+        .query("{ users(where: {name: {_like: \"a%\"}}) { name } }", None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("case-insensitive"), "{err}");
+    let err = e
+        .transaction(async |tx| tx.query("{ users { name } }", None).await)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("case-insensitive"), "{err}");
+}
+
+#[tokio::test]
+async fn a_value_the_declared_type_does_not_admit_is_an_error_not_a_null() {
+    let e = engine().await;
+    // The table is not STRICT, so this goes in.
+    sqlx::raw_sql("INSERT INTO users (id, name, active) VALUES (4, 'Dan', 'true');")
+        .execute(&pool_of(&e))
+        .await
+        .unwrap();
+    let err = e
+        .query("{ users(where: {id: {_eq: 4}}) { active } }", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err}");
+    assert!(err.to_string().contains("BOOLEAN"), "{err}");
+    // A column that is not asked for does not get in the way.
+    let v = q(&e, "{ users(where: {id: {_eq: 4}}) { name } }").await;
+    assert_eq!(v["users"], json!([{"name": "Dan"}]));
+}
+
+/// The engine's own pool, for a test that has to write around the engine.
+fn pool_of(e: &Engine<sqlx::Sqlite>) -> SqlitePool {
+    e.pool().clone()
+}
+
+#[tokio::test]
+async fn a_persisted_mutation_keeps_its_code() {
+    let e = engine().await;
+    let err = vision_graphql::QueryRegistry::compile_all(
+        &e,
+        [(
+            "m",
+            "mutation { insert_users(objects: [{name: \"x\"}]) { affected_rows } }",
+        )],
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    assert_eq!(err.code(), vision_graphql::ErrorCode::Unsupported);
+}

@@ -215,7 +215,7 @@ fn render_list(
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    let shape = row_shape(selection, table);
+    let shape = row_shape(selection, table, ctx.dialect);
     write!(
         ctx.sql,
         "{}",
@@ -234,7 +234,10 @@ fn render_list(
 /// builds the row's JSON object by hand ([`Dialect::rows_list_open`]) needs.
 /// A column the table does not have is `Plain` here; the inner select refuses
 /// it with the error that names it.
-fn row_shape(selection: &[Field], table: &Table) -> Vec<(String, JsonKind)> {
+fn row_shape(selection: &[Field], table: &Table, dialect: Dialect) -> Vec<(String, JsonKind)> {
+    if !dialect.builds_row_objects() {
+        return Vec::new();
+    }
     selection
         .iter()
         .map(|f| match f {
@@ -293,7 +296,7 @@ fn render_inner_select(
     ctx.sql.push_str("SELECT ");
     if !root.args.distinct_on.is_empty() && !windowed {
         ctx.sql.push_str("DISTINCT ON (");
-        render_distinct_on_columns(root, table, table_alias, ctx)?;
+        render_distinct_on_columns(&root.args.distinct_on, table, table_alias, &root.alias, ctx)?;
         ctx.sql.push_str(") ");
     }
     for (i, field) in selection.iter().enumerate() {
@@ -388,8 +391,12 @@ fn render_inner_select(
             " FROM (SELECT {table_alias}.*, row_number() OVER (PARTITION BY "
         )
         .unwrap();
-        render_distinct_on_columns(root, table, table_alias, ctx)?;
+        render_distinct_on_columns(&root.args.distinct_on, table, table_alias, &root.alias, ctx)?;
+        // The same ORDER BY orders the window and the outer rows. Rendered
+        // once and copied: rendering it twice would push its binds twice.
+        let ob_start = ctx.sql.len();
         render_order_by(&root.args, table, table_alias, schema, ctx)?;
+        let order_by = ctx.sql[ob_start..].to_string();
         write!(
             ctx.sql,
             ") AS {DISTINCT_ROW_NUMBER} FROM {}.{} {table_alias}",
@@ -403,6 +410,7 @@ fn render_inner_select(
             ") {table_alias} WHERE {table_alias}.{DISTINCT_ROW_NUMBER} = 1"
         )
         .unwrap();
+        ctx.sql.push_str(&order_by);
     } else {
         write!(
             ctx.sql,
@@ -412,8 +420,8 @@ fn render_inner_select(
         )
         .unwrap();
         render_where(&root.args, table, table_alias, schema, ctx)?;
+        render_order_by(&root.args, table, table_alias, schema, ctx)?;
     }
-    render_order_by(&root.args, table, table_alias, schema, ctx)?;
     render_limit_offset(&root.args, &root.alias, ctx);
     Ok(())
 }
@@ -424,18 +432,19 @@ const DISTINCT_ROW_NUMBER: &str = "\"__vision_graphql_rn\"";
 
 /// The `distinct_on` columns, comma-separated and qualified.
 fn render_distinct_on_columns(
-    root: &RootField,
+    distinct_on: &[String],
     table: &Table,
     table_alias: &str,
+    path: &str,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    for (i, col_name) in root.args.distinct_on.iter().enumerate() {
+    for (i, col_name) in distinct_on.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
         let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-            path: format!("{}.distinct_on.{col_name}", root.alias),
-            message: format!("unknown column '{col_name}' on '{}'", root.table),
+            path: format!("{path}.distinct_on.{col_name}"),
+            message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
         write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
     }
@@ -665,7 +674,7 @@ fn render_relation_subquery(
     let remote_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
 
-    let shape = row_shape(selection, target);
+    let shape = row_shape(selection, target, ctx.dialect);
     match rel.kind {
         crate::schema::RelKind::Array => {
             write!(
@@ -685,7 +694,15 @@ fn render_relation_subquery(
         }
     }
 
+    let rel_path = format!("{parent_path}.{alias}");
+    let distinct = !args.distinct_on.is_empty();
+    let windowed = distinct && ctx.dialect.distinct_on_by_window();
     ctx.sql.push_str("SELECT ");
+    if distinct && !windowed {
+        ctx.sql.push_str("DISTINCT ON (");
+        render_distinct_on_columns(&args.distinct_on, target, &remote_alias, &rel_path, ctx)?;
+        ctx.sql.push_str(") ");
+    }
     for (i, field) in selection.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -774,64 +791,66 @@ fn render_relation_subquery(
         _ => None,
     };
 
-    if let Some(cte_alias) = visible_cte {
-        write!(ctx.sql, " FROM {cte_alias} {remote_alias}").unwrap();
-    } else {
-        write!(
-            ctx.sql,
-            " FROM {}.{} {remote_alias}",
+    let source = match visible_cte {
+        Some(cte_alias) => cte_alias,
+        None => format!(
+            "{}.{}",
             quote_ident(&target.physical_schema),
-            quote_ident(&target.physical_name),
-        )
-        .unwrap();
-    }
-
-    ctx.sql.push_str(" WHERE ");
-    for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
-        if i > 0 {
-            ctx.sql.push_str(" AND ");
-        }
-        let l = parent_table
-            .find_column(local_col)
-            .ok_or_else(|| Error::Validate {
-                path: format!("{parent_path}.{alias}"),
-                message: format!(
-                    "relation mapping: unknown local column '{local_col}' on '{}'",
-                    parent_table.exposed_name
-                ),
-            })?;
-        let r = target
-            .find_column(remote_col)
-            .ok_or_else(|| Error::Validate {
-                path: format!("{parent_path}.{alias}"),
-                message: format!(
-                    "relation mapping: unknown remote column '{remote_col}' on '{}'",
-                    target.exposed_name
-                ),
-            })?;
+            quote_ident(&target.physical_name)
+        ),
+    };
+    let ob_path = format!("{rel_path}.order_by");
+    if windowed {
+        // As at the root (see render_inner_select): number the rows within
+        // each distinct group and keep the first. The derived table is
+        // correlated to the parent row — SQLite allows that in FROM — so the
+        // numbering is per parent, as `DISTINCT ON` inside the correlated
+        // subquery is on PostgreSQL.
         write!(
             ctx.sql,
-            "{remote_alias}.{} = {parent_alias}.{}",
-            quote_ident(&r.physical_name),
-            quote_ident(&l.physical_name),
+            " FROM (SELECT {remote_alias}.*, row_number() OVER (PARTITION BY "
         )
         .unwrap();
-    }
-    if let Some(expr) = args.where_.as_ref() {
-        ctx.sql.push_str(" AND ");
-        render_bool_expr(expr, target, &remote_alias, schema, ctx)?;
-    }
-
-    if !args.order_by.is_empty() {
-        ctx.sql.push_str(" ORDER BY ");
-        let ob_path = format!("{parent_path}.{alias}.order_by");
-        for (i, ob) in args.order_by.iter().enumerate() {
-            if i > 0 {
-                ctx.sql.push_str(", ");
-            }
-            render_order_by_expr(ob, target, &remote_alias, schema, &ob_path, ctx)?;
-            render_order_dir(ob, ctx);
-        }
+        render_distinct_on_columns(&args.distinct_on, target, &remote_alias, &rel_path, ctx)?;
+        let ob_start = ctx.sql.len();
+        render_relation_order_by(args, target, &remote_alias, schema, &ob_path, ctx)?;
+        let order_by = ctx.sql[ob_start..].to_string();
+        write!(
+            ctx.sql,
+            ") AS {DISTINCT_ROW_NUMBER} FROM {source} {remote_alias}"
+        )
+        .unwrap();
+        render_relation_where(
+            args,
+            rel,
+            parent_table,
+            parent_alias,
+            target,
+            &remote_alias,
+            schema,
+            &rel_path,
+            ctx,
+        )?;
+        write!(
+            ctx.sql,
+            ") {remote_alias} WHERE {remote_alias}.{DISTINCT_ROW_NUMBER} = 1"
+        )
+        .unwrap();
+        ctx.sql.push_str(&order_by);
+    } else {
+        write!(ctx.sql, " FROM {source} {remote_alias}").unwrap();
+        render_relation_where(
+            args,
+            rel,
+            parent_table,
+            parent_alias,
+            target,
+            &remote_alias,
+            schema,
+            &rel_path,
+            ctx,
+        )?;
+        render_relation_order_by(args, target, &remote_alias, schema, &ob_path, ctx)?;
     }
 
     if let Some(limit) = args.limit.as_ref() {
@@ -854,6 +873,83 @@ fn render_relation_subquery(
     ctx.sql.push_str(&row_alias);
     ctx.sql.push(')');
 
+    Ok(())
+}
+
+/// A relation subquery's WHERE: the correlation to the parent row, then the
+/// relation's own `where`.
+#[allow(clippy::too_many_arguments)]
+fn render_relation_where(
+    args: &QueryArgs,
+    rel: &crate::schema::Relation,
+    parent_table: &Table,
+    parent_alias: &str,
+    target: &Table,
+    remote_alias: &str,
+    schema: &Schema,
+    rel_path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    ctx.sql.push_str(" WHERE ");
+    for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(" AND ");
+        }
+        let l = parent_table
+            .find_column(local_col)
+            .ok_or_else(|| Error::Validate {
+                path: rel_path.to_string(),
+                message: format!(
+                    "relation mapping: unknown local column '{local_col}' on '{}'",
+                    parent_table.exposed_name
+                ),
+            })?;
+        let r = target
+            .find_column(remote_col)
+            .ok_or_else(|| Error::Validate {
+                path: rel_path.to_string(),
+                message: format!(
+                    "relation mapping: unknown remote column '{remote_col}' on '{}'",
+                    target.exposed_name
+                ),
+            })?;
+        write!(
+            ctx.sql,
+            "{remote_alias}.{} = {parent_alias}.{}",
+            quote_ident(&r.physical_name),
+            quote_ident(&l.physical_name),
+        )
+        .unwrap();
+    }
+    if let Some(expr) = args.where_.as_ref() {
+        ctx.sql.push_str(" AND ");
+        render_bool_expr(expr, target, remote_alias, schema, ctx)?;
+    }
+    Ok(())
+}
+
+/// `ORDER BY` for a relation subquery: the `distinct_on` columns first, as
+/// at the root, then the relation's own terms.
+fn render_relation_order_by(
+    args: &QueryArgs,
+    target: &Table,
+    remote_alias: &str,
+    schema: &Schema,
+    ob_path: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let prefix = distinct_order_prefix(args);
+    if prefix.is_empty() && args.order_by.is_empty() {
+        return Ok(());
+    }
+    ctx.sql.push_str(" ORDER BY ");
+    for (i, ob) in prefix.iter().chain(args.order_by.iter()).enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        render_order_by_expr(ob, target, remote_alias, schema, ob_path, ctx)?;
+        render_order_dir(ob, ctx);
+    }
     Ok(())
 }
 
@@ -1077,6 +1173,23 @@ fn render_order_by_expr(
     Ok(())
 }
 
+/// The `distinct_on` columns the ORDER BY has to start with, as order terms —
+/// those the document did not already order by. `DISTINCT ON` demands the
+/// leading order terms be the distinct columns, and the window form partitions
+/// by them, so either way they come first.
+fn distinct_order_prefix(args: &QueryArgs) -> Vec<crate::ast::OrderBy> {
+    args.distinct_on
+        .iter()
+        .filter(|d| {
+            !args
+                .order_by
+                .iter()
+                .any(|ob| ob.path.is_empty() && ob.column == **d)
+        })
+        .map(|d| crate::ast::OrderBy::column(d.clone(), crate::ast::OrderDir::Asc))
+        .collect()
+}
+
 fn render_order_by(
     args: &QueryArgs,
     table: &Table,
@@ -1084,20 +1197,7 @@ fn render_order_by(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    // distinct_on columns must lead the ORDER BY; they are always own columns.
-    let mut prefix: Vec<crate::ast::OrderBy> = Vec::new();
-    for d in &args.distinct_on {
-        let already = args
-            .order_by
-            .iter()
-            .any(|ob| ob.path.is_empty() && ob.column == *d);
-        if !already {
-            prefix.push(crate::ast::OrderBy::column(
-                d.clone(),
-                crate::ast::OrderDir::Asc,
-            ));
-        }
-    }
+    let prefix = distinct_order_prefix(args);
     if prefix.is_empty() && args.order_by.is_empty() {
         return Ok(());
     }
@@ -1467,7 +1567,7 @@ fn render_by_pk(
     ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    let shape = row_shape(selection, table);
+    let shape = row_shape(selection, table, ctx.dialect);
     write!(
         ctx.sql,
         "{}",
@@ -2931,6 +3031,15 @@ fn render_agg_op(
                 return Err(Error::Validate {
                     path: format!("aggregate.{}.distinct", sel.alias),
                     message: "'distinct' needs 'columns' to be distinct on".into(),
+                });
+            }
+            if columns.len() > 1 && !ctx.dialect.counts_tuples() {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "count over several columns is not available on {:?}: count one \
+                         column, or count(*)",
+                        ctx.dialect
+                    ),
                 });
             }
             write!(ctx.sql, "'{key}', count(").unwrap();
@@ -5440,6 +5549,18 @@ mod tests {
         fn by_pk_and_typename() {
             let (sql, _) = render("{ users_by_pk(id: 1) { __typename name active } }");
             insta::assert_snapshot!(sql);
+        }
+
+        #[test]
+        fn distinct_on_inside_a_relation() {
+            let source = "{ users { name posts(distinct_on: [user_id], where: {views: {_gt: 1}}, order_by: {views: desc}, limit: 2) { title } } }";
+            let (sql, _) = render(source);
+            insta::assert_snapshot!("sqlite_relation_distinct_on", sql);
+            // And the PostgreSQL form, which lives in the same function.
+            let doc = parse_document(source).unwrap();
+            let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
+            let (sql, _) = super::super::render(&op, &schema(), Dialect::Postgres).unwrap();
+            insta::assert_snapshot!("postgres_relation_distinct_on", sql);
         }
     }
 }

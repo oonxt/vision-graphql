@@ -29,6 +29,16 @@ release commits; entries from 0.13.0 on are written as the work lands.
 - **`SchemaWarning::LooselyTypedTable`** for a SQLite table that is not
   `STRICT`: the declared types the schema was derived from are not enforced.
 
+### Fixed
+
+- **`distinct_on` on a nested array relation was dropped.** The argument was
+  published on relation fields and accepted by the lowering, but the relation
+  subquery never rendered it — on PostgreSQL as much as anywhere — so
+  `users { posts(distinct_on: [kind]) { … } }` answered with every post and no
+  error. It now renders `DISTINCT ON` inside the correlated subquery (the
+  `row_number()` form on SQLite), with the distinct columns leading the
+  subquery's `ORDER BY` as they do at the root.
+
 ### Changed
 
 - **The engine is generic over its backend.** `Engine`, `ScopedEngine`,

@@ -14,9 +14,11 @@
 //! [`connect_options`] sets both on every connection of a pool.
 //! [`verify`] checks a pool that was built some other way, and
 //! [`Schema::introspect_sqlite`](crate::Schema::introspect_sqlite) runs it
-//! first, so a misconfigured pool is refused before it serves anything. A
-//! version below 3.44 is refused too: `json_group_array(… ORDER BY …)`, which
-//! nested `order_by` renders to, arrived there.
+//! first, so a misconfigured pool is refused before it serves anything, and an
+//! [`Engine`](crate::Engine) runs it once before the first statement on its
+//! own pool, so a schema built by hand is guarded the same way. A version
+//! below 3.38 is refused too: that is where `->` and the built-in JSON
+//! functions the rendered SQL uses arrived.
 
 use crate::error::{Error, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
@@ -24,7 +26,7 @@ use sqlx::Row;
 use std::str::FromStr;
 
 /// The oldest SQLite the rendered SQL runs on.
-pub const MIN_VERSION: (u32, u32, u32) = (3, 44, 0);
+pub const MIN_VERSION: (u32, u32, u32) = (3, 38, 0);
 
 /// Connection options for `url` (`sqlite://path`, `sqlite::memory:`, …)
 /// with the pragmas the engine relies on. Hand the result to
@@ -93,7 +95,8 @@ mod tests {
         assert_eq!(parse_version("3.51.3"), Some((3, 51, 3)));
         assert_eq!(parse_version("3.9"), Some((3, 9, 0)));
         assert!(parse_version("3.9") < Some(MIN_VERSION));
-        assert!(parse_version("3.44.0") >= Some(MIN_VERSION));
+        assert!(parse_version("3.38.0") >= Some(MIN_VERSION));
+        assert!(parse_version("3.37.2") < Some(MIN_VERSION));
         assert_eq!(parse_version("x"), None);
     }
 }

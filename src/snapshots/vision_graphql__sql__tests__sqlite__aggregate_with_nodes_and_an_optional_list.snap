@@ -2,4 +2,4 @@
 source: src/sql.rs
 expression: sql
 ---
-SELECT json_object('posts_aggregate', (SELECT json_object('aggregate', json_object('count', count(*), 'sum', json_object('views', sum(t0."views")), 'max', json_object('title', max(t0."title"))), 'nodes', json_group_array(json_object('title', t0."title", 'published', CASE t0."published" WHEN 1 THEN json('true') WHEN 0 THEN json('false') END))) FROM (SELECT "published", "title", "views" FROM "main"."posts" s1 WHERE (?1 IS NULL OR s1."id" IN (SELECT value FROM json_each(?1)))) t0)) AS result
+SELECT json_object('posts_aggregate', (SELECT json_object('aggregate', json_object('count', count(*), 'sum', json_object('views', sum(t0."views")), 'max', json_object('title', max(t0."title"))), 'nodes', json_group_array(json_object('title', t0."title", 'published', CASE WHEN t0."published" IS NULL THEN NULL WHEN t0."published" = 1 THEN json('true') WHEN t0."published" = 0 THEN json('false') ELSE json('not a boolean') END))) FROM (SELECT "published", "title", "views" FROM "main"."posts" s1 WHERE (?1 IS NULL OR s1."id" IN (SELECT value FROM json_each(?1)))) t0)) AS result

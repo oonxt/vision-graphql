@@ -154,18 +154,20 @@ a builder that reaches one anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | `distinct_on` | Spelled as `row_number() OVER (PARTITION BY … ORDER BY …) = 1` over a derived table; same rows as PostgreSQL's `DISTINCT ON`. |
 | `order_by` without `nulls_first` / `nulls_last` | PostgreSQL's defaults (`asc` → nulls last, `desc` → nulls first), written out. SQLite's own default is the reverse. |
 | `_in` / `_nin` | One placeholder holding the list as JSON, read by `json_each`; a compiled statement's text is independent of the list's length, as on PostgreSQL. |
-| `_like` / `_nlike` | `LIKE … ESCAPE '\'`. Case-sensitive only with `PRAGMA case_sensitive_like`, which `sqlite::connect_options` sets and `Schema::introspect_sqlite` checks; a pool without it is refused rather than answering `_like` case-insensitively. |
+| `_like` / `_nlike` | `LIKE … ESCAPE '\\'`. Case-sensitive only with `PRAGMA case_sensitive_like`, which `sqlite::connect_options` sets; `Schema::introspect_sqlite` checks it, and so does the engine before the first statement on its pool, so a pool without it is refused rather than answering `_like` case-insensitively. |
 | `_ilike` / `_nilike` | `lower(x) LIKE lower(y)`: ASCII case folding, where PostgreSQL folds Unicode. |
 | Booleans, JSON columns | Come back as JSON booleans and JSON values. (SQLite holds `0`/`1` and text; the renderer converts at the point the value enters `json_object`.) |
 | Column types | Read from the declared type the way SQLite's affinity rules do: every integer is `bigint` (SQLite integers are 64-bit whatever the declaration), `BOOLEAN` → `Boolean`, `REAL` / `FLOAT` / `DOUBLE` → `Float`, `TEXT` / `CHAR` / `CLOB` → `String`, `JSON` / `JSONB`, `DATE` / `TIME` / `DATETIME` / `TIMESTAMP` and `UUID` as text-backed scalars compared as text — store ISO 8601 or the ordering is not chronological. |
-| `NUMERIC` / `DECIMAL`, `BLOB`, no declared type | Left out of the schema and reported as skipped columns (`vision-gql diff`): SQLite holds a `NUMERIC` as a double, and a sum that is wrong past the fifteenth digit is the wrong kind of wrong. Declare `REAL` to publish a float knowingly. |
-| Tables that are not `STRICT` | Introspected, with a `SchemaWarning::LooselyTypedTable`: the database does not enforce the declared types, so a `'abc'` in an `INTEGER` column reaches the client as a string. |
+| `NUMERIC` / `DECIMAL`, `BLOB`, no declared type | Left out of the schema and recorded as skipped columns (`schema::introspect_sqlite::introspect` returns them; the `vision-gql` CLI is PostgreSQL-only for now): SQLite holds a `NUMERIC` as a double, and a sum that is wrong past the fifteenth digit is the wrong kind of wrong. Declare `REAL` to publish a float knowingly. |
+| Tables that are not `STRICT` | Introspected, with a `SchemaWarning::LooselyTypedTable`: the database does not enforce the declared types, so a `'abc'` in an `INTEGER` column reaches the client as a string. A `BOOLEAN` or `JSON` column holding something else is an error (`SQLite reports malformed JSON: …`), not a null. |
 | JSON path components | A component that is all digits indexes an array; PostgreSQL's `#>` would also accept it as an object key. |
 | Foreign keys | Enforcement is per connection (`PRAGMA foreign_keys`); `connect_options` turns it on and introspection refuses a pool where it is off. Relations are derived from the declarations either way. |
 | Multiple schemas | Only `main`; attached databases are not walked. |
 | Mutations, `on_conflict`, nested insert | Not yet. Refused, not published. SQLite allows no DML inside a CTE, so a mutation is a sequence of statements in one transaction — a different execution model from the one statement of data-modifying CTEs PostgreSQL gets, and it is not built. |
 | `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
-| Version | 3.44 or later (`json_group_array(… ORDER BY …)`); checked at introspection. sqlx bundles 3.51. |
+| `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
+| `vision-gql` CLI | PostgreSQL-only for now. |
+| Version | 3.38 or later (`->`, built-in JSON functions); checked at introspection and before the engine's first statement. sqlx bundles 3.51. |
 
 ## JSON/JSONB path reads
 

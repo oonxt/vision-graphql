@@ -23,6 +23,12 @@ pub trait Backend: sqlx::Database + sealed::Sealed {
     /// The SQL this backend is rendered in.
     const DIALECT: Dialect;
 
+    /// Check that a pool's connections behave the way the rendered SQL
+    /// assumes. Run by the engine once, before the first statement on its
+    /// own pool; PostgreSQL has nothing to check, SQLite has per-connection
+    /// pragmas (see [`crate::sqlite::verify`]).
+    fn verify_pool(pool: &sqlx::Pool<Self>) -> impl Future<Output = Result<()>> + Send;
+
     /// Run one rendered statement on any executor of this database — the pool,
     /// a connection, a transaction's connection — and return the one JSON
     /// value it yields.
@@ -53,6 +59,10 @@ impl sealed::Sealed for sqlx::Postgres {}
 impl Backend for sqlx::Postgres {
     const DIALECT: Dialect = Dialect::Postgres;
 
+    fn verify_pool(_pool: &sqlx::Pool<Self>) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
     fn execute<'c, E>(
         executor: E,
         sql: &str,
@@ -79,6 +89,10 @@ impl sealed::Sealed for sqlx::Sqlite {}
 #[cfg(feature = "sqlite")]
 impl Backend for sqlx::Sqlite {
     const DIALECT: Dialect = Dialect::Sqlite;
+
+    fn verify_pool(pool: &sqlx::Pool<Self>) -> impl Future<Output = Result<()>> + Send {
+        crate::sqlite::verify(pool)
+    }
 
     fn execute<'c, E>(
         executor: E,

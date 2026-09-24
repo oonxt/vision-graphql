@@ -1,6 +1,6 @@
 //! Execute a rendered statement against SQLite.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{Bind, NullOf};
 use serde_json::Value;
 use sqlx::sqlite::Sqlite;
@@ -50,6 +50,18 @@ where
             Bind::TextArray(v) => q.bind(json_list(v)),
         };
     }
-    let json = q.fetch_one(executor).await?;
+    // `json('…')` on a non-JSON literal is the one way the rendered SQL can
+    // raise, and it raises exactly when a column holds a value its declared
+    // type does not admit (see `Dialect::value_as_json`). SQLite's message is
+    // the same for every such case; this one says what it means here.
+    let json = q.fetch_one(executor).await.map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.message().contains("malformed JSON") => Error::Decode(
+            "SQLite reports malformed JSON: a column holds a value its declared type does not \
+             admit — text in a BOOLEAN column, or a JSON column that is not JSON; the table is \
+             not STRICT (see SchemaWarning::LooselyTypedTable)"
+                .into(),
+        ),
+        _ => Error::Database(e),
+    })?;
     Ok(json.0)
 }

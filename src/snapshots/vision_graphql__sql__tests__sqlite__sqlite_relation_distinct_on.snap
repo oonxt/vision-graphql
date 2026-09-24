@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_object('users', (SELECT json_group_array(json_object('name', r1."name", 'posts', json(r1."posts"))) FROM (SELECT t0."name" AS "name", (SELECT json_group_array(json_object('title', r3."title")) FROM (SELECT t2."title" AS "title" FROM (SELECT t2.*, row_number() OVER (PARTITION BY t2."user_id" ORDER BY t2."user_id" ASC NULLS LAST, t2."views" DESC NULLS FIRST) AS "__vision_graphql_rn" FROM "main"."posts" t2 WHERE t2."user_id" = t0."id" AND t2."views" > ?1) t2 WHERE t2."__vision_graphql_rn" = 1 ORDER BY t2."user_id" ASC NULLS LAST, t2."views" DESC NULLS FIRST LIMIT 2) r3) AS "posts" FROM "main"."users" t0) r1)) AS result
