@@ -8,6 +8,7 @@ use vision_graphql::parser::{lower, lower_with, parse_document, Bindings};
 use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::sql::{render, render_now};
 use vision_graphql::types::{resolve_binds, Inputs};
+use vision_graphql::Dialect;
 
 fn sample_schema() -> Schema {
     Schema::builder()
@@ -52,7 +53,7 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let doc = parse_document(Q).unwrap();
             let op = lower(&doc, &vars, None, &schema).unwrap();
-            let _ = render_now(&op, &schema, &Inputs::none()).unwrap();
+            let _ = render_now(&op, &schema, &Inputs::none(), Dialect::Postgres).unwrap();
         });
     });
 
@@ -63,14 +64,14 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let doc = cache.get(Q).unwrap();
             let op = lower(&doc, &vars, None, &schema).unwrap();
-            let _ = render_now(&op, &schema, &Inputs::none()).unwrap();
+            let _ = render_now(&op, &schema, &Inputs::none(), Dialect::Postgres).unwrap();
         });
     });
 
     // All that is left of a request once the query is compiled.
     let doc = parse_document(Q).unwrap();
     let op = lower_with(&doc, Bindings::symbolic(), None, &schema).unwrap();
-    let (_sql, specs) = render(&op, &schema).unwrap();
+    let (_sql, specs) = render(&op, &schema, Dialect::Postgres).unwrap();
     c.bench_function("compiled_request", |b| {
         b.iter(|| {
             let _ = resolve_binds(&specs, &Inputs::variables(&vars)).unwrap();

@@ -58,6 +58,7 @@ pub mod ast;
 pub mod backend;
 pub mod builder;
 pub mod compiled;
+pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod executor;
@@ -83,6 +84,7 @@ pub use builder::{
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,
 };
 pub use compiled::CompiledQuery;
+pub use dialect::Dialect;
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::{Error, ErrorCode};
 pub use limits::ParseLimits;

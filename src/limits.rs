@@ -1033,7 +1033,13 @@ mod exec_tests {
         let render = |limits: ExecutionLimits| {
             let mut op = lower("{ users(limit: 10, offset: 5) { id } }");
             limits.apply(&mut op, &schema).unwrap();
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap()
+            crate::sql::render_now(
+                &op,
+                &schema,
+                &crate::types::Inputs::none(),
+                crate::dialect::Dialect::Postgres,
+            )
+            .unwrap()
         };
 
         // Default: inline, and the statement reads the way the query does.
@@ -1061,9 +1067,14 @@ mod exec_tests {
         let sql_for = |n: u64| {
             let mut op = lower(&format!("{{ users(limit: {n}) {{ id }} }}"));
             limits.apply(&mut op, &schema).unwrap();
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
-                .unwrap()
-                .0
+            crate::sql::render_now(
+                &op,
+                &schema,
+                &crate::types::Inputs::none(),
+                crate::dialect::Dialect::Postgres,
+            )
+            .unwrap()
+            .0
         };
         assert_eq!(sql_for(1), sql_for(1000));
     }
@@ -1077,8 +1088,13 @@ mod exec_tests {
             .bind_row_counts(true)
             .apply(&mut op, &schema)
             .unwrap();
-        let (sql, binds) =
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none()).unwrap();
+        let (sql, binds) = crate::sql::render_now(
+            &op,
+            &schema,
+            &crate::types::Inputs::none(),
+            crate::dialect::Dialect::Postgres,
+        )
+        .unwrap();
         assert!(sql.contains("LIMIT $"), "{sql}");
         assert_eq!(binds, vec![crate::types::Bind::Int8(25)]);
     }
@@ -1140,9 +1156,14 @@ mod exec_tests {
         let render = |q: &str, limits: ExecutionLimits| {
             let mut op = lower(q);
             limits.apply(&mut op, &schema).unwrap();
-            crate::sql::render_now(&op, &schema, &crate::types::Inputs::none())
-                .unwrap()
-                .0
+            crate::sql::render_now(
+                &op,
+                &schema,
+                &crate::types::Inputs::none(),
+                crate::dialect::Dialect::Postgres,
+            )
+            .unwrap()
+            .0
         };
 
         // Both selected: the count sees every row, `nodes` sees 25.
@@ -1347,7 +1368,7 @@ mod exec_tests {
         );
         // …and unbounded limits skip the walk entirely, so the renderer
         // carries the same bound.
-        let err = crate::sql::render(&op, &schema).unwrap_err();
+        let err = crate::sql::render(&op, &schema, crate::dialect::Dialect::Postgres).unwrap_err();
         assert!(
             format!("{err}").contains("nest deeper than the limit"),
             "{err}"

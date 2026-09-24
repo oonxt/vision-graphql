@@ -3,6 +3,7 @@
 use crate::ast::Operation;
 use crate::backend::Backend;
 use crate::compiled::CompiledQuery;
+use crate::dialect::Dialect;
 use crate::error::{Error, Result};
 use crate::limits::ExecutionLimits;
 use crate::parse_cache::ParseCache;
@@ -61,9 +62,10 @@ pub(crate) fn prepare_symbolic(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
+    dialect: Dialect,
 ) -> Result<(String, Vec<crate::types::BindSpec>)> {
     limits.apply(op, schema)?;
-    render(op, schema)
+    render(op, schema, dialect)
 }
 
 /// [`prepare_symbolic`] for the fully-literal paths: every parameter resolves
@@ -72,8 +74,9 @@ fn prepare(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
+    dialect: Dialect,
 ) -> Result<(String, Vec<Bind>)> {
-    let (sql, specs) = prepare_symbolic(op, schema, limits)?;
+    let (sql, specs) = prepare_symbolic(op, schema, limits, dialect)?;
     let binds = crate::types::resolve_binds(&specs, &Inputs::none())?;
     Ok((sql, binds))
 }
@@ -709,7 +712,7 @@ async fn run_operation<DB: Backend, R: Run<DB>>(
     limits: &ExecutionLimits,
     scoped: bool,
 ) -> Result<Value> {
-    let (sql, binds) = prepare(&mut op, schema, limits)?;
+    let (sql, binds) = prepare(&mut op, schema, limits, DB::DIALECT)?;
     tracing::debug!(
         target: "vision_graphql::engine",
         %sql,

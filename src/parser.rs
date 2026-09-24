@@ -4609,7 +4609,13 @@ mod tests {
         let render = |q: &str, vars: serde_json::Value| {
             let s = schema();
             parse_and_lower(q, &vars, None, &s).and_then(|op| {
-                crate::sql::render_now(&op, &s, &crate::types::Inputs::none()).map(|_| ())
+                crate::sql::render_now(
+                    &op,
+                    &s,
+                    &crate::types::Inputs::none(),
+                    crate::dialect::Dialect::Postgres,
+                )
+                .map(|_| ())
             })
         };
 

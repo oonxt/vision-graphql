@@ -4,6 +4,7 @@ use vision_graphql::ast::{
 };
 use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::sql::render;
+use vision_graphql::Dialect;
 
 fn sample_schema() -> Schema {
     Schema::builder()
@@ -71,7 +72,7 @@ fn bench_render(c: &mut Criterion) {
     let op = moderately_complex_query();
     c.bench_function("render_moderately_complex", |b| {
         b.iter(|| {
-            let _ = render(&op, &schema).unwrap();
+            let _ = render(&op, &schema, Dialect::Postgres).unwrap();
         });
     });
 }

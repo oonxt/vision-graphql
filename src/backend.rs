@@ -6,6 +6,7 @@
 //! in this crate, so it is not something a caller implements — it is what a
 //! caller *picks*, by the pool they hand the engine.
 
+use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::types::Bind;
 use serde_json::Value;
@@ -18,6 +19,9 @@ mod sealed {
 /// A database the engine can render for and execute against. See the module
 /// docs.
 pub trait Backend: sqlx::Database + sealed::Sealed {
+    /// The SQL this backend is rendered in.
+    const DIALECT: Dialect;
+
     /// Run one rendered statement on any executor of this database — the pool,
     /// a connection, a transaction's connection — and return the one JSON
     /// value it yields.
@@ -46,6 +50,8 @@ pub trait Backend: sqlx::Database + sealed::Sealed {
 impl sealed::Sealed for sqlx::Postgres {}
 
 impl Backend for sqlx::Postgres {
+    const DIALECT: Dialect = Dialect::Postgres;
+
     fn execute<'c, E>(
         executor: E,
         sql: &str,

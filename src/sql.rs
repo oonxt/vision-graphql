@@ -1,6 +1,7 @@
 //! SQL generation from IR.
 
 use crate::ast::{Count, Field, Operation, QueryArgs, RootField, Val};
+use crate::dialect::{escape_string_literal, pg_type_name, quote_ident, Dialect};
 use crate::error::{Error, Result};
 use crate::schema::{ColumnType, Schema, Table};
 use crate::types::{Bind, BindSpec, Inputs};
@@ -14,8 +15,12 @@ use std::fmt::Write as _;
 /// converted here, so literal type errors surface at render time either way.
 /// Use [`render_now`] when the operation is already fully literal.
 #[tracing::instrument(level = "trace", skip_all)]
-pub fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<BindSpec>)> {
-    let mut ctx = RenderCtx::default();
+pub fn render(
+    op: &Operation,
+    schema: &Schema,
+    dialect: Dialect,
+) -> Result<(String, Vec<BindSpec>)> {
+    let mut ctx = RenderCtx::new(dialect);
     match op {
         Operation::Query(roots) => render_query(roots, schema, &mut ctx),
         Operation::Mutation(fields) => render_mutation(fields, schema, &mut ctx),
@@ -29,14 +34,17 @@ pub fn render_now(
     op: &Operation,
     schema: &Schema,
     inputs: &Inputs<'_>,
+    dialect: Dialect,
 ) -> Result<(String, Vec<Bind>)> {
-    let (sql, specs) = render(op, schema)?;
+    let (sql, specs) = render(op, schema, dialect)?;
     let binds = crate::types::resolve_binds(&specs, inputs)?;
     Ok((sql, binds))
 }
 
-#[derive(Default)]
 struct RenderCtx {
+    /// Whose SQL this is. Not defaulted: a context built without saying is a
+    /// PostgreSQL statement handed to whichever backend is listening.
+    dialect: Dialect,
     sql: String,
     binds: Vec<BindSpec>,
     alias_counter: usize,
@@ -57,6 +65,18 @@ struct RenderCtx {
 }
 
 impl RenderCtx {
+    fn new(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            sql: String::new(),
+            binds: Vec::new(),
+            alias_counter: 0,
+            inserted_ctes: Default::default(),
+            current_mutation_cte: None,
+            scope_check_ctes: Vec::new(),
+        }
+    }
+
     fn next_alias(&mut self, prefix: &str) -> String {
         let a = format!("{prefix}{}", self.alias_counter);
         self.alias_counter += 1;
@@ -132,7 +152,7 @@ fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Re
     // near the parser, and two roots sharing a key mean the second silently
     // overwrites the first in the decoded response.
     crate::ast::ensure_unique_root_aliases(roots.iter().map(|r| r.alias.as_str()))?;
-    ctx.sql.push_str("SELECT json_build_object(");
+    write!(ctx.sql, "SELECT {}", ctx.dialect.json_object_open()).unwrap();
     for (i, root) in roots.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -150,7 +170,7 @@ fn render_root(root: &RootField, schema: &Schema, ctx: &mut RenderCtx) -> Result
     // never has to be escaped into the SQL text.
     if let crate::ast::RootBody::Introspection(value) = &root.body {
         let n = ctx.push_fixed(crate::types::Bind::Text(value.to_string()));
-        write!(ctx.sql, "${n}::json").unwrap();
+        ctx.sql.push_str(&ctx.dialect.json_param(n));
         return Ok(());
     }
     let table = schema.table(&root.table).ok_or_else(|| Error::Validate {
@@ -193,9 +213,7 @@ fn render_list(
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    ctx.sql.push_str("(SELECT coalesce(json_agg(row_to_json(");
-    ctx.sql.push_str(&row_alias);
-    ctx.sql.push_str(")), '[]'::json) FROM (");
+    ctx.sql.push_str(&ctx.dialect.rows_list_open(&row_alias));
     render_inner_select(root, selection, table, &inner_alias, schema, ctx)?;
     ctx.sql.push_str(") ");
     ctx.sql.push_str(&row_alias);
@@ -406,8 +424,8 @@ fn render_bool_expr(
             })?;
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
-            let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
-            let op_str = cmp_sql(*op);
+            let placeholder = ctx.dialect.param(n, &col.pg_type);
+            let op_str = ctx.dialect.cmp(*op);
             write!(
                 ctx.sql,
                 "{table_alias}.{} {op_str} {placeholder}",
@@ -456,14 +474,9 @@ fn render_bool_expr(
                 return Ok(());
             }
             let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
-            let pred = if *negated { "<> ALL" } else { "= ANY" };
-            write!(
-                ctx.sql,
-                "{table_alias}.{} {pred} (${n}::{}[])",
-                quote_ident(&col.physical_name),
-                pg_type_cast(&col.pg_type)
-            )
-            .unwrap();
+            let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+            ctx.sql
+                .push_str(&ctx.dialect.in_list(&lhs, n, &col.pg_type, *negated));
             Ok(())
         }
         BoolExpr::Relation { name, inner } => {
@@ -577,14 +590,10 @@ fn render_relation_subquery(
 
     match rel.kind {
         crate::schema::RelKind::Array => {
-            ctx.sql.push_str("(SELECT coalesce(json_agg(row_to_json(");
-            ctx.sql.push_str(&row_alias);
-            ctx.sql.push_str(")), '[]'::json) FROM (");
+            ctx.sql.push_str(&ctx.dialect.rows_list_open(&row_alias));
         }
         crate::schema::RelKind::Object => {
-            ctx.sql.push_str("(SELECT row_to_json(");
-            ctx.sql.push_str(&row_alias);
-            ctx.sql.push_str(") FROM (");
+            ctx.sql.push_str(&ctx.dialect.row_object_open(&row_alias));
         }
     }
 
@@ -1042,29 +1051,12 @@ fn render_count(count: &Count, keyword: &str, path: &str, ctx: &mut RenderCtx) {
         Count::Lit(n) => write!(ctx.sql, " {keyword} {n}").unwrap(),
         Count::Bound(n) => {
             let i = ctx.push_fixed(crate::types::Bind::Int8(*n as i64));
-            write!(ctx.sql, " {keyword} ${i}::int8").unwrap();
+            write!(ctx.sql, " {keyword} {}", ctx.dialect.count_param(i)).unwrap();
         }
         Count::Var { .. } => {
             let n = ctx.push_count(count, || path.to_string());
-            write!(ctx.sql, " {keyword} ${n}::int8").unwrap();
+            write!(ctx.sql, " {keyword} {}", ctx.dialect.count_param(n)).unwrap();
         }
-    }
-}
-
-/// The SQL spelling of a comparison operator.
-fn cmp_sql(op: crate::ast::CmpOp) -> &'static str {
-    use crate::ast::CmpOp;
-    match op {
-        CmpOp::Eq => "=",
-        CmpOp::Neq => "<>",
-        CmpOp::Gt => ">",
-        CmpOp::Gte => ">=",
-        CmpOp::Lt => "<",
-        CmpOp::Lte => "<=",
-        CmpOp::Like => "LIKE",
-        CmpOp::ILike => "ILIKE",
-        CmpOp::NLike => "NOT LIKE",
-        CmpOp::NILike => "NOT ILIKE",
     }
 }
 
@@ -1152,11 +1144,11 @@ fn render_optional(
     match inner {
         BoolExpr::Compare { op, value, .. } => {
             let n = ctx.push_scalar(value, &col.pg_type, path)?;
-            let cast = pg_type_cast(&col.pg_type);
+            let p = ctx.dialect.param(n, &col.pg_type);
             write!(
                 ctx.sql,
-                "(${n}::{cast} IS NULL OR {qualified} {} ${n}::{cast})",
-                cmp_sql(*op)
+                "({p} IS NULL OR {qualified} {} {p})",
+                ctx.dialect.cmp(*op)
             )
             .unwrap();
         }
@@ -1168,21 +1160,18 @@ fn render_optional(
                 return render_plain(ctx);
             }
             let n = ctx.push_optional_array(values, &col.pg_type, path)?;
-            let cast = pg_type_cast(&col.pg_type);
-            let pred = if *negated { "<> ALL" } else { "= ANY" };
             write!(
                 ctx.sql,
-                "(${n}::{cast}[] IS NULL OR {qualified} {pred} (${n}::{cast}[]))"
+                "({} IS NULL OR {})",
+                ctx.dialect.list_param(n, &col.pg_type),
+                ctx.dialect.in_list(&qualified, n, &col.pg_type, *negated)
             )
             .unwrap();
         }
         BoolExpr::IsNull { is_null, .. } => {
             let n = ctx.push_scalar(is_null, &ColumnType::Bool, path)?;
-            write!(
-                ctx.sql,
-                "(${n}::boolean IS NULL OR ({qualified} IS NULL) = ${n}::boolean)"
-            )
-            .unwrap();
+            let p = ctx.dialect.bool_param(n);
+            write!(ctx.sql, "({p} IS NULL OR ({qualified} IS NULL) = {p})").unwrap();
         }
         _ => unreachable!("matched above"),
     }
@@ -1207,8 +1196,14 @@ fn render_value_compare(
     crate::type_system::check_cmp(op, pg, path, &value_subject(pg))?;
     let l = ctx.push_comparison(left, pg, path)?;
     let r = ctx.push_comparison(right, pg, path)?;
-    let cast = pg_type_cast(pg);
-    write!(ctx.sql, "${l}::{cast} {} ${r}::{cast}", cmp_sql(op)).unwrap();
+    write!(
+        ctx.sql,
+        "{} {} {}",
+        ctx.dialect.param(l, pg),
+        ctx.dialect.cmp(op),
+        ctx.dialect.param(r, pg)
+    )
+    .unwrap();
     Ok(())
 }
 
@@ -1232,15 +1227,15 @@ fn render_value_in_list(
     }
     let v = ctx.push_comparison(value, pg, path)?;
     let list = ctx.push_array(values, pg, path)?;
-    let cast = pg_type_cast(pg);
-    let pred = if negated { "<> ALL" } else { "= ANY" };
-    write!(ctx.sql, "${v}::{cast} {pred} (${list}::{cast}[])").unwrap();
+    let lhs = ctx.dialect.param(v, pg);
+    ctx.sql
+        .push_str(&ctx.dialect.in_list(&lhs, list, pg, negated));
     Ok(())
 }
 
 /// What a column-less comparison is "on", for its refusal message.
 pub(crate) fn value_subject(pg: &ColumnType) -> String {
-    format!("a {} value", pg_type_cast(pg))
+    format!("a {} value", pg_type_name(pg))
 }
 
 /// [`BoolExpr::Optional`] under `_or` or `_not` is refused: a dropped
@@ -1298,7 +1293,12 @@ fn render_is_null(qualified: &str, column: &str, is_null: &Val, ctx: &mut Render
         None => {
             let n =
                 ctx.push_comparison(is_null, &ColumnType::Bool, || format!("where.{column}"))?;
-            write!(ctx.sql, "({qualified} IS NULL) = ${n}::boolean").unwrap();
+            write!(
+                ctx.sql,
+                "({qualified} IS NULL) = {}",
+                ctx.dialect.bool_param(n)
+            )
+            .unwrap();
         }
     }
     Ok(())
@@ -1340,44 +1340,9 @@ fn render_json_path_expr(
             ),
         });
     }
-    let n = ctx.push_fixed(Bind::TextArray(
-        path.iter().map(|c| Some(c.clone())).collect(),
-    ));
-    Ok(format!(
-        "{table_alias}.{} #> ${n}::text[]",
-        quote_ident(&col.physical_name),
-    ))
-}
-
-/// Return the PostgreSQL type keyword used in a cast expression (`$1::type`)
-/// for a given schema ColumnType.
-fn pg_type_cast(pg: &crate::schema::ColumnType) -> std::borrow::Cow<'static, str> {
-    use crate::schema::ColumnType;
-    std::borrow::Cow::Borrowed(match pg {
-        ColumnType::Bool => "bool",
-        ColumnType::Int2 => "int2",
-        ColumnType::Int4 => "int4",
-        ColumnType::Int8 => "int8",
-        ColumnType::Float4 => "float4",
-        ColumnType::Float8 => "float8",
-        ColumnType::Text => "text",
-        ColumnType::Varchar => "varchar",
-        ColumnType::Uuid => "uuid",
-        ColumnType::Numeric => "numeric",
-        ColumnType::Timestamp => "timestamp",
-        ColumnType::TimestampTz => "timestamptz",
-        ColumnType::Json => "json",
-        ColumnType::Jsonb => "jsonb",
-        ColumnType::Date => "date",
-        ColumnType::Time => "time",
-        ColumnType::Enum { schema, name } => {
-            return std::borrow::Cow::Owned(format!(
-                "{}.{}",
-                quote_ident(schema),
-                quote_ident(name)
-            ));
-        }
-    })
+    let n = ctx.push_fixed(ctx.dialect.json_path_bind(path));
+    let col_sql = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+    Ok(ctx.dialect.json_path(&col_sql, n))
 }
 
 /// `__typename` in a SELECT list: a literal of the type this selection set
@@ -1389,9 +1354,10 @@ fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCt
     for alias in names {
         write!(
             ctx.sql,
-            ", '{}', '{}'::text",
+            ", '{}', {}",
             escape_string_literal(alias),
-            escape_string_literal(&crate::type_names::mutation_response(table))
+            ctx.dialect
+                .text_literal(&crate::type_names::mutation_response(table))
         )
         .unwrap();
     }
@@ -1400,28 +1366,11 @@ fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCt
 fn render_typename_select(table: &Table, alias: &str, ctx: &mut RenderCtx) {
     write!(
         ctx.sql,
-        "'{}'::text AS {}",
-        escape_string_literal(crate::type_names::row(table)),
+        "{} AS {}",
+        ctx.dialect.text_literal(crate::type_names::row(table)),
         quote_ident(alias)
     )
     .unwrap();
-}
-
-fn quote_ident(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
-}
-
-fn escape_string_literal(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 fn render_by_pk(
@@ -1435,9 +1384,8 @@ fn render_by_pk(
     ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    ctx.sql.push_str("(SELECT row_to_json(");
-    ctx.sql.push_str(&row_alias);
-    ctx.sql.push_str(") FROM (SELECT ");
+    ctx.sql.push_str(&ctx.dialect.row_object_open(&row_alias));
+    ctx.sql.push_str("SELECT ");
     for (i, field) in selection.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -1532,7 +1480,7 @@ fn render_by_pk(
         let n = ctx.push_comparison(value, &col.pg_type, || {
             format!("{}.pk.{col_name}", root.alias)
         })?;
-        let ph = format!("${n}::{}", pg_type_cast(&col.pg_type));
+        let ph = ctx.dialect.param(n, &col.pg_type);
         write!(
             ctx.sql,
             "{inner_alias}.{} = {ph}",
@@ -1679,7 +1627,7 @@ fn render_mutation(
         }
     }
     ctx.sql.push(' ');
-    ctx.sql.push_str("SELECT json_build_object(");
+    write!(ctx.sql, "SELECT {}", ctx.dialect.json_object_open()).unwrap();
     for (i, mf) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -1910,13 +1858,12 @@ fn render_insert_cte_recursive(
             let col = table
                 .find_column(exposed)
                 .expect("column should exist — validated at parse");
-            let cast = pg_type_cast(&col.pg_type);
             match obj.columns.get(exposed) {
-                None => write!(ctx.sql, "NULL::{cast}").unwrap(),
+                None => ctx.sql.push_str(&ctx.dialect.null_of(&col.pg_type)),
                 Some(v) => {
                     let n = ctx
                         .push_scalar(v, &col.pg_type, || format!("{cte}.objects[{r}].{exposed}"))?;
-                    write!(ctx.sql, "${n}::{cast}").unwrap();
+                    ctx.sql.push_str(&ctx.dialect.param(n, &col.pg_type));
                 }
             }
         }
@@ -2287,9 +2234,9 @@ fn render_update_cte(
         let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
-            "{} = ${n}::{}",
+            "{} = {}",
             quote_ident(&col.physical_name),
-            pg_type_cast(&col.pg_type)
+            ctx.dialect.param(n, &col.pg_type)
         )
         .unwrap();
     }
@@ -2336,9 +2283,9 @@ fn render_update_by_pk_cte(
         let n = ctx.push_scalar(value, &col.pg_type, || format!("{cte}._set.{exposed}"))?;
         write!(
             ctx.sql,
-            "{} = ${n}::{}",
+            "{} = {}",
             quote_ident(&col.physical_name),
-            pg_type_cast(&col.pg_type)
+            ctx.dialect.param(n, &col.pg_type)
         )
         .unwrap();
     }
@@ -2355,9 +2302,9 @@ fn render_update_by_pk_cte(
         let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
-            "{} = ${n}::{}",
+            "{} = {}",
             quote_ident(&col.physical_name),
-            pg_type_cast(&col.pg_type)
+            ctx.dialect.param(n, &col.pg_type)
         )
         .unwrap();
     }
@@ -2431,9 +2378,9 @@ fn render_delete_by_pk_cte(
         let n = ctx.push_comparison(value, &col.pg_type, || format!("{cte}.pk.{col_name}"))?;
         write!(
             ctx.sql,
-            "{} = ${n}::{}",
+            "{} = {}",
             quote_ident(&col.physical_name),
-            pg_type_cast(&col.pg_type)
+            ctx.dialect.param(n, &col.pg_type)
         )
         .unwrap();
     }
@@ -2482,13 +2429,13 @@ fn render_mutation_output_for_inner(
             if *one {
                 ctx.sql.push_str("(SELECT ");
                 if returning.is_empty() {
-                    ctx.sql.push_str("'{}'::json");
+                    ctx.sql.push_str(ctx.dialect.empty_json_object());
                 } else {
                     render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
                 }
                 write!(ctx.sql, " FROM {cte} LIMIT 1)").unwrap();
             } else {
-                ctx.sql.push_str("json_build_object(");
+                ctx.sql.push_str(ctx.dialect.json_object_open());
                 // affected_rows sums the parent CTE with every child CTE that
                 // was emitted under it.
                 ctx.sql.push_str("'affected_rows', (");
@@ -2516,12 +2463,16 @@ fn render_mutation_output_for_inner(
                 ctx.sql.push(')');
 
                 if !returning.is_empty() {
-                    ctx.sql
-                        .push_str(", 'returning', (SELECT coalesce(json_agg(");
+                    write!(
+                        ctx.sql,
+                        ", 'returning', (SELECT {}",
+                        ctx.dialect.json_agg_open()
+                    )
+                    .unwrap();
                     render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
-                    write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+                    write!(ctx.sql, "{} FROM {cte})", ctx.dialect.json_agg_close()).unwrap();
                 } else {
-                    ctx.sql.push_str(", 'returning', '[]'::json");
+                    write!(ctx.sql, ", 'returning', {}", ctx.dialect.empty_json_array()).unwrap();
                 }
                 render_response_typenames(response_typenames, tbl, ctx);
                 ctx.sql.push(')');
@@ -2540,18 +2491,23 @@ fn render_mutation_output_for_inner(
             })?;
             write!(
                 ctx.sql,
-                "'{}', json_build_object(",
-                escape_string_literal(alias)
+                "'{}', {}",
+                escape_string_literal(alias),
+                ctx.dialect.json_object_open()
             )
             .unwrap();
             write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
             if !returning.is_empty() {
-                ctx.sql
-                    .push_str(", 'returning', (SELECT coalesce(json_agg(");
+                write!(
+                    ctx.sql,
+                    ", 'returning', (SELECT {}",
+                    ctx.dialect.json_agg_open()
+                )
+                .unwrap();
                 render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
-                write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+                write!(ctx.sql, "{} FROM {cte})", ctx.dialect.json_agg_close()).unwrap();
             } else {
-                ctx.sql.push_str(", 'returning', '[]'::json");
+                write!(ctx.sql, ", 'returning', {}", ctx.dialect.empty_json_array()).unwrap();
             }
             render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
@@ -2568,7 +2524,7 @@ fn render_mutation_output_for_inner(
             })?;
             write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
             if selection.is_empty() {
-                ctx.sql.push_str("'{}'::json");
+                ctx.sql.push_str(ctx.dialect.empty_json_object());
             } else {
                 render_json_build_object_for_nodes(selection, cte, tbl, alias, schema, ctx)?;
             }
@@ -2587,18 +2543,23 @@ fn render_mutation_output_for_inner(
             })?;
             write!(
                 ctx.sql,
-                "'{}', json_build_object(",
-                escape_string_literal(alias)
+                "'{}', {}",
+                escape_string_literal(alias),
+                ctx.dialect.json_object_open()
             )
             .unwrap();
             write!(ctx.sql, "'affected_rows', (SELECT count(*) FROM {cte})").unwrap();
             if !returning.is_empty() {
-                ctx.sql
-                    .push_str(", 'returning', (SELECT coalesce(json_agg(");
+                write!(
+                    ctx.sql,
+                    ", 'returning', (SELECT {}",
+                    ctx.dialect.json_agg_open()
+                )
+                .unwrap();
                 render_json_build_object_for_nodes(returning, cte, tbl, alias, schema, ctx)?;
-                write!(ctx.sql, "), '[]'::json) FROM {cte})").unwrap();
+                write!(ctx.sql, "{} FROM {cte})", ctx.dialect.json_agg_close()).unwrap();
             } else {
-                ctx.sql.push_str(", 'returning', '[]'::json");
+                write!(ctx.sql, ", 'returning', {}", ctx.dialect.empty_json_array()).unwrap();
             }
             render_response_typenames(response_typenames, tbl, ctx);
             ctx.sql.push(')');
@@ -2615,7 +2576,7 @@ fn render_mutation_output_for_inner(
             })?;
             write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
             if selection.is_empty() {
-                ctx.sql.push_str("'{}'::json");
+                ctx.sql.push_str(ctx.dialect.empty_json_object());
             } else {
                 render_json_build_object_for_nodes(selection, cte, tbl, alias, schema, ctx)?;
             }
@@ -2708,7 +2669,7 @@ fn render_aggregate_object(
             .iter()
             .any(|s| !matches!(s.op, crate::ast::AggOp::Typename));
 
-    ctx.sql.push_str("(SELECT json_build_object(");
+    write!(ctx.sql, "(SELECT {}", ctx.dialect.json_object_open()).unwrap();
     let mut first = true;
     for alias in typenames {
         if !first {
@@ -2717,9 +2678,10 @@ fn render_aggregate_object(
         first = false;
         write!(
             ctx.sql,
-            "'{}', '{}'::text",
+            "'{}', {}",
             escape_string_literal(alias),
-            escape_string_literal(&crate::type_names::aggregate(table))
+            ctx.dialect
+                .text_literal(&crate::type_names::aggregate(table))
         )
         .unwrap();
     }
@@ -2730,7 +2692,7 @@ fn render_aggregate_object(
             ctx.sql.push_str(", ");
         }
         first = false;
-        ctx.sql.push_str("'aggregate', json_build_object(");
+        write!(ctx.sql, "'aggregate', {}", ctx.dialect.json_object_open()).unwrap();
         for (i, op) in ops.iter().enumerate() {
             if i > 0 {
                 ctx.sql.push_str(", ");
@@ -2752,7 +2714,7 @@ fn render_aggregate_object(
                 let node_alias = ctx.next_alias("t");
                 let mut node_args = args.clone();
                 node_args.limit = Some(limit.clone());
-                ctx.sql.push_str("'nodes', (SELECT coalesce(json_agg(");
+                write!(ctx.sql, "'nodes', (SELECT {}", ctx.dialect.json_agg_open()).unwrap();
                 render_json_build_object_for_nodes(
                     node_fields,
                     &node_alias,
@@ -2761,7 +2723,7 @@ fn render_aggregate_object(
                     schema,
                     ctx,
                 )?;
-                ctx.sql.push_str("), '[]'::json) FROM (");
+                write!(ctx.sql, "{} FROM (", ctx.dialect.json_agg_close()).unwrap();
                 render_aggregate_source(
                     &node_args,
                     &[],
@@ -2775,7 +2737,7 @@ fn render_aggregate_object(
                 write!(ctx.sql, ") {node_alias})").unwrap();
             }
             None => {
-                ctx.sql.push_str("'nodes', coalesce(json_agg(");
+                write!(ctx.sql, "'nodes', {}", ctx.dialect.json_agg_open()).unwrap();
                 render_json_build_object_for_nodes(
                     node_fields,
                     &inner_alias,
@@ -2784,7 +2746,7 @@ fn render_aggregate_object(
                     schema,
                     ctx,
                 )?;
-                ctx.sql.push_str("), '[]'::json)");
+                ctx.sql.push_str(ctx.dialect.json_agg_close());
             }
         }
     }
@@ -2915,8 +2877,9 @@ fn render_agg_op(
         AggOp::Typename => {
             write!(
                 ctx.sql,
-                "'{key}', '{}'::text",
-                escape_string_literal(&crate::type_names::aggregate_fields(table))
+                "'{key}', {}",
+                ctx.dialect
+                    .text_literal(&crate::type_names::aggregate_fields(table))
             )
             .unwrap();
             Ok(())
@@ -2959,7 +2922,7 @@ fn render_agg_func(
         }
         seen.push(k);
     }
-    write!(ctx.sql, "'{key}', json_build_object(").unwrap();
+    write!(ctx.sql, "'{key}', {}", ctx.dialect.json_object_open()).unwrap();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -2968,9 +2931,10 @@ fn render_agg_func(
             AggField::Typename { alias } => {
                 write!(
                     ctx.sql,
-                    "'{}', '{}'::text",
+                    "'{}', {}",
                     escape_string_literal(alias),
-                    escape_string_literal(&crate::type_names::agg_op_fields(table, pg_func))
+                    ctx.dialect
+                        .text_literal(&crate::type_names::agg_op_fields(table, pg_func))
                 )
                 .unwrap();
             }
@@ -3022,7 +2986,7 @@ fn render_json_build_object_for_nodes(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     ensure_unique_selection_keys(fields, parent_path)?;
-    ctx.sql.push_str("json_build_object(");
+    ctx.sql.push_str(ctx.dialect.json_object_open());
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
@@ -3031,9 +2995,9 @@ fn render_json_build_object_for_nodes(
             Field::Typename { alias } => {
                 write!(
                     ctx.sql,
-                    "'{}', '{}'::text",
+                    "'{}', {}",
                     escape_string_literal(alias),
-                    escape_string_literal(crate::type_names::row(table))
+                    ctx.dialect.text_literal(crate::type_names::row(table))
                 )
                 .unwrap();
             }
@@ -3345,8 +3309,8 @@ fn render_bool_expr_no_alias(
             })?;
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.pg_type, || format!("where.{column}"))?;
-            let placeholder = format!("${n}::{}", pg_type_cast(&col.pg_type));
-            let op_str = cmp_sql(*op);
+            let placeholder = ctx.dialect.param(n, &col.pg_type);
+            let op_str = ctx.dialect.cmp(*op);
             write!(
                 ctx.sql,
                 "{} {op_str} {placeholder}",
@@ -3394,14 +3358,9 @@ fn render_bool_expr_no_alias(
                 return Ok(());
             }
             let n = ctx.push_array(values, &col.pg_type, || format!("where.{column}"))?;
-            let pred = if *negated { "<> ALL" } else { "= ANY" };
-            write!(
-                ctx.sql,
-                "{} {pred} (${n}::{}[])",
-                quote_ident(&col.physical_name),
-                pg_type_cast(&col.pg_type)
-            )
-            .unwrap();
+            let lhs = quote_ident(&col.physical_name);
+            ctx.sql
+                .push_str(&ctx.dialect.in_list(&lhs, n, &col.pg_type, *negated));
             Ok(())
         }
         BoolExpr::Relation { name, inner } => {
@@ -3469,7 +3428,7 @@ mod tests {
     /// parameters straight away — the shape every caller of `Engine::query`
     /// sees.
     fn render(op: &Operation, schema: &Schema) -> Result<(String, Vec<Bind>)> {
-        render_now(op, schema, &Inputs::none())
+        render_now(op, schema, &Inputs::none(), Dialect::Postgres)
     }
 
     fn users_schema() -> Schema {

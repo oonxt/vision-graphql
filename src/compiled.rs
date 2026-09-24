@@ -358,7 +358,7 @@ pub(crate) fn compile<DB: Backend>(
             crate::scope::apply_scope(&mut op, scope, schema)?;
         }
         root_alias = crate::engine::single_root_alias(&op).map(String::from);
-        let (sql, specs) = crate::engine::prepare_symbolic(&mut op, schema, limits)?;
+        let (sql, specs) = crate::engine::prepare_symbolic(&mut op, schema, limits, DB::DIALECT)?;
         shapes.push(Shape { pinned, sql, specs });
     }
     Ok(CompiledQuery {
@@ -441,7 +441,15 @@ mod tests {
     use crate::predicate::{col, principal, Principal};
     use crate::schema::{ColumnType, Relation, Schema, Table};
     use crate::scope::apply_scope;
-    use crate::sql::render;
+    use crate::types::BindSpec;
+
+    /// The PostgreSQL rendering, which is what every assertion here is about.
+    fn render(
+        op: &crate::ast::Operation,
+        schema: &Schema,
+    ) -> crate::error::Result<(String, Vec<BindSpec>)> {
+        crate::sql::render(op, schema, crate::dialect::Dialect::Postgres)
+    }
     use crate::types::{resolve_binds, Bind, Inputs, NullOf};
     use serde_json::{json, Value};
 
