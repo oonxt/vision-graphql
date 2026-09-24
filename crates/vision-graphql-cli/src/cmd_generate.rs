@@ -12,7 +12,7 @@ pub struct Args {
     pub url: String,
     pub output: String,
     pub force: bool,
-    pub schemas: Vec<String>,
+    pub schemas: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
 }
@@ -31,9 +31,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let source = crate::db::connect(&args.url)?;
-    let db = crate::db::introspect(&source, &args.schemas, &args.url)
-        .await?
-        .db;
+    let found = source.introspect(args.schemas.as_deref()).await?;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
     let meta = HeaderMeta {
@@ -44,7 +42,7 @@ pub async fn run(args: Args) -> Result<()> {
         redacted_source_url: redact_url(&args.url),
     };
 
-    let body = toml_template(&db, &filter, &meta);
+    let body = toml_template(&found.db, &filter, &meta, found.dialect);
 
     match output_target {
         OutputTarget::Stdout => {

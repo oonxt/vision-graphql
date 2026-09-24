@@ -581,17 +581,9 @@ impl Schema {
     /// walked.
     #[cfg(feature = "sqlite")]
     pub async fn introspect_sqlite(pool: &sqlx::SqlitePool) -> crate::error::Result<SchemaBuilder> {
-        let found = crate::schema::introspect_sqlite::introspect(pool).await?;
-        let mut sb = crate::schema::merge::build_from_introspection(found.db)
-            .dialect(crate::dialect::Dialect::Sqlite);
-        for name in found.loosely_typed {
-            // The builder holds the only reference this early, so the table
-            // can be marked in place.
-            if let Some(t) = sb.tables.get_mut(&name).and_then(Arc::get_mut) {
-                t.loosely_typed = true;
-            }
-        }
-        Ok(sb)
+        Ok(crate::schema::introspect_sqlite::introspect(pool)
+            .await?
+            .into_builder())
     }
 }
 
@@ -611,6 +603,26 @@ impl SchemaBuilder {
 
     pub fn table(mut self, t: Table) -> Self {
         self.tables.insert(t.exposed_name.clone(), Arc::new(t));
+        self
+    }
+
+    /// Mark tables whose declared column types the database does not enforce
+    /// — see [`Table::loosely_typed`]. Names not in the builder are ignored:
+    /// a table the caller filtered out has nothing to warn about.
+    pub fn loosely_typed<I, S>(mut self, tables: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in tables {
+            // Shared with nothing yet — the Arc is the builder's own — unless
+            // a caller kept a clone, in which case the table is rebuilt.
+            if let Some(arc) = self.tables.get_mut(name.as_ref()) {
+                if let Some(t) = Arc::get_mut(arc) {
+                    t.loosely_typed = true;
+                }
+            }
+        }
         self
     }
 

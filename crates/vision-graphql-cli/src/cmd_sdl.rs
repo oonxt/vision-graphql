@@ -8,7 +8,6 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use vision_graphql::schema::merge::build_from_introspection;
 
 use crate::filter::TableFilter;
 use crate::render::redact_url;
@@ -20,22 +19,20 @@ pub struct Args {
     pub force: bool,
     pub check: bool,
     pub config: Option<PathBuf>,
-    pub schemas: Vec<String>,
+    pub schemas: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
     pub ignore: Option<Vec<String>>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
     let source = crate::db::connect(&args.url)?;
-    let found = crate::db::introspect(&source, &args.schemas, &args.url).await?;
+    let found = source.introspect(args.schemas.as_deref()).await?;
 
     let filter = TableFilter::new(args.include.as_deref(), args.ignore.as_deref())?;
     // Filtering happens on the exposed names, the same ones the overlay and the
-    // generated TOML use. The dialect decides what the SDL publishes — a
-    // SQLite schema lists no statistical aggregates.
-    let mut builder = build_from_introspection(found.db)
-        .dialect(found.dialect)
-        .retain_tables(|name| filter.keep(name));
+    // generated TOML use. The builder is the engine's own — dialect included,
+    // so a SQLite schema lists no statistical aggregates.
+    let mut builder = found.into_builder().retain_tables(|name| filter.keep(name));
 
     if let Some(path) = &args.config {
         builder = builder

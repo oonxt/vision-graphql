@@ -49,11 +49,11 @@ struct CommonDb {
     #[arg(long)]
     url: Option<String>,
 
-    /// Comma-separated Postgres schemas to introspect. The first one owns the
-    /// bare table names; later ones are exposed prefixed (`audit_orders`).
-    /// Not for SQLite, which has one schema.
-    #[arg(long = "schema", value_delimiter = ',', default_value = "public")]
-    schemas: Vec<String>,
+    /// Comma-separated Postgres schemas to introspect; `public` when not
+    /// given. The first one owns the bare table names; later ones are exposed
+    /// prefixed (`audit_orders`). Not for SQLite, which has one schema.
+    #[arg(long = "schema", value_delimiter = ',')]
+    schemas: Option<Vec<String>>,
 
     /// Comma-separated globs; restrict to matching tables.
     #[arg(long, value_delimiter = ',')]
