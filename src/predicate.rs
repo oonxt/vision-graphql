@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::ast::{BoolExpr, CmpOp, Val};
 use crate::error::{Error, Result};
-use crate::schema::PgType;
+use crate::schema::ColumnType;
 
 /// A value position in a scope template: a literal, or a named parameter
 /// substituted at bind time. `principal` is the conventional default name.
@@ -142,13 +142,13 @@ pub enum ScopeExpr {
         left: Operand,
         op: CmpOp,
         right: Operand,
-        ty: PgType,
+        ty: ColumnType,
     },
     /// A membership test with no column; see [`Typed::in_set`].
     ValueInSet {
         value: Operand,
         set: Operand,
-        ty: PgType,
+        ty: ColumnType,
         negated: bool,
     },
 }
@@ -261,19 +261,19 @@ pub fn constant(value: bool) -> ScopeExpr {
 }
 
 /// Start a predicate over a value that is not a column:
-/// `typed(param("role"), PgType::Text).eq("admin")`.
+/// `typed(param("role"), ColumnType::Text).eq("admin")`.
 ///
 /// A column comparison takes its bind type from the column. Here there is no
 /// column — the whole point is a condition on the principal alone, "an admin
 /// sees every row" — so `ty` says what the operands bind as. It is kept in the
 /// SQL as `$n::ty = $m::ty` rather than folded by the host so that one
 /// statement compiled against the policy serves every principal.
-pub fn typed(value: impl Into<Operand>, ty: PgType) -> Typed {
+pub fn typed(value: impl Into<Operand>, ty: ColumnType) -> Typed {
     Typed(value.into(), ty)
 }
 
 /// Builder returned by [`typed`]; finish with a comparison method.
-pub struct Typed(Operand, PgType);
+pub struct Typed(Operand, ColumnType);
 
 impl Typed {
     fn cmp(self, op: CmpOp, v: impl Into<Operand>) -> ScopeExpr {
@@ -315,7 +315,7 @@ impl Typed {
         self.cmp(CmpOp::NILike, v)
     }
     /// The value is a member of `set`, one operand resolving to a list:
-    /// `typed("vip", PgType::Text).in_set(param("tiers"))`.
+    /// `typed("vip", ColumnType::Text).in_set(param("tiers"))`.
     pub fn in_set(self, set: impl Into<Operand>) -> ScopeExpr {
         ScopeExpr::ValueInSet {
             value: self.0,
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn typed_leaf_keeps_both_operands_and_its_type() {
-        let expr = typed(param("role"), PgType::Text).eq("admin");
+        let expr = typed(param("role"), ColumnType::Text).eq("admin");
         // Symbolic: the parameter survives to the request.
         let BoolExpr::ValueCompare {
             left, right, pg, ..
@@ -682,7 +682,7 @@ mod tests {
         };
         assert!(matches!(left, Val::ScopeParam(ref n) if n == "role"));
         assert_eq!(right, json!("admin"));
-        assert_eq!(pg, PgType::Text);
+        assert_eq!(pg, ColumnType::Text);
         // Resolved: both sides literal.
         let p = Principal::new().set("role", "admin");
         let BoolExpr::ValueCompare { left, .. } = expr.resolve(&p).unwrap() else {
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn set_leaves_take_the_whole_list_from_one_operand() {
         let p = Principal::new().set("tiers", json!(["vip", "gold"]));
-        let BoolExpr::ValueInList { value, values, .. } = typed("vip", PgType::Text)
+        let BoolExpr::ValueInList { value, values, .. } = typed("vip", ColumnType::Text)
             .in_set(param("tiers"))
             .resolve(&p)
             .unwrap()
@@ -717,8 +717,8 @@ mod tests {
     fn constant_and_typed_leaves_report_their_params() {
         let expr = and([
             constant(true),
-            typed(param("role"), PgType::Text).eq(param("wanted")),
-            typed("vip", PgType::Text).in_set(param("tiers")),
+            typed(param("role"), ColumnType::Text).eq(param("wanted")),
+            typed("vip", ColumnType::Text).in_set(param("tiers")),
             col("status").in_set(param("states")),
         ]);
         let mut out = std::collections::BTreeSet::new();

@@ -403,7 +403,7 @@ fn insert_field(out: &mut Map<String, Value>, alias: String, value: Value) -> Re
 mod tests {
     use super::*;
     use crate::parser::parse_document;
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
     use async_graphql_parser::types::{DocumentOperations, Selection};
     use std::collections::HashMap;
 
@@ -411,15 +411,15 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build()

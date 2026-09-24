@@ -370,7 +370,7 @@ mod tests {
     use super::*;
     use vision_graphql::schema::config::{RelationKindOverlay, RelationOverlay, TableOverlay};
     use vision_graphql::schema::introspect::{IntrospectedColumn, IntrospectedTable};
-    use vision_graphql::schema::PgType;
+    use vision_graphql::schema::ColumnType;
 
     fn db_users_only() -> IntrospectedDb {
         let mut db = IntrospectedDb::default();
@@ -382,12 +382,12 @@ mod tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: PgType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "email".into(),
-                        pg_type: PgType::Text,
+                        ty: ColumnType::Text,
                         nullable: true,
                     },
                 ],
@@ -408,7 +408,7 @@ mod tests {
     fn col(name: &str) -> IntrospectedColumn {
         IntrospectedColumn {
             name: name.into(),
-            pg_type: PgType::Text,
+            ty: ColumnType::Text,
             nullable: true,
         }
     }
@@ -583,7 +583,7 @@ mod tests {
                 name: "profiles".into(),
                 columns: vec![IntrospectedColumn {
                     name: "id".into(),
-                    pg_type: PgType::Int4,
+                    ty: ColumnType::Int4,
                     nullable: false,
                 }],
                 primary_key: vec!["id".into()],

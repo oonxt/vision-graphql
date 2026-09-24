@@ -1,7 +1,9 @@
 //! Public engine API.
 
 use crate::ast::Operation;
+use crate::backend::Backend;
 use crate::compiled::CompiledQuery;
+use crate::dialect::Dialect;
 use crate::error::{Error, Result};
 use crate::limits::ExecutionLimits;
 use crate::parse_cache::ParseCache;
@@ -10,11 +12,12 @@ use crate::predicate::Principal;
 use crate::schema::Schema;
 use crate::scope::{apply_scope, ScopeSet};
 use crate::sql::render;
-use crate::types::Inputs;
+use crate::types::{Bind, Inputs};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::postgres::Postgres;
-use sqlx::PgPool;
+use sqlx::Pool;
+use std::future::Future;
 use std::sync::Arc;
 
 /// Typed shape of an `insert` / `update` / `delete` mutation result:
@@ -59,9 +62,10 @@ pub(crate) fn prepare_symbolic(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
+    dialect: Dialect,
 ) -> Result<(String, Vec<crate::types::BindSpec>)> {
     limits.apply(op, schema)?;
-    render(op, schema)
+    render(op, schema, dialect)
 }
 
 /// [`prepare_symbolic`] for the fully-literal paths: every parameter resolves
@@ -70,14 +74,76 @@ fn prepare(
     op: &mut Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
-) -> Result<(String, Vec<crate::types::Bind>)> {
-    let (sql, specs) = prepare_symbolic(op, schema, limits)?;
+    dialect: Dialect,
+) -> Result<(String, Vec<Bind>)> {
+    let (sql, specs) = prepare_symbolic(op, schema, limits, dialect)?;
     let binds = crate::types::resolve_binds(&specs, &Inputs::none())?;
     Ok((sql, binds))
 }
 
-pub struct Engine {
-    pool: PgPool,
+/// Where one statement goes: the engine's pool, a caller's executor, or a
+/// transaction's connection.
+///
+/// Private, and the reason every executing method has one body: the three
+/// kinds of target cannot share sqlx's `Executor` in code generic over the
+/// backend. sqlx implements `Executor` for `&Pool<DB>` only under a
+/// higher-ranked bound on `&mut DB::Connection` that would have to be
+/// repeated on every public impl block here, and for the connection types
+/// one driver at a time. This trait has one impl per kind and no such bound;
+/// [`Backend`] supplies the driver-specific step.
+trait Run<DB: Backend>: Send {
+    fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send;
+
+    /// What to log the target as. The type is what tells a pool run from one
+    /// on a borrowed connection — the distinction an operator needs when a
+    /// statement did not see a row the transaction beside it just wrote.
+    fn name(&self) -> &'static str;
+}
+
+impl<DB: Backend> Run<DB> for &Pool<DB> {
+    async fn run(self, sql: &str, binds: &[Bind]) -> Result<Value> {
+        let mut conn = self.acquire().await?;
+        DB::execute_conn(&mut conn, sql, binds).await
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+impl<DB: Backend> Run<DB> for &mut DB::Connection {
+    fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send {
+        DB::execute_conn(self, sql, binds)
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
+/// A caller-supplied sqlx executor, as the `_on` methods take. The lifetime
+/// is the executor's own (`Executor<'c>`), carried here so the impl can name
+/// it.
+struct External<'c, E>(E, std::marker::PhantomData<&'c ()>);
+
+impl<'c, E> External<'c, E> {
+    fn new(executor: E) -> Self {
+        External(executor, std::marker::PhantomData)
+    }
+}
+
+impl<'c, DB: Backend, E: sqlx::Executor<'c, Database = DB>> Run<DB> for External<'c, E> {
+    fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send {
+        DB::execute(self.0, sql, binds)
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<E>()
+    }
+}
+
+pub struct Engine<DB: Backend = Postgres> {
+    pool: Pool<DB>,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
     limits: ExecutionLimits,
@@ -96,8 +162,8 @@ fn log_schema_warnings(schema: &Schema) {
     }
 }
 
-impl Engine {
-    pub fn new(pool: PgPool, schema: Schema) -> Self {
+impl<DB: Backend> Engine<DB> {
+    pub fn new(pool: Pool<DB>, schema: Schema) -> Self {
         log_schema_warnings(&schema);
         Self {
             pool,
@@ -109,7 +175,7 @@ impl Engine {
 
     /// Same as [`Engine::new`], with an explicit parse-cache capacity.
     /// `capacity == 0` parses every request from scratch.
-    pub fn with_parse_cache_capacity(pool: PgPool, schema: Schema, capacity: usize) -> Self {
+    pub fn with_parse_cache_capacity(pool: Pool<DB>, schema: Schema, capacity: usize) -> Self {
         log_schema_warnings(&schema);
         Self {
             pool,
@@ -126,7 +192,7 @@ impl Engine {
     /// Parsing is schema-independent, so an application running a separate
     /// engine per role — the way per-role column visibility is expressed — would
     /// otherwise parse the same document once per role.
-    pub fn with_parse_cache(pool: PgPool, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
+    pub fn with_parse_cache(pool: Pool<DB>, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
         log_schema_warnings(&schema);
         Self {
             pool,
@@ -182,7 +248,21 @@ impl Engine {
         )
     }
 
-    /// Parse a GraphQL query string, execute against PostgreSQL, return the
+    /// Lower and run a text operation on `target`. Every text method on this
+    /// engine — pool or `_on` — comes through here.
+    async fn text_to<R: Run<DB>>(
+        &self,
+        target: R,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
+        let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let op = self.lower(source, &vars, operation_name)?;
+        run_operation(target, op, &self.schema, &self.limits, false).await
+    }
+
+    /// Parse a GraphQL query string, execute against the database, return the
     /// Hasura-shaped `data` object as `serde_json::Value`.
     ///
     /// A document holding more than one operation needs
@@ -198,14 +278,14 @@ impl Engine {
 
     /// [`Engine::query`] on a caller-supplied executor: the engine's pool
     /// (`&pool`), a connection borrowed from a transaction the caller holds
-    /// (`&mut *tx`), or any other [`sqlx::PgExecutor`].
+    /// (`&mut *tx`), or any other [`sqlx::Executor`] of this engine's backend.
     ///
     /// The engine begins, commits and rolls back nothing here. This is the
     /// entry point for a host that owns the transaction — because its
     /// lifetime, its timeout and the other statements in it are the host's
     /// business — and wants this engine's statements to run in it. A
     /// statement sees what the connection sees, uncommitted rows included.
-    pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn query_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         source: &str,
@@ -220,45 +300,53 @@ impl Engine {
     /// `variables`: a client that ships one document holding every operation it
     /// might send picks one per request by name. Without it such a document can
     /// only be run through [`Engine::compile_with`], which has always taken one.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_with(
         &self,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.query_with_on(&self.pool, source, variables, operation_name)
+        self.text_to(&self.pool, source, variables, operation_name)
             .await
     }
 
     /// [`Engine::query_with`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn query_with_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn query_with_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = self.lower(source, &vars, operation_name)?;
-        run_operation_on(executor, op, &self.schema, &self.limits, false).await
+        self.text_to(External::new(executor), source, variables, operation_name)
+            .await
     }
 
     /// Execute any [`crate::builder::IntoOperation`] (builders, raw `RootField`, or `Operation`).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        self.run_on(&self.pool, op).await
+        run_operation(
+            &self.pool,
+            op.into_operation(),
+            &self.schema,
+            &self.limits,
+            false,
+        )
+        .await
     }
 
     /// [`Engine::run`] on a caller-supplied executor; see [`Engine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn run_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn run_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
-        run_operation_on(
-            executor,
+        run_operation(
+            External::new(executor),
             op.into_operation(),
             &self.schema,
             &self.limits,
@@ -285,13 +373,13 @@ impl Engine {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<T> {
-        self.query_as_with_on(&self.pool, source, variables, operation_name)
-            .await
+        let data = self.query_with(source, variables, operation_name).await?;
+        unwrap_and_deserialize(data, None)
     }
 
     /// [`Engine::query_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn query_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn query_as_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         source: &str,
@@ -303,7 +391,7 @@ impl Engine {
 
     /// [`Engine::query_as_with`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn query_as_with_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn query_as_with_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         source: &str,
@@ -327,19 +415,29 @@ impl Engine {
         &self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        self.run_as_on(&self.pool, op).await
+        let operation = op.into_operation();
+        let alias = single_root_alias(&operation).map(String::from);
+        let data = run_operation(&self.pool, operation, &self.schema, &self.limits, false).await?;
+        unwrap_and_deserialize(data, alias.as_deref())
     }
 
     /// [`Engine::run_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn run_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn run_as_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = run_operation_on(executor, operation, &self.schema, &self.limits, false).await?;
+        let data = run_operation(
+            External::new(executor),
+            operation,
+            &self.schema,
+            &self.limits,
+            false,
+        )
+        .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -349,7 +447,7 @@ impl Engine {
     /// [`crate::compiled`] for which queries can be compiled — a variable in a
     /// position that decides the shape of the SQL cannot be, and yields
     /// [`Error::NotCompilable`].
-    pub fn compile(&self, source: &str) -> Result<CompiledQuery> {
+    pub fn compile(&self, source: &str) -> Result<CompiledQuery<DB>> {
         self.compile_inner(source, None, None)
     }
 
@@ -362,7 +460,7 @@ impl Engine {
     /// serves every principal, and — because tables absent from the policy are
     /// denied at compile time — a table the policy does not mention fails here
     /// rather than at request time.
-    pub fn compile_scoped(&self, source: &str, policy: &ScopePolicy) -> Result<CompiledQuery> {
+    pub fn compile_scoped(&self, source: &str, policy: &ScopePolicy) -> Result<CompiledQuery<DB>> {
         self.compile_inner(source, None, Some(policy))
     }
 
@@ -373,7 +471,7 @@ impl Engine {
         source: &str,
         operation_name: Option<&str>,
         policy: Option<&ScopePolicy>,
-    ) -> Result<CompiledQuery> {
+    ) -> Result<CompiledQuery<DB>> {
         self.compile_inner(source, operation_name, policy)
     }
 
@@ -382,7 +480,7 @@ impl Engine {
         source: &str,
         operation_name: Option<&str>,
         policy: Option<&ScopePolicy>,
-    ) -> Result<CompiledQuery> {
+    ) -> Result<CompiledQuery<DB>> {
         let doc = self.parse_cache.get(source)?;
         crate::compiled::compile(&doc, operation_name, policy, &self.schema, &self.limits)
     }
@@ -393,25 +491,26 @@ impl Engine {
     /// Refuses a statement compiled against a policy: that one needs a
     /// principal, and running it without one would mean running a scoped query
     /// unscoped.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute(
         &self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        self.execute_on(&self.pool, compiled, variables).await
+        execute_compiled(&self.pool, compiled, variables, None).await
     }
 
     /// [`Engine::execute`] on a caller-supplied executor; see
     /// [`Engine::query_on`]. The same guard applies: a statement compiled
     /// against a policy is refused without a principal.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn execute_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn execute_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled_on(executor, compiled, variables, None).await
+        execute_compiled(External::new(executor), compiled, variables, None).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -419,14 +518,14 @@ impl Engine {
     ///
     /// Refuses a statement that was compiled without a policy, since its SQL
     /// carries no predicates and the principal would silently have no effect.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute_scoped(
         &self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        self.execute_scoped_on(&self.pool, compiled, variables, principal)
-            .await
+        execute_compiled(&self.pool, compiled, variables, Some(principal)).await
     }
 
     /// [`Engine::execute_scoped`] on a caller-supplied executor; see
@@ -439,44 +538,51 @@ impl Engine {
     /// lends the connection, the engine executes. The principal is the
     /// caller's to supply per call, as on the pool.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn execute_scoped_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn execute_scoped_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled_on(executor, compiled, variables, Some(principal)).await
+        execute_compiled(
+            External::new(executor),
+            compiled,
+            variables,
+            Some(principal),
+        )
+        .await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and
     /// deserializing into `T`.
     pub async fn execute_as<T: DeserializeOwned>(
         &self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<T> {
-        self.execute_as_on(&self.pool, compiled, variables).await
+        let data = self.execute(compiled, variables).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
     }
 
     /// Same as [`Engine::execute_scoped`], unwrapping the single root field and
     /// deserializing into `T`.
     pub async fn execute_scoped_as<T: DeserializeOwned>(
         &self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<T> {
-        self.execute_scoped_as_on(&self.pool, compiled, variables, principal)
-            .await
+        let data = self.execute_scoped(compiled, variables, principal).await?;
+        unwrap_and_deserialize(data, compiled.root_alias.as_deref())
     }
 
     /// [`Engine::execute_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn execute_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn execute_as_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<T> {
         let data = self.execute_on(executor, compiled, variables).await?;
@@ -485,10 +591,14 @@ impl Engine {
 
     /// [`Engine::execute_scoped_as`] on a caller-supplied executor; see
     /// [`Engine::execute_scoped_on`].
-    pub async fn execute_scoped_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn execute_scoped_as_on<
+        'c,
+        E: sqlx::Executor<'c, Database = DB>,
+        T: DeserializeOwned,
+    >(
         &self,
         executor: E,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<T> {
@@ -501,14 +611,14 @@ impl Engine {
     /// Scoped execution handle: every query it runs is rewritten so each
     /// table access point carries the [`ScopeSet`]'s predicate for that
     /// table, and tables without an entry are denied. See [`crate::scope`].
-    pub fn scoped(&self, scope: ScopeSet) -> ScopedEngine<'_> {
+    pub fn scoped(&self, scope: ScopeSet) -> ScopedEngine<'_, DB> {
         ScopedEngine {
             engine: self,
             scope,
         }
     }
 
-    /// Run a closure inside a single PostgreSQL transaction. Every call on
+    /// Run a closure inside a single database transaction. Every call on
     /// the [`TxClient`] inside the closure — [`query`](TxClient::query),
     /// [`run`](TxClient::run), [`execute`](TxClient::execute) and
     /// [`execute_scoped`](TxClient::execute_scoped) — uses the same
@@ -518,7 +628,7 @@ impl Engine {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn transaction<F, T>(&self, f: F) -> Result<T>
     where
-        F: AsyncFnOnce(&mut TxClient) -> Result<T>,
+        F: AsyncFnOnce(&mut TxClient<DB>) -> Result<T>,
     {
         let tx = self.pool.begin().await?;
         let mut tc = TxClient {
@@ -540,7 +650,7 @@ impl Engine {
     }
 }
 
-/// Run a compiled statement on `executor`: the shape its `@choices` pick,
+/// Run a compiled statement on `target`: the shape its `@choices` pick,
 /// with variables, defaults and — for a statement compiled against a policy —
 /// the principal resolved into binds. The one execution path for compiled
 /// statements: the pool, the engine's own transaction and a caller's
@@ -548,9 +658,9 @@ impl Engine {
 /// statement with the right entry point — a scoped statement without a
 /// principal would run unscoped, and an unscoped one with a principal would
 /// look restricted while restricting nothing.
-async fn execute_compiled_on<'c, E: sqlx::PgExecutor<'c>>(
-    executor: E,
-    compiled: &CompiledQuery,
+async fn execute_compiled<DB: Backend, R: Run<DB>>(
+    target: R,
+    compiled: &CompiledQuery<DB>,
     variables: Option<Value>,
     principal: Option<&Principal>,
 ) -> Result<Value> {
@@ -581,37 +691,32 @@ async fn execute_compiled_on<'c, E: sqlx::PgExecutor<'c>>(
         sql = %shape.sql,
         binds = binds.len(),
         scoped = compiled.scoped,
-        executor = std::any::type_name::<E>(),
+        executor = target.name(),
         "executing compiled"
     );
-    crate::executor::execute_on(executor, &shape.sql, &binds).await
+    target.run(&shape.sql, &binds).await
 }
 
 /// Prepare an already-lowered (and, when `scoped`, already-rewritten)
-/// operation and run it on `executor`. The one execution path for text and
-/// builder operations, as [`execute_compiled_on`] is for compiled ones.
-///
-/// `executor` is logged by type, which is what tells a pool run
-/// (`&Pool<Postgres>`) from one on a borrowed connection (`&mut
-/// PgConnection`) — the distinction an operator needs when a statement did
-/// not see a row the transaction beside it just wrote.
-async fn run_operation_on<'c, E: sqlx::PgExecutor<'c>>(
-    executor: E,
+/// operation and run it on `target`. The one execution path for text and
+/// builder operations, as [`execute_compiled`] is for compiled ones.
+async fn run_operation<DB: Backend, R: Run<DB>>(
+    target: R,
     mut op: Operation,
     schema: &Schema,
     limits: &ExecutionLimits,
     scoped: bool,
 ) -> Result<Value> {
-    let (sql, binds) = prepare(&mut op, schema, limits)?;
+    let (sql, binds) = prepare(&mut op, schema, limits, DB::DIALECT)?;
     tracing::debug!(
         target: "vision_graphql::engine",
         %sql,
         binds = binds.len(),
         scoped,
-        executor = std::any::type_name::<E>(),
+        executor = target.name(),
         "executing"
     );
-    crate::executor::execute_on(executor, &sql, &binds).await
+    target.run(&sql, &binds).await
 }
 
 /// Parse (via the cache) and lower `source`. The one lowering step for every
@@ -628,7 +733,7 @@ fn lower_source(
     crate::parser::lower(&doc, vars, operation_name, schema)
 }
 
-/// A handle to an open PostgreSQL transaction that exposes the same query
+/// A handle to an open database transaction that exposes the same query
 /// surface as [`Engine`] — text, builder and compiled statements alike.
 /// Obtained via [`Engine::transaction`]; cannot be constructed directly.
 /// Methods take `&mut self` because the underlying connection is exclusively
@@ -638,14 +743,14 @@ fn lower_source(
 /// ([`TxClient::execute_scoped`]). For a transaction that must stay inside
 /// one [`ScopeSet`] whatever the closure does, see
 /// [`ScopedEngine::transaction`].
-pub struct TxClient {
-    tx: sqlx::Transaction<'static, Postgres>,
+pub struct TxClient<DB: Backend = Postgres> {
+    tx: sqlx::Transaction<'static, DB>,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
     limits: ExecutionLimits,
 }
 
-impl TxClient {
+impl<DB: Backend> TxClient<DB> {
     /// Same as [`Engine::query`], but runs on the transaction's connection.
     pub async fn query(&mut self, source: &str, variables: Option<Value>) -> Result<Value> {
         self.query_with(source, variables, None).await
@@ -667,13 +772,13 @@ impl TxClient {
             &vars,
             operation_name,
         )?;
-        run_operation_on(&mut *self.tx, op, &self.schema, &self.limits, false).await
+        run_operation::<DB, _>(&mut *self.tx, op, &self.schema, &self.limits, false).await
     }
 
     /// Same as [`Engine::run`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        run_operation_on(
+        run_operation::<DB, _>(
             &mut *self.tx,
             op.into_operation(),
             &self.schema,
@@ -711,7 +816,8 @@ impl TxClient {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
         let data =
-            run_operation_on(&mut *self.tx, operation, &self.schema, &self.limits, false).await?;
+            run_operation::<DB, _>(&mut *self.tx, operation, &self.schema, &self.limits, false)
+                .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -720,10 +826,10 @@ impl TxClient {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute(
         &mut self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled_on(&mut *self.tx, compiled, variables, None).await
+        execute_compiled::<DB, _>(&mut *self.tx, compiled, variables, None).await
     }
 
     /// Same as [`Engine::execute_scoped`], but runs on the transaction's
@@ -734,18 +840,18 @@ impl TxClient {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn execute_scoped(
         &mut self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled_on(&mut *self.tx, compiled, variables, Some(principal)).await
+        execute_compiled::<DB, _>(&mut *self.tx, compiled, variables, Some(principal)).await
     }
 
     /// Same as [`TxClient::execute`], unwrapping the single root field and
     /// deserializing into `T`.
     pub async fn execute_as<T: DeserializeOwned>(
         &mut self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<T> {
         let data = self.execute(compiled, variables).await?;
@@ -756,7 +862,7 @@ impl TxClient {
     /// and deserializing into `T`.
     pub async fn execute_scoped_as<T: DeserializeOwned>(
         &mut self,
-        compiled: &CompiledQuery,
+        compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<T> {
@@ -770,23 +876,32 @@ impl TxClient {
 /// before rendering. Scoped `update`/`delete` (and their `_by_pk` forms) inject
 /// the predicate as a filter; `insert` injects it as a post-insert check,
 /// enforced at every nested level.
-pub struct ScopedEngine<'e> {
-    engine: &'e Engine,
+pub struct ScopedEngine<'e, DB: Backend = Postgres> {
+    engine: &'e Engine<DB>,
     scope: ScopeSet,
 }
 
-impl ScopedEngine<'_> {
-    /// The scope rewrite, then execution on `executor`. Every executing
+impl<DB: Backend> ScopedEngine<'_, DB> {
+    /// The scope rewrite, then execution on `target`. Every executing
     /// method on this handle comes through here, so none can reach the
     /// renderer unscoped. ([`ScopedEngine::transaction`] hands out a
     /// [`ScopedTxClient`], which has its own copy of the same two steps.)
-    async fn run_scoped_on<'c, E: sqlx::PgExecutor<'c>>(
-        &self,
-        executor: E,
-        mut op: Operation,
-    ) -> Result<Value> {
+    async fn run_scoped_to<R: Run<DB>>(&self, target: R, mut op: Operation) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.engine.schema)?;
-        run_operation_on(executor, op, &self.engine.schema, &self.engine.limits, true).await
+        run_operation(target, op, &self.engine.schema, &self.engine.limits, true).await
+    }
+
+    /// Lower, then [`run_scoped_to`](Self::run_scoped_to).
+    async fn text_to<R: Run<DB>>(
+        &self,
+        target: R,
+        source: &str,
+        variables: Option<Value>,
+        operation_name: Option<&str>,
+    ) -> Result<Value> {
+        let vars = variables.unwrap_or(Value::Object(Default::default()));
+        let op = self.engine.lower(source, &vars, operation_name)?;
+        self.run_scoped_to(target, op).await
     }
 
     /// Same as [`Engine::query`], with the scope rewrite applied.
@@ -802,7 +917,7 @@ impl ScopedEngine<'_> {
     /// [`ScopedEngine::query`] on a caller-supplied executor; see
     /// [`Engine::query_on`] for what that means. The [`ScopeSet`] is this
     /// handle's, fixed when it was made; the connection is the caller's.
-    pub async fn query_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn query_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         source: &str,
@@ -812,45 +927,48 @@ impl ScopedEngine<'_> {
     }
 
     /// [`ScopedEngine::query`] naming the operation to run.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn query_with(
         &self,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.query_with_on(&self.engine.pool, source, variables, operation_name)
+        self.text_to(&self.engine.pool, source, variables, operation_name)
             .await
     }
 
     /// [`ScopedEngine::query_with`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn query_with_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn query_with_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        let vars = variables.unwrap_or(Value::Object(Default::default()));
-        let op = self.engine.lower(source, &vars, operation_name)?;
-        self.run_scoped_on(executor, op).await
+        self.text_to(External::new(executor), source, variables, operation_name)
+            .await
     }
 
     /// Same as [`Engine::run`], with the scope rewrite applied.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&self, op: impl crate::builder::IntoOperation) -> Result<Value> {
-        self.run_on(&self.engine.pool, op).await
+        self.run_scoped_to(&self.engine.pool, op.into_operation())
+            .await
     }
 
     /// [`ScopedEngine::run`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn run_on<'c, E: sqlx::PgExecutor<'c>>(
+    pub async fn run_on<'c, E: sqlx::Executor<'c, Database = DB>>(
         &self,
         executor: E,
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
-        self.run_scoped_on(executor, op.into_operation()).await
+        self.run_scoped_to(External::new(executor), op.into_operation())
+            .await
     }
 
     /// Same as [`Engine::query_as`], with the scope rewrite applied.
@@ -869,13 +987,13 @@ impl ScopedEngine<'_> {
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<T> {
-        self.query_as_with_on(&self.engine.pool, source, variables, operation_name)
-            .await
+        let data = self.query_with(source, variables, operation_name).await?;
+        unwrap_and_deserialize(data, None)
     }
 
     /// [`ScopedEngine::query_as`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn query_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn query_as_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         source: &str,
@@ -887,7 +1005,7 @@ impl ScopedEngine<'_> {
 
     /// [`ScopedEngine::query_as_with`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn query_as_with_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn query_as_with_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         source: &str,
@@ -905,19 +1023,24 @@ impl ScopedEngine<'_> {
         &self,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
-        self.run_as_on(&self.engine.pool, op).await
+        let operation = op.into_operation();
+        let alias = single_root_alias(&operation).map(String::from);
+        let data = self.run_scoped_to(&self.engine.pool, operation).await?;
+        unwrap_and_deserialize(data, alias.as_deref())
     }
 
     /// [`ScopedEngine::run_as`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn run_as_on<'c, E: sqlx::PgExecutor<'c>, T: DeserializeOwned>(
+    pub async fn run_as_on<'c, E: sqlx::Executor<'c, Database = DB>, T: DeserializeOwned>(
         &self,
         executor: E,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = self.run_scoped_on(executor, operation).await?;
+        let data = self
+            .run_scoped_to(External::new(executor), operation)
+            .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -927,7 +1050,7 @@ impl ScopedEngine<'_> {
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn transaction<F, T>(&self, f: F) -> Result<T>
     where
-        F: AsyncFnOnce(&mut ScopedTxClient) -> Result<T>,
+        F: AsyncFnOnce(&mut ScopedTxClient<DB>) -> Result<T>,
     {
         let tx = self.engine.pool.begin().await?;
         let mut tc = ScopedTxClient {
@@ -960,18 +1083,18 @@ impl ScopedEngine<'_> {
 /// would be a way out. A transaction over compiled statements is
 /// [`Engine::transaction`] with [`TxClient::execute_scoped`], where the
 /// caller — not the closure's author — supplies the principal each time.
-pub struct ScopedTxClient {
-    tx: sqlx::Transaction<'static, Postgres>,
+pub struct ScopedTxClient<DB: Backend = Postgres> {
+    tx: sqlx::Transaction<'static, DB>,
     schema: Arc<Schema>,
     parse_cache: Arc<ParseCache>,
     scope: ScopeSet,
     limits: ExecutionLimits,
 }
 
-impl ScopedTxClient {
+impl<DB: Backend> ScopedTxClient<DB> {
     async fn run_scoped(&mut self, mut op: Operation) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        run_operation_on(&mut *self.tx, op, &self.schema, &self.limits, true).await
+        run_operation::<DB, _>(&mut *self.tx, op, &self.schema, &self.limits, true).await
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.

@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use vision_graphql::predicate::{col, principal, Principal};
-use vision_graphql::schema::{PgType, Relation, Schema, Table};
+use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::{Engine, Error, ScopePolicy};
 
 mod common;
@@ -15,18 +15,18 @@ fn schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, true)
                 .primary_key(&["id"])
                 .relation("orders", Relation::array("orders").on([("id", "user_id")])),
         )
         .table(
             Table::new("orders", "public", "orders")
-                .column("id", "id", PgType::Int4, false)
-                .column("user_id", "user_id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
-                .column("ref", "ref", PgType::Uuid, true)
-                .column("qty", "qty", PgType::Int4, true)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("user_id", "user_id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
+                .column("ref", "ref", ColumnType::Uuid, true)
+                .column("qty", "qty", ColumnType::Int4, true)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )

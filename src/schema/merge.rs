@@ -102,7 +102,7 @@ pub fn build_from_introspection(db: IntrospectedDb) -> SchemaBuilder {
         let column_names: std::collections::BTreeSet<&str> =
             it.columns.iter().map(|c| c.name.as_str()).collect();
         for col in &it.columns {
-            t = t.column(&col.name, &col.name, col.pg_type.clone(), col.nullable);
+            t = t.column(&col.name, &col.name, col.ty.clone(), col.nullable);
         }
         if !it.primary_key.is_empty() {
             let refs: Vec<&str> = it.primary_key.iter().map(String::as_str).collect();
@@ -206,7 +206,7 @@ pub fn apply_config(
             t = t.column(
                 &col.exposed_name,
                 &col.physical_name,
-                col.pg_type.clone(),
+                col.ty.clone(),
                 col.nullable,
             );
         }
@@ -396,7 +396,7 @@ mod tests {
                 name: "value_type".into(),
                 columns: vec![IntrospectedColumn {
                     name: "title".into(),
-                    pg_type: PgType::Text,
+                    ty: ColumnType::Text,
                     nullable: false,
                 }],
                 primary_key: vec!["title".into()],
@@ -414,12 +414,12 @@ mod tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: PgType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "value_type".into(),
-                        pg_type: PgType::Text,
+                        ty: ColumnType::Text,
                         nullable: false,
                     },
                 ],
@@ -459,7 +459,7 @@ mod tests {
     use crate::schema::introspect::{
         IntrospectedColumn, IntrospectedForeignKey, IntrospectedTable,
     };
-    use crate::schema::PgType;
+    use crate::schema::ColumnType;
 
     fn fixture_with_posts_to_users() -> IntrospectedDb {
         let mut db = IntrospectedDb::default();
@@ -470,7 +470,7 @@ mod tests {
                 name: "users".into(),
                 columns: vec![IntrospectedColumn {
                     name: "id".into(),
-                    pg_type: PgType::Int4,
+                    ty: ColumnType::Int4,
                     nullable: false,
                 }],
                 primary_key: vec!["id".into()],
@@ -488,12 +488,12 @@ mod tests {
                 columns: vec![
                     IntrospectedColumn {
                         name: "id".into(),
-                        pg_type: PgType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                     IntrospectedColumn {
                         name: "user_id".into(),
-                        pg_type: PgType::Int4,
+                        ty: ColumnType::Int4,
                         nullable: false,
                     },
                 ],
@@ -540,7 +540,7 @@ mod tests {
         let sb = sb.table(Table::new("widgets", "public", "widgets").column(
             "id",
             "id",
-            crate::schema::PgType::Int4,
+            crate::schema::ColumnType::Int4,
             false,
         ));
 
@@ -611,7 +611,7 @@ mod tests {
         fn int_col(name: &str) -> IntrospectedColumn {
             IntrospectedColumn {
                 name: name.into(),
-                pg_type: PgType::Int4,
+                ty: ColumnType::Int4,
                 nullable: false,
             }
         }
@@ -795,7 +795,7 @@ mod tests {
                 name: "audit_orders".into(),
                 columns: vec![IntrospectedColumn {
                     name: "id".into(),
-                    pg_type: PgType::Int4,
+                    ty: ColumnType::Int4,
                     nullable: false,
                 }],
                 primary_key: vec!["id".into()],
@@ -854,7 +854,7 @@ mod tests {
             .unwrap();
         posts.columns.push(IntrospectedColumn {
             name: "editor_id".into(),
-            pg_type: PgType::Int4,
+            ty: ColumnType::Int4,
             nullable: true,
         });
         posts.foreign_keys.push(IntrospectedForeignKey {

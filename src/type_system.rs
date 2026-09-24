@@ -28,7 +28,7 @@
 //! is what the engine binds anyway.
 
 use crate::ast::AggFunc;
-use crate::schema::{PgType, RelKind, Schema, Table};
+use crate::schema::{ColumnType, RelKind, Schema, Table};
 use crate::type_names;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -281,31 +281,31 @@ fn directive_defs() -> Vec<DirectiveDef> {
 ///
 /// The names past the five built-ins are Hasura's, which are also the names a
 /// client would already have a serializer for.
-pub fn scalar_name(pg: &PgType) -> String {
+pub fn scalar_name(pg: &ColumnType) -> String {
     match pg {
         // Both are GraphQL `Int`: the spec's Int is 32-bit signed, which holds
         // every int2 and int4 value.
-        PgType::Int2 | PgType::Int4 => "Int".into(),
-        PgType::Int8 => "bigint".into(),
-        PgType::Float4 | PgType::Float8 => "Float".into(),
-        PgType::Bool => "Boolean".into(),
-        PgType::Text | PgType::Varchar => "String".into(),
-        PgType::Numeric => "numeric".into(),
-        PgType::Uuid => "uuid".into(),
-        PgType::Timestamp => "timestamp".into(),
-        PgType::TimestampTz => "timestamptz".into(),
-        PgType::Date => "date".into(),
-        PgType::Time => "time".into(),
-        PgType::Json => "json".into(),
-        PgType::Jsonb => "jsonb".into(),
+        ColumnType::Int2 | ColumnType::Int4 => "Int".into(),
+        ColumnType::Int8 => "bigint".into(),
+        ColumnType::Float4 | ColumnType::Float8 => "Float".into(),
+        ColumnType::Bool => "Boolean".into(),
+        ColumnType::Text | ColumnType::Varchar => "String".into(),
+        ColumnType::Numeric => "numeric".into(),
+        ColumnType::Uuid => "uuid".into(),
+        ColumnType::Timestamp => "timestamp".into(),
+        ColumnType::TimestampTz => "timestamptz".into(),
+        ColumnType::Date => "date".into(),
+        ColumnType::Time => "time".into(),
+        ColumnType::Json => "json".into(),
+        ColumnType::Jsonb => "jsonb".into(),
         // The variants are not introspected, so this cannot be a GraphQL enum;
         // see the module docs.
-        PgType::Enum { name, .. } => name.clone(),
+        ColumnType::Enum { name, .. } => name.clone(),
     }
 }
 
 /// Whether `func` means anything for a column of this type.
-pub fn applies(func: AggFunc, pg: &PgType) -> bool {
+pub fn applies(func: AggFunc, pg: &ColumnType) -> bool {
     if func.numeric_only() {
         pg.is_numeric()
     } else {
@@ -317,7 +317,7 @@ pub fn applies(func: AggFunc, pg: &PgType) -> bool {
 ///
 /// One sentence per way of failing, shared by both entry points — the parser
 /// and the renderer — so the document path and the builder get the same reason.
-pub fn why_inapplicable(func: AggFunc, pg: &PgType) -> &'static str {
+pub fn why_inapplicable(func: AggFunc, pg: &ColumnType) -> &'static str {
     if func.numeric_only() {
         "it is not a number"
     } else if !pg.is_orderable() {
@@ -339,30 +339,30 @@ pub fn why_inapplicable(func: AggFunc, pg: &PgType) -> &'static str {
 /// precision are rounded by the JSON round-trip on the way out. That is the
 /// deliberate trade — a string would make one scalar serialize two ways — and
 /// an opt-in exact (stringified) transport is the recorded follow-up.
-fn result_type(func: AggFunc, pg: &PgType) -> PgType {
+fn result_type(func: AggFunc, pg: &ColumnType) -> ColumnType {
     use AggFunc::*;
     match func {
         // Ordering answers with what it was given.
         Max | Min => pg.clone(),
         // Summing widens, so that a total of many `int4` cannot overflow one.
         Sum => match pg {
-            PgType::Int2 | PgType::Int4 => PgType::Int8,
-            PgType::Int8 => PgType::Numeric,
+            ColumnType::Int2 | ColumnType::Int4 => ColumnType::Int8,
+            ColumnType::Int8 => ColumnType::Numeric,
             other => other.clone(),
         },
         // Everything arithmetic answers exactly for exact input and in floating
         // point for floating input.
         Avg | Stddev | StddevPop | StddevSamp | Variance | VarPop | VarSamp => match pg {
-            PgType::Float4 | PgType::Float8 => PgType::Float8,
-            _ => PgType::Numeric,
+            ColumnType::Float4 | ColumnType::Float8 => ColumnType::Float8,
+            _ => ColumnType::Numeric,
         },
     }
 }
 
 /// Whether `LIKE`-family operators apply, which is what decides whether the
 /// comparison input for this scalar carries them.
-fn is_stringish(pg: &PgType) -> bool {
-    matches!(pg, PgType::Text | PgType::Varchar)
+fn is_stringish(pg: &ColumnType) -> bool {
+    matches!(pg, ColumnType::Text | ColumnType::Varchar)
 }
 
 /// Whether a comparison operator is published for a column type — and therefore
@@ -371,14 +371,14 @@ fn is_stringish(pg: &PgType) -> bool {
 /// inputs from this, and `sql.rs` checks every rendered comparison against it;
 /// a second hand-written copy of either side is how `_gt` over `jsonb` came to
 /// be accepted while never being published.
-pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &PgType) -> bool {
+pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &ColumnType) -> bool {
     use crate::ast::CmpOp::*;
     match op {
         // `json` has no `=`: PostgreSQL keeps it as the text it was given and
         // defines no equality over that, so `data = $1::json` is an error on
         // every request. `jsonb` compares structurally. `_in` is `= ANY`, so
         // it answers to this too.
-        Eq | Neq => !matches!(pg, PgType::Json),
+        Eq | Neq => !matches!(pg, ColumnType::Json),
         Gt | Gte | Lt | Lte => pg.is_orderable(),
         Like | ILike | NLike | NILike => is_stringish(pg),
     }
@@ -391,7 +391,7 @@ pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &PgType) -> bool {
 /// column, or the type of a column-less leaf.
 pub(crate) fn check_cmp(
     op: crate::ast::CmpOp,
-    pg: &PgType,
+    pg: &ColumnType,
     path: impl FnOnce() -> String,
     subject: &str,
 ) -> crate::error::Result<()> {
@@ -409,11 +409,11 @@ pub(crate) fn check_cmp(
 }
 
 /// Why [`cmp_applies`] said no, in the words of the schema.
-pub(crate) fn why_cmp_inapplicable(op: crate::ast::CmpOp, pg: &PgType) -> &'static str {
+pub(crate) fn why_cmp_inapplicable(op: crate::ast::CmpOp, pg: &ColumnType) -> &'static str {
     use crate::ast::CmpOp::*;
     match op {
         Eq | Neq => {
-            debug_assert!(matches!(pg, PgType::Json));
+            debug_assert!(matches!(pg, ColumnType::Json));
             "json has no equality operator (jsonb does)"
         }
         Gt | Gte | Lt | Lte => {
@@ -446,7 +446,7 @@ struct Builder<'a> {
     types: BTreeMap<String, TypeDef>,
     /// Scalars reached from a column, so only the comparison inputs that can be
     /// used get published.
-    scalars: BTreeMap<String, PgType>,
+    scalars: BTreeMap<String, ColumnType>,
     /// Scalars that appear only as an aggregate's *result* — `bigint` for the
     /// sum of an `integer`, say. They need a type of their own, but no
     /// comparison input: nothing can be filtered on them, since no column has
@@ -477,7 +477,7 @@ impl<'a> Builder<'a> {
         self.types.insert(def.name().to_string(), def);
     }
 
-    fn note_scalar(&mut self, pg: &PgType) -> String {
+    fn note_scalar(&mut self, pg: &ColumnType) -> String {
         let name = scalar_name(pg);
         if !BUILT_IN_SCALARS.contains(&name.as_str()) {
             self.scalars
@@ -529,7 +529,7 @@ impl<'a> Builder<'a> {
         });
 
         // Comparison inputs, one per scalar any column uses.
-        let scalars: Vec<(String, PgType)> = self
+        let scalars: Vec<(String, ColumnType)> = self
             .scalars
             .iter()
             .map(|(n, p)| (n.clone(), p.clone()))
@@ -641,13 +641,13 @@ impl<'a> Builder<'a> {
     fn column_fields(&mut self, t: &Table) -> Vec<Field> {
         let mut fields = Vec::new();
         for col in t.columns() {
-            let scalar = self.note_scalar(&col.pg_type);
+            let scalar = self.note_scalar(&col.ty);
             let mut ty = TypeRef::named(&scalar);
             if !col.nullable {
                 ty = ty.non_null();
             }
             let mut f = Field::new(&col.exposed_name, ty);
-            if matches!(col.pg_type, PgType::Json | PgType::Jsonb) {
+            if matches!(col.ty, ColumnType::Json | ColumnType::Jsonb) {
                 f = f.with_args(vec![InputValue::new("path", TypeRef::named("String"))
                     .described("Dot-separated path extracted with `#>`, e.g. \"a.b.0\".")]);
             }
@@ -741,9 +741,9 @@ impl<'a> Builder<'a> {
         for func in AggFunc::ALL {
             let cols: Vec<Field> = t
                 .columns()
-                .filter(|c| applies(func, &c.pg_type))
+                .filter(|c| applies(func, &c.ty))
                 .map(|c| {
-                    let name = scalar_name(&result_type(func, &c.pg_type));
+                    let name = scalar_name(&result_type(func, &c.ty));
                     self.result_scalars.insert(name.clone());
                     Field::new(&c.exposed_name, TypeRef::named(name))
                 })
@@ -778,7 +778,7 @@ impl<'a> Builder<'a> {
             InputValue::new("_not", TypeRef::named(&name)),
         ];
         for col in t.columns() {
-            let scalar = self.note_scalar(&col.pg_type);
+            let scalar = self.note_scalar(&col.ty);
             fields.push(InputValue::new(
                 &col.exposed_name,
                 TypeRef::named(comparison_exp_name(&scalar)),
@@ -849,7 +849,7 @@ impl<'a> Builder<'a> {
         let row_cols: Vec<InputValue> = t
             .columns()
             .map(|c| {
-                let scalar = scalar_name(&c.pg_type);
+                let scalar = scalar_name(&c.ty);
                 InputValue::new(&c.exposed_name, TypeRef::named(scalar))
             })
             .collect();
@@ -958,7 +958,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn comparison_exp(&mut self, scalar: &str, pg: &PgType) {
+    fn comparison_exp(&mut self, scalar: &str, pg: &ColumnType) {
         let named = || TypeRef::named(scalar);
         let mut fields = vec![InputValue::new("_is_null", TypeRef::named("Boolean"))];
         if cmp_applies(crate::ast::CmpOp::Eq, pg) {
@@ -1192,7 +1192,7 @@ fn pk_args(t: &Table) -> Option<Vec<InputValue>> {
         .map(|c| {
             InputValue::new(
                 &c.exposed_name,
-                TypeRef::named(scalar_name(&c.pg_type)).non_null(),
+                TypeRef::named(scalar_name(&c.ty)).non_null(),
             )
         })
         .collect();
@@ -1288,31 +1288,31 @@ pub fn dangling_references(ts: &TypeSystem) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
-                    .column("data", "data", PgType::Jsonb, true)
-                    .column("meta", "meta", PgType::Json, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
+                    .column("data", "data", ColumnType::Jsonb, true)
+                    .column("meta", "meta", ColumnType::Json, true)
                     .primary_key(&["id"])
                     .unique_constraint("users_pkey", &["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("score", "score", PgType::Numeric, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("score", "score", ColumnType::Numeric, true)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("summary", "public", "summary")
-                    .column("total", "total", PgType::Int8, true)
+                    .column("total", "total", ColumnType::Int8, true)
                     .read_only(true),
             )
             .build()
@@ -1470,15 +1470,15 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("things", "public", "things")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("label", "label", PgType::Text, true)
-                    .column("day", "day", PgType::Date, true)
-                    .column("flag", "flag", PgType::Bool, true)
-                    .column("token", "token", PgType::Uuid, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("label", "label", ColumnType::Text, true)
+                    .column("day", "day", ColumnType::Date, true)
+                    .column("flag", "flag", ColumnType::Bool, true)
+                    .column("token", "token", ColumnType::Uuid, true)
                     .column(
                         "mood",
                         "mood",
-                        PgType::Enum {
+                        ColumnType::Enum {
                             schema: "public".into(),
                             name: "mood".into(),
                         },
@@ -1544,7 +1544,7 @@ mod tests {
             .table(
                 Table::new("users", "public", "users")
                     // `id` is the declared key but is not exposed.
-                    .column("name", "name", PgType::Text, true)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"]),
             )
             .build();
@@ -1575,7 +1575,7 @@ mod tests {
             .table(Table::new("hidden", "public", "hidden"))
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -1597,7 +1597,7 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("ghosts", Relation::array("ghosts").on([("id", "user_id")])),
             )
@@ -1620,7 +1620,7 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("summary", "public", "summary")
-                    .column("total", "total", PgType::Int8, true)
+                    .column("total", "total", ColumnType::Int8, true)
                     .read_only(true),
             )
             .build();
@@ -1636,21 +1636,21 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_aggregate", "public", "users_aggregate").column(
                     "id",
                     "id",
-                    PgType::Int4,
+                    ColumnType::Int4,
                     false,
                 ),
             )
             .table(Table::new("users_by_pk", "public", "users_by_pk").column(
                 "id",
                 "id",
-                PgType::Int4,
+                ColumnType::Int4,
                 false,
             ))
             .build();
@@ -1683,17 +1683,17 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_one", "public", "users_one")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_by_pk", "public", "users_by_pk")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -1730,21 +1730,21 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .relation("author", Relation::array("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("users_aggregate", "public", "users_aggregate").column(
                     "id",
                     "id",
-                    PgType::Int4,
+                    ColumnType::Int4,
                     false,
                 ),
             )
@@ -1780,15 +1780,15 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("posts_aggregate", "posts_aggregate", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("posts_aggregate", "posts_aggregate", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false),
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false),
             )
             .build();
         let ts = TypeSystem::build(&schema);

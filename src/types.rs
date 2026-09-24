@@ -3,7 +3,7 @@
 use crate::ast::Val;
 use crate::error::{Error, Result};
 use crate::predicate::Principal;
-use crate::schema::PgType;
+use crate::schema::ColumnType;
 use serde_json::Value;
 
 /// Everything a rendered statement needs to turn its [`BindSpec`]s into
@@ -100,7 +100,7 @@ pub enum BindSpec {
     /// A scalar column value.
     Scalar {
         val: Val,
-        pg: PgType,
+        pg: ColumnType,
         /// Error path, e.g. `where.user_id`.
         path: String,
         /// Whether a null here is refused.
@@ -117,7 +117,7 @@ pub enum BindSpec {
     /// An `_in` / `_nin` list, resolving to a JSON array.
     Array {
         val: Val,
-        pg: PgType,
+        pg: ColumnType,
         path: String,
         /// Whether a null here is refused. Set for a plain `_in`, where a null
         /// is not a list and `= ANY(NULL)` would match nothing; not set for an
@@ -135,19 +135,23 @@ pub enum BindSpec {
 impl BindSpec {
     /// Convert `val` now when it is a literal, so errors are caught at render
     /// time; otherwise keep it for the request that supplies the value.
-    pub(crate) fn scalar(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+    pub(crate) fn scalar(val: Val, pg: &ColumnType, path: impl FnOnce() -> String) -> Result<Self> {
         Self::scalar_inner(val, pg, path, false)
     }
 
     /// A scalar in a comparison, where a null is refused rather than compared.
     /// See [`BindSpec::Scalar::reject_null`].
-    pub(crate) fn comparison(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+    pub(crate) fn comparison(
+        val: Val,
+        pg: &ColumnType,
+        path: impl FnOnce() -> String,
+    ) -> Result<Self> {
         Self::scalar_inner(val, pg, path, true)
     }
 
     fn scalar_inner(
         val: Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
         reject_null: bool,
     ) -> Result<Self> {
@@ -174,7 +178,7 @@ impl BindSpec {
     }
 
     /// Same as [`BindSpec::scalar`] for an `_in` / `_nin` list.
-    pub(crate) fn array(val: Val, pg: &PgType, path: impl FnOnce() -> String) -> Result<Self> {
+    pub(crate) fn array(val: Val, pg: &ColumnType, path: impl FnOnce() -> String) -> Result<Self> {
         Self::array_inner(val, pg, path, true)
     }
 
@@ -182,7 +186,7 @@ impl BindSpec {
     /// [`BindSpec::Array::reject_null`].
     pub(crate) fn optional_array(
         val: Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<Self> {
         Self::array_inner(val, pg, path, false)
@@ -190,7 +194,7 @@ impl BindSpec {
 
     fn array_inner(
         val: Val,
-        pg: &PgType,
+        pg: &ColumnType,
         path: impl FnOnce() -> String,
         reject_null: bool,
     ) -> Result<Self> {
@@ -276,7 +280,7 @@ pub(crate) fn null_comparison(path: &str) -> Error {
     }
 }
 
-fn bind_array(v: &Value, pg: &PgType, path: &str) -> Result<Bind> {
+fn bind_array(v: &Value, pg: &ColumnType, path: &str) -> Result<Bind> {
     let items = v.as_array().ok_or_else(|| Error::Validate {
         path: path.to_string(),
         message: format!("expected a list, got {v}"),
@@ -339,29 +343,29 @@ pub enum NullOf {
 impl NullOf {
     /// The bind type of a scalar value of `pg` — the one [`json_to_bind`]
     /// produces for a non-null value.
-    pub fn scalar(pg: &PgType) -> Self {
+    pub fn scalar(pg: &ColumnType) -> Self {
         match pg {
-            PgType::Bool => NullOf::Bool,
-            PgType::Int2 | PgType::Int4 => NullOf::Int4,
-            PgType::Int8 => NullOf::Int8,
-            PgType::Float4 | PgType::Float8 => NullOf::Float8,
-            PgType::Numeric
-            | PgType::Text
-            | PgType::Varchar
-            | PgType::Uuid
-            | PgType::Timestamp
-            | PgType::TimestampTz
-            | PgType::Date
-            | PgType::Time
-            | PgType::Enum { .. }
-            | PgType::Json
-            | PgType::Jsonb => NullOf::Text,
+            ColumnType::Bool => NullOf::Bool,
+            ColumnType::Int2 | ColumnType::Int4 => NullOf::Int4,
+            ColumnType::Int8 => NullOf::Int8,
+            ColumnType::Float4 | ColumnType::Float8 => NullOf::Float8,
+            ColumnType::Numeric
+            | ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Uuid
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Date
+            | ColumnType::Time
+            | ColumnType::Enum { .. }
+            | ColumnType::Json
+            | ColumnType::Jsonb => NullOf::Text,
         }
     }
 
     /// The bind type of a list of `pg` — the one [`json_to_bind_array`]
     /// produces.
-    pub fn array(pg: &PgType) -> Self {
+    pub fn array(pg: &ColumnType) -> Self {
         match NullOf::scalar(pg) {
             NullOf::Bool => NullOf::BoolArray,
             NullOf::Int4 => NullOf::Int4Array,
@@ -395,12 +399,12 @@ pub(crate) fn json_equiv(a: &Value, b: &Value) -> bool {
     }
 }
 
-pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
+pub fn json_to_bind(v: &Value, pg: &ColumnType) -> Result<Bind> {
     if v.is_null() {
         return Ok(Bind::Null(NullOf::scalar(pg)));
     }
     match pg {
-        PgType::Bool => v
+        ColumnType::Bool => v
             .as_bool()
             .map(Bind::Bool)
             .ok_or_else(|| Error::TypeMap("expected Bool".into())),
@@ -409,23 +413,23 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
         // smallint is knowable from the value, and a literal that cannot fit
         // should fail where the query is compiled, not on the request that
         // happens to run it.
-        PgType::Int2 => v
+        ColumnType::Int2 => v
             .as_i64()
             .and_then(|n| i16::try_from(n).ok())
             .map(|n| Bind::Int4(n as i32))
             .ok_or_else(|| {
                 Error::TypeMap(format!("expected an integer in smallint range, got {v}"))
             }),
-        PgType::Int4 => v
+        ColumnType::Int4 => v
             .as_i64()
             .and_then(|n| i32::try_from(n).ok())
             .map(Bind::Int4)
             .ok_or_else(|| Error::TypeMap("expected an integer".into())),
-        PgType::Int8 => v
+        ColumnType::Int8 => v
             .as_i64()
             .map(Bind::Int8)
             .ok_or_else(|| Error::TypeMap("expected Int8".into())),
-        PgType::Float4 | PgType::Float8 => v
+        ColumnType::Float4 | ColumnType::Float8 => v
             .as_f64()
             .map(Bind::Float8)
             .ok_or_else(|| Error::TypeMap("expected floating point".into())),
@@ -440,32 +444,32 @@ pub fn json_to_bind(v: &Value, pg: &PgType) -> Result<Bind> {
         // more precision than a double can hold arrives here already rounded,
         // and the string form is the only way to carry one exactly. Documented
         // in the README beside the type mapping.
-        PgType::Numeric => match v {
+        ColumnType::Numeric => match v {
             Value::String(s) => Ok(Bind::Text(s.clone())),
             Value::Number(n) => Ok(Bind::Text(n.to_string())),
             other => Err(Error::TypeMap(format!(
                 "expected a number or a string for numeric, got {other}"
             ))),
         },
-        PgType::Text
-        | PgType::Varchar
-        | PgType::Uuid
-        | PgType::Timestamp
-        | PgType::TimestampTz
-        | PgType::Date
-        | PgType::Time
-        | PgType::Enum { .. } => v
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Uuid
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Date
+        | ColumnType::Time
+        | ColumnType::Enum { .. } => v
             .as_str()
             .map(|s| Bind::Text(s.to_string()))
             .ok_or_else(|| Error::TypeMap(format!("expected string for {pg:?}"))),
-        PgType::Json | PgType::Jsonb => Ok(Bind::Text(v.to_string())),
+        ColumnType::Json | ColumnType::Jsonb => Ok(Bind::Text(v.to_string())),
     }
 }
 
 /// Convert a JSON array (from `_in` / `_nin`) into a single array bind for
 /// `= ANY($n)` / `<> ALL($n)`. NULL elements are allowed and keep SQL `IN`
 /// semantics (they never match).
-pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
+pub fn json_to_bind_array(values: &[Value], pg: &ColumnType) -> Result<Bind> {
     fn collect<T>(
         values: &[Value],
         f: impl Fn(&Value) -> Option<T>,
@@ -484,8 +488,8 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
             .collect()
     }
     match pg {
-        PgType::Bool => collect(values, Value::as_bool, "Bool").map(Bind::BoolArray),
-        PgType::Int2 => collect(
+        ColumnType::Bool => collect(values, Value::as_bool, "Bool").map(Bind::BoolArray),
+        ColumnType::Int2 => collect(
             values,
             |v| {
                 v.as_i64()
@@ -495,19 +499,19 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
             "an integer in smallint range",
         )
         .map(Bind::Int4Array),
-        PgType::Int4 => collect(
+        ColumnType::Int4 => collect(
             values,
             |v| v.as_i64().and_then(|n| i32::try_from(n).ok()),
             "an integer",
         )
         .map(Bind::Int4Array),
-        PgType::Int8 => collect(values, Value::as_i64, "Int8").map(Bind::Int8Array),
-        PgType::Float4 | PgType::Float8 => {
+        ColumnType::Int8 => collect(values, Value::as_i64, "Int8").map(Bind::Int8Array),
+        ColumnType::Float4 | ColumnType::Float8 => {
             collect(values, Value::as_f64, "floating point").map(Bind::Float8Array)
         }
         // Same as the scalar case: `_in: [1, 2]` on a numeric column is the
         // natural way to write it.
-        PgType::Numeric => collect(
+        ColumnType::Numeric => collect(
             values,
             |v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -517,17 +521,17 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
             "a number or a string",
         )
         .map(Bind::TextArray),
-        PgType::Text
-        | PgType::Varchar
-        | PgType::Uuid
-        | PgType::Timestamp
-        | PgType::TimestampTz
-        | PgType::Date
-        | PgType::Time
-        | PgType::Enum { .. } => {
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Uuid
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Date
+        | ColumnType::Time
+        | ColumnType::Enum { .. } => {
             collect(values, |v| v.as_str().map(str::to_string), "string").map(Bind::TextArray)
         }
-        PgType::Json | PgType::Jsonb => Ok(Bind::TextArray(
+        ColumnType::Json | ColumnType::Jsonb => Ok(Bind::TextArray(
             values
                 .iter()
                 .map(|v| {
@@ -545,18 +549,18 @@ pub fn json_to_bind_array(values: &[Value], pg: &PgType) -> Result<Bind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::PgType;
+    use crate::schema::ColumnType;
     use serde_json::json;
 
     #[test]
     fn convert_int4_value() {
-        let bind = json_to_bind(&json!(42), &PgType::Int4).unwrap();
+        let bind = json_to_bind(&json!(42), &ColumnType::Int4).unwrap();
         assert!(matches!(bind, Bind::Int4(42)));
     }
 
     #[test]
     fn convert_text_value() {
-        let bind = json_to_bind(&json!("hi"), &PgType::Text).unwrap();
+        let bind = json_to_bind(&json!("hi"), &ColumnType::Text).unwrap();
         match bind {
             Bind::Text(s) => assert_eq!(s, "hi"),
             _ => panic!("unexpected variant"),
@@ -565,23 +569,23 @@ mod tests {
 
     #[test]
     fn convert_null_value() {
-        let bind = json_to_bind(&json!(null), &PgType::Int4).unwrap();
+        let bind = json_to_bind(&json!(null), &ColumnType::Int4).unwrap();
         assert_eq!(bind, Bind::Null(NullOf::Int4));
         // Declared as what a value would be, per type — see `Bind::Null`.
         assert_eq!(
-            json_to_bind(&json!(null), &PgType::Uuid).unwrap(),
+            json_to_bind(&json!(null), &ColumnType::Uuid).unwrap(),
             Bind::Null(NullOf::Text)
         );
         assert_eq!(
-            json_to_bind(&json!(null), &PgType::Bool).unwrap(),
+            json_to_bind(&json!(null), &ColumnType::Bool).unwrap(),
             Bind::Null(NullOf::Bool)
         );
         assert_eq!(
-            json_to_bind(&json!(null), &PgType::Int8).unwrap(),
+            json_to_bind(&json!(null), &ColumnType::Int8).unwrap(),
             Bind::Null(NullOf::Int8)
         );
-        assert_eq!(NullOf::array(&PgType::Int2), NullOf::Int4Array);
-        assert_eq!(NullOf::array(&PgType::Jsonb), NullOf::TextArray);
+        assert_eq!(NullOf::array(&ColumnType::Int2), NullOf::Int4Array);
+        assert_eq!(NullOf::array(&ColumnType::Jsonb), NullOf::TextArray);
     }
 
     /// `int2` has no bind of its own: it goes out as int4 and the cast narrows
@@ -589,13 +593,13 @@ mod tests {
     #[test]
     fn smallint_binds_through_int4_but_keeps_its_own_range() {
         assert!(matches!(
-            json_to_bind(&json!(7), &PgType::Int2).unwrap(),
+            json_to_bind(&json!(7), &ColumnType::Int2).unwrap(),
             Bind::Int4(7)
         ));
         // Knowable from the value, so it fails here rather than at the server.
-        let err = json_to_bind(&json!(100000), &PgType::Int2).unwrap_err();
+        let err = json_to_bind(&json!(100000), &ColumnType::Int2).unwrap_err();
         assert!(format!("{err}").contains("smallint range"), "{err}");
-        assert!(json_to_bind(&json!(100000), &PgType::Int4).is_ok());
+        assert!(json_to_bind(&json!(100000), &ColumnType::Int4).is_ok());
     }
 
     #[test]
@@ -611,12 +615,12 @@ mod tests {
                 "179769313486231570000000000000000000.5",
             ),
         ] {
-            match json_to_bind(&input, &PgType::Numeric).unwrap() {
+            match json_to_bind(&input, &ColumnType::Numeric).unwrap() {
                 Bind::Text(s) => assert_eq!(s, expected, "for {input}"),
                 other => panic!("expected text, got {other:?}"),
             }
         }
-        let err = json_to_bind(&json!(true), &PgType::Numeric).unwrap_err();
+        let err = json_to_bind(&json!(true), &ColumnType::Numeric).unwrap_err();
         assert!(format!("{err}").contains("number or a string"), "{err}");
     }
 
@@ -624,8 +628,8 @@ mod tests {
     /// as, or a statement prepared on a null disagrees with the next request.
     #[test]
     fn null_of_matches_what_a_value_binds_as() {
-        use crate::schema::PgType::*;
-        let cases: Vec<(PgType, Value)> = vec![
+        use crate::schema::ColumnType::*;
+        let cases: Vec<(ColumnType, Value)> = vec![
             (Bool, json!(true)),
             (Int2, json!(1)),
             (Int4, json!(1)),
@@ -683,7 +687,7 @@ mod tests {
 
     #[test]
     fn reject_type_mismatch() {
-        let err = json_to_bind(&json!("not a number"), &PgType::Int4).unwrap_err();
+        let err = json_to_bind(&json!("not a number"), &ColumnType::Int4).unwrap_err();
         assert!(format!("{err}").contains("expected an integer"));
     }
 }

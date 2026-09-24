@@ -2359,8 +2359,8 @@ fn lower_scalar_field(
         });
     };
 
-    use crate::schema::PgType;
-    if !matches!(col.pg_type, PgType::Json | PgType::Jsonb) {
+    use crate::schema::ColumnType;
+    if !matches!(col.ty, ColumnType::Json | ColumnType::Jsonb) {
         return Err(Error::Validate {
             path: format!("{parent_path}.{alias}"),
             message: format!(
@@ -3316,16 +3316,13 @@ fn lower_aggregate_selection(
                                 // cannot exist, and PostgreSQL would answer
                                 // "function sum(text) does not exist" at request
                                 // time.
-                                if !crate::type_system::applies(func, &col.pg_type) {
+                                if !crate::type_system::applies(func, &col.ty) {
                                     return Err(Error::Validate {
                                         path: format!("{path}.{calias}"),
                                         message: format!(
                                             "'{op_name}' does not apply to '{}': {}",
                                             col.exposed_name,
-                                            crate::type_system::why_inapplicable(
-                                                func,
-                                                &col.pg_type
-                                            )
+                                            crate::type_system::why_inapplicable(func, &col.ty)
                                         ),
                                     });
                                 }
@@ -3511,16 +3508,16 @@ fn parse_count_args(
 mod tests {
     use super::*;
     use crate::ast::{Field, Operation};
-    use crate::schema::{PgType, Schema, Table};
+    use crate::schema::{ColumnType, Schema, Table};
     use serde_json::json;
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
-                    .column("data", "data", PgType::Jsonb, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
+                    .column("data", "data", ColumnType::Jsonb, true)
                     .primary_key(&["id"]),
             )
             .build()
@@ -3735,15 +3732,15 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("title", "title", PgType::Text, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
             .build()
@@ -4556,8 +4553,8 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("email", "email", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("email", "email", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .unique_constraint("users_pkey", &["id"])
                     .unique_constraint("users_email_key", &["email"]),
@@ -4586,7 +4583,7 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -4609,7 +4606,13 @@ mod tests {
         let render = |q: &str, vars: serde_json::Value| {
             let s = schema();
             parse_and_lower(q, &vars, None, &s).and_then(|op| {
-                crate::sql::render_now(&op, &s, &crate::types::Inputs::none()).map(|_| ())
+                crate::sql::render_now(
+                    &op,
+                    &s,
+                    &crate::types::Inputs::none(),
+                    crate::dialect::Dialect::Postgres,
+                )
+                .map(|_| ())
             })
         };
 
@@ -4706,8 +4709,8 @@ mod tests {
         let s = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("posts_aggregate", "posts_aggregate", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("posts_aggregate", "posts_aggregate", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .relation(
                         "posts",
@@ -4716,8 +4719,8 @@ mod tests {
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -4968,17 +4971,17 @@ mod tests {
         let s = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_one", "public", "users_one")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_by_pk", "public", "users_by_pk")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build();
@@ -5067,8 +5070,8 @@ mod tests {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("score", "score", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("score", "score", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .build()
@@ -5123,20 +5126,20 @@ mod tests {
         let s = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .relation("author", Relation::array("users").on([("user_id", "id")])),
             )
             .table(
                 Table::new("users_aggregate", "public", "users_aggregate").column(
                     "id",
                     "id",
-                    PgType::Int4,
+                    ColumnType::Int4,
                     false,
                 ),
             )
@@ -5158,21 +5161,21 @@ mod tests {
         let s = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"]),
             )
             .table(
                 Table::new("users_aggregate", "public", "users_aggregate").column(
                     "id",
                     "id",
-                    PgType::Int4,
+                    ColumnType::Int4,
                     false,
                 ),
             )
             .table(Table::new("users_by_pk", "public", "users_by_pk").column(
                 "id",
                 "id",
-                PgType::Int4,
+                ColumnType::Int4,
                 false,
             ))
             .build();

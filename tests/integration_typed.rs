@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use vision_graphql::ast::OrderDir;
-use vision_graphql::schema::{PgType, Schema, Table};
+use vision_graphql::schema::{ColumnType, Schema, Table};
 use vision_graphql::{Engine, Mutation, MutationResult, Query};
 
 mod common;
@@ -19,9 +19,9 @@ fn users_schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, true)
-                .column("active", "active", PgType::Bool, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, true)
+                .column("active", "active", ColumnType::Bool, false)
                 .primary_key(&["id"]),
         )
         .build()

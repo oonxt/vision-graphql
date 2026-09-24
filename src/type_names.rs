@@ -47,10 +47,10 @@ pub fn mutation_response(table: &Table) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{PgType, Table};
+    use crate::schema::{ColumnType, Table};
 
     fn users() -> Table {
-        Table::new("users", "public", "users").column("id", "id", PgType::Int4, false)
+        Table::new("users", "public", "users").column("id", "id", ColumnType::Int4, false)
     }
 
     #[test]
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn names_follow_the_exposed_name_not_the_physical_one() {
-        let t = Table::new("profiles", "app", "users").column("id", "id", PgType::Int4, false);
+        let t = Table::new("profiles", "app", "users").column("id", "id", ColumnType::Int4, false);
         assert_eq!(row(&t), "profiles");
         assert_eq!(mutation_response(&t), "profiles_mutation_response");
     }

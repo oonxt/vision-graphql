@@ -11,11 +11,11 @@
 //! ```
 //! use vision_graphql::predicate::{col, principal};
 //! use vision_graphql::policy::ScopePolicy;
-//! # use vision_graphql::schema::{Schema, Table, PgType, Relation};
+//! # use vision_graphql::schema::{Schema, Table, ColumnType, Relation};
 //! # let schema = Schema::builder()
 //! #     .table(Table::new("orders", "public", "orders")
-//! #         .column("id", "id", PgType::Int4, false)
-//! #         .column("user_id", "user_id", PgType::Int4, false)
+//! #         .column("id", "id", ColumnType::Int4, false)
+//! #         .column("user_id", "user_id", ColumnType::Int4, false)
 //! #         .primary_key(&["id"]))
 //! #     .build();
 //! let policy = ScopePolicy::builder()
@@ -35,7 +35,7 @@ use serde_json::Value;
 use crate::ast::{CmpOp, Val};
 use crate::error::{Error, Result};
 use crate::predicate::{is_param_ref, Operand, Principal, ScopeExpr};
-use crate::schema::{PgType, Schema, Table};
+use crate::schema::{ColumnType, Schema, Table};
 use crate::scope::{ColumnScope, ScopeSet};
 use crate::types::BindSpec;
 
@@ -355,28 +355,18 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
             let subject = format!("'{}'", col.exposed_name);
             match expr {
                 ScopeExpr::Compare { op, value, .. } => {
-                    crate::type_system::check_cmp(*op, &col.pg_type, || path.clone(), &subject)?;
-                    validate_scalar(value, &col.pg_type, &path)
+                    crate::type_system::check_cmp(*op, &col.ty, || path.clone(), &subject)?;
+                    validate_scalar(value, &col.ty, &path)
                 }
                 ScopeExpr::InList { values, .. } => {
-                    crate::type_system::check_cmp(
-                        CmpOp::Eq,
-                        &col.pg_type,
-                        || path.clone(),
-                        &subject,
-                    )?;
+                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
                     values
                         .iter()
-                        .try_for_each(|v| validate_scalar(v, &col.pg_type, &path))
+                        .try_for_each(|v| validate_scalar(v, &col.ty, &path))
                 }
                 ScopeExpr::InSet { set, .. } => {
-                    crate::type_system::check_cmp(
-                        CmpOp::Eq,
-                        &col.pg_type,
-                        || path.clone(),
-                        &subject,
-                    )?;
-                    validate_list(set, &col.pg_type, &path)
+                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
+                    validate_list(set, &col.ty, &path)
                 }
                 _ => Ok(()),
             }
@@ -447,13 +437,13 @@ fn validate_param_ref(operand: &Operand, path: &str) -> Result<()> {
 /// not be null. Going through [`BindSpec`] rather than restating its rules
 /// keeps `validate` and rendering one judgement; a parameter comes back as a
 /// deferred spec, which is exactly "checked per request".
-fn validate_scalar(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
+fn validate_scalar(operand: &Operand, ty: &ColumnType, path: &str) -> Result<()> {
     validate_param_ref(operand, path)?;
     BindSpec::comparison(operand.symbolic(), ty, || path.to_string()).map(drop)
 }
 
 /// An operand standing for a whole list; see [`validate_scalar`].
-fn validate_list(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
+fn validate_list(operand: &Operand, ty: &ColumnType, path: &str) -> Result<()> {
     validate_param_ref(operand, path)?;
     BindSpec::array(operand.symbolic(), ty, || path.to_string()).map(drop)
 }
@@ -462,22 +452,22 @@ fn validate_list(operand: &Operand, ty: &PgType, path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::predicate::{col, principal, rel};
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
     use crate::TableScope;
 
     fn schema() -> Schema {
         Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("orders", Relation::array("orders").on([("id", "user_id")])),
             )
             .table(
                 Table::new("orders", "public", "orders")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
-                    .column("meta", "meta", PgType::Json, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .column("meta", "meta", ColumnType::Json, true)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -694,9 +684,9 @@ mod tests {
             .allow(
                 "orders",
                 crate::predicate::or([
-                    typed(param("role"), PgType::Text).eq("admin"),
-                    typed("vip", PgType::Text).in_set(param("tiers")),
-                    typed(param("level"), PgType::Int4).gte(3),
+                    typed(param("role"), ColumnType::Text).eq("admin"),
+                    typed("vip", ColumnType::Text).in_set(param("tiers")),
+                    typed(param("level"), ColumnType::Int4).gte(3),
                     col("user_id").in_set(param("ids")),
                     constant(false),
                 ]),
@@ -709,10 +699,10 @@ mod tests {
         );
         let refused = [
             // An operator the type does not have.
-            typed(param("level"), PgType::Int4).like("adm%"),
+            typed(param("level"), ColumnType::Int4).like("adm%"),
             // json has no equality; jsonb would.
-            typed(param("claims"), PgType::Json).eq(serde_json::json!({"admin": true})),
-            typed(param("claims"), PgType::Json).in_set(serde_json::json!([])),
+            typed(param("claims"), ColumnType::Json).eq(serde_json::json!({"admin": true})),
+            typed(param("claims"), ColumnType::Json).in_set(serde_json::json!([])),
             col("meta").eq(serde_json::json!({})),
             col("meta").in_set(param("metas")),
             // A column-side literal set that is not a list, or is mistyped.
@@ -722,15 +712,15 @@ mod tests {
             col("user_id").eq("seven"),
             col("user_id").in_(["seven"]),
             // A literal that does not bind as the type.
-            typed(param("level"), PgType::Int4).eq("three"),
+            typed(param("level"), ColumnType::Int4).eq("three"),
             // A null: comparing against it matches nothing.
-            typed(param("role"), PgType::Text).eq(serde_json::Value::Null),
+            typed(param("role"), ColumnType::Text).eq(serde_json::Value::Null),
             // A parameter name the grammar refuses.
-            typed(param("ro le"), PgType::Text).eq("admin"),
+            typed(param("ro le"), ColumnType::Text).eq("admin"),
             // A literal set with a member of the wrong type.
-            typed("vip", PgType::Text).in_set(serde_json::json!(["vip", 1])),
+            typed("vip", ColumnType::Text).in_set(serde_json::json!(["vip", 1])),
             // A literal "set" that is not a list.
-            typed("vip", PgType::Text).in_set("vip"),
+            typed("vip", ColumnType::Text).in_set("vip"),
             col("user_id").in_set(param("not ok")),
         ];
         for expr in refused {
@@ -743,7 +733,10 @@ mod tests {
         // A refusal names the parameter of the leaf it is about, as the
         // renderer's would, so the two read alike.
         let err = ScopePolicy::builder()
-            .allow("orders", typed(param("level"), PgType::Int4).eq("three"))
+            .allow(
+                "orders",
+                typed(param("level"), ColumnType::Int4).eq("three"),
+            )
             .validate(&schema())
             .unwrap_err();
         assert!(
@@ -754,7 +747,7 @@ mod tests {
         ScopePolicy::builder()
             .allow(
                 "orders",
-                typed(param("claims"), PgType::Jsonb).eq(serde_json::json!({"admin": true})),
+                typed(param("claims"), ColumnType::Jsonb).eq(serde_json::json!({"admin": true})),
             )
             .validate(&schema())
             .unwrap();

@@ -145,22 +145,22 @@ fn render_description(description: Option<&str>, indent: usize, out: &mut String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{PgType, Relation, Schema, Table};
+    use crate::schema::{ColumnType, Relation, Schema, Table};
 
     fn ts() -> TypeSystem {
         let schema = Schema::builder()
             .table(
                 Table::new("users", "public", "users")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("name", "name", PgType::Text, true)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
                     .primary_key(&["id"])
                     .unique_constraint("users_pkey", &["id"])
                     .relation("posts", Relation::array("posts").on([("id", "user_id")])),
             )
             .table(
                 Table::new("posts", "public", "posts")
-                    .column("id", "id", PgType::Int4, false)
-                    .column("user_id", "user_id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
                     .primary_key(&["id"])
                     .relation("user", Relation::object("users").on([("user_id", "id")])),
             )
@@ -236,7 +236,7 @@ mod tests {
         let schema = Schema::builder()
             .table(
                 Table::new("v", "public", "v")
-                    .column("id", "id", PgType::Int4, false)
+                    .column("id", "id", ColumnType::Int4, false)
                     .read_only(true),
             )
             .build();

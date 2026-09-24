@@ -5,25 +5,26 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use vision_graphql::parse_cache::ParseCache;
 use vision_graphql::parser::{lower, lower_with, parse_document, Bindings};
-use vision_graphql::schema::{PgType, Relation, Schema, Table};
+use vision_graphql::schema::{ColumnType, Relation, Schema, Table};
 use vision_graphql::sql::{render, render_now};
 use vision_graphql::types::{resolve_binds, Inputs};
+use vision_graphql::Dialect;
 
 fn sample_schema() -> Schema {
     Schema::builder()
         .table(
             Table::new("users", "public", "users")
-                .column("id", "id", PgType::Int4, false)
-                .column("name", "name", PgType::Text, true)
-                .column("active", "active", PgType::Bool, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("name", "name", ColumnType::Text, true)
+                .column("active", "active", ColumnType::Bool, false)
                 .primary_key(&["id"])
                 .relation("posts", Relation::array("posts").on([("id", "user_id")])),
         )
         .table(
             Table::new("posts", "public", "posts")
-                .column("id", "id", PgType::Int4, false)
-                .column("title", "title", PgType::Text, false)
-                .column("user_id", "user_id", PgType::Int4, false)
+                .column("id", "id", ColumnType::Int4, false)
+                .column("title", "title", ColumnType::Text, false)
+                .column("user_id", "user_id", ColumnType::Int4, false)
                 .primary_key(&["id"])
                 .relation("user", Relation::object("users").on([("user_id", "id")])),
         )
@@ -52,7 +53,7 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let doc = parse_document(Q).unwrap();
             let op = lower(&doc, &vars, None, &schema).unwrap();
-            let _ = render_now(&op, &schema, &Inputs::none()).unwrap();
+            let _ = render_now(&op, &schema, &Inputs::none(), Dialect::Postgres).unwrap();
         });
     });
 
@@ -63,14 +64,14 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let doc = cache.get(Q).unwrap();
             let op = lower(&doc, &vars, None, &schema).unwrap();
-            let _ = render_now(&op, &schema, &Inputs::none()).unwrap();
+            let _ = render_now(&op, &schema, &Inputs::none(), Dialect::Postgres).unwrap();
         });
     });
 
     // All that is left of a request once the query is compiled.
     let doc = parse_document(Q).unwrap();
     let op = lower_with(&doc, Bindings::symbolic(), None, &schema).unwrap();
-    let (_sql, specs) = render(&op, &schema).unwrap();
+    let (_sql, specs) = render(&op, &schema, Dialect::Postgres).unwrap();
     c.bench_function("compiled_request", |b| {
         b.iter(|| {
             let _ = resolve_binds(&specs, &Inputs::variables(&vars)).unwrap();

@@ -55,8 +55,10 @@
 //!   ([`parse_cache`]).
 
 pub mod ast;
+pub mod backend;
 pub mod builder;
 pub mod compiled;
+pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod executor;
@@ -76,11 +78,13 @@ pub mod type_names;
 pub mod type_system;
 pub mod types;
 
+pub use backend::Backend;
 pub use builder::{
     AggregateBuilder, ByPkBuilder, DeleteBuilder, DeleteByPkBuilder, InsertBuilder, IntoOperation,
     Mutation, Query, QueryBuilder, UpdateBuilder, UpdateByPkBuilder,
 };
 pub use compiled::CompiledQuery;
+pub use dialect::Dialect;
 pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
 pub use error::{Error, ErrorCode};
 pub use limits::ParseLimits;
