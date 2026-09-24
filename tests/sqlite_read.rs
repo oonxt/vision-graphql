@@ -522,31 +522,12 @@ async fn scope_holds() {
 async fn what_is_published_is_what_is_implemented() {
     let e = engine().await;
     let ts = e.schema().type_system();
-    assert!(ts.mutation_root().is_none());
+    assert!(ts.mutation_root().is_some());
     let sdl = vision_graphql::sdl::render(ts);
     assert!(!sdl.contains("stddev"), "{sdl}");
-    assert!(!sdl.contains("insert_"), "{sdl}");
     assert!(sdl.contains("_ilike"), "{sdl}");
     assert!(sdl.contains("distinct_on"), "{sdl}");
     // And refused when reached anyway.
-    let err = e
-        .query(
-            "mutation { insert_users(objects: [{name: \"x\"}]) { affected_rows } }",
-            None,
-        )
-        .await
-        .unwrap_err();
-    // The parser still lowers the root — the renderer is the one point both
-    // entry points pass through, and it is where the refusal lives.
-    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
-    let err = e
-        .run(vision_graphql::Mutation::insert(
-            "users",
-            vec![[("name".to_string(), json!("x"))].into_iter().collect()],
-        ))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
     let err = e
         .query(
             "{ posts_aggregate { aggregate { stddev { views } } } }",
@@ -722,13 +703,13 @@ fn pool_of(e: &Engine<sqlx::Sqlite>) -> SqlitePool {
 }
 
 #[tokio::test]
-async fn a_persisted_mutation_keeps_its_code() {
+async fn a_persisted_unsupported_query_keeps_its_code() {
     let e = engine().await;
     let err = vision_graphql::QueryRegistry::compile_all(
         &e,
         [(
             "m",
-            "mutation { insert_users(objects: [{name: \"x\"}]) { affected_rows } }",
+            "{ posts_aggregate { aggregate { stddev { views } } } }",
         )],
     )
     .err()

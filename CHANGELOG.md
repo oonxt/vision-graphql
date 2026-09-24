@@ -7,12 +7,18 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Added
 
-- **SQLite, for reads.** Behind the `sqlite` cargo feature: `Engine<sqlx::Sqlite>`
+- **SQLite.** Behind the `sqlite` cargo feature: `Engine<sqlx::Sqlite>`
   answers every query feature — lists, `_by_pk`, nested relations, filters,
   `order_by`, `limit`/`offset`, `distinct_on`, aggregates, JSON path reads,
   variables, compiled and persisted statements, scoped execution,
-  transactions — against a SQLite database, with the schema read by
-  `Schema::introspect_sqlite`. The things SQLite answers differently by
+  transactions — and every mutation — insert, nested insert in both
+  directions, `on_conflict`, update, delete, the `_by_pk` forms, `returning`,
+  the scope guards — against a SQLite database, with the schema read by
+  `Schema::introspect_sqlite`. A mutation there is a sequence of statements
+  in one transaction rather than one statement of data-modifying CTEs
+  (`vision_graphql::plan`), which SQLite does not have; the README's
+  *Backends* table records where that shows (later fields see earlier
+  writes; `returning { relation }` sees the whole table). The things SQLite answers differently by
   default are answered PostgreSQL's way: booleans and JSON columns come back
   as JSON booleans and JSON values rather than `0`/`1` and escaped strings,
   NULLs sort last on `asc` and first on `desc`, `_like` is case-sensitive.
@@ -41,13 +47,25 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Changed
 
+- **A scope check violation is `Error::ScopeViolation`.** The post-write
+  guard — a scoped insert that wrote a row outside the scope, an update that
+  moved one out — surfaced as `Error::Database` on PostgreSQL, with the
+  violation text buried in a failed cast's message, and classified as
+  `DATABASE_ERROR`. Both backends now raise `Error::ScopeViolation { table,
+  rows, action }`, code `SCOPE_DENIED`, with the same message as before; a
+  host that matched on the message keeps working, one that matched on the
+  variant sees the denial it is.
 - **The engine is generic over its backend.** `Engine`, `ScopedEngine`,
   `TxClient`, `ScopedTxClient`, `CompiledQuery` and `QueryRegistry` take a
   `DB: Backend` parameter, defaulting to `sqlx::Postgres`, so a program that
   names `Engine` keeps compiling. The `_on` twins accept any
   `sqlx::Executor` of that backend where they took `sqlx::PgExecutor`; a
   `CompiledQuery` is typed by the backend it was rendered for, so a statement
-  compiled on one engine cannot be handed to an engine on another. This is
+  compiled on one engine cannot be handed to an engine on another. The `_on`
+  twins take anything `sqlx::Acquire` yields a connection from — `&pool`,
+  `&mut conn`, `&mut tx`, `&mut *tx` — where they took an `Executor`: a
+  SQLite mutation is several statements on one connection, which an executor
+  cannot promise; inside a caller's transaction it runs as a savepoint. This is
   the groundwork for a SQLite backend; nothing PostgreSQL-facing behaves
   differently, and the rendered SQL is unchanged. One place the default does
   not reach: a `QueryRegistry::new()` that is never handed an engine or a
@@ -62,7 +80,10 @@ release commits; entries from 0.13.0 on are written as the work lands.
 - **`sql::render` and `sql::render_now` take a `Dialect`.** The renderer no
   longer assumes PostgreSQL by omission; `Backend::DIALECT` is what the
   engine passes. Callers of these low-level functions pass
-  `Dialect::Postgres`.
+  `Dialect::Postgres`. `sql::render_any` returns a `Rendered` — one statement,
+  or a mutation plan — and is what the engine uses; `render` is the statement
+  form and refuses a plan. `CompiledQuery::sql` on a plan is its statements
+  one per line.
 
 ## 0.23.0 — 2026-09-16
 

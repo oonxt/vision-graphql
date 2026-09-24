@@ -619,7 +619,7 @@ impl<'a> Builder<'a> {
         self.bool_exp(t);
         self.order_by_input(t);
         self.select_column_enum(t);
-        if !t.read_only && self.schema.dialect().supports_mutations() {
+        if !t.read_only {
             self.mutation_inputs(t);
             self.add(TypeDef::Object {
                 name: type_names::mutation_response(t),
@@ -1032,9 +1032,6 @@ impl<'a> Builder<'a> {
     }
 
     fn mutation_root(&mut self, tables: &[&std::sync::Arc<Table>]) -> Option<String> {
-        if !self.schema.dialect().supports_mutations() {
-            return None;
-        }
         // The query root's real-thing-wins rule, for mutation names: with
         // tables `users` and `users_one`, the name `insert_users_one` reads
         // literally as the bulk insert into `users_one`, so the synthesized

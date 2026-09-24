@@ -29,28 +29,31 @@ pub trait Backend: sqlx::Database + sealed::Sealed {
     /// pragmas (see [`crate::sqlite::verify`]).
     fn verify_pool(pool: &sqlx::Pool<Self>) -> impl Future<Output = Result<()>> + Send;
 
-    /// Run one rendered statement on any executor of this database — the pool,
-    /// a connection, a transaction's connection — and return the one JSON
+    /// Run one rendered statement on a connection and return the one JSON
     /// value it yields.
-    fn execute<'c, E>(
-        executor: E,
-        sql: &str,
-        binds: &[Bind],
-    ) -> impl Future<Output = Result<Value>> + Send
-    where
-        E: sqlx::Executor<'c, Database = Self>;
-
-    /// [`Backend::execute`] on a bare connection.
     ///
-    /// Not a convenience: sqlx implements `Executor` for `&mut PgConnection`,
-    /// `&mut SqliteConnection` and so on one driver at a time, with no impl
-    /// generic over `DB::Connection`, so code generic over the backend cannot
-    /// hand a transaction's connection to [`Backend::execute`]. This is the
-    /// door it goes through instead.
+    /// A connection rather than an `Executor`: sqlx implements `Executor`
+    /// for `&mut PgConnection`, `&mut SqliteConnection` and so on one driver
+    /// at a time, with no impl generic over `DB::Connection`, and for
+    /// `&Pool<DB>` only under a bound every caller would have to repeat. The
+    /// engine acquires a connection from whatever it was given and comes
+    /// through here.
     fn execute_conn(
         conn: &mut Self::Connection,
         sql: &str,
         binds: &[Bind],
+    ) -> impl Future<Output = Result<Value>> + Send;
+
+    /// Run a [`MutationPlan`](crate::plan::MutationPlan) on a connection and
+    /// assemble its response. Atomic: the backend opens a transaction on the
+    /// connection — a savepoint, when it is already in one — and closes it,
+    /// so a failure part-way undoes the plan's statements and nothing else.
+    /// Only a dialect whose mutations are plans ever produces one; the
+    /// others never see this called.
+    fn execute_plan(
+        conn: &mut Self::Connection,
+        plan: &crate::plan::MutationPlan,
+        inputs: &crate::types::Inputs<'_>,
     ) -> impl Future<Output = Result<Value>> + Send;
 }
 
@@ -63,23 +66,24 @@ impl Backend for sqlx::Postgres {
         std::future::ready(Ok(()))
     }
 
-    fn execute<'c, E>(
-        executor: E,
-        sql: &str,
-        binds: &[Bind],
-    ) -> impl Future<Output = Result<Value>> + Send
-    where
-        E: sqlx::Executor<'c, Database = Self>,
-    {
-        crate::executor::execute_on(executor, sql, binds)
-    }
-
     fn execute_conn(
         conn: &mut sqlx::PgConnection,
         sql: &str,
         binds: &[Bind],
     ) -> impl Future<Output = Result<Value>> + Send {
         crate::executor::execute_on(conn, sql, binds)
+    }
+
+    fn execute_plan(
+        _conn: &mut sqlx::PgConnection,
+        _plan: &crate::plan::MutationPlan,
+        _inputs: &crate::types::Inputs<'_>,
+    ) -> impl Future<Output = Result<Value>> + Send {
+        // PostgreSQL mutations render as one statement; the renderer never
+        // produces a plan for this dialect.
+        std::future::ready(Err(crate::error::Error::Schema(
+            "internal: a mutation plan reached the PostgreSQL backend".into(),
+        )))
     }
 }
 
@@ -94,22 +98,19 @@ impl Backend for sqlx::Sqlite {
         crate::sqlite::verify(pool)
     }
 
-    fn execute<'c, E>(
-        executor: E,
-        sql: &str,
-        binds: &[Bind],
-    ) -> impl Future<Output = Result<Value>> + Send
-    where
-        E: sqlx::Executor<'c, Database = Self>,
-    {
-        crate::executor::sqlite::execute_on(executor, sql, binds)
-    }
-
     fn execute_conn(
         conn: &mut sqlx::SqliteConnection,
         sql: &str,
         binds: &[Bind],
     ) -> impl Future<Output = Result<Value>> + Send {
         crate::executor::sqlite::execute_on(conn, sql, binds)
+    }
+
+    fn execute_plan(
+        conn: &mut sqlx::SqliteConnection,
+        plan: &crate::plan::MutationPlan,
+        inputs: &crate::types::Inputs<'_>,
+    ) -> impl Future<Output = Result<Value>> + Send {
+        crate::executor::sqlite::execute_plan(conn, plan, inputs)
     }
 }

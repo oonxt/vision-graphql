@@ -1,7 +1,7 @@
 //! # vision-graphql
 //!
-//! A Hasura-style GraphQL-to-SQL query engine for PostgreSQL — and, for reads,
-//! SQLite (the `sqlite` feature; see [`backend`]). Accepts GraphQL query strings or
+//! A Hasura-style GraphQL-to-SQL query engine for PostgreSQL and SQLite (the
+//! `sqlite` feature; see [`backend`]). Accepts GraphQL query strings or
 //! typed Rust builders and returns `serde_json::Value` in Hasura's data
 //! shape.
 //!
@@ -68,6 +68,7 @@ pub mod limits;
 pub mod parse_cache;
 pub mod parser;
 pub mod persisted;
+pub mod plan;
 pub mod policy;
 pub mod predicate;
 pub mod schema;

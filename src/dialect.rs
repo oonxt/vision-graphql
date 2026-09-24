@@ -543,15 +543,13 @@ impl Dialect {
         }
     }
 
-    /// Whether the renderer can write. SQLite cannot yet: its mutations are
-    /// a sequence of statements in one transaction rather than one statement
-    /// of data-modifying CTEs, and that execution model is not built. Until
-    /// it is, the type system publishes no mutation root for a SQLite schema
-    /// and the renderer refuses one.
-    pub(crate) fn supports_mutations(self) -> bool {
+    /// Whether a mutation is a sequence of statements ([`crate::plan`])
+    /// rather than one statement of data-modifying CTEs. SQLite allows no
+    /// DML inside a CTE.
+    pub(crate) fn mutations_by_plan(self) -> bool {
         match self {
-            Dialect::Postgres => true,
-            Dialect::Sqlite => false,
+            Dialect::Postgres => false,
+            Dialect::Sqlite => true,
         }
     }
 }

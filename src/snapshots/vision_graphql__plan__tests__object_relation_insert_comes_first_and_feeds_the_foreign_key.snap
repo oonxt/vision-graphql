@@ -1,0 +1,7 @@
+---
+source: src/plan.rs
+expression: p.text()
+---
+INSERT INTO "main"."users" ("name") VALUES (?1) ON CONFLICT ("name") DO UPDATE SET "id" = "users"."id" RETURNING json_object('__rowid', rowid, 'id', "id", 'name', "name", 'active', CASE WHEN "active" IS NULL THEN NULL WHEN "active" = 1 THEN json('true') WHEN "active" = 0 THEN json('false') ELSE json('not a boolean') END, 'meta', json("meta"))
+INSERT INTO "main"."posts" ("title", "user_id") VALUES (?1, ?2) RETURNING json_object('__rowid', rowid, 'id', "id", 'user_id', "user_id", 'title', "title")
+SELECT json_object('id', t0."id") FROM (SELECT x.* FROM "main"."posts" x JOIN json_each(?1) je ON x.rowid = je.value ORDER BY je.key) t0 LIMIT 1

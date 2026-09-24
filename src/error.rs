@@ -37,6 +37,22 @@ pub enum Error {
     #[error("scope: {0}")]
     Scope(String),
 
+    /// A scoped write left a row outside the scope — inserted there, or moved
+    /// there by an update — and the whole mutation was undone. The engine's
+    /// post-write guard, on either backend: PostgreSQL raises it from inside
+    /// the statement and the executor recognises the message, SQLite's plan
+    /// counts the rows and raises it itself. The text is the guard's own.
+    #[error(
+        "vision_graphql: scope check violation on \"{table}\" ({rows} rows) {action} outside scope"
+    )]
+    ScopeViolation {
+        /// Exposed name of the table.
+        table: String,
+        rows: i64,
+        /// `inserted` or `modified`.
+        action: String,
+    },
+
     /// The document was rejected before parsing, by [`crate::limits::ParseLimits`].
     /// Distinct from [`Error::Parse`] so an endpoint can answer "too large /
     /// too deep" differently from "syntactically invalid".
@@ -65,6 +81,24 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// The [`Error::ScopeViolation`] a database error message carries, if it
+    /// is one: PostgreSQL's guard raises by casting the violation text to an
+    /// integer, and the text comes back inside the cast's own message.
+    pub(crate) fn scope_violation_in(message: &str) -> Option<Error> {
+        let marker = "vision_graphql: scope check violation on \"";
+        let rest = &message[message.find(marker)? + marker.len()..];
+        let (table, rest) = rest.split_once("\" (")?;
+        let (rows, rest) = rest.split_once(" rows) ")?;
+        let (action, _) = rest.split_once(" outside scope")?;
+        Some(Error::ScopeViolation {
+            table: table.to_string(),
+            rows: rows.parse().ok()?,
+            action: action.to_string(),
+        })
+    }
+}
 
 /// A stable, machine-readable classification of an [`Error`].
 ///
@@ -131,7 +165,9 @@ impl Error {
             Error::CostLimit { .. } => ErrorCode::LimitExceeded,
             Error::Validate { .. } | Error::TypeMap(_) => ErrorCode::ValidationFailed,
             Error::Variable { .. } => ErrorCode::VariableMissing,
-            Error::ScopeDenied { .. } | Error::ScopeColumnDenied { .. } => ErrorCode::ScopeDenied,
+            Error::ScopeDenied { .. }
+            | Error::ScopeColumnDenied { .. }
+            | Error::ScopeViolation { .. } => ErrorCode::ScopeDenied,
             // Not an answer about the caller's access: `Error::Scope` carries a
             // policy that would not load and a compiled statement run through
             // the wrong entry point — both the host's own mistakes. Reporting
