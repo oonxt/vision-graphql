@@ -13,8 +13,8 @@ Each of these has actually been broken here. None of them made a test fail.
 directly. So a check that lives in lowering guards one of the two entry points
 and leaves the other open. Scope rewriting and `ExecutionLimits` both run on the
 IR for this reason. When adding another such pass, put it beside them, and route
-it through `engine::prepare` so a new entry point cannot skip it by calling
-`render_now` directly.
+it through `engine::prepare_symbolic` so a new entry point cannot skip it by
+calling `render_now` directly.
 
 **New SQL that reads a table must be taught to `apply_scope`.** `scope.rs`
 rewrites the IR before rendering. A renderer path that reaches a table without a
@@ -34,6 +34,27 @@ known yet. The same applies to row counts and `Count`.
 `__schema`. Adding an operator to the comparison inputs there without adding it
 to `lower_where` tells clients — and their code generators — that something
 works which will then be rejected. The tests assert this direction explicitly.
+
+**A dialect seam is a `match`, not a default.** `Dialect` is an enum so that a
+backend added later fails to compile at every seam it has not answered. The
+rule cuts the other way too: PostgreSQL SQL that lives outside a `Dialect`
+method is invisible to that check — `DISTINCT ON`, the null order of `ORDER
+BY` and a bare `OFFSET` were all rendered inline and were all wrong on SQLite
+without a test failing, until each got a seam. New SQL that is one database's
+spelling goes through `Dialect`; and a seam's *semantics* are verified against
+each real database (`tests/sqlite_*.rs` beside the PostgreSQL suite), not
+against the rendered string.
+
+**A mutation plan derives every statement from the scoped IR.** On SQLite a
+mutation is a sequence of statements (`plan.rs`), and each one that reads a
+table — the scope guard, the `returning` read, the read before a delete —
+takes its predicate from the IR that `apply_scope` already rewrote
+(`scope_check`, `scope`, `where_`, the relation args in `returning`). A step
+that spells a table name and a predicate of its own is a read `apply_scope`
+never saw. The plan's transaction belongs to `Backend::execute_plan`: a step
+that fails must undo the steps before it, and only them, wherever the plan
+runs — the pool, `Engine::transaction`, or a caller's connection (a
+savepoint). Both properties are what `tests/sqlite_write.rs` pins.
 
 **Recursion over documents needs a bound that survives the input.**
 `ParseLimits` scans raw text before parsing because a deeply nested input value
@@ -111,6 +132,11 @@ docker run --rm -d --name vg-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 post
 export TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
 cargo test --workspace          # ~13s
 ```
+
+The SQLite suites (`tests/sqlite_read.rs`, `tests/sqlite_write.rs`, the CLI's
+`sqlite_*` e2e) need no server: each test opens an in-memory database, or a
+file it removes when done. They run with `--all-features`, which the gates
+above pass.
 
 Without `TEST_DATABASE_URL` each test starts a container of its own through
 testcontainers, which works — the start is retried now — but costs a minute for
