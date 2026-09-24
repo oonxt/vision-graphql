@@ -1264,8 +1264,9 @@ Every executing method on `Engine` has an `_on` twin that takes the
 connection to run on — `query_on`, `run_on`, `execute_on`,
 `execute_scoped_on`, and their `_as` forms — and so do `ScopedEngine`'s text
 and builder methods (`query_on`, `run_on`, `_as` forms; a scoped handle runs
-no compiled statements). The twin takes anything sqlx can `Acquire` a
-connection from: `&pool`, `&mut conn`, `&mut tx` or `&mut *tx`. The pool
+no compiled statements). The twin takes a `Target`: `&pool`, `&mut conn`,
+`&mut tx` or `&mut *tx`, and the future it returns is `Send`, so it can be
+awaited from a handler or a spawned task. The pool
 method is the twin bound to the engine's own pool. Hand it a transaction you
 began, and
 the engine's statements join whatever else that transaction carries — native
