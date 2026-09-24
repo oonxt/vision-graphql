@@ -3,6 +3,21 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **The `_on` twins on a borrowed connection could not be awaited in a
+  `Send` future.** 0.24.0 bounded their target by `sqlx::Acquire<'c>`, and a
+  host future holding `query_on(&mut *tx, …)` — an axum handler, a
+  `tokio::spawn` — failed its `Send` check with "implementation of `Send` is
+  not general enough", reported at the host's `spawn` rather than at the
+  call. The twins now take a sealed `Target`, implemented for `&Pool`, and
+  for `&mut` a connection, a pooled connection or a transaction of either
+  backend — the same set of arguments as before, with no lifetime in the
+  bound — and a compile-time test holds every twin to `Send` on both
+  backends, including inside a spawned task.
+
 ## 0.24.0 — 2026-09-24
 
 ### Added

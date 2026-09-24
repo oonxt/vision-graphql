@@ -135,9 +135,16 @@ impl<DB: Backend> Run<DB> for OnPool<'_, DB> {
     }
 }
 
-impl<DB: Backend> Run<DB> for &mut DB::Connection {
+/// A transaction's connection, as [`TxClient`] and [`ScopedTxClient`] hold
+/// it. A wrapper rather than a bare `&mut DB::Connection` so that the
+/// [`Target`] impls below can name the concrete connection types: generic
+/// over `DB`, this impl would overlap every one of them as far as coherence
+/// can tell.
+struct OnConn<'a, DB: Backend>(&'a mut DB::Connection);
+
+impl<DB: Backend> Run<DB> for OnConn<'_, DB> {
     fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send {
-        DB::execute_conn(self, sql, binds)
+        DB::execute_conn(self.0, sql, binds)
     }
 
     /// The transaction's connection: the plan runs as a savepoint in the
@@ -148,7 +155,41 @@ impl<DB: Backend> Run<DB> for &mut DB::Connection {
         plan: &MutationPlan,
         inputs: &Inputs<'_>,
     ) -> impl Future<Output = Result<Value>> + Send {
-        DB::execute_plan(self, plan, inputs)
+        DB::execute_plan(self.0, plan, inputs)
+    }
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<&mut DB::Connection>()
+    }
+}
+
+/// What an `_on` method runs on: the pool, or a connection the caller
+/// borrows to it — a bare one, a pooled one, or a transaction's.
+///
+/// Sealed, with one impl per kind and no lifetime in any bound. 0.24.0 took
+/// anything `sqlx::Acquire<'c>`, and that lifetime-bearing bound is what broke
+/// callers: a host future holding the call — an axum handler, a spawned task
+/// — is checked for `Send` with its lifetimes erased, which asks for
+/// `Acquire<'c>` for *every* `'c`, and a borrowed connection does not have
+/// that. The error surfaced at the host's `spawn`, nowhere near this crate.
+///
+/// A plan (a mutation on SQLite) runs in a savepoint on a connection that is
+/// already in a transaction, so it is atomic inside the caller's transaction
+/// too.
+#[allow(private_bounds)]
+pub trait Target<DB: Backend>: Run<DB> {}
+
+impl<DB: Backend> Target<DB> for &Pool<DB> {}
+
+impl<DB: Backend> Run<DB> for &Pool<DB> {
+    async fn run(self, sql: &str, binds: &[Bind]) -> Result<Value> {
+        let mut conn = self.acquire().await?;
+        DB::execute_conn(&mut conn, sql, binds).await
+    }
+
+    async fn run_plan(self, plan: &MutationPlan, inputs: &Inputs<'_>) -> Result<Value> {
+        let mut conn = self.acquire().await?;
+        DB::execute_plan(&mut conn, plan, inputs).await
     }
 
     fn name(&self) -> &'static str {
@@ -156,37 +197,43 @@ impl<DB: Backend> Run<DB> for &mut DB::Connection {
     }
 }
 
-/// A caller-supplied target, as the `_on` methods take: anything sqlx can
-/// [`Acquire`](sqlx::Acquire) a connection from — the pool, a connection, a
-/// transaction. `Acquire` rather than `Executor` because a plan is several
-/// statements on one connection inside one transaction, which an executor —
-/// consumed by a single statement — cannot promise; `Acquire::begin` on a
-/// connection already in a transaction is a savepoint, so the plan is atomic
-/// inside the caller's transaction too. The lifetime is the target's own
-/// (`Acquire<'c>`), carried here so the impl can name it.
-struct External<'c, A>(A, std::marker::PhantomData<&'c ()>);
+/// A borrowed connection: bare, pooled, or a transaction's. Spelled per
+/// backend because generic over `DB` the bare one is `&mut DB::Connection`,
+/// a projection coherence cannot tell apart from the other two.
+macro_rules! connection_targets {
+    ($db:ty, $conn:ty) => {
+        connection_targets!(@one $db, $conn, |c| c);
+        connection_targets!(@one $db, sqlx::Transaction<'_, $db>, |c| &mut **c);
+        connection_targets!(@one $db, sqlx::pool::PoolConnection<$db>, |c| &mut **c);
+    };
+    (@one $db:ty, $t:ty, |$c:ident| $conn:expr) => {
+        impl Target<$db> for &mut $t {}
 
-impl<'c, A> External<'c, A> {
-    fn new(target: A) -> Self {
-        External(target, std::marker::PhantomData)
-    }
+        impl Run<$db> for &mut $t {
+            fn run(self, sql: &str, binds: &[Bind]) -> impl Future<Output = Result<Value>> + Send {
+                let $c = self;
+                <$db as Backend>::execute_conn($conn, sql, binds)
+            }
+
+            fn run_plan(
+                self,
+                plan: &MutationPlan,
+                inputs: &Inputs<'_>,
+            ) -> impl Future<Output = Result<Value>> + Send {
+                let $c = self;
+                <$db as Backend>::execute_plan($conn, plan, inputs)
+            }
+
+            fn name(&self) -> &'static str {
+                std::any::type_name::<Self>()
+            }
+        }
+    };
 }
 
-impl<'c, DB: Backend, A: sqlx::Acquire<'c, Database = DB> + Send> Run<DB> for External<'c, A> {
-    async fn run(self, sql: &str, binds: &[Bind]) -> Result<Value> {
-        let mut conn = self.0.acquire().await?;
-        DB::execute_conn(&mut conn, sql, binds).await
-    }
-
-    async fn run_plan(self, plan: &MutationPlan, inputs: &Inputs<'_>) -> Result<Value> {
-        let mut conn = self.0.acquire().await?;
-        DB::execute_plan(&mut conn, plan, inputs).await
-    }
-
-    fn name(&self) -> &'static str {
-        std::any::type_name::<A>()
-    }
-}
+connection_targets!(Postgres, sqlx::PgConnection);
+#[cfg(feature = "sqlite")]
+connection_targets!(sqlx::Sqlite, sqlx::SqliteConnection);
 
 pub struct Engine<DB: Backend = Postgres> {
     pool: Pool<DB>,
@@ -367,16 +414,17 @@ impl<DB: Backend> Engine<DB> {
         self.query_with(source, variables, None).await
     }
 
-    /// [`Engine::query`] on a caller-supplied executor: the engine's pool
-    /// (`&pool`), a connection borrowed from a transaction the caller holds
-    /// (`&mut *tx`), or any other [`sqlx::Executor`] of this engine's backend.
+    /// [`Engine::query`] on a caller-supplied executor: a pool (`&pool`), a
+    /// transaction the caller holds (`&mut tx` or `&mut *tx`), or a
+    /// connection (`&mut conn`, pooled or not) of this engine's backend — the
+    /// [`Target`]s.
     ///
     /// The engine begins, commits and rolls back nothing here. This is the
     /// entry point for a host that owns the transaction — because its
     /// lifetime, its timeout and the other statements in it are the host's
     /// business — and wants this engine's statements to run in it. A
     /// statement sees what the connection sees, uncommitted rows included.
-    pub async fn query_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn query_on<A: Target<DB>>(
         &self,
         target: A,
         source: &str,
@@ -405,14 +453,14 @@ impl<DB: Backend> Engine<DB> {
     /// [`Engine::query_with`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn query_with_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn query_with_on<A: Target<DB>>(
         &self,
         target: A,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(External::new(target), source, variables, operation_name)
+        self.text_to(target, source, variables, operation_name)
             .await
     }
 
@@ -431,13 +479,13 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::run`] on a caller-supplied executor; see [`Engine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn run_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn run_on<A: Target<DB>>(
         &self,
         target: A,
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
         run_operation(
-            External::new(target),
+            target,
             op.into_operation(),
             &self.schema,
             &self.limits,
@@ -470,11 +518,7 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::query_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn query_as_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn query_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         source: &str,
@@ -485,11 +529,7 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::query_as_with`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn query_as_with_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn query_as_with_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         source: &str,
@@ -522,21 +562,14 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::run_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn run_as_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send, T: DeserializeOwned>(
+    pub async fn run_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = run_operation(
-            External::new(target),
-            operation,
-            &self.schema,
-            &self.limits,
-            false,
-        )
-        .await?;
+        let data = run_operation(target, operation, &self.schema, &self.limits, false).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -603,13 +636,13 @@ impl<DB: Backend> Engine<DB> {
     /// [`Engine::query_on`]. The same guard applies: a statement compiled
     /// against a policy is refused without a principal.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn execute_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn execute_on<A: Target<DB>>(
         &self,
         target: A,
         compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled(External::new(target), compiled, variables, None).await
+        execute_compiled(target, compiled, variables, None).await
     }
 
     /// Run a statement compiled by [`Engine::compile_scoped`], binding
@@ -637,14 +670,14 @@ impl<DB: Backend> Engine<DB> {
     /// lends the connection, the engine executes. The principal is the
     /// caller's to supply per call, as on the pool.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn execute_scoped_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn execute_scoped_on<A: Target<DB>>(
         &self,
         target: A,
         compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled(External::new(target), compiled, variables, Some(principal)).await
+        execute_compiled(target, compiled, variables, Some(principal)).await
     }
 
     /// Same as [`Engine::execute`], unwrapping the single root field and
@@ -672,11 +705,7 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::execute_as`] on a caller-supplied executor; see
     /// [`Engine::query_on`].
-    pub async fn execute_as_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn execute_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         compiled: &CompiledQuery<DB>,
@@ -688,11 +717,7 @@ impl<DB: Backend> Engine<DB> {
 
     /// [`Engine::execute_scoped_as`] on a caller-supplied executor; see
     /// [`Engine::execute_scoped_on`].
-    pub async fn execute_scoped_as_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn execute_scoped_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         compiled: &CompiledQuery<DB>,
@@ -894,14 +919,14 @@ impl<DB: Backend> TxClient<DB> {
             &vars,
             operation_name,
         )?;
-        run_operation::<DB, _>(&mut *self.tx, op, &self.schema, &self.limits, false).await
+        run_operation::<DB, _>(OnConn(&mut *self.tx), op, &self.schema, &self.limits, false).await
     }
 
     /// Same as [`Engine::run`], but runs on the transaction's connection.
     #[tracing::instrument(level = "debug", skip_all)]
     pub async fn run(&mut self, op: impl crate::builder::IntoOperation) -> Result<Value> {
         run_operation::<DB, _>(
-            &mut *self.tx,
+            OnConn(&mut *self.tx),
             op.into_operation(),
             &self.schema,
             &self.limits,
@@ -937,9 +962,14 @@ impl<DB: Backend> TxClient<DB> {
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data =
-            run_operation::<DB, _>(&mut *self.tx, operation, &self.schema, &self.limits, false)
-                .await?;
+        let data = run_operation::<DB, _>(
+            OnConn(&mut *self.tx),
+            operation,
+            &self.schema,
+            &self.limits,
+            false,
+        )
+        .await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -951,7 +981,7 @@ impl<DB: Backend> TxClient<DB> {
         compiled: &CompiledQuery<DB>,
         variables: Option<Value>,
     ) -> Result<Value> {
-        execute_compiled::<DB, _>(&mut *self.tx, compiled, variables, None).await
+        execute_compiled::<DB, _>(OnConn(&mut *self.tx), compiled, variables, None).await
     }
 
     /// Same as [`Engine::execute_scoped`], but runs on the transaction's
@@ -966,7 +996,7 @@ impl<DB: Backend> TxClient<DB> {
         variables: Option<Value>,
         principal: &Principal,
     ) -> Result<Value> {
-        execute_compiled::<DB, _>(&mut *self.tx, compiled, variables, Some(principal)).await
+        execute_compiled::<DB, _>(OnConn(&mut *self.tx), compiled, variables, Some(principal)).await
     }
 
     /// Same as [`TxClient::execute`], unwrapping the single root field and
@@ -1039,7 +1069,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     /// [`ScopedEngine::query`] on a caller-supplied executor; see
     /// [`Engine::query_on`] for what that means. The [`ScopeSet`] is this
     /// handle's, fixed when it was made; the connection is the caller's.
-    pub async fn query_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn query_on<A: Target<DB>>(
         &self,
         target: A,
         source: &str,
@@ -1063,14 +1093,14 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     /// [`ScopedEngine::query_with`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn query_with_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn query_with_on<A: Target<DB>>(
         &self,
         target: A,
         source: &str,
         variables: Option<Value>,
         operation_name: Option<&str>,
     ) -> Result<Value> {
-        self.text_to(External::new(target), source, variables, operation_name)
+        self.text_to(target, source, variables, operation_name)
             .await
     }
 
@@ -1084,13 +1114,12 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
     /// [`ScopedEngine::run`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn run_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send>(
+    pub async fn run_on<A: Target<DB>>(
         &self,
         target: A,
         op: impl crate::builder::IntoOperation,
     ) -> Result<Value> {
-        self.run_scoped_to(External::new(target), op.into_operation())
-            .await
+        self.run_scoped_to(target, op.into_operation()).await
     }
 
     /// Same as [`Engine::query_as`], with the scope rewrite applied.
@@ -1115,11 +1144,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
 
     /// [`ScopedEngine::query_as`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn query_as_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn query_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         source: &str,
@@ -1130,11 +1155,7 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
 
     /// [`ScopedEngine::query_as_with`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn query_as_with_on<
-        'c,
-        A: sqlx::Acquire<'c, Database = DB> + Send,
-        T: DeserializeOwned,
-    >(
+    pub async fn query_as_with_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         source: &str,
@@ -1160,14 +1181,14 @@ impl<DB: Backend> ScopedEngine<'_, DB> {
 
     /// [`ScopedEngine::run_as`] on a caller-supplied executor; see
     /// [`ScopedEngine::query_on`].
-    pub async fn run_as_on<'c, A: sqlx::Acquire<'c, Database = DB> + Send, T: DeserializeOwned>(
+    pub async fn run_as_on<A: Target<DB>, T: DeserializeOwned>(
         &self,
         target: A,
         op: impl crate::builder::IntoOperation,
     ) -> Result<T> {
         let operation = op.into_operation();
         let alias = single_root_alias(&operation).map(String::from);
-        let data = self.run_scoped_to(External::new(target), operation).await?;
+        let data = self.run_scoped_to(target, operation).await?;
         unwrap_and_deserialize(data, alias.as_deref())
     }
 
@@ -1221,7 +1242,7 @@ pub struct ScopedTxClient<DB: Backend = Postgres> {
 impl<DB: Backend> ScopedTxClient<DB> {
     async fn run_scoped(&mut self, mut op: Operation) -> Result<Value> {
         apply_scope(&mut op, &self.scope, &self.schema)?;
-        run_operation::<DB, _>(&mut *self.tx, op, &self.schema, &self.limits, true).await
+        run_operation::<DB, _>(OnConn(&mut *self.tx), op, &self.schema, &self.limits, true).await
     }
 
     /// Same as [`TxClient::query`], with the scope rewrite applied.

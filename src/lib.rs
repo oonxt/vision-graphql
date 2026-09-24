@@ -94,7 +94,7 @@ pub use builder::{
 };
 pub use compiled::CompiledQuery;
 pub use dialect::Dialect;
-pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, TxClient};
+pub use engine::{Engine, MutationResult, ScopedEngine, ScopedTxClient, Target, TxClient};
 pub use error::{Error, ErrorCode};
 pub use limits::ParseLimits;
 pub use parse_cache::ParseCache;
