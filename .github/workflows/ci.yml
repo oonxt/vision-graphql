@@ -31,11 +31,11 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --all-features
 
   # `rust-version` in Cargo.toml is a promise. This is what keeps it one.
   msrv:
@@ -59,6 +59,7 @@ jobs:
       - name: Library and binary build on the declared MSRV
         run: |
           cargo check -p vision-graphql --lib
+          cargo check -p vision-graphql --lib --all-features
           cargo check -p vision-graphql-cli --bins
       - name: Both crates declare the same MSRV
         run: |
@@ -102,9 +103,9 @@ jobs:
       # budget. With the service container above there are no containers to
       # race for, so the cap here is only about how much a runner can chew.
       - name: Tests
-        run: cargo nextest run --workspace --test-threads 4
+        run: cargo nextest run --workspace --all-features --test-threads 4
 
       # nextest does not run doctests; the examples in the docs are part of the
       # public surface and go stale silently otherwise.
       - name: Doctests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --all-features --doc

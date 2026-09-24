@@ -1,4 +1,4 @@
-//! Execute generated SQL against PostgreSQL.
+//! Execute a rendered statement against PostgreSQL.
 
 use crate::error::Result;
 use crate::types::{Bind, NullOf};

@@ -31,7 +31,7 @@
 //!
 //! A variable that decides the *shape* of the SQL rather than a value in it
 //! cannot be deferred, and compiling such a query fails with
-//! [`Error::NotCompilable`](crate::Error::NotCompilable) naming the position:
+//! [`Error::NotCompilable`] naming the position:
 //!
 //! - `where: $w` — a whole filter object, and likewise `order_by: $o`,
 //!   `distinct_on: $d`; these decide which predicates and clauses exist.

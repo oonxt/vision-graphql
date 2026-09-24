@@ -162,8 +162,34 @@ fn log_schema_warnings(schema: &Schema) {
     }
 }
 
+/// Refuse a schema that describes another database than the engine runs on.
+///
+/// A panic, not an error: this is a construction-time mismatch of two things
+/// the program chose — the pool and the schema — like passing a PostgreSQL
+/// URL to a SQLite pool. Left unchecked it is not always loud: most SQL
+/// rendered for the wrong dialect is refused by the database, but a `LIKE`
+/// without its escape clause or an `ORDER BY` with the other default null
+/// order runs, and answers wrongly.
+fn check_dialect<DB: Backend>(schema: &Schema) {
+    assert!(
+        schema.dialect() == DB::DIALECT,
+        "vision_graphql: the schema describes {:?} but the engine runs on {:?}; \
+         introspect the schema from the same database the pool connects to, or \
+         set SchemaBuilder::dialect",
+        schema.dialect(),
+        DB::DIALECT
+    );
+}
+
 impl<DB: Backend> Engine<DB> {
+    /// Build an engine on `pool` for `schema`.
+    ///
+    /// # Panics
+    ///
+    /// If the schema describes a different database than the pool connects
+    /// to — see [`Schema::dialect`].
     pub fn new(pool: Pool<DB>, schema: Schema) -> Self {
+        check_dialect::<DB>(&schema);
         log_schema_warnings(&schema);
         Self {
             pool,
@@ -176,6 +202,7 @@ impl<DB: Backend> Engine<DB> {
     /// Same as [`Engine::new`], with an explicit parse-cache capacity.
     /// `capacity == 0` parses every request from scratch.
     pub fn with_parse_cache_capacity(pool: Pool<DB>, schema: Schema, capacity: usize) -> Self {
+        check_dialect::<DB>(&schema);
         log_schema_warnings(&schema);
         Self {
             pool,
@@ -193,6 +220,7 @@ impl<DB: Backend> Engine<DB> {
     /// engine per role — the way per-role column visibility is expressed — would
     /// otherwise parse the same document once per role.
     pub fn with_parse_cache(pool: Pool<DB>, schema: Schema, parse_cache: Arc<ParseCache>) -> Self {
+        check_dialect::<DB>(&schema);
         log_schema_warnings(&schema);
         Self {
             pool,

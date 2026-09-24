@@ -1,7 +1,8 @@
 //! What the engine asks of a database driver.
 //!
 //! [`Engine`](crate::Engine) is generic over a [`Backend`], which is one of
-//! sqlx's database marker types (`sqlx::Postgres` today). The trait is sealed:
+//! sqlx's database marker types: `sqlx::Postgres`, or `sqlx::Sqlite` behind
+//! the `sqlite` feature. The trait is sealed:
 //! a backend is a renderer dialect plus an execution model, both of which live
 //! in this crate, so it is not something a caller implements — it is what a
 //! caller *picks*, by the pool they hand the engine.
@@ -69,5 +70,32 @@ impl Backend for sqlx::Postgres {
         binds: &[Bind],
     ) -> impl Future<Output = Result<Value>> + Send {
         crate::executor::execute_on(conn, sql, binds)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl sealed::Sealed for sqlx::Sqlite {}
+
+#[cfg(feature = "sqlite")]
+impl Backend for sqlx::Sqlite {
+    const DIALECT: Dialect = Dialect::Sqlite;
+
+    fn execute<'c, E>(
+        executor: E,
+        sql: &str,
+        binds: &[Bind],
+    ) -> impl Future<Output = Result<Value>> + Send
+    where
+        E: sqlx::Executor<'c, Database = Self>,
+    {
+        crate::executor::sqlite::execute_on(executor, sql, binds)
+    }
+
+    fn execute_conn(
+        conn: &mut sqlx::SqliteConnection,
+        sql: &str,
+        binds: &[Bind],
+    ) -> impl Future<Output = Result<Value>> + Send {
+        crate::executor::sqlite::execute_on(conn, sql, binds)
     }
 }

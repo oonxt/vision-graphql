@@ -5,6 +5,30 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ## Unreleased
 
+### Added
+
+- **SQLite, for reads.** Behind the `sqlite` cargo feature: `Engine<sqlx::Sqlite>`
+  answers every query feature — lists, `_by_pk`, nested relations, filters,
+  `order_by`, `limit`/`offset`, `distinct_on`, aggregates, JSON path reads,
+  variables, compiled and persisted statements, scoped execution,
+  transactions — against a SQLite database, with the schema read by
+  `Schema::introspect_sqlite`. The things SQLite answers differently by
+  default are answered PostgreSQL's way: booleans and JSON columns come back
+  as JSON booleans and JSON values rather than `0`/`1` and escaped strings,
+  NULLs sort last on `asc` and first on `desc`, `_like` is case-sensitive.
+  What SQLite cannot do is not published for a SQLite schema and refused if
+  reached anyway — mutations (a different execution model, not yet built),
+  `stddev`/`variance` — with the new `Error::Unsupported` (`UNSUPPORTED`).
+  `vision_graphql::sqlite::connect_options` builds a pool with the pragmas
+  the SQL relies on, and introspection refuses a pool without them. See the
+  README's *Backends* for the full table, including the column types that are
+  left out (`NUMERIC`, `BLOB`) and why.
+- **`Schema::dialect`.** A schema records which database it describes;
+  `Engine::new` refuses a schema of another dialect than its backend's.
+  `SchemaBuilder::dialect` sets it on a hand-built schema.
+- **`SchemaWarning::LooselyTypedTable`** for a SQLite table that is not
+  `STRICT`: the declared types the schema was derived from are not enforced.
+
 ### Changed
 
 - **The engine is generic over its backend.** `Engine`, `ScopedEngine`,

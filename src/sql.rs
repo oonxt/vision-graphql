@@ -1,7 +1,9 @@
 //! SQL generation from IR.
 
 use crate::ast::{Count, Field, Operation, QueryArgs, RootField, Val};
-use crate::dialect::{escape_string_literal, pg_type_name, quote_ident, Dialect};
+use crate::dialect::{
+    escape_string_literal, json_kind, pg_type_name, quote_ident, Dialect, JsonKind,
+};
 use crate::error::{Error, Result};
 use crate::schema::{ColumnType, Schema, Table};
 use crate::types::{Bind, BindSpec, Inputs};
@@ -213,12 +215,42 @@ fn render_list(
 ) -> Result<()> {
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    write!(ctx.sql, "{}", ctx.dialect.rows_list_open(&row_alias)).unwrap();
+    let shape = row_shape(selection, table);
+    write!(
+        ctx.sql,
+        "{}",
+        ctx.dialect.rows_list_open(&row_alias, &shape)
+    )
+    .unwrap();
     render_inner_select(root, selection, table, &inner_alias, schema, ctx)?;
     ctx.sql.push_str(") ");
     ctx.sql.push_str(&row_alias);
     ctx.sql.push(')');
     Ok(())
+}
+
+/// The response keys a row selection produces, with what each holds — the
+/// order of the inner select's output columns, which is what a dialect that
+/// builds the row's JSON object by hand ([`Dialect::rows_list_open`]) needs.
+/// A column the table does not have is `Plain` here; the inner select refuses
+/// it with the error that names it.
+fn row_shape(selection: &[Field], table: &Table) -> Vec<(String, JsonKind)> {
+    selection
+        .iter()
+        .map(|f| match f {
+            Field::Typename { alias } => (alias.clone(), JsonKind::Plain),
+            Field::Column { column, alias } => (
+                alias.clone(),
+                table
+                    .find_column(column)
+                    .map(|c| json_kind(&c.ty))
+                    .unwrap_or(JsonKind::Plain),
+            ),
+            Field::JsonPath { alias, .. }
+            | Field::Relation { alias, .. }
+            | Field::RelationAggregate { alias, .. } => (alias.clone(), JsonKind::Json),
+        })
+        .collect()
 }
 
 /// Refuse two selection fields answering to one response key.
@@ -257,19 +289,11 @@ fn render_inner_select(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     ensure_unique_selection_keys(selection, &root.alias)?;
+    let windowed = !root.args.distinct_on.is_empty() && ctx.dialect.distinct_on_by_window();
     ctx.sql.push_str("SELECT ");
-    if !root.args.distinct_on.is_empty() {
+    if !root.args.distinct_on.is_empty() && !windowed {
         ctx.sql.push_str("DISTINCT ON (");
-        for (i, col_name) in root.args.distinct_on.iter().enumerate() {
-            if i > 0 {
-                ctx.sql.push_str(", ");
-            }
-            let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
-                path: format!("{}.distinct_on.{col_name}", root.alias),
-                message: format!("unknown column '{col_name}' on '{}'", root.table),
-            })?;
-            write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
-        }
+        render_distinct_on_columns(root, table, table_alias, ctx)?;
         ctx.sql.push_str(") ");
     }
     for (i, field) in selection.iter().enumerate() {
@@ -351,16 +375,70 @@ fn render_inner_select(
             }
         }
     }
-    write!(
-        ctx.sql,
-        " FROM {}.{} {table_alias}",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
-    )
-    .unwrap();
-    render_where(&root.args, table, table_alias, schema, ctx)?;
+    if windowed {
+        // No `DISTINCT ON`: number the rows within each distinct group in
+        // the order asked for and keep the first. The derived table carries
+        // every column of the table under the same alias, so the selection,
+        // the correlated subqueries in it and the outer ORDER BY render
+        // exactly as they do without the window. The `WHERE` goes inside,
+        // where it filters before numbering, as `DISTINCT ON` filters before
+        // choosing.
+        write!(
+            ctx.sql,
+            " FROM (SELECT {table_alias}.*, row_number() OVER (PARTITION BY "
+        )
+        .unwrap();
+        render_distinct_on_columns(root, table, table_alias, ctx)?;
+        render_order_by(&root.args, table, table_alias, schema, ctx)?;
+        write!(
+            ctx.sql,
+            ") AS {DISTINCT_ROW_NUMBER} FROM {}.{} {table_alias}",
+            quote_ident(&table.physical_schema),
+            quote_ident(&table.physical_name),
+        )
+        .unwrap();
+        render_where(&root.args, table, table_alias, schema, ctx)?;
+        write!(
+            ctx.sql,
+            ") {table_alias} WHERE {table_alias}.{DISTINCT_ROW_NUMBER} = 1"
+        )
+        .unwrap();
+    } else {
+        write!(
+            ctx.sql,
+            " FROM {}.{} {table_alias}",
+            quote_ident(&table.physical_schema),
+            quote_ident(&table.physical_name),
+        )
+        .unwrap();
+        render_where(&root.args, table, table_alias, schema, ctx)?;
+    }
     render_order_by(&root.args, table, table_alias, schema, ctx)?;
     render_limit_offset(&root.args, &root.alias, ctx);
+    Ok(())
+}
+
+/// The column the window form of `distinct_on` numbers rows by. Quoted and
+/// prefixed so it cannot be a column of the table.
+const DISTINCT_ROW_NUMBER: &str = "\"__vision_graphql_rn\"";
+
+/// The `distinct_on` columns, comma-separated and qualified.
+fn render_distinct_on_columns(
+    root: &RootField,
+    table: &Table,
+    table_alias: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    for (i, col_name) in root.args.distinct_on.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        let col = table.find_column(col_name).ok_or_else(|| Error::Validate {
+            path: format!("{}.distinct_on.{col_name}", root.alias),
+            message: format!("unknown column '{col_name}' on '{}'", root.table),
+        })?;
+        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+    }
     Ok(())
 }
 
@@ -424,14 +502,9 @@ fn render_bool_expr(
             })?;
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
             let placeholder = ctx.dialect.param(n, &col.ty);
-            let op_str = ctx.dialect.cmp(*op);
-            write!(
-                ctx.sql,
-                "{table_alias}.{} {op_str} {placeholder}",
-                quote_ident(&col.physical_name)
-            )
-            .unwrap();
+            write!(ctx.sql, "{}", ctx.dialect.compare(&lhs, *op, placeholder)).unwrap();
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
@@ -592,12 +665,23 @@ fn render_relation_subquery(
     let remote_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
 
+    let shape = row_shape(selection, target);
     match rel.kind {
         crate::schema::RelKind::Array => {
-            write!(ctx.sql, "{}", ctx.dialect.rows_list_open(&row_alias)).unwrap();
+            write!(
+                ctx.sql,
+                "{}",
+                ctx.dialect.rows_list_open(&row_alias, &shape)
+            )
+            .unwrap();
         }
         crate::schema::RelKind::Object => {
-            write!(ctx.sql, "{}", ctx.dialect.row_object_open(&row_alias)).unwrap();
+            write!(
+                ctx.sql,
+                "{}",
+                ctx.dialect.row_object_open(&row_alias, &shape)
+            )
+            .unwrap();
         }
     }
 
@@ -754,6 +838,8 @@ fn render_relation_subquery(
         render_count(limit, "LIMIT", &format!("{parent_path}.{alias}.limit"), ctx);
     } else if matches!(rel.kind, crate::schema::RelKind::Object) {
         ctx.sql.push_str(" LIMIT 1");
+    } else if args.offset.is_some() && ctx.dialect.offset_needs_limit() {
+        ctx.sql.push_str(" LIMIT -1");
     }
     if let Some(offset) = args.offset.as_ref() {
         render_count(
@@ -857,16 +943,8 @@ fn render_relation_field(
 /// `ASC` sorts NULLs last, `DESC` sorts them first — so `DESC NULLS LAST` has to
 /// be requested, it is not what plain `desc` gives you.
 fn render_order_dir(ob: &crate::ast::OrderBy, ctx: &mut RenderCtx) {
-    ctx.sql.push_str(match ob.direction {
-        crate::ast::OrderDir::Asc => " ASC",
-        crate::ast::OrderDir::Desc => " DESC",
-    });
-    if let Some(n) = ob.nulls {
-        ctx.sql.push_str(match n {
-            crate::ast::NullsOrder::First => " NULLS FIRST",
-            crate::ast::NullsOrder::Last => " NULLS LAST",
-        });
-    }
+    ctx.sql
+        .push_str(ctx.dialect.order_dir(ob.direction, ob.nulls));
 }
 
 fn render_order_by_expr(
@@ -1039,6 +1117,8 @@ fn render_order_by(
 fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
     if let Some(limit) = args.limit.as_ref() {
         render_count(limit, "LIMIT", &format!("{path}.limit"), ctx);
+    } else if args.offset.is_some() && ctx.dialect.offset_needs_limit() {
+        ctx.sql.push_str(" LIMIT -1");
     }
     if let Some(offset) = args.offset.as_ref() {
         render_count(offset, "OFFSET", &format!("{path}.offset"), ctx);
@@ -1151,8 +1231,8 @@ fn render_optional(
             let p = ctx.dialect.param(n, &col.ty);
             write!(
                 ctx.sql,
-                "({p} IS NULL OR {qualified} {} {p})",
-                ctx.dialect.cmp(*op)
+                "({p} IS NULL OR {})",
+                ctx.dialect.compare(&qualified, *op, &p)
             )
             .unwrap();
         }
@@ -1202,10 +1282,9 @@ fn render_value_compare(
     let r = ctx.push_comparison(right, pg, path)?;
     write!(
         ctx.sql,
-        "{} {} {}",
-        ctx.dialect.param(l, pg),
-        ctx.dialect.cmp(op),
-        ctx.dialect.param(r, pg)
+        "{}",
+        ctx.dialect
+            .compare(ctx.dialect.param(l, pg), op, ctx.dialect.param(r, pg))
     )
     .unwrap();
     Ok(())
@@ -1388,7 +1467,13 @@ fn render_by_pk(
     ensure_unique_selection_keys(selection, &root.alias)?;
     let inner_alias = ctx.next_alias("t");
     let row_alias = ctx.next_alias("r");
-    write!(ctx.sql, "{}", ctx.dialect.row_object_open(&row_alias)).unwrap();
+    let shape = row_shape(selection, table);
+    write!(
+        ctx.sql,
+        "{}",
+        ctx.dialect.row_object_open(&row_alias, &shape)
+    )
+    .unwrap();
     ctx.sql.push_str("SELECT ");
     for (i, field) in selection.iter().enumerate() {
         if i > 0 {
@@ -1575,6 +1660,11 @@ fn render_mutation(
     use crate::ast::MutationField;
     // See render_query: the builder path has no other duplicate-key guard.
     crate::ast::ensure_unique_root_aliases(fields.iter().map(MutationField::alias))?;
+    if !ctx.dialect.supports_mutations() {
+        return Err(Error::Unsupported {
+            message: format!("mutations are not implemented for {:?}", ctx.dialect),
+        });
+    }
     check_mutable(fields, schema)?;
     ctx.sql.push_str("WITH ");
     for (i, mf) in fields.iter().enumerate() {
@@ -2899,6 +2989,11 @@ fn render_agg_func(
 ) -> Result<()> {
     use crate::ast::AggField;
     let pg_func = func.name();
+    if !ctx.dialect.supports_agg(func) {
+        return Err(Error::Unsupported {
+            message: format!("'{pg_func}' is not available on {:?}", ctx.dialect),
+        });
+    }
     // Same rule the parser applies: a function with no column to apply to
     // would render `{}` with the function never called — an answer that looks
     // complete and contains nothing.
@@ -3013,11 +3108,12 @@ fn render_json_build_object_for_nodes(
                 // arrive from the typed builder, where they are arbitrary
                 // strings — unescaped, one apostrophe breaks the statement and
                 // a crafted one rewrites it.
+                let value = format!("{table_alias}.{}", quote_ident(&col.physical_name));
                 write!(
                     ctx.sql,
-                    "'{}', {table_alias}.{}",
+                    "'{}', {}",
                     escape_string_literal(alias),
-                    quote_ident(&col.physical_name)
+                    ctx.dialect.value_as_json(value, json_kind(&col.ty))
                 )
                 .unwrap();
             }
@@ -3032,7 +3128,13 @@ fn render_json_build_object_for_nodes(
                 })?;
                 let err_path = format!("{parent_path}.nodes.{alias}");
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, "'{}', {expr}", escape_string_literal(alias)).unwrap();
+                write!(
+                    ctx.sql,
+                    "'{}', {}",
+                    escape_string_literal(alias),
+                    ctx.dialect.value_as_json(expr, JsonKind::Json)
+                )
+                .unwrap();
             }
             Field::Relation {
                 name,
@@ -3311,14 +3413,9 @@ fn render_bool_expr_no_alias(
             })?;
             check_cmp_applies(*op, col)?;
             let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            let lhs = quote_ident(&col.physical_name);
             let placeholder = ctx.dialect.param(n, &col.ty);
-            let op_str = ctx.dialect.cmp(*op);
-            write!(
-                ctx.sql,
-                "{} {op_str} {placeholder}",
-                quote_ident(&col.physical_name)
-            )
-            .unwrap();
+            write!(ctx.sql, "{}", ctx.dialect.compare(&lhs, *op, placeholder)).unwrap();
             Ok(())
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
@@ -5266,5 +5363,83 @@ mod tests {
             "must correlate through the relation, got: {sql}"
         );
         assert!(sql.contains(") DESC NULLS LAST"), "got: {sql}");
+    }
+
+    /// The SQLite dialect, pinned as text: a compiled statement is reused by
+    /// its SQL, so the shape must not drift without someone noticing. The
+    /// semantics are checked against a real SQLite in `tests/sqlite_read.rs`;
+    /// these say what that SQL is.
+    mod sqlite {
+        use crate::dialect::Dialect;
+        use crate::parser::{lower_with, parse_document, Bindings};
+        use crate::schema::{ColumnType, Relation, Schema, Table};
+
+        fn schema() -> Schema {
+            Schema::builder()
+                .dialect(Dialect::Sqlite)
+                .table(
+                    Table::new("users", "main", "users")
+                        .column("id", "id", ColumnType::Int8, false)
+                        .column("name", "name", ColumnType::Text, false)
+                        .column("active", "active", ColumnType::Bool, false)
+                        .column("meta", "meta", ColumnType::Json, true)
+                        .column("score", "score", ColumnType::Float8, true)
+                        .primary_key(&["id"])
+                        .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+                )
+                .table(
+                    Table::new("posts", "main", "posts")
+                        .column("id", "id", ColumnType::Int8, false)
+                        .column("user_id", "user_id", ColumnType::Int8, false)
+                        .column("title", "title", ColumnType::Text, false)
+                        .column("views", "views", ColumnType::Int8, false)
+                        .column("published", "published", ColumnType::Bool, true)
+                        .primary_key(&["id"])
+                        .relation("user", Relation::object("users").on([("user_id", "id")])),
+                )
+                .build()
+        }
+
+        fn render(source: &str) -> (String, Vec<crate::types::BindSpec>) {
+            let doc = parse_document(source).unwrap();
+            let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
+            super::super::render(&op, &schema(), Dialect::Sqlite).unwrap()
+        }
+
+        #[test]
+        fn nested_list_with_the_kinds_wrapped_and_a_bound_list() {
+            let (sql, binds) = render(
+                r#"query($ids: [bigint!]!, $q: String!) {
+                    users(where: {id: {_in: $ids}, name: {_ilike: $q}}, order_by: {score: asc}, offset: 2) {
+                        id name active meta first: meta(path: "tags.0")
+                        posts(order_by: {title: desc}, limit: 3) { title published user { name } }
+                    }
+                }"#,
+            );
+            insta::assert_snapshot!(sql);
+            assert_eq!(binds.len(), 3);
+        }
+
+        #[test]
+        fn distinct_on_is_a_window_over_a_derived_table() {
+            let (sql, _) = render(
+                "{ posts(distinct_on: [user_id], where: {views: {_gt: 1}}, order_by: [{user_id: asc}, {views: desc}], limit: 5) { user_id title published } }",
+            );
+            insta::assert_snapshot!(sql);
+        }
+
+        #[test]
+        fn aggregate_with_nodes_and_an_optional_list() {
+            let (sql, _) = render(
+                "query($ids: [bigint!] @optional) { posts_aggregate(where: {id: {_in: $ids}}) { aggregate { count sum { views } max { title } } nodes { title published } } }",
+            );
+            insta::assert_snapshot!(sql);
+        }
+
+        #[test]
+        fn by_pk_and_typename() {
+            let (sql, _) = render("{ users_by_pk(id: 1) { __typename name active } }");
+            insta::assert_snapshot!(sql);
+        }
     }
 }

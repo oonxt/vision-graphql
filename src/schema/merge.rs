@@ -193,8 +193,9 @@ pub fn apply_config(
             .and_then(|o| o.schema.clone())
             .unwrap_or(old_physical_schema);
 
-        let mut t =
-            Table::new(&new_exposed, &physical_schema, &old_physical_name).read_only(read_only);
+        let mut t = Table::new(&new_exposed, &physical_schema, &old_physical_name)
+            .read_only(read_only)
+            .loosely_typed(old.loosely_typed);
 
         let hidden: std::collections::BTreeSet<&str> = overlay
             .map(|o| o.hide_columns.iter().map(String::as_str).collect())
