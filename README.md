@@ -63,7 +63,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 |---|---|
 | Select, `_by_pk`, `_aggregate` | ✓ |
 | Aggregates on a relation (`user { posts_aggregate { … } }`) | ✓ |
-| Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, `stddev`(`_pop`/`_samp`), `variance`/`var_pop`/`var_samp`, with field aliases | ✓ |
+| Aggregates: `count` (incl. `columns:` / `distinct:`), `sum`, `avg`, `max`, `min`, `stddev`(`_pop`/`_samp`), `variance`/`var_pop`/`var_samp`, with field aliases | ✓ (SQLite: no `stddev`/`var` family — see [Backends](#backends)) |
 | Object + Array relations | ✓ |
 | `EXISTS` relation filters in `where` | ✓ |
 | Mutations: `insert` / `insert_one` / `update` / `update_by_pk` / `delete` / `delete_by_pk` | ✓ |
@@ -78,11 +78,11 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `__typename` in every selection set | ✓ |
 | Schema introspection (`__schema` / `__type`), off by default | ✓ |
 | SDL export (`vision-gql sdl`, `--check` for CI) | ✓ |
-| JSON/JSONB path reads (`data(path: "a.b")` → `#>`, keeps structure) | ✓ |
+| JSON/JSONB path reads (`data(path: "a.b")` → `#>` / SQLite `->`, keeps structure) | ✓ |
 | GraphQL variables (incl. declared defaults, `query($n: Int = 10)`), named + inline fragments | ✓ |
 | `operationName` (`query_with` / `query_as_with`, on every handle) | ✓ |
 | GraphQL-shaped errors (`Error::to_graphql_response`, `Error::code`) | ✓ |
-| Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ |
+| Multiple schemas in one Schema (`Schema::introspect_schemas`), incl. cross-schema FK relations | ✓ (PostgreSQL; a SQLite file has one) |
 | PG enum / `date` / `time` / `smallint` / `character(n)` columns (enum casts are schema-qualified) | ✓ |
 | Array, `bytea`, `interval`, `inet` columns | Not mapped — left out of the schema, and reported by `vision-gql diff` |
 | TOML config overlay (`expose_as`, `schema`, `hide_columns`, manual relations) | ✓ |
@@ -110,7 +110,7 @@ and left, not forgotten.
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
 | Computed fields, subscriptions | Not planned. |
-| `WITHOUT ROWID` tables on SQLite | See [Backends](#backends). |
+| On SQLite: `stddev`/`var` aggregates, `count(columns: [a, b])`, `WITHOUT ROWID` tables, `on_conflict` on a row of defaults | Not published where the type system can withhold them, refused with `UNSUPPORTED` otherwise. See [Backends](#backends). |
 
 ## Backends
 
@@ -1192,11 +1192,15 @@ thing that goes wrong is the only thing that happens.
 **`extensions.code`** is the stable classification — `VALIDATION_FAILED`,
 `VARIABLE_MISSING`, `SCOPE_DENIED`, `DOCUMENT_REJECTED` (the document was too
 large or too deep to look at), `LIMIT_EXCEEDED` (an ordinary document asking for
-too much), `PARSE_FAILED`, `NOT_COMPILABLE`, `DATABASE_ERROR`, `INTERNAL_ERROR`
-— and what an HTTP layer maps to a status. The string is the contract, not the
-enum variant.
+too much), `PARSE_FAILED`, `NOT_COMPILABLE`, `UNSUPPORTED` (the backend this
+engine runs on does not implement what was asked; the same document is answered
+on another), `DATABASE_ERROR`, `INTERNAL_ERROR` — and what an HTTP layer maps
+to a status. The string is the contract, not the enum variant.
 
-`SCOPE_DENIED` means the caller's access, and only that. A policy that would not
+`SCOPE_DENIED` means the caller's access, and only that: a table or column the
+scope does not admit, and the post-write guard (`Error::ScopeViolation`) — a
+scoped insert that wrote a row outside the scope, an update that moved one out
+— which undoes the whole mutation. A policy that would not
 load, or a compiled statement run through the wrong entry point, is the host's
 own mistake and comes back as `INTERNAL_ERROR`: telling a client it lacks
 permission for a bug it had no part in would send it looking in the wrong place.

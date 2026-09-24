@@ -23,8 +23,9 @@ release commits; entries from 0.13.0 on are written as the work lands.
   as JSON booleans and JSON values rather than `0`/`1` and escaped strings,
   NULLs sort last on `asc` and first on `desc`, `_like` is case-sensitive.
   What SQLite cannot do is not published for a SQLite schema and refused if
-  reached anyway — mutations (a different execution model, not yet built),
-  `stddev`/`variance` — with the new `Error::Unsupported` (`UNSUPPORTED`).
+  reached anyway — `stddev`/`variance`, `count` over several columns, a
+  `WITHOUT ROWID` table, `on_conflict` on a row of defaults — with the new
+  `Error::Unsupported` (`UNSUPPORTED`).
   `vision_graphql::sqlite::connect_options` builds a pool with the pragmas
   the SQL relies on, and introspection refuses a pool without them. See the
   README's *Backends* for the full table, including the column types that are
@@ -38,6 +39,8 @@ release commits; entries from 0.13.0 on are written as the work lands.
   `SchemaBuilder::dialect` sets it on a hand-built schema.
 - **`SchemaWarning::LooselyTypedTable`** for a SQLite table that is not
   `STRICT`: the declared types the schema was derived from are not enforced.
+  `SchemaBuilder::loosely_typed` marks tables on a hand-built schema; the
+  `vision-gql diff` report carries them as `table_warnings`.
 
 ### Fixed
 
@@ -62,20 +65,21 @@ release commits; entries from 0.13.0 on are written as the work lands.
 - **The engine is generic over its backend.** `Engine`, `ScopedEngine`,
   `TxClient`, `ScopedTxClient`, `CompiledQuery` and `QueryRegistry` take a
   `DB: Backend` parameter, defaulting to `sqlx::Postgres`, so a program that
-  names `Engine` keeps compiling. The `_on` twins accept any
-  `sqlx::Executor` of that backend where they took `sqlx::PgExecutor`; a
-  `CompiledQuery` is typed by the backend it was rendered for, so a statement
-  compiled on one engine cannot be handed to an engine on another. The `_on`
-  twins take anything `sqlx::Acquire` yields a connection from — `&pool`,
-  `&mut conn`, `&mut tx`, `&mut *tx` — where they took an `Executor`: a
-  SQLite mutation is several statements on one connection, which an executor
-  cannot promise; inside a caller's transaction it runs as a savepoint. This is
-  the groundwork for a SQLite backend; nothing PostgreSQL-facing behaves
-  differently, and the rendered SQL is unchanged. One place the default does
-  not reach: a `QueryRegistry::new()` that is never handed an engine or a
-  compiled statement has nothing to infer its backend from and needs the
-  annotation `QueryRegistry<Postgres>` — default type parameters do not take
-  part in inference.
+  names `Engine` keeps compiling. A `CompiledQuery` is typed by the backend
+  it was rendered for, so a statement compiled on one engine cannot be handed
+  to an engine on another. The `_on` twins take anything `sqlx::Acquire`
+  yields a connection from — `&pool`, `&mut conn`, `&mut tx`, `&mut *tx` —
+  where they took a `sqlx::PgExecutor`: a SQLite mutation is several
+  statements on one connection, which an executor cannot promise; inside a
+  caller's transaction it runs as a savepoint. Nothing PostgreSQL-facing
+  behaves differently, and the rendered SQL is unchanged. One place the
+  default does not reach: a `QueryRegistry::new()` that is never handed an
+  engine or a compiled statement has nothing to infer its backend from and
+  needs the annotation `QueryRegistry<Postgres>` — default type parameters do
+  not take part in inference. `Backend`, `Dialect`, `sql::Rendered` and
+  `plan::MutationPlan` are public types; `Backend` is sealed.
+- **`Engine::pool`** hands back the pool the engine runs on, for a host that
+  built the engine first and wants to run its own statements beside it.
 - **`PgType` is `ColumnType`, and `Column::pg_type` is `Column::ty`.** The
   enum names what a column is, not one backend's spelling of it; the field on
   `Column` and `IntrospectedColumn` follows, in the same release rather than

@@ -54,6 +54,11 @@
 //!   time and [`Engine::execute`] runs it with any variables — see
 //!   [`compiled`]. Parsing is cached across requests either way
 //!   ([`parse_cache`]).
+//! - Two backends: PostgreSQL, and SQLite behind the `sqlite` feature. The
+//!   engine is generic over a sealed [`Backend`]; the SQL it renders is per
+//!   [`Dialect`] ([`dialect`]), and a SQLite mutation runs as a plan of
+//!   statements in one transaction ([`plan`]). What one backend cannot do is
+//!   not published for it, and refused with [`Error::Unsupported`] if reached.
 
 pub mod ast;
 pub mod backend;
