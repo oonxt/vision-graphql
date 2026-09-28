@@ -447,7 +447,9 @@ engine goes on its own. The way to reach another database today is
 `postgres_fdw`: create foreign tables in a schema (say `remote`), then include it
 in `introspect_schemas`. They introspect like any other relation, but carry no
 constraints, so declare a `primary_key` in the overlay if you want `_by_pk` on
-them. Note that a foreign table on the inner side of a correlated subquery
+them, or `order_by` through a relation onto them to be a join rather than a
+subquery per row (see [Keys on views](#keys-on-views-and-ordering-through-a-relation)).
+Note that a foreign table on the inner side of a correlated subquery
 pushes down poorly, and that a transaction spanning the FDW boundary is not
 atomic.
 

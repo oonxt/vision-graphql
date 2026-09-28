@@ -23,10 +23,9 @@ release commits; entries from 0.13.0 on are written as the work lands.
   `k` null would have tested no key and matched every row. (An empty key list
   is PostgreSQL's answer and stays: `_has_keys_all: []` holds for every
   non-null row, as `_nin: []` does.) `BindSpec::Array` gains a
-  `reject_null_elements` field. On SQLite they are
-  neither published nor run (`UNSUPPORTED`): it has no structural
-  containment over JSON, and an approximation would answer the hard cases
-  wrongly without a sound.
+  `reject_null_elements` field. On SQLite they are neither published nor run
+  (`UNSUPPORTED`): it has no structural containment over JSON, and an
+  approximation would answer the hard cases wrongly without a sound.
 
 ### Fixed
 
