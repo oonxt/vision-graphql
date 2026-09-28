@@ -3,6 +3,26 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **jsonb operators in `where`: `_contains`, `_contained_in`, `_has_key`,
+  `_has_keys_any`, `_has_keys_all`.** Filtering on a key inside a `jsonb`
+  column was refused (`unsupported operator '_contains'`), and the way round
+  it — fetch the ids with SQL, then `id: {_in: [...]}` — cost a round trip,
+  put the id list into the query text, and could not be combined with other
+  conditions in the same query. They are now published on `jsonb` columns
+  (not `json`, where PostgreSQL defines none of them), as Hasura names them,
+  and render as the operators `@>`, `<@`, `?`, `?|`, `?&` rather than the
+  `jsonb_exists` functions, so a GIN index on the column serves them. A key
+  is bound as text and a key list as `text[]` whatever the column is — on the
+  eager path, the compiled path, under `@optional`, and in a scope policy,
+  which checks the operand as a key when it is built. On SQLite they are
+  neither published nor run (`UNSUPPORTED`): it has no structural
+  containment over JSON, and an approximation would answer the hard cases
+  wrongly without a sound.
+
 ## 0.24.1 — 2026-09-24
 
 ### Fixed

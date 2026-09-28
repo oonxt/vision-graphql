@@ -353,19 +353,38 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
             })?;
             let path = format!("{path}.{column}");
             let subject = format!("'{}'", col.exposed_name);
+            let dialect = schema.dialect();
             match expr {
                 ScopeExpr::Compare { op, value, .. } => {
-                    crate::type_system::check_cmp(*op, &col.ty, || path.clone(), &subject)?;
-                    validate_scalar(value, &col.ty, &path)
+                    crate::type_system::check_cmp(
+                        *op,
+                        &col.ty,
+                        dialect,
+                        || path.clone(),
+                        &subject,
+                    )?;
+                    validate_operand(*op, value, &col.ty, &path)
                 }
                 ScopeExpr::InList { values, .. } => {
-                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
+                    crate::type_system::check_cmp(
+                        CmpOp::Eq,
+                        &col.ty,
+                        dialect,
+                        || path.clone(),
+                        &subject,
+                    )?;
                     values
                         .iter()
                         .try_for_each(|v| validate_scalar(v, &col.ty, &path))
                 }
                 ScopeExpr::InSet { set, .. } => {
-                    crate::type_system::check_cmp(CmpOp::Eq, &col.ty, || path.clone(), &subject)?;
+                    crate::type_system::check_cmp(
+                        CmpOp::Eq,
+                        &col.ty,
+                        dialect,
+                        || path.clone(),
+                        &subject,
+                    )?;
                     validate_list(set, &col.ty, &path)
                 }
                 _ => Ok(()),
@@ -384,17 +403,19 @@ fn validate_expr(expr: &ScopeExpr, table: &Table, schema: &Schema, path: &str) -
             crate::type_system::check_cmp(
                 *op,
                 ty,
+                schema.dialect(),
                 || path.clone(),
                 &crate::sql::value_subject(ty),
             )?;
             validate_scalar(left, ty, &path)?;
-            validate_scalar(right, ty, &path)
+            validate_operand(*op, right, ty, &path)
         }
         ScopeExpr::ValueInSet { value, set, ty, .. } => {
             let path = leaf_path(path, [value, set]);
             crate::type_system::check_cmp(
                 CmpOp::Eq,
                 ty,
+                schema.dialect(),
                 || path.clone(),
                 &crate::sql::value_subject(ty),
             )?;
@@ -440,6 +461,15 @@ fn validate_param_ref(operand: &Operand, path: &str) -> Result<()> {
 fn validate_scalar(operand: &Operand, ty: &ColumnType, path: &str) -> Result<()> {
     validate_param_ref(operand, path)?;
     BindSpec::comparison(operand.symbolic(), ty, || path.to_string()).map(drop)
+}
+
+/// The right-hand side of `lhs <op> operand`, typed as the operator types it
+/// (see [`CmpOp::operand`]) — a key test on a `jsonb` column takes a string.
+fn validate_operand(op: CmpOp, operand: &Operand, lhs: &ColumnType, path: &str) -> Result<()> {
+    match op.operand(lhs) {
+        crate::ast::CmpOperand::Scalar(ty) => validate_scalar(operand, &ty, path),
+        crate::ast::CmpOperand::List(ty) => validate_list(operand, &ty, path),
+    }
 }
 
 /// An operand standing for a whole list; see [`validate_scalar`].

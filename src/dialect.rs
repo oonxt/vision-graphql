@@ -285,6 +285,27 @@ impl Dialect {
                         _ => unreachable!("only the pattern operators reach here"),
                     };
                 }
+                // The operators rather than `jsonb_exists` and friends: a GIN
+                // index on the column serves `@>`, `?`, `?|` and `?&`, and
+                // does not serve the functions. A `?` here is no placeholder —
+                // PostgreSQL's are `$n` and nothing rewrites them.
+                CmpOp::Contains
+                | CmpOp::ContainedIn
+                | CmpOp::HasKey
+                | CmpOp::HasKeysAny
+                | CmpOp::HasKeysAll => match self {
+                    Dialect::Postgres => match op {
+                        CmpOp::Contains => "@>",
+                        CmpOp::ContainedIn => "<@",
+                        CmpOp::HasKey => "?",
+                        CmpOp::HasKeysAny => "?|",
+                        CmpOp::HasKeysAll => "?&",
+                        _ => unreachable!("only the jsonb operators reach here"),
+                    },
+                    Dialect::Sqlite => {
+                        unreachable!("refused by supports_cmp before rendering")
+                    }
+                },
             };
             write!(f, "{lhs} {plain} {rhs}")
         })
@@ -539,6 +560,44 @@ impl Dialect {
                 | AggFunc::Variance
                 | AggFunc::VarPop
                 | AggFunc::VarSamp,
+            ) => false,
+        }
+    }
+
+    /// Whether the dialect implements a comparison operator at all, on the
+    /// types [`cmp_applies`](crate::type_system::cmp_applies) allows it on.
+    ///
+    /// SQLite has no containment over JSON: `@>` recurses through objects and
+    /// arrays with rules of its own (an array contains a bare scalar it holds,
+    /// at the top level only), and an approximation that agrees on the easy
+    /// cases would answer the others wrongly without a sound. The key tests
+    /// go with it, so that the jsonb operators come and go as one family. The
+    /// type system publishes none of them there, and the renderer refuses
+    /// them from the builder.
+    pub(crate) fn supports_cmp(self, op: crate::ast::CmpOp) -> bool {
+        use crate::ast::CmpOp;
+        match (self, op) {
+            (Dialect::Postgres, _) => true,
+            (
+                Dialect::Sqlite,
+                CmpOp::Eq
+                | CmpOp::Neq
+                | CmpOp::Gt
+                | CmpOp::Gte
+                | CmpOp::Lt
+                | CmpOp::Lte
+                | CmpOp::Like
+                | CmpOp::ILike
+                | CmpOp::NLike
+                | CmpOp::NILike,
+            ) => true,
+            (
+                Dialect::Sqlite,
+                CmpOp::Contains
+                | CmpOp::ContainedIn
+                | CmpOp::HasKey
+                | CmpOp::HasKeysAny
+                | CmpOp::HasKeysAll,
             ) => false,
         }
     }

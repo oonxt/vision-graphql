@@ -527,13 +527,46 @@ fn render_where(
 /// through. Without it the builder accepted `_gt` over `jsonb` — an ordering
 /// PostgreSQL will evaluate and nobody should depend on — while `__schema`
 /// said no such operator existed.
-fn check_cmp_applies(op: crate::ast::CmpOp, col: &crate::schema::Column) -> Result<()> {
+fn check_cmp_applies(
+    op: crate::ast::CmpOp,
+    col: &crate::schema::Column,
+    dialect: Dialect,
+) -> Result<()> {
     crate::type_system::check_cmp(
         op,
         &col.ty,
+        dialect,
         || format!("where.{}", col.exposed_name),
         &format!("'{}'", col.exposed_name),
     )
+}
+
+/// `lhs <op> operand`, with the operand bound as the operator types it
+/// ([`CmpOp::operand`](crate::ast::CmpOp::operand)) rather than as `lhs`.
+/// The one place a comparison binds its operand, so that `_has_key` cannot
+/// be bound as `jsonb` on one path and as text on another. A null operand is
+/// refused, as it is in every comparison.
+fn render_cmp(
+    lhs: &str,
+    lhs_ty: &ColumnType,
+    op: crate::ast::CmpOp,
+    value: &Val,
+    path: impl FnOnce() -> String,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    use crate::ast::CmpOperand;
+    let rhs = match op.operand(lhs_ty) {
+        CmpOperand::Scalar(ty) => {
+            let n = ctx.push_comparison(value, &ty, path)?;
+            ctx.dialect.param(n, &ty).to_string()
+        }
+        CmpOperand::List(ty) => {
+            let n = ctx.push_array(value, &ty, path)?;
+            ctx.dialect.list_param(n, &ty).to_string()
+        }
+    };
+    write!(ctx.sql, "{}", ctx.dialect.compare(lhs, op, rhs)).unwrap();
+    Ok(())
 }
 
 pub(crate) fn render_bool_expr(
@@ -562,12 +595,9 @@ pub(crate) fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            check_cmp_applies(*op, col)?;
-            let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            check_cmp_applies(*op, col, ctx.dialect)?;
             let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
-            let placeholder = ctx.dialect.param(n, &col.ty);
-            write!(ctx.sql, "{}", ctx.dialect.compare(&lhs, *op, placeholder)).unwrap();
-            Ok(())
+            render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
         BoolExpr::Const(b) => {
@@ -603,7 +633,7 @@ pub(crate) fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            check_cmp_applies(crate::ast::CmpOp::Eq, col)?;
+            check_cmp_applies(crate::ast::CmpOp::Eq, col, ctx.dialect)?;
             if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
@@ -1357,8 +1387,8 @@ fn render_optional(
         message: format!("unknown column '{column}' on '{}'", table.exposed_name),
     })?;
     match inner {
-        BoolExpr::Compare { op, .. } => check_cmp_applies(*op, col)?,
-        BoolExpr::InList { .. } => check_cmp_applies(crate::ast::CmpOp::Eq, col)?,
+        BoolExpr::Compare { op, .. } => check_cmp_applies(*op, col, ctx.dialect)?,
+        BoolExpr::InList { .. } => check_cmp_applies(crate::ast::CmpOp::Eq, col, ctx.dialect)?,
         _ => {}
     }
     let render_plain = |ctx: &mut RenderCtx| match alias {
@@ -1380,8 +1410,17 @@ fn render_optional(
     let path = || format!("where.{column}");
     match inner {
         BoolExpr::Compare { op, value, .. } => {
-            let n = ctx.push_scalar(value, &col.ty, path)?;
-            let p = ctx.dialect.param(n, &col.ty);
+            use crate::ast::CmpOperand;
+            let p = match op.operand(&col.ty) {
+                CmpOperand::Scalar(ty) => {
+                    let n = ctx.push_scalar(value, &ty, path)?;
+                    ctx.dialect.param(n, &ty).to_string()
+                }
+                CmpOperand::List(ty) => {
+                    let n = ctx.push_optional_array(value, &ty, path)?;
+                    ctx.dialect.list_param(n, &ty).to_string()
+                }
+            };
             write!(
                 ctx.sql,
                 "({p} IS NULL OR {})",
@@ -1430,17 +1469,10 @@ fn render_value_compare(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     let path = || crate::ast::value_leaf_path([left, right]);
-    crate::type_system::check_cmp(op, pg, path, &value_subject(pg))?;
+    crate::type_system::check_cmp(op, pg, ctx.dialect, path, &value_subject(pg))?;
     let l = ctx.push_comparison(left, pg, path)?;
-    let r = ctx.push_comparison(right, pg, path)?;
-    write!(
-        ctx.sql,
-        "{}",
-        ctx.dialect
-            .compare(ctx.dialect.param(l, pg), op, ctx.dialect.param(r, pg))
-    )
-    .unwrap();
-    Ok(())
+    let lhs = ctx.dialect.param(l, pg).to_string();
+    render_cmp(&lhs, pg, op, right, path, ctx)
 }
 
 /// [`BoolExpr::ValueInList`]: `$n::pg = ANY($m::pg[])`, or `<> ALL` when
@@ -1455,7 +1487,13 @@ fn render_value_in_list(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     let path = || crate::ast::value_leaf_path([value, values]);
-    crate::type_system::check_cmp(crate::ast::CmpOp::Eq, pg, path, &value_subject(pg))?;
+    crate::type_system::check_cmp(
+        crate::ast::CmpOp::Eq,
+        pg,
+        ctx.dialect,
+        path,
+        &value_subject(pg),
+    )?;
     if is_empty_literal_list(values) {
         BindSpec::comparison(value.clone(), pg, path)?;
         ctx.sql.push_str(if negated { "TRUE" } else { "FALSE" });
@@ -3557,12 +3595,9 @@ pub(crate) fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            check_cmp_applies(*op, col)?;
-            let n = ctx.push_comparison(value, &col.ty, || format!("where.{column}"))?;
+            check_cmp_applies(*op, col, ctx.dialect)?;
             let lhs = quote_ident(&col.physical_name);
-            let placeholder = ctx.dialect.param(n, &col.ty);
-            write!(ctx.sql, "{}", ctx.dialect.compare(&lhs, *op, placeholder)).unwrap();
-            Ok(())
+            render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
         BoolExpr::Const(b) => {
@@ -3597,7 +3632,7 @@ pub(crate) fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            check_cmp_applies(crate::ast::CmpOp::Eq, col)?;
+            check_cmp_applies(crate::ast::CmpOp::Eq, col, ctx.dialect)?;
             if is_empty_literal_list(values) {
                 ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
                 return Ok(());
@@ -5442,6 +5477,60 @@ mod tests {
         assert!(format!("{err}").contains("'_like' does not apply"), "{err}");
         // The published ones still render.
         render(&compare("id", CmpOp::Gt), &schema).unwrap();
+        // The jsonb family is jsonb's alone.
+        let err = render(&compare("id", CmpOp::HasKey), &schema).unwrap_err();
+        assert!(
+            format!("{err}").contains("'_has_key' does not apply"),
+            "{err}"
+        );
+    }
+
+    /// The operators, and the operand each binds: a key is text and a key
+    /// list a text array, whatever the column is. Semantics are pinned in
+    /// `tests/integration_jsonb_operators.rs`; this catches a swapped symbol.
+    #[test]
+    fn jsonb_operators_render_with_their_operand_types() {
+        use crate::ast::{BoolExpr, CmpOp};
+        use serde_json::json;
+        let schema = Schema::builder()
+            .table(
+                Table::new("d", "public", "d")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("extra", "extra", ColumnType::Jsonb, true),
+            )
+            .build();
+        for (op, value, want) in [
+            (CmpOp::Contains, json!({"a": 1}), r#""extra" @> $1::jsonb"#),
+            (
+                CmpOp::ContainedIn,
+                json!({"a": 1}),
+                r#""extra" <@ $1::jsonb"#,
+            ),
+            (CmpOp::HasKey, json!("a"), r#""extra" ? $1::text"#),
+            (CmpOp::HasKeysAny, json!(["a"]), r#""extra" ?| $1::text[]"#),
+            (CmpOp::HasKeysAll, json!(["a"]), r#""extra" ?& $1::text[]"#),
+        ] {
+            let op_ = Operation::Query(vec![RootField {
+                table: "d".into(),
+                alias: "d".into(),
+                args: QueryArgs {
+                    where_: Some(BoolExpr::Compare {
+                        column: "extra".into(),
+                        op,
+                        value: crate::ast::Val::Lit(value),
+                    }),
+                    ..QueryArgs::default()
+                },
+                body: RootBody::List {
+                    selection: vec![Field::Column {
+                        column: "id".into(),
+                        alias: "id".into(),
+                    }],
+                },
+            }]);
+            let (sql, _) = render(&op_, &schema).unwrap();
+            assert!(sql.contains(want), "{op:?}: {sql}");
+        }
     }
 
     #[test]
