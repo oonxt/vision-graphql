@@ -736,9 +736,61 @@ pub enum CmpOp {
     ILike,
     NLike,
     NILike,
+    /// `jsonb @> value`: the column contains the operand, structurally.
+    Contains,
+    /// `jsonb <@ value`: the operand contains the column.
+    ContainedIn,
+    /// `jsonb ? key`: a top-level key (or array string element) exists.
+    HasKey,
+    /// `jsonb ?| keys`: any of the keys exists.
+    HasKeysAny,
+    /// `jsonb ?& keys`: all of the keys exist.
+    ///
+    /// Over an empty list this holds for every non-null row — all of no keys
+    /// are present — as `_nin: []` holds for every row. That is PostgreSQL's
+    /// answer and the logical one, so it is kept; a null *key* is refused
+    /// instead, because PostgreSQL skips it and `[$k]` with `k` null would
+    /// become that empty list without the request saying so.
+    HasKeysAll,
+}
+
+/// What a comparison's right-hand side is bound as, given the type of its
+/// left-hand side.
+///
+/// Most operators compare like with like. The key tests do not: `_has_key`
+/// on a `jsonb` column takes a string, and `_has_keys_any` a list of them.
+/// Every place that binds, validates or publishes an operand asks this one
+/// function, so a key cannot be bound as `jsonb` in one path and as text in
+/// another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CmpOperand {
+    /// One value of this type.
+    Scalar(ColumnType),
+    /// A list of values of this type, bound as one array.
+    List(ColumnType),
 }
 
 impl CmpOp {
+    /// How the operand of `lhs <op> operand` is typed. See [`CmpOperand`].
+    pub(crate) fn operand(self, lhs: &ColumnType) -> CmpOperand {
+        match self {
+            CmpOp::HasKey => CmpOperand::Scalar(ColumnType::Text),
+            CmpOp::HasKeysAny | CmpOp::HasKeysAll => CmpOperand::List(ColumnType::Text),
+            CmpOp::Eq
+            | CmpOp::Neq
+            | CmpOp::Gt
+            | CmpOp::Gte
+            | CmpOp::Lt
+            | CmpOp::Lte
+            | CmpOp::Like
+            | CmpOp::ILike
+            | CmpOp::NLike
+            | CmpOp::NILike
+            | CmpOp::Contains
+            | CmpOp::ContainedIn => CmpOperand::Scalar(lhs.clone()),
+        }
+    }
+
     /// The operator's name in a `where` object (`_eq`, `_ilike`, …).
     pub fn gql_name(self) -> &'static str {
         match self {
@@ -752,6 +804,11 @@ impl CmpOp {
             CmpOp::ILike => "_ilike",
             CmpOp::NLike => "_nlike",
             CmpOp::NILike => "_nilike",
+            CmpOp::Contains => "_contains",
+            CmpOp::ContainedIn => "_contained_in",
+            CmpOp::HasKey => "_has_key",
+            CmpOp::HasKeysAny => "_has_keys_any",
+            CmpOp::HasKeysAll => "_has_keys_all",
         }
     }
 
@@ -771,6 +828,11 @@ impl CmpOp {
             CmpOp::ILike,
             CmpOp::NLike,
             CmpOp::NILike,
+            CmpOp::Contains,
+            CmpOp::ContainedIn,
+            CmpOp::HasKey,
+            CmpOp::HasKeysAny,
+            CmpOp::HasKeysAll,
         ]
         .into_iter()
         .find(|op| op.gql_name() == name)

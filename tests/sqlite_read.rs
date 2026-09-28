@@ -717,3 +717,65 @@ async fn a_persisted_unsupported_query_keeps_its_code() {
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
     assert_eq!(err.code(), vision_graphql::ErrorCode::Unsupported);
 }
+
+/// SQLite has no `jsonb` containment, and the key tests go with it: none of
+/// the five is published on a JSONB column there, and each is refused as
+/// unsupported — not as a mistake in the document — when reached anyway,
+/// from a document or from the builder.
+#[tokio::test]
+async fn jsonb_operators_are_neither_published_nor_run() {
+    let pool = pool().await;
+    sqlx::raw_sql(
+        "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB) STRICT;
+         INSERT INTO depts VALUES (1, '{\"is_mdt\": true}');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    // STRICT takes no JSONB; a plain table does.
+    sqlx::raw_sql(
+        "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB);
+         INSERT INTO depts VALUES (1, '{\"is_mdt\": true}');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = Schema::introspect_sqlite(&pool).await.unwrap().build();
+    let e = Engine::new(pool, schema);
+    let sdl = vision_graphql::sdl::render(e.schema().type_system());
+    let block = sdl
+        .split("input jsonb_comparison_exp")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("jsonb_comparison_exp");
+    assert!(block.contains("_eq"), "{block}");
+    for op in [
+        "_contains",
+        "_contained_in",
+        "_has_key",
+        "_has_keys_any",
+        "_has_keys_all",
+    ] {
+        assert!(!block.contains(op), "{op} published: {block}");
+    }
+    for where_ in [
+        r#"{extra: {_contains: {is_mdt: true}}}"#,
+        r#"{extra: {_has_key: "is_mdt"}}"#,
+        r#"{extra: {_has_keys_all: ["is_mdt"]}}"#,
+    ] {
+        let err = e
+            .query(&format!("{{ depts(where: {where_}) {{ id }} }}"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{where_}: {err}");
+    }
+    let err = e
+        .run(Query::from("depts").select(&["id"]).where_cmp(
+            "extra",
+            CmpOp::HasKey,
+            json!("is_mdt"),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+}

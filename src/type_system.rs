@@ -381,22 +381,40 @@ pub(crate) fn cmp_applies(op: crate::ast::CmpOp, pg: &ColumnType) -> bool {
         Eq | Neq => !matches!(pg, ColumnType::Json),
         Gt | Gte | Lt | Lte => pg.is_orderable(),
         Like | ILike | NLike | NILike => is_stringish(pg),
+        // `jsonb` only: PostgreSQL defines none of them on `json`.
+        Contains | ContainedIn | HasKey | HasKeysAny | HasKeysAll => {
+            matches!(pg, ColumnType::Jsonb)
+        }
     }
 }
 
-/// Refuse `op` on a value of type `pg`. The one wording for every place that
-/// asks — a column comparison in either renderer, a column-less comparison,
-/// and policy validation — so that what is refused, and how it is explained,
-/// cannot drift between them. `subject` names what is being compared: a
-/// column, or the type of a column-less leaf.
+/// Refuse `op` on a value of type `pg`, or on `dialect`. The one wording for
+/// every place that asks — a column comparison in either renderer, a
+/// column-less comparison, and policy validation — so that what is refused,
+/// and how it is explained, cannot drift between them. `subject` names what
+/// is being compared: a column, or the type of a column-less leaf.
+///
+/// The type is asked first: `_contains` on an integer is a mistake in the
+/// document on every backend, and saying the backend lacks it would suggest
+/// otherwise.
 pub(crate) fn check_cmp(
     op: crate::ast::CmpOp,
     pg: &ColumnType,
+    dialect: crate::dialect::Dialect,
     path: impl FnOnce() -> String,
     subject: &str,
 ) -> crate::error::Result<()> {
     if cmp_applies(op, pg) {
-        return Ok(());
+        if dialect.supports_cmp(op) {
+            return Ok(());
+        }
+        return Err(crate::error::Error::Unsupported {
+            message: format!(
+                "{}: operator '{}' is not available on {dialect:?}",
+                path(),
+                op.gql_name()
+            ),
+        });
     }
     Err(crate::error::Error::Validate {
         path: path(),
@@ -421,6 +439,9 @@ pub(crate) fn why_cmp_inapplicable(op: crate::ast::CmpOp, pg: &ColumnType) -> &'
             "json/jsonb values have no published ordering"
         }
         Like | ILike | NLike | NILike => "pattern matching applies to text columns only",
+        Contains | ContainedIn | HasKey | HasKeysAny | HasKeysAll => {
+            "containment and key tests apply to jsonb columns only"
+        }
     }
 }
 
@@ -962,6 +983,7 @@ impl<'a> Builder<'a> {
     }
 
     fn comparison_exp(&mut self, scalar: &str, pg: &ColumnType) {
+        use crate::ast::{CmpOp, CmpOperand};
         let named = || TypeRef::named(scalar);
         let mut fields = vec![InputValue::new("_is_null", TypeRef::named("Boolean"))];
         if cmp_applies(crate::ast::CmpOp::Eq, pg) {
@@ -979,6 +1001,26 @@ impl<'a> Builder<'a> {
             for op in ["_like", "_nlike", "_ilike", "_nilike"] {
                 fields.push(InputValue::new(op, named()));
             }
+        }
+        let dialect = self.schema.dialect();
+        for op in [
+            CmpOp::Contains,
+            CmpOp::ContainedIn,
+            CmpOp::HasKey,
+            CmpOp::HasKeysAny,
+            CmpOp::HasKeysAll,
+        ] {
+            if !cmp_applies(op, pg) || !dialect.supports_cmp(op) {
+                continue;
+            }
+            // The operand's own type, which for a key test is not the
+            // column's: `_has_key: String`, `_has_keys_any: [String!]`.
+            let ty = match op.operand(pg) {
+                CmpOperand::Scalar(t) if &t == pg => named(),
+                CmpOperand::Scalar(t) => TypeRef::named(scalar_name(&t)),
+                CmpOperand::List(t) => TypeRef::named(scalar_name(&t)).non_null().list(),
+            };
+            fields.push(InputValue::new(op.gql_name(), ty));
         }
         self.add(TypeDef::InputObject {
             name: comparison_exp_name(scalar),
@@ -1392,6 +1434,34 @@ mod tests {
         assert!(!names.contains(&"_gt"));
         assert!(!names.contains(&"_like"));
         assert!(names.contains(&"_eq"));
+        // Containment and key tests, each with the operand type it binds.
+        let ty = |name: &str| {
+            fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.ty.clone())
+                .unwrap_or_else(|| panic!("{name} not published"))
+        };
+        assert_eq!(ty("_contains"), TypeRef::named("jsonb"));
+        assert_eq!(ty("_contained_in"), TypeRef::named("jsonb"));
+        assert_eq!(ty("_has_key"), TypeRef::named("String"));
+        assert_eq!(
+            ty("_has_keys_any"),
+            TypeRef::named("String").non_null().list()
+        );
+        assert_eq!(
+            ty("_has_keys_all"),
+            TypeRef::named("String").non_null().list()
+        );
+        // Every published name lowers to the operator it names.
+        for f in fields {
+            assert!(
+                matches!(f.name.as_str(), "_is_null" | "_in" | "_nin")
+                    || crate::ast::CmpOp::from_gql_name(&f.name).is_some(),
+                "{} is published but not lowered",
+                f.name
+            );
+        }
 
         // json has no equality at all, so only `_is_null` is left.
         let TypeDef::InputObject { fields, .. } = ts.get("json_comparison_exp").unwrap() else {

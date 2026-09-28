@@ -71,6 +71,7 @@ envelope for multi-root GraphQL strings. The untyped `query`/`run` returning
 | `returning` clause on mutations (with nested relations) | ✓ |
 | Multi-request transactions (`Engine::transaction`) | ✓ |
 | Operators: `_eq`/`_neq`/`_gt`/`_gte`/`_lt`/`_lte`/`_like`/`_ilike`/`_nlike`/`_nilike`/`_in`/`_nin`/`_is_null` | ✓ |
+| jsonb operators: `_contains` (`@>`), `_contained_in` (`<@`), `_has_key` (`?`), `_has_keys_any` (`?\|`), `_has_keys_all` (`?&`) — on `jsonb` columns, GIN-indexable | ✓ (PostgreSQL; not on SQLite — see [Backends](#backends)) |
 | Comparing against `null` is refused, not silently empty | ✓ |
 | `order_by` / `limit` / `offset` / `distinct_on` | ✓ |
 | `order_by` NULL placement (`asc_nulls_last`, `desc_nulls_last`, …) | ✓ |
@@ -105,7 +106,7 @@ and left, not forgotten.
 |---|---|
 | `distinct_on` on an `_aggregate` | The aggregate's source does not render it, so it is refused rather than dropped, and not published. `count(columns: […], distinct: true)` counts distinct values. |
 | Fragments inside an `_aggregate` selection | The `aggregate`/`nodes` keys are matched literally; a fragment there is refused. `nodes` itself is a full row selection — relations included — and takes fragments like any other. |
-| `_regex`, `_similar`, jsonb `_contains` / `_has_key`, array operators | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
+| `_regex`, `_similar`, array operators, jsonb `_cast` | The operators listed above are the ones the lowering implements — and the ones introspection publishes, deliberately. |
 | Array, `bytea`, `interval`, `inet` columns | No type mapping: the column is left out of the schema, and `vision-gql diff` reports it. |
 | PG enum values | The type is published as a named scalar, not a GraphQL enum: introspection reads the type's name but not its variants. |
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
@@ -167,6 +168,7 @@ anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | Mutations: what differs | Later fields of one mutation see earlier fields' writes, and `returning { relation }` sees every related row, where PostgreSQL's CTEs share one snapshot. A column an object leaves out gets its default (the one-statement form writes NULL for a column another object in the batch set), and an object with no values at all cannot take `on_conflict`. Rows are identified by `rowid`: a `WITHOUT ROWID` table cannot be written (SQLite: `no such column: rowid`). A deleted row's `returning` is read just before the delete, relations included. |
 | `on_conflict` | `constraint` names a unique constraint as on PostgreSQL — SQLite's auto-names (`sqlite_autoindex_t_1`), a `CREATE UNIQUE INDEX` name, or `<table>_pkey` for the primary key — and is resolved to its columns, which is what SQLite's `ON CONFLICT (…)` takes. `update_columns`, `where` and `DO NOTHING` as on PostgreSQL; a nested `DO NOTHING` is a no-op update so the row's key is still returned for its dependants. |
 | `stddev*` / `var*` | SQLite has no statistical aggregates. Not published, refused. |
+| jsonb `_contains` / `_contained_in` / `_has_key` / `_has_keys_any` / `_has_keys_all` | Not published, refused. SQLite has no structural containment over JSON — PostgreSQL's `@>` recurses with rules of its own — and the key tests are left out with it so the family is one decision. |
 | `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
 | `vision-gql` CLI | `generate`, `diff` and `sdl` take a `sqlite://` URL. `diff` reports skipped columns (`NUMERIC`, `BLOB`, untyped) as on PostgreSQL; a table that is not `STRICT` is warned about. |
 | Version | 3.38 or later (`->`, built-in JSON functions); checked at introspection and before the engine's first statement. sqlx bundles 3.51. |
