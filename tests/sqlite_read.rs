@@ -779,3 +779,106 @@ async fn jsonb_operators_are_neither_published_nor_run() {
         .unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
 }
+
+fn titles_of(v: &Value, key: &str) -> Vec<String> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["title"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `order_by` through an object relation: a `LEFT JOIN` when a key pins the
+/// target row, and — under `distinct_on`'s window form — the correlated
+/// subquery. Every row stays, and a scope-hidden row sorts as NULL.
+#[tokio::test]
+async fn order_by_through_a_relation() {
+    let e = engine().await;
+    // users.id is the key: joined. bob > Cara > Ann under binary collation.
+    let v = q(
+        &e,
+        "{ posts(order_by: [{user: {name: desc}}, {id: asc}]) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["mid", "omega", "zeta", "alpha"]);
+
+    let v = q(
+        &e,
+        "{ posts_aggregate(order_by: [{user: {name: asc}}, {id: asc}], limit: 3) { aggregate { count } nodes { title } } }",
+    )
+    .await;
+    assert_eq!(v["posts_aggregate"]["aggregate"]["count"], json!(3));
+    assert_eq!(
+        titles_of(&v["posts_aggregate"], "nodes"),
+        ["zeta", "alpha", "omega"]
+    );
+
+    // The window form of distinct_on keeps the relation term a subquery.
+    let v = q(
+        &e,
+        "{ posts(distinct_on: [views], order_by: [{views: asc}, {user: {name: desc}}]) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["zeta", "mid", "omega"]);
+
+    // Scope on the joined hop is in its ON: bob's post stays, sorted as NULL.
+    let scoped = e.scoped(ScopeSet::new().unrestricted("posts").allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Neq,
+            value: json!(2).into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ posts(order_by: [{user: {name: desc_nulls_last}}, {id: asc}]) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&v, "posts"), ["omega", "zeta", "alpha", "mid"]);
+}
+
+/// A view keyed by the overlay's primary key is joined; unkeyed, it is the
+/// subquery. The same answer either way.
+#[tokio::test]
+async fn order_by_through_a_view_keyed_or_not() {
+    use vision_graphql::schema::{ColumnType, Relation, Table};
+    for keyed in [true, false] {
+        let mut view = Table::new("active_users", "main", "active_users")
+            .column("id", "id", ColumnType::Int8, true)
+            .column("name", "name", ColumnType::Text, true);
+        if keyed {
+            view = view.primary_key(&["id"]);
+        }
+        let schema = Schema::builder()
+            .dialect(Dialect::Sqlite)
+            .table(
+                Table::new("posts", "main", "posts")
+                    .column("id", "id", ColumnType::Int8, false)
+                    .column("user_id", "user_id", ColumnType::Int8, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .primary_key(&["id"])
+                    .relation(
+                        "author",
+                        Relation::object("active_users").on([("user_id", "id")]),
+                    ),
+            )
+            .table(view)
+            .build();
+        let e = Engine::new(pool().await, schema);
+        let v = q(
+            &e,
+            "{ posts(order_by: [{author: {name: asc_nulls_last}}, {id: asc}]) { title } }",
+        )
+        .await;
+        // bob is inactive: no row in the view, so his post sorts last.
+        assert_eq!(
+            titles_of(&v, "posts"),
+            ["zeta", "alpha", "omega", "mid"],
+            "keyed: {keyed}"
+        );
+    }
+}

@@ -40,9 +40,12 @@ pub struct TableOverlay {
     /// constraints, so introspection finds no PK for them and `_by_pk` is
     /// unavailable — this is how you say "`id` identifies a row in this view".
     ///
-    /// Nothing enforces uniqueness; the columns are used to build the `WHERE`
-    /// of a `_by_pk` lookup, so a non-unique choice just means the lookup
-    /// returns whichever row Postgres reaches first.
+    /// Nothing enforces uniqueness, and the key is trusted where it is used:
+    /// it builds the `WHERE` of a `_by_pk` lookup, and it is what lets an
+    /// `order_by` through an object relation onto this table be a `LEFT JOIN`
+    /// rather than a subquery per outer row. A choice that is not in fact
+    /// unique makes the lookup return whichever row the database reaches
+    /// first, and makes that join repeat the outer rows it matches twice.
     #[serde(default)]
     pub primary_key: Option<Vec<String>>,
 }

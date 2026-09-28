@@ -947,7 +947,8 @@ async fn ordering_through_restricted_relation_cannot_see_out_of_scope_rows() {
         .map(|o| o["title"].as_str().expect("title"))
         .collect();
 
-    // All three orders survive (the sort is a scalar subquery, not a join), but
+    // All three orders survive (the scope predicate sits in the join's ON, or
+    // the subquery's WHERE — never the outer WHERE), but
     // alice's two sort as NULL — last under ASC — instead of by 'alice'.
     assert_eq!(
         titles,

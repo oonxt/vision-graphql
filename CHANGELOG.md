@@ -28,6 +28,26 @@ release commits; entries from 0.13.0 on are written as the work lands.
   containment over JSON, and an approximation would answer the hard cases
   wrongly without a sound.
 
+### Changed
+
+- **`order_by` through an object relation evaluated its target once per
+  row.** `staffs(order_by: {bonus: {total_amount: desc}})` rendered the term
+  as a correlated subquery, which on an aggregate view is the view evaluated
+  for every outer row — a scan of the base table per row when its mapped
+  column has no index. Reported at 30 s where the equivalent `LEFT JOIN` took
+  0.06 s (reproduced locally: 63 s against 47 ms, 6 000 rows over a
+  300 000-row base table). The term is now a `LEFT JOIN` when every hop's
+  mapping is covered by a primary key, unique constraint or unique index of
+  its target, at the root, in nested lists and in an aggregate's rows; the
+  scope predicate of each hop goes into that join's `ON`, so a row the caller
+  may not read still sorts as NULL and the outer row stays. A view has no
+  constraints: declare `primary_key` in its overlay to get the join. That key
+  is trusted — one that does not identify the view's rows now repeats outer
+  rows, where before it only affected `_by_pk`. Anything not covered keeps
+  the subquery, which cannot repeat a row; if that is slow, index the mapped
+  column. `distinct_on` on SQLite, which renders as a window, keeps the
+  subquery too. An aggregate's source now selects its columns qualified.
+
 ## 0.24.1 — 2026-09-24
 
 ### Fixed

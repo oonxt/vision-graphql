@@ -461,8 +461,10 @@ fn render_inner_select(
         render_distinct_on_columns(&root.args.distinct_on, table, table_alias, &root.alias, ctx)?;
         // The same ORDER BY orders the window and the outer rows. Rendered
         // once and copied: rendering it twice would push its binds twice.
+        // No joins here: the outer copy sees only the derived table, not a
+        // join inside it, so a relation term stays a correlated subquery.
         let ob_start = ctx.sql.len();
-        render_order_by(&root.args, table, table_alias, schema, ctx)?;
+        render_order_by(&root.args, &[], table, table_alias, schema, ctx)?;
         let order_by = ctx.sql[ob_start..].to_string();
         write!(
             ctx.sql,
@@ -486,8 +488,16 @@ fn render_inner_select(
             quote_ident(&table.physical_name),
         )
         .unwrap();
+        let joins = render_order_joins(
+            &root.args.order_by,
+            table,
+            table_alias,
+            schema,
+            "order_by",
+            ctx,
+        )?;
         render_where(&root.args, table, table_alias, schema, ctx)?;
-        render_order_by(&root.args, table, table_alias, schema, ctx)?;
+        render_order_by(&root.args, &joins, table, table_alias, schema, ctx)?;
     }
     render_limit_offset(&root.args, &root.alias, ctx);
     Ok(())
@@ -909,8 +919,9 @@ fn render_relation_subquery(
         )
         .unwrap();
         render_distinct_on_columns(&args.distinct_on, target, &remote_alias, &rel_path, ctx)?;
+        // No joins, as at the root: the outer copy cannot see them.
         let ob_start = ctx.sql.len();
-        render_relation_order_by(args, target, &remote_alias, schema, &ob_path, ctx)?;
+        render_relation_order_by(args, &[], target, &remote_alias, schema, &ob_path, ctx)?;
         let order_by = ctx.sql[ob_start..].to_string();
         write!(
             ctx.sql,
@@ -936,6 +947,8 @@ fn render_relation_subquery(
         ctx.sql.push_str(&order_by);
     } else {
         write!(ctx.sql, " FROM {source} {remote_alias}").unwrap();
+        let joins =
+            render_order_joins(&args.order_by, target, &remote_alias, schema, &ob_path, ctx)?;
         render_relation_where(
             args,
             rel,
@@ -947,7 +960,7 @@ fn render_relation_subquery(
             &rel_path,
             ctx,
         )?;
-        render_relation_order_by(args, target, &remote_alias, schema, &ob_path, ctx)?;
+        render_relation_order_by(args, &joins, target, &remote_alias, schema, &ob_path, ctx)?;
     }
 
     if let Some(limit) = args.limit.as_ref() {
@@ -1026,9 +1039,12 @@ fn render_relation_where(
 }
 
 /// `ORDER BY` for a relation subquery: the `distinct_on` columns first, as
-/// at the root, then the relation's own terms.
+/// at the root, then the relation's own terms. `joins` is what
+/// [`render_order_joins`] returned for `args.order_by`, or empty where no
+/// joins were rendered.
 fn render_relation_order_by(
     args: &QueryArgs,
+    joins: &[Option<String>],
     target: &Table,
     remote_alias: &str,
     schema: &Schema,
@@ -1040,11 +1056,17 @@ fn render_relation_order_by(
         return Ok(());
     }
     ctx.sql.push_str(" ORDER BY ");
-    for (i, ob) in prefix.iter().chain(args.order_by.iter()).enumerate() {
+    let terms = prefix.iter().map(|ob| (ob, None)).chain(
+        args.order_by
+            .iter()
+            .enumerate()
+            .map(|(i, ob)| (ob, joins.get(i).and_then(|j| j.as_deref()))),
+    );
+    for (i, (ob, joined)) in terms.enumerate() {
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        render_order_by_expr(ob, target, remote_alias, schema, ob_path, ctx)?;
+        render_order_by_expr(ob, joined, target, remote_alias, schema, ob_path, ctx)?;
         render_order_dir(ob, ctx);
     }
     Ok(())
@@ -1111,26 +1133,6 @@ fn render_relation_field(
     Ok(())
 }
 
-/// The expression an ORDER BY term sorts on.
-///
-/// A plain column renders as `alias."col"`. A term that walks object relations
-/// renders as a correlated scalar subquery, e.g. ordering `experiments` by
-/// `{sample: {collected_at: asc}}`:
-///
-/// ```sql
-/// (SELECT ob0."collected_at" FROM "public"."samples" AS ob0
-///   WHERE ob0."id" = e0."sample_id" LIMIT 1)
-/// ```
-///
-/// A correlated subquery is used rather than a JOIN so the row multiplicity of
-/// the surrounding query is untouched — object relations are 1:1, so LIMIT 1 is
-/// exact, and NULL (no matching row) sorts as PostgreSQL's default.
-///
-/// Each hop's scope predicate (`OrderByHop::filter`, injected by `apply_scope`)
-/// is ANDed into the subquery's WHERE, so a scoped caller sorts only by rows it
-/// could have read. A row filtered out by scope contributes no row to the
-/// subquery, so the term evaluates to NULL — the same as no related row at all,
-/// which is exactly what the caller is entitled to know.
 /// `ASC` / `DESC`, plus an explicit `NULLS FIRST|LAST` when the caller asked for
 /// one. Omitting it leaves PostgreSQL's default, which is asymmetric:
 /// `ASC` sorts NULLs last, `DESC` sorts them first — so `DESC NULLS LAST` has to
@@ -1140,40 +1142,28 @@ fn render_order_dir(ob: &crate::ast::OrderBy, ctx: &mut RenderCtx) {
         .push_str(ctx.dialect.order_dir(ob.direction, ob.nulls));
 }
 
-fn render_order_by_expr(
-    ob: &crate::ast::OrderBy,
-    table: &Table,
+/// One object-relation hop of an `order_by` path, resolved.
+struct OrderHop<'a> {
+    alias: String,
+    target: &'a Table,
+    qualified: String,
+    /// Join conditions tying this hop to the previous one (or, for the
+    /// first hop, to the outer row).
+    conds: Vec<String>,
+    filter: Option<&'a crate::ast::BoolExpr>,
+}
+
+/// Resolve `ob.path` hop by hop, allocating an alias per hop, and the column
+/// it ends on.
+fn walk_order_path<'a>(
+    ob: &'a crate::ast::OrderBy,
+    table: &'a Table,
     table_alias: &str,
-    schema: &Schema,
+    schema: &'a Schema,
     path_ctx: &str,
     ctx: &mut RenderCtx,
-) -> Result<()> {
-    if ob.path.is_empty() {
-        let col = table
-            .find_column(&ob.column)
-            .ok_or_else(|| Error::Validate {
-                path: format!("{path_ctx}.{}", ob.column),
-                message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
-            })?;
-        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
-        return Ok(());
-    }
-
-    struct Hop<'a> {
-        alias: String,
-        target: &'a Table,
-        qualified: String,
-        /// Join conditions tying this hop to the previous one (or, for the
-        /// first hop, to the outer row).
-        conds: Vec<String>,
-        filter: Option<&'a crate::ast::BoolExpr>,
-    }
-
-    // Walk the path first: the FROM/JOIN text needs the leaf alias, which is
-    // only known at the end, and the SQL must be emitted in a single forward
-    // pass so bind placeholders stay in step with the binds render_bool_expr
-    // pushes.
-    let mut hops: Vec<Hop> = Vec::with_capacity(ob.path.len());
+) -> Result<(Vec<OrderHop<'a>>, &'a crate::schema::Column)> {
+    let mut hops: Vec<OrderHop> = Vec::with_capacity(ob.path.len());
     let mut cur = table;
     let mut cur_alias = table_alias.to_string();
 
@@ -1216,7 +1206,7 @@ fn render_order_by_expr(
             ));
         }
 
-        hops.push(Hop {
+        hops.push(OrderHop {
             alias: a.clone(),
             target,
             qualified: format!(
@@ -1236,6 +1226,137 @@ fn render_order_by_expr(
         path: format!("{path_ctx}.{}", ob.column),
         message: format!("unknown column '{}' on '{}'", ob.column, cur.exposed_name),
     })?;
+    Ok((hops, col))
+}
+
+/// Whether every hop of `ob.path` is an object relation that
+/// [pins one row](Schema::pins_one_row). Anything this cannot resolve answers
+/// `false`, which leaves the term to the subquery path and its error.
+fn order_path_is_pinned(ob: &crate::ast::OrderBy, table: &Table, schema: &Schema) -> bool {
+    let mut cur = table;
+    for hop in &ob.path {
+        let Some(rel) = cur.find_relation(&hop.relation) else {
+            return false;
+        };
+        let Some(target) = schema.table(&rel.target_table) else {
+            return false;
+        };
+        if rel.kind != crate::schema::RelKind::Object || !schema.pins_one_row(target, rel) {
+            return false;
+        }
+        cur = target;
+    }
+    true
+}
+
+/// `LEFT JOIN`s for the `order_by` terms that walk only relations pinning one
+/// row, rendered right after the `FROM` of the query they order. Returns, per
+/// term of `order_by` (same index), the expression a joined term sorts on;
+/// `None` for a term that is a plain column or stays a subquery — see
+/// [`render_order_by_expr`].
+///
+/// Each hop's scope predicate goes into its `ON`, never the `WHERE`: a hop the
+/// caller may not read leaves the outer row in place with a NULL to sort on,
+/// exactly as the subquery form does. In the `WHERE` it would drop the outer
+/// row instead.
+fn render_order_joins(
+    order_by: &[crate::ast::OrderBy],
+    table: &Table,
+    table_alias: &str,
+    schema: &Schema,
+    path_ctx: &str,
+    ctx: &mut RenderCtx,
+) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for ob in order_by {
+        if ob.path.is_empty() || !order_path_is_pinned(ob, table, schema) {
+            out.push(None);
+            continue;
+        }
+        let (hops, col) = walk_order_path(ob, table, table_alias, schema, path_ctx, ctx)?;
+        for h in &hops {
+            write!(
+                ctx.sql,
+                " LEFT JOIN {} AS {} ON {}",
+                h.qualified,
+                h.alias,
+                h.conds.join(" AND ")
+            )
+            .unwrap();
+            if let Some(f) = h.filter {
+                ctx.sql.push_str(" AND (");
+                render_bool_expr(f, h.target, &h.alias, schema, ctx)?;
+                ctx.sql.push(')');
+            }
+        }
+        let leaf = hops.last().expect("path is non-empty");
+        out.push(Some(format!(
+            "{}.{}",
+            leaf.alias,
+            quote_ident(&col.physical_name)
+        )));
+    }
+    Ok(out)
+}
+
+/// The expression an ORDER BY term sorts on.
+///
+/// A plain column renders as `alias."col"`. A term whose path
+/// [`render_order_joins`] already joined renders as the joined column
+/// (`joined`). Any other term that walks object relations renders as a
+/// correlated scalar subquery, e.g. ordering `experiments` by
+/// `{sample: {collected_at: asc}}`:
+///
+/// ```sql
+/// (SELECT ob0."collected_at" FROM "public"."samples" AS ob0
+///   WHERE ob0."id" = e0."sample_id" LIMIT 1)
+/// ```
+///
+/// Why two forms. A `LEFT JOIN` lets the planner read the target once — a
+/// hash join — where the subquery is evaluated once per outer row; on an
+/// aggregate view whose base table has no index on the mapped column that is
+/// one scan of the base table per row (30 s against 0.06 s, measured). But a
+/// join over a match that is not unique multiplies the outer rows, so it is
+/// only taken when every hop [pins one row](Schema::pins_one_row) — a primary
+/// key, unique constraint or unique index covers the mapping, or the overlay
+/// declares a `primary_key` (a view has no constraints). Otherwise the
+/// subquery stays: its `LIMIT 1` leaves the multiplicity untouched whatever
+/// the data holds, and NULL (no matching row) sorts as the default.
+///
+/// Each hop's scope predicate (`OrderByHop::filter`, injected by `apply_scope`)
+/// is ANDed into the subquery's WHERE, or into the join's ON, so a scoped
+/// caller sorts only by rows it could have read. A row filtered out by scope
+/// contributes no row, so the term evaluates to NULL — the same as no related
+/// row at all, which is exactly what the caller is entitled to know.
+fn render_order_by_expr(
+    ob: &crate::ast::OrderBy,
+    joined: Option<&str>,
+    table: &Table,
+    table_alias: &str,
+    schema: &Schema,
+    path_ctx: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    if let Some(expr) = joined {
+        ctx.sql.push_str(expr);
+        return Ok(());
+    }
+    if ob.path.is_empty() {
+        let col = table
+            .find_column(&ob.column)
+            .ok_or_else(|| Error::Validate {
+                path: format!("{path_ctx}.{}", ob.column),
+                message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
+            })?;
+        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+        return Ok(());
+    }
+
+    // Walk the path first: the FROM/JOIN text needs the leaf alias, which is
+    // only known at the end, and the SQL must be emitted in a single forward
+    // pass so bind placeholders stay in step with the binds render_bool_expr
+    // pushes.
+    let (hops, col) = walk_order_path(ob, table, table_alias, schema, path_ctx, ctx)?;
 
     let first = &hops[0];
     let leaf = hops.last().expect("path is non-empty");
@@ -1287,28 +1408,16 @@ fn distinct_order_prefix(args: &QueryArgs) -> Vec<crate::ast::OrderBy> {
         .collect()
 }
 
+/// `ORDER BY` at the root: the `distinct_on` columns first, then the terms.
 fn render_order_by(
     args: &QueryArgs,
+    joins: &[Option<String>],
     table: &Table,
     table_alias: &str,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    let prefix = distinct_order_prefix(args);
-    if prefix.is_empty() && args.order_by.is_empty() {
-        return Ok(());
-    }
-    ctx.sql.push_str(" ORDER BY ");
-    let mut first = true;
-    for ob in prefix.iter().chain(args.order_by.iter()) {
-        if !first {
-            ctx.sql.push_str(", ");
-        }
-        first = false;
-        render_order_by_expr(ob, table, table_alias, schema, "order_by", ctx)?;
-        render_order_dir(ob, ctx);
-    }
-    Ok(())
+    render_relation_order_by(args, joins, table, table_alias, schema, "order_by", ctx)
 }
 
 fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
@@ -3443,6 +3552,10 @@ fn render_aggregate_source(
         }
     }
 
+    // Alias the source so the where clause goes through the standard
+    // renderer, which supports EXISTS relation filters (needed both for
+    // user-written relation filters and for scope-injected predicates).
+    let src_alias = ctx.next_alias("s");
     ctx.sql.push_str("SELECT ");
     if cols_needed.is_empty() {
         ctx.sql.push('1');
@@ -3453,13 +3566,11 @@ fn render_aggregate_source(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            ctx.sql.push_str(&quote_ident(c));
+            // Qualified: an `order_by` join brings in a table that may have a
+            // column of the same name. The output column keeps the bare name.
+            write!(ctx.sql, "{src_alias}.{}", quote_ident(c)).unwrap();
         }
     }
-    // Alias the source so the where clause goes through the standard
-    // renderer, which supports EXISTS relation filters (needed both for
-    // user-written relation filters and for scope-injected predicates).
-    let src_alias = ctx.next_alias("s");
     // Inside a mutation, a relation reads the CTE holding the rows this
     // statement just wrote — and an aggregate over that relation has to read
     // the same thing, or one response reports a row under `posts` and `count: 0`
@@ -3487,6 +3598,8 @@ fn render_aggregate_source(
         )
         .unwrap(),
     }
+    let ob_path = format!("{path}.order_by");
+    let joins = render_order_joins(&args.order_by, table, &src_alias, schema, &ob_path, ctx)?;
 
     // The correlation and the user's `where` are both filters on the same
     // source, so they are ANDed; the correlation goes first because it is the
@@ -3544,10 +3657,11 @@ fn render_aggregate_source(
             }
             render_order_by_expr(
                 ob,
+                joins[i].as_deref(),
                 table,
                 &src_alias,
                 schema,
-                &format!("{path}.order_by"),
+                &ob_path,
                 ctx,
             )?;
             render_order_dir(ob, ctx);
@@ -4236,6 +4350,87 @@ mod tests {
         );
     }
 
+    /// The fixture above with `users.id` as the primary key: `posts.user` now
+    /// pins one row.
+    fn users_posts_keyed_schema() -> Schema {
+        use crate::schema::Relation;
+        Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("name", "name", ColumnType::Text, true)
+                    .primary_key(&["id"])
+                    .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+            )
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("title", "title", ColumnType::Text, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .primary_key(&["id"])
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .build()
+    }
+
+    fn render_source(source: &str, schema: &Schema) -> String {
+        let op =
+            crate::parser::parse_and_lower(source, &serde_json::json!({}), None, schema).unwrap();
+        render(&op, schema).unwrap().0
+    }
+
+    /// A relation the target's key pins is joined once, not asked per row —
+    /// and the join is a LEFT one, so a post with no author stays.
+    #[test]
+    fn order_by_a_pinned_relation_is_a_left_join() {
+        let sql = render_source(
+            "query { posts(order_by: {user: {name: desc_nulls_last}}) { id } }",
+            &users_posts_keyed_schema(),
+        );
+        assert!(
+            sql.contains(r#"LEFT JOIN "public"."users" AS ob2 ON ob2."id" = t0."user_id""#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"ORDER BY ob2."name" DESC NULLS LAST"#),
+            "{sql}"
+        );
+        assert!(!sql.contains("(SELECT ob"), "{sql}");
+    }
+
+    /// Nested list and aggregate source take the same join.
+    #[test]
+    fn order_by_join_reaches_nested_lists_and_aggregates() {
+        let schema = users_posts_keyed_schema();
+        let nested = render_source(
+            "query { users { id posts(order_by: {user: {name: asc}}) { title } } }",
+            &schema,
+        );
+        assert!(
+            nested.contains(r#"LEFT JOIN "public"."users" AS ob"#),
+            "{nested}"
+        );
+        let agg = render_source(
+            "{ posts_aggregate(order_by: {user: {name: asc}}, limit: 2) { nodes { id } } }",
+            &schema,
+        );
+        assert!(agg.contains(r#"LEFT JOIN "public"."users" AS ob"#), "{agg}");
+        // The source's own columns are qualified: `users` has an `id` too.
+        assert!(agg.contains(r#"SELECT s1."id" FROM"#), "{agg}");
+    }
+
+    /// Without a key covering the mapping the subquery stays: a join over a
+    /// match that is not unique would repeat the outer row.
+    #[test]
+    fn order_by_an_unpinned_relation_stays_a_subquery() {
+        let sql = render_source(
+            "query { posts(order_by: {user: {name: asc}}) { id } }",
+            &users_posts_schema(),
+        );
+        assert!(!sql.contains("LEFT JOIN"), "{sql}");
+        assert!(sql.contains("ORDER BY (SELECT"), "{sql}");
+    }
+
     // ── NULL placement in ORDER BY ─────────────────────────────────────────
 
     /// PostgreSQL's default is asymmetric: ASC sorts NULLs last, DESC sorts them
@@ -4775,7 +4970,7 @@ mod tests {
             "{sql}"
         );
         // The columns count() reads must be projected by the inner select.
-        assert!(sql.contains(r#"SELECT "id", "name" FROM"#), "{sql}");
+        assert!(sql.contains(r#"SELECT s1."id", s1."name" FROM"#), "{sql}");
     }
 
     #[test]
