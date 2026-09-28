@@ -18,7 +18,12 @@ release commits; entries from 0.13.0 on are written as the work lands.
   `jsonb_exists` functions, so a GIN index on the column serves them. A key
   is bound as text and a key list as `text[]` whatever the column is — on the
   eager path, the compiled path, under `@optional`, and in a scope policy,
-  which checks the operand as a key when it is built. On SQLite they are
+  which checks the operand as a key when it is built. A null key is refused
+  rather than passed on: PostgreSQL skips it, so `_has_keys_all: [$k]` with
+  `k` null would have tested no key and matched every row. (An empty key list
+  is PostgreSQL's answer and stays: `_has_keys_all: []` holds for every
+  non-null row, as `_nin: []` does.) `BindSpec::Array` gains a
+  `reject_null_elements` field. On SQLite they are
   neither published nor run (`UNSUPPORTED`): it has no structural
   containment over JSON, and an approximation would answer the hard cases
   wrongly without a sound.

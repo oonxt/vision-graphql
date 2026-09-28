@@ -468,7 +468,10 @@ fn validate_scalar(operand: &Operand, ty: &ColumnType, path: &str) -> Result<()>
 fn validate_operand(op: CmpOp, operand: &Operand, lhs: &ColumnType, path: &str) -> Result<()> {
     match op.operand(lhs) {
         crate::ast::CmpOperand::Scalar(ty) => validate_scalar(operand, &ty, path),
-        crate::ast::CmpOperand::List(ty) => validate_list(operand, &ty, path),
+        crate::ast::CmpOperand::List(ty) => {
+            validate_param_ref(operand, path)?;
+            BindSpec::operand_list(operand.symbolic(), &ty, false, || path.to_string()).map(drop)
+        }
     }
 }
 

@@ -124,6 +124,14 @@ pub enum BindSpec {
         /// `@optional` operand, where a null is the request leaving the filter
         /// out and binds as SQL NULL.
         reject_null: bool,
+        /// Whether a null *element* is refused. Not for `_in`, where a null
+        /// element keeps SQL's meaning and matches nothing. Set for a key
+        /// list (`_has_keys_all`), where PostgreSQL skips a null key: `[$k]`
+        /// with `k` null would test no key at all, and `_has_keys_all` over no
+        /// keys holds for every row — a filter dropped by a null, which is
+        /// what [`reject_null`](BindSpec::Array::reject_null) refuses for a
+        /// whole operand.
+        reject_null_elements: bool,
     },
     /// A `limit` / `offset` supplied as a variable.
     Count {
@@ -179,7 +187,19 @@ impl BindSpec {
 
     /// Same as [`BindSpec::scalar`] for an `_in` / `_nin` list.
     pub(crate) fn array(val: Val, pg: &ColumnType, path: impl FnOnce() -> String) -> Result<Self> {
-        Self::array_inner(val, pg, path, true)
+        Self::array_inner(val, pg, path, true, false)
+    }
+
+    /// The list operand of a comparison operator (`_has_keys_any`), where
+    /// neither the list nor an element may be null. See
+    /// [`BindSpec::Array::reject_null_elements`].
+    pub(crate) fn operand_list(
+        val: Val,
+        pg: &ColumnType,
+        optional: bool,
+        path: impl FnOnce() -> String,
+    ) -> Result<Self> {
+        Self::array_inner(val, pg, path, !optional, true)
     }
 
     /// An `_in` / `_nin` list that may be null. See
@@ -189,7 +209,7 @@ impl BindSpec {
         pg: &ColumnType,
         path: impl FnOnce() -> String,
     ) -> Result<Self> {
-        Self::array_inner(val, pg, path, false)
+        Self::array_inner(val, pg, path, false, false)
     }
 
     fn array_inner(
@@ -197,6 +217,7 @@ impl BindSpec {
         pg: &ColumnType,
         path: impl FnOnce() -> String,
         reject_null: bool,
+        reject_null_elements: bool,
     ) -> Result<Self> {
         if val.is_lit() {
             let path = path();
@@ -208,13 +229,14 @@ impl BindSpec {
             if !reject_null && resolved.is_null() {
                 return Ok(BindSpec::Fixed(Bind::Null(NullOf::array(pg))));
             }
-            return bind_array(&resolved, pg, &path).map(BindSpec::Fixed);
+            return bind_array(&resolved, pg, &path, reject_null_elements).map(BindSpec::Fixed);
         }
         Ok(BindSpec::Array {
             val,
             pg: pg.clone(),
             path: path(),
             reject_null,
+            reject_null_elements,
         })
     }
 
@@ -245,12 +267,13 @@ impl BindSpec {
                 pg,
                 path,
                 reject_null,
+                reject_null_elements,
             } => {
                 let v = val.resolve(inputs)?;
                 if !*reject_null && v.is_null() {
                     return Ok(Bind::Null(NullOf::array(pg)));
                 }
-                bind_array(&v, pg, path)
+                bind_array(&v, pg, path, *reject_null_elements)
             }
             BindSpec::Count { val, path } => {
                 let n = val.resolve(inputs, path)?;
@@ -280,11 +303,19 @@ pub(crate) fn null_comparison(path: &str) -> Error {
     }
 }
 
-fn bind_array(v: &Value, pg: &ColumnType, path: &str) -> Result<Bind> {
+fn bind_array(v: &Value, pg: &ColumnType, path: &str, reject_null_elements: bool) -> Result<Bind> {
     let items = v.as_array().ok_or_else(|| Error::Validate {
         path: path.to_string(),
         message: format!("expected a list, got {v}"),
     })?;
+    if reject_null_elements && items.iter().any(Value::is_null) {
+        return Err(Error::Validate {
+            path: path.to_string(),
+            message: "a null in this list would be skipped, not matched; \
+                      leave it out, or make the whole operand @optional"
+                .into(),
+        });
+    }
     json_to_bind_array(items, pg).map_err(|e| Error::Validate {
         path: path.to_string(),
         message: format!("{e}"),

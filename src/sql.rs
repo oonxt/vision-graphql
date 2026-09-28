@@ -186,6 +186,20 @@ impl RenderCtx {
         Ok(self.binds.len())
     }
 
+    /// Append the list operand of a comparison operator. See
+    /// [`BindSpec::operand_list`].
+    fn push_operand_list(
+        &mut self,
+        val: &Val,
+        pg: &ColumnType,
+        optional: bool,
+        path: impl FnOnce() -> String,
+    ) -> Result<usize> {
+        self.binds
+            .push(BindSpec::operand_list(val.clone(), pg, optional, path)?);
+        Ok(self.binds.len())
+    }
+
     /// Append a parameter the renderer determined on its own.
     pub(crate) fn push_fixed(&mut self, bind: Bind) -> usize {
         self.binds.push(BindSpec::Fixed(bind));
@@ -561,7 +575,7 @@ fn render_cmp(
             ctx.dialect.param(n, &ty).to_string()
         }
         CmpOperand::List(ty) => {
-            let n = ctx.push_array(value, &ty, path)?;
+            let n = ctx.push_operand_list(value, &ty, false, path)?;
             ctx.dialect.list_param(n, &ty).to_string()
         }
     };
@@ -1417,7 +1431,7 @@ fn render_optional(
                     ctx.dialect.param(n, &ty).to_string()
                 }
                 CmpOperand::List(ty) => {
-                    let n = ctx.push_optional_array(value, &ty, path)?;
+                    let n = ctx.push_operand_list(value, &ty, true, path)?;
                     ctx.dialect.list_param(n, &ty).to_string()
                 }
             };

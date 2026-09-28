@@ -745,6 +745,12 @@ pub enum CmpOp {
     /// `jsonb ?| keys`: any of the keys exists.
     HasKeysAny,
     /// `jsonb ?& keys`: all of the keys exist.
+    ///
+    /// Over an empty list this holds for every non-null row — all of no keys
+    /// are present — as `_nin: []` holds for every row. That is PostgreSQL's
+    /// answer and the logical one, so it is kept; a null *key* is refused
+    /// instead, because PostgreSQL skips it and `[$k]` with `k` null would
+    /// become that empty list without the request saying so.
     HasKeysAll,
 }
 

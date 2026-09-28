@@ -227,3 +227,61 @@ async fn published_with_the_operand_types_they_take() {
         .unwrap();
     assert!(!text.contains("_has_key"), "{text}");
 }
+
+/// PostgreSQL skips a null in the key list of `?&` / `?|`, so `[$k]` with
+/// `k` null would test no key — and `_has_keys_all` over no keys holds for
+/// every row. A filter dropped by a null is refused wherever it can arrive:
+/// written out, through a variable on either path, as an element of a list
+/// variable, under `@optional`, and in a scope policy's principal.
+#[tokio::test]
+async fn a_null_key_is_refused_not_skipped() {
+    let (engine, _db) = setup().await;
+    let refused = |r: Result<Value, Error>, what: &str| match r {
+        Err(e @ Error::Validate { .. }) => {
+            assert!(e.to_string().contains("null"), "{what}: {e}")
+        }
+        other => panic!("{what}: expected a refusal, got {other:?}"),
+    };
+    for where_ in [
+        r#"{extra: {_has_keys_all: [null]}}"#,
+        r#"{extra: {_has_keys_any: ["tags", null]}}"#,
+    ] {
+        let q = format!("{{ departments(where: {where_}) {{ id }} }}");
+        refused(engine.query(&q, None).await, where_);
+    }
+
+    let one = r#"query($k: String) { departments(where: {extra: {_has_keys_all: [$k]}}) { id } }"#;
+    let list =
+        r#"query($ks: [String]) { departments(where: {extra: {_has_keys_any: $ks}}) { id } }"#;
+    let optional = r#"query($ks: [String] @optional) { departments(where: {extra: {_has_keys_all: $ks}}) { id } }"#;
+    for (src, vars) in [
+        (one, json!({"k": null})),
+        (list, json!({"ks": ["tags", null]})),
+        (optional, json!({"ks": [null]})),
+    ] {
+        refused(engine.query(src, Some(vars.clone())).await, src);
+        let compiled = engine.compile(src).expect("compile");
+        refused(engine.execute(&compiled, Some(vars)).await, src);
+    }
+    // The optional operand itself may still be null: that leaves it out.
+    let compiled = engine.compile(optional).unwrap();
+    let v = engine
+        .execute(&compiled, Some(json!({"ks": null})))
+        .await
+        .unwrap();
+    assert_eq!(v["departments"].as_array().unwrap().len(), 5);
+
+    let policy = ScopePolicy::from_toml(
+        r#"
+        [tables.departments]
+        where = { extra = { _has_keys_all = "$principal" } }
+        "#,
+        &schema(),
+    )
+    .expect("policy");
+    let r = engine
+        .scoped(policy.bind_value(json!([null])).unwrap())
+        .query("{ departments { id } }", None)
+        .await;
+    refused(r, "scope principal");
+}
