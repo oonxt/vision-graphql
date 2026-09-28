@@ -523,9 +523,38 @@ fn render_distinct_on_columns(
             path: format!("{path}.distinct_on.{col_name}"),
             message: format!("unknown column '{col_name}' on '{}'", table.exposed_name),
         })?;
+        check_distinct_applies(col, ctx.dialect, || {
+            format!("{path}.distinct_on.{col_name}")
+        })?;
         write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
     }
     Ok(())
+}
+
+/// Refuse telling rows apart by `col` where the dialect would do it by a
+/// different equality than the comparisons publish: `distinct_on` and
+/// `count(distinct: true)` group by `=`, and on SQLite a JSON column's `=` is
+/// text equality — two spellings of one `jsonb` value would be two groups.
+/// The column enum both take is shared with a plain `count(columns:)`, which
+/// is sound on any column, so the refusal is here rather than in what is
+/// published. PostgreSQL passes unchanged; a `json` column there is refused
+/// by the database, which has no equality for it.
+fn check_distinct_applies(
+    col: &crate::schema::Column,
+    dialect: Dialect,
+    path: impl FnOnce() -> String,
+) -> Result<()> {
+    if dialect.supports_cmp(crate::ast::CmpOp::Eq, &col.ty) {
+        return Ok(());
+    }
+    Err(Error::Unsupported {
+        message: format!(
+            "{}: telling rows apart by '{}' is not available on {dialect:?}, which compares \
+             JSON as text",
+            path(),
+            col.exposed_name
+        ),
+    })
 }
 
 fn render_where(
@@ -3261,6 +3290,11 @@ fn render_agg_op(
                         path: format!("aggregate.{}", sel.alias),
                         message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
                     })?;
+                    if *distinct {
+                        check_distinct_applies(col, ctx.dialect, || {
+                            format!("aggregate.{}", sel.alias)
+                        })?;
+                    }
                     write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
                 }
                 if columns.len() > 1 {

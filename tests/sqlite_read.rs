@@ -718,50 +718,59 @@ async fn a_persisted_unsupported_query_keeps_its_code() {
     assert_eq!(err.code(), vision_graphql::ErrorCode::Unsupported);
 }
 
-/// SQLite has no `jsonb` containment, and the key tests go with it: none of
-/// the five is published on a JSONB column there, and each is refused as
-/// unsupported — not as a mistake in the document — when reached anyway,
-/// from a document or from the builder.
+/// SQLite compares JSON as text: `json()` and `jsonb()` keep key order, so
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` differ there and are equal to
+/// PostgreSQL's `jsonb`. No comparison on a JSON column is published — only
+/// `_is_null` is left — and each is refused as unsupported, not as a mistake
+/// in the document, when reached anyway: from a document, from the builder,
+/// and in a scope policy.
 #[tokio::test]
-async fn jsonb_operators_are_neither_published_nor_run() {
+async fn json_columns_publish_no_comparison_but_is_null() {
     let pool = pool().await;
     sqlx::raw_sql(
-        "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB) STRICT;
-         INSERT INTO depts VALUES (1, '{\"is_mdt\": true}');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap_err();
-    // STRICT takes no JSONB; a plain table does.
-    sqlx::raw_sql(
-        "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB);
-         INSERT INTO depts VALUES (1, '{\"is_mdt\": true}');",
+        "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB, doc JSON);
+         INSERT INTO depts VALUES (1, '{\"b\": 2, \"a\": 1}', '{\"b\": 2, \"a\": 1}'),
+                                  (2, NULL, NULL);
+         CREATE TABLE members (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES depts, extra JSONB);",
     )
     .execute(&pool)
     .await
     .unwrap();
     let schema = Schema::introspect_sqlite(&pool).await.unwrap().build();
-    let e = Engine::new(pool, schema);
-    let sdl = vision_graphql::sdl::render(e.schema().type_system());
-    let block = sdl
-        .split("input jsonb_comparison_exp")
-        .nth(1)
-        .and_then(|rest| rest.split('}').next())
-        .expect("jsonb_comparison_exp");
-    assert!(block.contains("_eq"), "{block}");
-    for op in [
-        "_contains",
-        "_contained_in",
-        "_has_key",
-        "_has_keys_any",
-        "_has_keys_all",
-    ] {
-        assert!(!block.contains(op), "{op} published: {block}");
+    let sdl = vision_graphql::sdl::render(schema.type_system());
+    for input in ["input jsonb_comparison_exp", "input json_comparison_exp"] {
+        let block = sdl
+            .split(input)
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .unwrap_or_else(|| panic!("{input} missing"));
+        let fields: Vec<&str> = block
+            .lines()
+            .filter_map(|l| l.trim().split(':').next())
+            .filter(|f| !f.is_empty() && *f != "{")
+            .collect();
+        assert_eq!(fields, ["_is_null"], "{input}: {block}");
     }
+    let policy = vision_graphql::ScopePolicy::from_toml(
+        r#"
+        [tables.depts]
+        where = { extra = { _eq = { a = 1 } } }
+        "#,
+        &schema,
+    )
+    .unwrap_err();
+    assert!(matches!(policy, Error::Unsupported { .. }), "{policy}");
+
+    let e = Engine::new(pool, schema);
     for where_ in [
-        r#"{extra: {_contains: {is_mdt: true}}}"#,
-        r#"{extra: {_has_key: "is_mdt"}}"#,
-        r#"{extra: {_has_keys_all: ["is_mdt"]}}"#,
+        // Equal on PostgreSQL, where jsonb ignores key order; the text differs.
+        r#"{extra: {_eq: {a: 1, b: 2}}}"#,
+        r#"{extra: {_neq: {a: 1, b: 2}}}"#,
+        r#"{extra: {_in: [{a: 1, b: 2}]}}"#,
+        r#"{extra: {_nin: [{a: 1, b: 2}]}}"#,
+        r#"{extra: {_contains: {a: 1}}}"#,
+        r#"{extra: {_has_key: "a"}}"#,
+        r#"{extra: {_has_keys_all: ["a"]}}"#,
     ] {
         let err = e
             .query(&format!("{{ depts(where: {where_}) {{ id }} }}"), None)
@@ -769,15 +778,44 @@ async fn jsonb_operators_are_neither_published_nor_run() {
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{where_}: {err}");
     }
+    for op in [CmpOp::Eq, CmpOp::HasKey] {
+        let err = e
+            .run(
+                Query::from("depts")
+                    .select(&["id"])
+                    .where_cmp("extra", op, json!("a")),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{op:?}: {err}");
+    }
+    // `json` has no equality on either backend: a mistake in the document.
     let err = e
-        .run(Query::from("depts").select(&["id"]).where_cmp(
-            "extra",
-            CmpOp::HasKey,
-            json!("is_mdt"),
-        ))
+        .query("{ depts(where: {doc: {_eq: {a: 1}}}) { id } }", None)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    assert!(matches!(err, Error::Validate { .. }), "{err}");
+    let v = q(&e, "{ depts(where: {extra: {_is_null: false}}) { id } }").await;
+    assert_eq!(v["depts"], json!([{"id": 1}]));
+
+    // Grouping is equality too: `distinct_on` and `count(distinct: true)`
+    // would split one jsonb value spelled two ways. Counting values stays.
+    for src in [
+        "{ depts(distinct_on: [extra]) { id } }",
+        "{ depts(distinct_on: [doc]) { id } }",
+        "{ depts { members(distinct_on: [extra]) { id } } }",
+        "{ depts_aggregate { aggregate { count(columns: [extra], distinct: true) } } }",
+        "{ depts_aggregate { aggregate { count(columns: [doc], distinct: true) } } }",
+    ] {
+        let err = e.query(src, None).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{src}: {err}");
+    }
+    let v = q(
+        &e,
+        "{ depts_aggregate { aggregate { count(columns: [extra]) } } }",
+    )
+    .await;
+    assert_eq!(v["depts_aggregate"]["aggregate"]["count"], json!(1));
 }
 
 fn titles_of(v: &Value, key: &str) -> Vec<String> {
