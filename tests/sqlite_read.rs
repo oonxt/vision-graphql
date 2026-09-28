@@ -730,7 +730,8 @@ async fn json_columns_publish_no_comparison_but_is_null() {
     sqlx::raw_sql(
         "CREATE TABLE depts (id INTEGER PRIMARY KEY, extra JSONB, doc JSON);
          INSERT INTO depts VALUES (1, '{\"b\": 2, \"a\": 1}', '{\"b\": 2, \"a\": 1}'),
-                                  (2, NULL, NULL);",
+                                  (2, NULL, NULL);
+         CREATE TABLE members (id INTEGER PRIMARY KEY, dept_id INTEGER REFERENCES depts, extra JSONB);",
     )
     .execute(&pool)
     .await
@@ -796,6 +797,25 @@ async fn json_columns_publish_no_comparison_but_is_null() {
     assert!(matches!(err, Error::Validate { .. }), "{err}");
     let v = q(&e, "{ depts(where: {extra: {_is_null: false}}) { id } }").await;
     assert_eq!(v["depts"], json!([{"id": 1}]));
+
+    // Grouping is equality too: `distinct_on` and `count(distinct: true)`
+    // would split one jsonb value spelled two ways. Counting values stays.
+    for src in [
+        "{ depts(distinct_on: [extra]) { id } }",
+        "{ depts(distinct_on: [doc]) { id } }",
+        "{ depts { members(distinct_on: [extra]) { id } } }",
+        "{ depts_aggregate { aggregate { count(columns: [extra], distinct: true) } } }",
+        "{ depts_aggregate { aggregate { count(columns: [doc], distinct: true) } } }",
+    ] {
+        let err = e.query(src, None).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{src}: {err}");
+    }
+    let v = q(
+        &e,
+        "{ depts_aggregate { aggregate { count(columns: [extra]) } } }",
+    )
+    .await;
+    assert_eq!(v["depts_aggregate"]["aggregate"]["count"], json!(1));
 }
 
 fn titles_of(v: &Value, key: &str) -> Vec<String> {

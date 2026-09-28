@@ -30,17 +30,19 @@ release commits; entries from 0.13.0 on are written as the work lands.
 
 ### Fixed
 
-- **On SQLite, `_eq` / `_neq` / `_in` / `_nin` on a `JSON` or `JSONB` column
-  compared text.** SQLite has no JSON type: the operand was bound as the
-  engine's serialisation and compared byte for byte with what was stored, and
-  `json()` / `jsonb()` keep key order, so `{"b": 2, "a": 1}` written by
-  anything but the engine never matched `{a: 1, b: 2}`, nor `1.0` matched
-  `1` — where PostgreSQL's `jsonb` calls both equal — and the answer was an
-  empty result, not an error. On SQLite a JSON column now publishes only
-  `_is_null`, and the others are refused as `UNSUPPORTED` from a document,
-  the builder and a scope policy. A SQLite schema's `__schema` and SDL lose
-  those four fields on its `json`/`jsonb` comparison inputs; PostgreSQL is
-  unchanged.
+- **On SQLite, a `JSONB` column's `_eq` / `_neq` / `_in` / `_nin`, and
+  `distinct_on` and `count(distinct: true)` over any JSON column, compared
+  text.** SQLite has no JSON type: the operand was bound as the engine's
+  serialisation and compared byte for byte with what was stored, and `json()`
+  / `jsonb()` keep key order, so `{"b": 2, "a": 1}` written by anything but
+  the engine never matched `{a: 1, b: 2}`, nor `1.0` matched `1` — where
+  PostgreSQL's `jsonb` calls both equal — and the answer was an empty result,
+  not an error; `distinct_on` and a distinct count split one value spelled
+  two ways into two. On SQLite `jsonb_comparison_exp` now carries only
+  `_is_null` (`json` never had equality, on either backend), and the four
+  operators, `distinct_on` over a JSON column and a distinct count of one are
+  refused as `UNSUPPORTED`, from a document, the builder and a scope policy.
+  A plain `count(columns: [extra])` still counts. PostgreSQL is unchanged.
 
 ### Changed
 
