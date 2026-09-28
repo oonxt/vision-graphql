@@ -376,6 +376,23 @@ target = "profiles"
 mapping = [["id", "followed_id"]]
 ```
 
+### Leaving tables out
+
+`retain_tables` keeps only the tables whose exposed name passes, and removes
+the relations other tables had into the ones it drops:
+
+```rust
+let schema = Schema::introspect_sqlite(&pool).await?
+    .retain_tables(|t| t != "_app_migrations")
+    .build();
+```
+
+A scope policy that names a removed table fails to build, like any unknown
+table. On SQLite this is the way to keep an application's own bookkeeping
+tables out of the API: everything shares `main`, and the `sqlite_` prefix
+that introspection skips is reserved. `vision-gql sdl --include-tables` /
+`--ignore-tables` narrow the schema through the same call.
+
 ### Keys on views, and ordering through a relation
 
 A view has no constraints, so introspection finds no key for it. Declare one
