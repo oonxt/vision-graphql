@@ -120,7 +120,7 @@ from the pool and defaults to PostgreSQL, so `Engine::new(pg_pool, schema)` is
 what it always was. SQLite is behind the `sqlite` cargo feature.
 
 ```toml
-vision-graphql = { version = "0.24", features = ["sqlite"] }
+vision-graphql = { version = "0.25", features = ["sqlite"] }
 ```
 
 ```rust
