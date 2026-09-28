@@ -501,32 +501,7 @@ impl Schema {
                 {
                     continue;
                 }
-                // Compare everything in physical-column space. Mappings and
-                // primary keys name exposed columns; constraints and indexes
-                // introspected from Postgres carry physical names. Resolving
-                // each name to exactly one canonical form (its physical name
-                // when the exposed column exists, itself otherwise — a
-                // constraint can cover a hidden column) keeps the check
-                // injective: pooling both spellings into one set once let a
-                // single mapping entry satisfy two different constraint
-                // columns.
-                let canonical = |name: &'_ str| -> String {
-                    target
-                        .find_column(name)
-                        .map(|c| c.physical_name.clone())
-                        .unwrap_or_else(|| name.to_string())
-                };
-                let remote: std::collections::BTreeSet<String> =
-                    rel.mapping.iter().map(|(_, r)| canonical(r)).collect();
-                let covered = |cols: &[String]| {
-                    !cols.is_empty() && cols.iter().all(|c| remote.contains(&canonical(c)))
-                };
-                // The overlay's logical primary_key counts even though nothing
-                // enforces it: it is the caller's assertion of what identifies
-                // a row, and doubting it here would warn on every keyed view.
-                let pinned = covered(&target.primary_key)
-                    || target.unique_constraints.values().any(|c| covered(c))
-                    || target.unique_indexes.values().any(|c| covered(c));
+                let pinned = self.pins_one_row(target, rel);
                 if !pinned {
                     out.push(SchemaWarning::NonDeterministicObjectRelation {
                         table: tname.clone(),
@@ -538,6 +513,44 @@ impl Schema {
             }
         }
         out
+    }
+
+    /// Whether `rel`'s mapped remote columns are covered by a primary key,
+    /// unique constraint or plain unique index of `target` — that is, whether
+    /// the relation matches at most one target row.
+    ///
+    /// Asked by [`warnings`](Self::warnings), and by the renderer to decide
+    /// whether an `order_by` through the relation may be a `LEFT JOIN`: a join
+    /// over a match that is not unique multiplies the outer rows, so the
+    /// answer here is what keeps that rendering from duplicating results.
+    pub(crate) fn pins_one_row(&self, target: &Table, rel: &Relation) -> bool {
+        // Compare everything in physical-column space. Mappings and
+        // primary keys name exposed columns; constraints and indexes
+        // introspected from Postgres carry physical names. Resolving
+        // each name to exactly one canonical form (its physical name
+        // when the exposed column exists, itself otherwise — a
+        // constraint can cover a hidden column) keeps the check
+        // injective: pooling both spellings into one set once let a
+        // single mapping entry satisfy two different constraint
+        // columns.
+        let canonical = |name: &'_ str| -> String {
+            target
+                .find_column(name)
+                .map(|c| c.physical_name.clone())
+                .unwrap_or_else(|| name.to_string())
+        };
+        let remote: std::collections::BTreeSet<String> =
+            rel.mapping.iter().map(|(_, r)| canonical(r)).collect();
+        let covered = |cols: &[String]| {
+            !cols.is_empty() && cols.iter().all(|c| remote.contains(&canonical(c)))
+        };
+        // The overlay's logical primary_key counts even though nothing
+        // enforces it: it is the caller's assertion of what identifies a
+        // row, and doubting it would warn on every keyed view — and would
+        // leave every view to the per-row subquery when ordered through.
+        covered(&target.primary_key)
+            || target.unique_constraints.values().any(|c| covered(c))
+            || target.unique_indexes.values().any(|c| covered(c))
     }
 
     /// Introspect the `public` schema and return a ready-to-customize builder.

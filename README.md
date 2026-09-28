@@ -374,6 +374,27 @@ target = "profiles"
 mapping = [["id", "followed_id"]]
 ```
 
+### Keys on views, and ordering through a relation
+
+A view has no constraints, so introspection finds no key for it. Declare one
+in the overlay when a column does identify its rows:
+
+```toml
+[tables.staff_bonuses]      # SELECT staff_id, sum(amount) … GROUP BY staff_id
+primary_key = ["staff_id"]
+```
+
+That gives the view `_by_pk`, and it decides how `order_by` through an object
+relation onto it renders. `staffs(order_by: {bonus: {total_amount: desc}})`
+is a `LEFT JOIN` when a primary key, unique constraint or unique index of the
+target covers the relation's mapping — the target is read once. Otherwise it
+is a correlated subquery per outer row, which never repeats a row whatever the
+data holds, but on an aggregate view evaluates the view once per row: with no
+index on the base table's mapped column, that is a scan of the base table per
+row. Either declare the key, or index the mapped column. The declared key is
+trusted, not checked: a `primary_key` that does not in fact identify the
+view's rows makes a join that repeats outer rows.
+
 ## Multiple schemas
 
 `Schema::introspect_schemas` reads several Postgres schemas into one GraphQL
