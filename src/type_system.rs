@@ -405,7 +405,7 @@ pub(crate) fn check_cmp(
     subject: &str,
 ) -> crate::error::Result<()> {
     if cmp_applies(op, pg) {
-        if dialect.supports_cmp(op) {
+        if dialect.supports_cmp(op, pg) {
             return Ok(());
         }
         return Err(crate::error::Error::Unsupported {
@@ -985,24 +985,26 @@ impl<'a> Builder<'a> {
     fn comparison_exp(&mut self, scalar: &str, pg: &ColumnType) {
         use crate::ast::{CmpOp, CmpOperand};
         let named = || TypeRef::named(scalar);
+        let dialect = self.schema.dialect();
+        // Published exactly where `check_cmp` would let it render.
+        let published = |op: CmpOp| cmp_applies(op, pg) && dialect.supports_cmp(op, pg);
         let mut fields = vec![InputValue::new("_is_null", TypeRef::named("Boolean"))];
-        if cmp_applies(crate::ast::CmpOp::Eq, pg) {
+        if published(CmpOp::Eq) {
             fields.push(InputValue::new("_eq", named()));
             fields.push(InputValue::new("_neq", named()));
             fields.push(InputValue::new("_in", named().non_null().list()));
             fields.push(InputValue::new("_nin", named().non_null().list()));
         }
-        if cmp_applies(crate::ast::CmpOp::Gt, pg) {
+        if published(CmpOp::Gt) {
             for op in ["_gt", "_gte", "_lt", "_lte"] {
                 fields.push(InputValue::new(op, named()));
             }
         }
-        if cmp_applies(crate::ast::CmpOp::Like, pg) {
+        if published(CmpOp::Like) {
             for op in ["_like", "_nlike", "_ilike", "_nilike"] {
                 fields.push(InputValue::new(op, named()));
             }
         }
-        let dialect = self.schema.dialect();
         for op in [
             CmpOp::Contains,
             CmpOp::ContainedIn,
@@ -1010,7 +1012,7 @@ impl<'a> Builder<'a> {
             CmpOp::HasKeysAny,
             CmpOp::HasKeysAll,
         ] {
-            if !cmp_applies(op, pg) || !dialect.supports_cmp(op) {
+            if !published(op) {
                 continue;
             }
             // The operand's own type, which for a key test is not the

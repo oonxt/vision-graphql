@@ -28,6 +28,20 @@ release commits; entries from 0.13.0 on are written as the work lands.
   containment over JSON, and an approximation would answer the hard cases
   wrongly without a sound.
 
+### Fixed
+
+- **On SQLite, `_eq` / `_neq` / `_in` / `_nin` on a `JSON` or `JSONB` column
+  compared text.** SQLite has no JSON type: the operand was bound as the
+  engine's serialisation and compared byte for byte with what was stored, and
+  `json()` / `jsonb()` keep key order, so `{"b": 2, "a": 1}` written by
+  anything but the engine never matched `{a: 1, b: 2}`, nor `1.0` matched
+  `1` — where PostgreSQL's `jsonb` calls both equal — and the answer was an
+  empty result, not an error. On SQLite a JSON column now publishes only
+  `_is_null`, and the others are refused as `UNSUPPORTED` from a document,
+  the builder and a scope policy. A SQLite schema's `__schema` and SDL lose
+  those four fields on its `json`/`jsonb` comparison inputs; PostgreSQL is
+  unchanged.
+
 ### Changed
 
 - **`order_by` through an object relation evaluated its target once per

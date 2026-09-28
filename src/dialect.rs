@@ -564,25 +564,36 @@ impl Dialect {
         }
     }
 
-    /// Whether the dialect implements a comparison operator at all, on the
-    /// types [`cmp_applies`](crate::type_system::cmp_applies) allows it on.
+    /// Whether the dialect implements a comparison operator on a type that
+    /// [`cmp_applies`](crate::type_system::cmp_applies) allows it on.
     ///
-    /// SQLite has no containment over JSON: `@>` recurses through objects and
-    /// arrays with rules of its own (an array contains a bare scalar it holds,
-    /// at the top level only), and an approximation that agrees on the easy
-    /// cases would answer the others wrongly without a sound. The key tests
-    /// go with it, so that the jsonb operators come and go as one family. The
-    /// type system publishes none of them there, and the renderer refuses
-    /// them from the builder.
-    pub(crate) fn supports_cmp(self, op: crate::ast::CmpOp) -> bool {
+    /// SQLite has no JSON type, only text and functions over it, and nothing
+    /// that compares two JSON values structurally:
+    ///
+    /// - `=` is text equality. `json()` normalises whitespace but keeps key
+    ///   order, and so does the binary `jsonb()`: `{"a":1,"b":2}` and
+    ///   `{"b":2,"a":1}` differ, as do `1.0` and `1`, where PostgreSQL's
+    ///   `jsonb` calls both pairs equal. `_eq`, `_neq`, `_in` and `_nin` on a
+    ///   JSON column would match when the stored text happens to be spelled
+    ///   as the engine spells the operand, and silently not otherwise.
+    /// - `@>` recurses through objects and arrays with rules of its own (an
+    ///   array contains a bare scalar it holds, at the top level only). The
+    ///   key tests go with it, so the jsonb operators come and go as one
+    ///   family.
+    ///
+    /// A structural comparison can be assembled from `json_tree`, at the cost
+    /// of expanding both sides per row and of matching PostgreSQL's edge
+    /// cases one by one; until that is done, none of these is published on
+    /// SQLite, and the renderer refuses each from the builder.
+    pub(crate) fn supports_cmp(self, op: crate::ast::CmpOp, ty: &ColumnType) -> bool {
         use crate::ast::CmpOp;
+        let json = matches!(ty, ColumnType::Json | ColumnType::Jsonb);
         match (self, op) {
             (Dialect::Postgres, _) => true,
+            (Dialect::Sqlite, CmpOp::Eq | CmpOp::Neq) => !json,
             (
                 Dialect::Sqlite,
-                CmpOp::Eq
-                | CmpOp::Neq
-                | CmpOp::Gt
+                CmpOp::Gt
                 | CmpOp::Gte
                 | CmpOp::Lt
                 | CmpOp::Lte
