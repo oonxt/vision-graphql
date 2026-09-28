@@ -920,3 +920,88 @@ async fn order_by_through_a_view_keyed_or_not() {
         );
     }
 }
+
+/// The case that asked for it: an application keeping its own bookkeeping
+/// table (a migration ledger) in the one namespace SQLite has. `sqlite_` is
+/// reserved, so no name keeps it out of introspection; `retain_tables` is how
+/// it leaves the schema — with the relation a user table has into it, and
+/// with nothing a request or a scope policy can still reach it through.
+#[tokio::test]
+async fn retain_tables_removes_a_table_and_every_way_into_it() {
+    const LEDGER: &str = r#"
+    CREATE TABLE _vision_schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT);
+    CREATE TABLE release_notes (
+        id INTEGER PRIMARY KEY,
+        version TEXT REFERENCES _vision_schema_migrations(version),
+        body TEXT
+    );
+    INSERT INTO _vision_schema_migrations VALUES ('0001', '2026-09-28');
+    INSERT INTO release_notes VALUES (1, '0001', 'first');
+    "#;
+    let pool = pool().await;
+    sqlx::raw_sql(LEDGER).execute(&pool).await.unwrap();
+
+    let before = Schema::introspect_sqlite(&pool).await.unwrap().build();
+    assert!(before.table("_vision_schema_migrations").is_some());
+    let (into_ledger, _) = before
+        .table("release_notes")
+        .unwrap()
+        .relations()
+        .find(|(_, r)| r.target_table == "_vision_schema_migrations")
+        .expect("the foreign key derives a relation into the ledger");
+    let into_ledger = into_ledger.clone();
+
+    let schema = Schema::introspect_sqlite(&pool)
+        .await
+        .unwrap()
+        .retain_tables(|t| t != "_vision_schema_migrations")
+        .build();
+    assert!(schema.table("_vision_schema_migrations").is_none());
+    let notes = schema.table("release_notes").unwrap();
+    assert!(
+        notes.find_relation(&into_ledger).is_none(),
+        "a relation into a removed table is removed with it"
+    );
+    assert!(notes.find_column("version").is_some(), "the column stays");
+
+    let sdl = vision_graphql::sdl::render(schema.type_system());
+    assert!(!sdl.contains("_vision_schema_migrations"), "{sdl}");
+
+    // A scope policy naming the table, or walking the relation into it, is a
+    // build error, not a rule that silently guards nothing.
+    let err = vision_graphql::ScopePolicy::from_toml(
+        r#"
+        [tables._vision_schema_migrations]
+        unrestricted = true
+        "#,
+        &schema,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown table"), "{err}");
+    let err = vision_graphql::ScopePolicy::from_toml(
+        &format!(
+            r#"
+            [tables.release_notes]
+            where = {{ {into_ledger} = {{ version = {{ _eq = "0001" }} }} }}
+            "#
+        ),
+        &schema,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains(&into_ledger), "{err}");
+
+    let e = Engine::new(pool, schema);
+    for doc in [
+        "{ _vision_schema_migrations { version } }".to_string(),
+        r#"mutation { insert__vision_schema_migrations(objects: [{version: "0002"}]) { affected_rows } }"#
+            .to_string(),
+        format!("{{ release_notes {{ id {into_ledger} {{ version }} }} }}"),
+        format!("{{ release_notes(where: {{{into_ledger}: {{version: {{_eq: \"0001\"}}}}}}) {{ id }} }}"),
+    ] {
+        assert!(e.query(&doc, None).await.is_err(), "{doc}");
+    }
+    assert_eq!(
+        q(&e, "{ release_notes { id version } }").await,
+        json!({"release_notes": [{"id": 1, "version": "0001"}]})
+    );
+}

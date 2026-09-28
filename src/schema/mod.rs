@@ -85,7 +85,7 @@ impl ColumnType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Column {
     pub exposed_name: String,
     pub physical_name: String,
@@ -151,7 +151,7 @@ impl RelationBuilder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Table {
     pub exposed_name: String,
     pub physical_schema: String,
@@ -313,6 +313,12 @@ impl Table {
         self.relation_order
             .iter()
             .filter_map(|n| self.relations_by_name.get_key_value(n))
+    }
+
+    pub(crate) fn retain_relations(&mut self, keep: impl Fn(&Relation) -> bool) {
+        self.relations_by_name.retain(|_, r| keep(r));
+        let by_name = &self.relations_by_name;
+        self.relation_order.retain(|n| by_name.contains_key(n));
     }
 
     pub(crate) fn columns_iter(&self) -> impl Iterator<Item = &Column> {
@@ -673,8 +679,33 @@ impl SchemaBuilder {
     /// For a caller that builds from introspection and then narrows — the CLI's
     /// `--include-tables` / `--ignore-tables`, or an application exposing one
     /// slice of a large database.
+    ///
+    /// A relation on a kept table that points at a removed one is removed
+    /// with it. Left behind, it would be unpublished — the type system only
+    /// publishes relations into published tables — yet still resolvable by
+    /// the typed builder and by scope templates, and fail there as an
+    /// "unknown table" the caller removed on purpose. Only relations into the
+    /// tables *this call* removed go: one naming a table not added yet may
+    /// still be completed by a later [`table`](Self::table).
     pub fn retain_tables(mut self, keep: impl Fn(&str) -> bool) -> Self {
-        self.tables.retain(|name, _| keep(name));
+        let removed: std::collections::HashSet<String> = self
+            .tables
+            .keys()
+            .filter(|name| !keep(name))
+            .cloned()
+            .collect();
+        if removed.is_empty() {
+            return self;
+        }
+        self.tables.retain(|name, _| !removed.contains(name));
+        for table in self.tables.values_mut() {
+            if table
+                .relations()
+                .any(|(_, r)| removed.contains(&r.target_table))
+            {
+                Arc::make_mut(table).retain_relations(|r| !removed.contains(&r.target_table));
+            }
+        }
         self
     }
 
@@ -750,6 +781,70 @@ mod tests {
         let posts = schema.table("posts").unwrap();
         let rel = posts.find_relation("user").unwrap();
         assert_eq!(rel.kind, RelKind::Object);
+    }
+
+    /// Removing a table removes the relations into it, and only those: the
+    /// kept tables' other relations stay, in their order.
+    #[test]
+    fn retain_tables_drops_relations_into_removed_tables() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .table(Table::new("tags", "public", "tags").column(
+                "post_id",
+                "post_id",
+                ColumnType::Int4,
+                false,
+            ))
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .relation("tags", Relation::array("tags").on([("id", "post_id")]))
+                    .relation("user", Relation::object("users").on([("user_id", "id")]))
+                    .relation(
+                        "tags_again",
+                        Relation::array("tags").on([("id", "post_id")]),
+                    ),
+            )
+            .retain_tables(|t| t != "users")
+            .build();
+        assert!(schema.table("users").is_none());
+        let names: Vec<&str> = schema
+            .table("posts")
+            .unwrap()
+            .relations()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["tags", "tags_again"]);
+    }
+
+    /// A relation whose target is not in the builder *yet* is not one this
+    /// call removed: a later `table` may still complete it.
+    #[test]
+    fn retain_tables_keeps_relations_into_tables_added_later() {
+        let schema = Schema::builder()
+            .table(
+                Table::new("posts", "public", "posts")
+                    .column("user_id", "user_id", ColumnType::Int4, false)
+                    .relation("user", Relation::object("users").on([("user_id", "id")])),
+            )
+            .table(Table::new("drafts", "public", "drafts"))
+            .retain_tables(|t| t != "drafts")
+            .table(
+                Table::new("users", "public", "users")
+                    .column("id", "id", ColumnType::Int4, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        assert!(schema
+            .table("posts")
+            .unwrap()
+            .find_relation("user")
+            .is_some());
     }
 
     /// The dictionary table from the field report: keyed by (serial, type),

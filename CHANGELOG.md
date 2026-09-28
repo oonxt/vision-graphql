@@ -3,6 +3,24 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **`SchemaBuilder::retain_tables` no longer leaves relations into the tables
+  it removes.** A relation on a kept table whose target was filtered out
+  stayed in the schema: unpublished, since SDL and `__schema` only publish
+  relations into published tables, but still resolvable by the typed builder
+  and by scope templates, where it failed as an `unknown table` the caller
+  had removed on purpose. It is now removed with its target. Only relations
+  into the tables that call removed are dropped, so one naming a table added
+  later with `table` is kept. A scope policy that names a removed table, or
+  walks a relation into one, is a build error, as for any unknown table.
+  This is how an application keeps its own table out of the schema — on
+  SQLite, where everything shares `main` and the reserved `sqlite_` prefix
+  cannot be used, it is the only way. `Table` and `Column` now implement
+  `Clone`.
+
 ## 0.25.0 — 2026-09-28
 
 ### Added
