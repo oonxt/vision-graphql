@@ -89,8 +89,24 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # And one MySQL, for the same reason; `tests/mysql_read.rs` takes a
+      # database of its own per test on it.
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: vg
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      MYSQL_TEST_URL: mysql://root:root@127.0.0.1:3306/vg
 
     steps:
       - uses: actions/checkout@v4

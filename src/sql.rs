@@ -2,7 +2,8 @@
 
 use crate::ast::{Count, Field, Operation, QueryArgs, RootField, Val};
 use crate::dialect::{
-    escape_string_literal, json_kind, pg_type_name, quote_ident, Dialect, JsonKind,
+    anonymise_placeholders, escape_string_literal, json_kind, pg_type_name, quote_ident, Dialect,
+    JsonKind, ORDER_NUMBER,
 };
 use crate::error::{Error, Result};
 use crate::plan::MutationPlan;
@@ -24,7 +25,7 @@ pub fn render(
     dialect: Dialect,
 ) -> Result<(String, Vec<BindSpec>)> {
     match render_any(op, schema, dialect)? {
-        Rendered::Statement { sql, specs } => Ok((sql, specs)),
+        Rendered::Statement { sql, specs, .. } => Ok((sql, specs)),
         Rendered::Plan(_) => Err(Error::Unsupported {
             message: format!(
                 "a mutation on {dialect:?} renders as a sequence of statements, not one; \
@@ -38,8 +39,199 @@ pub fn render(
 /// without data-modifying CTEs — a [`MutationPlan`] of several.
 #[derive(Debug, Clone)]
 pub enum Rendered {
-    Statement { sql: String, specs: Vec<BindSpec> },
+    Statement {
+        sql: String,
+        specs: Vec<BindSpec>,
+        /// The response's key order, for a dialect that
+        /// [reorders keys](Dialect::reorders_keys); `None` elsewhere.
+        keys: Option<KeyOrder>,
+    },
     Plan(Box<MutationPlan>),
+}
+
+/// The keys of a query's response, in the order the selection asked for
+/// them — for a dialect that [reorders them](Dialect::reorders_keys).
+///
+/// MySQL's `JSON_OBJECT` sorts an object's keys by length and then by name,
+/// so `{ name id }` comes back as `{"id": …, "name": …}` at every level. A
+/// GraphQL response is ordered as the selection is (the spec says so, and a
+/// client that reads the response as a list of pairs relies on it), so the
+/// engine walks the decoded value once and puts each object back in this
+/// order. What the selection does not shape — a JSON column, a path read —
+/// is data and is left alone.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyOrder {
+    /// A value to leave as it is: a scalar, a JSON column, a path read.
+    Any,
+    /// An object with these keys in this order, or null.
+    Object(Vec<(String, KeyOrder)>),
+    /// A list whose every element has this shape.
+    List(Box<KeyOrder>),
+}
+
+impl KeyOrder {
+    /// Put every object under `value` in this order, in place.
+    pub fn apply(&self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match (self, value) {
+            (KeyOrder::Any, _) => {}
+            (KeyOrder::Object(keys), Value::Object(map)) => {
+                let mut ordered = serde_json::Map::with_capacity(map.len());
+                for (key, order) in keys {
+                    if let Some(mut v) = map.remove(key) {
+                        order.apply(&mut v);
+                        ordered.insert(key.clone(), v);
+                    }
+                }
+                // Nothing should be left — every key came from the selection
+                // — but a key this cannot account for is kept, not lost.
+                for (k, v) in std::mem::take(map) {
+                    ordered.insert(k, v);
+                }
+                *map = ordered;
+            }
+            (KeyOrder::List(inner), Value::Array(items)) => {
+                for item in items {
+                    inner.apply(item);
+                }
+            }
+            // Null where an object or a list was possible; or a shape the
+            // value does not have, which is not this walk's business.
+            _ => {}
+        }
+    }
+}
+
+/// The [`KeyOrder`] of a query's response.
+fn key_order_of_query(roots: &[RootField], schema: &Schema) -> KeyOrder {
+    KeyOrder::Object(
+        roots
+            .iter()
+            .map(|root| {
+                let table = schema.table(&root.table);
+                let order = match (&root.body, table) {
+                    (crate::ast::RootBody::Introspection(_), _) | (_, None) => KeyOrder::Any,
+                    (crate::ast::RootBody::List { selection }, Some(t)) => {
+                        KeyOrder::List(Box::new(key_order_of_fields(selection, t, schema)))
+                    }
+                    (crate::ast::RootBody::ByPk { selection, .. }, Some(t)) => {
+                        key_order_of_fields(selection, t, schema)
+                    }
+                    (
+                        crate::ast::RootBody::Aggregate {
+                            ops,
+                            nodes,
+                            typenames,
+                            ..
+                        },
+                        Some(t),
+                    ) => key_order_of_aggregate(ops, nodes.as_deref(), typenames, t, schema),
+                };
+                (root.alias.clone(), order)
+            })
+            .collect(),
+    )
+}
+
+/// The [`KeyOrder`] of a row selection: the fields in order, a relation
+/// under its own shape.
+pub(crate) fn key_order_of_fields(selection: &[Field], table: &Table, schema: &Schema) -> KeyOrder {
+    KeyOrder::Object(
+        selection
+            .iter()
+            .map(|f| match f {
+                Field::Column { alias, .. }
+                | Field::JsonPath { alias, .. }
+                | Field::Typename { alias } => (alias.clone(), KeyOrder::Any),
+                Field::Relation {
+                    name,
+                    alias,
+                    selection,
+                    ..
+                } => {
+                    let order = match table
+                        .find_relation(name)
+                        .and_then(|rel| schema.table(&rel.target_table).map(|t| (rel, t)))
+                    {
+                        Some((rel, target)) => {
+                            let rows = key_order_of_fields(selection, target, schema);
+                            match rel.kind {
+                                crate::schema::RelKind::Array => KeyOrder::List(Box::new(rows)),
+                                crate::schema::RelKind::Object => rows,
+                            }
+                        }
+                        // Refused by the renderer; nothing to order.
+                        None => KeyOrder::Any,
+                    };
+                    (alias.clone(), order)
+                }
+                Field::RelationAggregate {
+                    name,
+                    alias,
+                    ops,
+                    nodes,
+                    typenames,
+                    ..
+                } => {
+                    let order = match table
+                        .find_relation(name)
+                        .and_then(|rel| schema.table(&rel.target_table))
+                    {
+                        Some(target) => {
+                            key_order_of_aggregate(ops, nodes.as_deref(), typenames, target, schema)
+                        }
+                        None => KeyOrder::Any,
+                    };
+                    (alias.clone(), order)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The [`KeyOrder`] of an `_aggregate` answer: the type names, then
+/// `aggregate` with its operations, then `nodes` — the order
+/// `render_aggregate_object` writes them in.
+fn key_order_of_aggregate(
+    ops: &[crate::ast::AggSelect],
+    nodes: Option<&[Field]>,
+    typenames: &[String],
+    table: &Table,
+    schema: &Schema,
+) -> KeyOrder {
+    use crate::ast::{AggField, AggOp};
+    let mut keys: Vec<(String, KeyOrder)> = typenames
+        .iter()
+        .map(|t| (t.clone(), KeyOrder::Any))
+        .collect();
+    if !ops.is_empty() {
+        let aggregate = ops
+            .iter()
+            .map(|sel| {
+                let order = match &sel.op {
+                    AggOp::Count { .. } | AggOp::Typename => KeyOrder::Any,
+                    AggOp::Func { fields, .. } => KeyOrder::Object(
+                        fields
+                            .iter()
+                            .map(|f| match f {
+                                AggField::Column(c) => (c.alias.clone(), KeyOrder::Any),
+                                AggField::Typename { alias } => (alias.clone(), KeyOrder::Any),
+                            })
+                            .collect(),
+                    ),
+                };
+                (sel.alias.clone(), order)
+            })
+            .collect();
+        keys.push(("aggregate".into(), KeyOrder::Object(aggregate)));
+    }
+    if let Some(fields) = nodes {
+        keys.push((
+            "nodes".into(),
+            KeyOrder::List(Box::new(key_order_of_fields(fields, table, schema))),
+        ));
+    }
+    KeyOrder::Object(keys)
 }
 
 impl Rendered {
@@ -65,8 +257,21 @@ impl Rendered {
 /// as a [`Rendered::Plan`] — see [`crate::plan`].
 pub fn render_any(op: &Operation, schema: &Schema, dialect: Dialect) -> Result<Rendered> {
     let mut ctx = RenderCtx::new(dialect);
+    let mut keys = None;
     match op {
-        Operation::Query(roots) => render_query(roots, schema, &mut ctx)?,
+        Operation::Query(roots) => {
+            render_query(roots, schema, &mut ctx)?;
+            if dialect.reorders_keys() {
+                keys = Some(key_order_of_query(roots, schema));
+            }
+        }
+        // Refused here, before a plan renders one dialect's spelling for a
+        // database that would run some of it.
+        Operation::Mutation(_) if !dialect.supports_mutations() => {
+            return Err(Error::Unsupported {
+                message: format!("mutations are not available on {dialect:?}"),
+            });
+        }
         Operation::Mutation(fields) if dialect.mutations_by_plan() => {
             use crate::ast::MutationField;
             crate::ast::ensure_unique_root_aliases(fields.iter().map(MutationField::alias))?;
@@ -77,10 +282,12 @@ pub fn render_any(op: &Operation, schema: &Schema, dialect: Dialect) -> Result<R
         }
         Operation::Mutation(fields) => render_mutation(fields, schema, &mut ctx)?,
     }
-    Ok(Rendered::Statement {
-        sql: ctx.sql,
-        specs: ctx.binds,
-    })
+    let (sql, specs) = if dialect.anonymous_placeholders() {
+        anonymise_placeholders(&ctx.sql, &ctx.binds)
+    } else {
+        (ctx.sql, ctx.binds)
+    };
+    Ok(Rendered::Statement { sql, specs, keys })
 }
 
 /// Render and immediately resolve every parameter against `inputs`.
@@ -226,7 +433,12 @@ fn render_query(roots: &[RootField], schema: &Schema, ctx: &mut RenderCtx) -> Re
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        write!(ctx.sql, "'{}', ", escape_string_literal(&root.alias)).unwrap();
+        write!(
+            ctx.sql,
+            "'{}', ",
+            escape_string_literal(&root.alias, ctx.dialect)
+        )
+        .unwrap();
         render_root(root, schema, ctx)?;
     }
     ctx.sql.push_str(") AS result");
@@ -290,10 +502,30 @@ fn render_list(
     )
     .unwrap();
     render_inner_select(root, selection, table, &inner_alias, schema, ctx)?;
-    ctx.sql.push_str(") ");
-    ctx.sql.push_str(&row_alias);
-    ctx.sql.push(')');
+    write!(ctx.sql, "{}", ctx.dialect.rows_list_close(&row_alias)).unwrap();
     Ok(())
+}
+
+/// Give the derived table whose select list ends at `select_end` its
+/// [`ORDER_NUMBER`] column: the row's position under `order_by`, the
+/// `ORDER BY` text the table was just rendered with. For a dialect that
+/// [numbers rows](Dialect::numbers_rows_for_order); a no-op elsewhere.
+///
+/// The text is copied, binds and all: the placeholders in it are numbered,
+/// so the copy binds the same parameters — which is what
+/// [`anonymise_placeholders`] undoes last. Inserted after the fact because
+/// the `ORDER BY` is only known once the joins and the `WHERE` before it
+/// have been rendered, and the binds must be pushed in the order the text
+/// first mentions them.
+fn number_rows(select_end: usize, order_by: &str, ctx: &mut RenderCtx) {
+    if !ctx.dialect.numbers_rows_for_order() {
+        return;
+    }
+    let window = order_by.strip_prefix(' ').unwrap_or(order_by);
+    ctx.sql.insert_str(
+        select_end,
+        &format!(", ROW_NUMBER() OVER ({window}) AS {ORDER_NUMBER}"),
+    );
 }
 
 /// The response keys a row selection produces, with what each holds — the
@@ -383,8 +615,8 @@ fn render_inner_select(
                 write!(
                     ctx.sql,
                     "{table_alias}.{} AS {}",
-                    quote_ident(&col.physical_name),
-                    quote_ident(alias)
+                    quote_ident(&col.physical_name, ctx.dialect),
+                    quote_ident(alias, ctx.dialect)
                 )
                 .unwrap();
             }
@@ -399,7 +631,7 @@ fn render_inner_select(
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(table_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, "{expr} AS {}", quote_ident(alias)).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(alias, ctx.dialect)).unwrap();
             }
             Field::Relation {
                 name,
@@ -445,6 +677,7 @@ fn render_inner_select(
             }
         }
     }
+    let select_end = ctx.sql.len();
     if windowed {
         // No `DISTINCT ON`: number the rows within each distinct group in
         // the order asked for and keep the first. The derived table carries
@@ -469,8 +702,8 @@ fn render_inner_select(
         write!(
             ctx.sql,
             ") AS {DISTINCT_ROW_NUMBER} FROM {}.{} {table_alias}",
-            quote_ident(&table.physical_schema),
-            quote_ident(&table.physical_name),
+            quote_ident(&table.physical_schema, ctx.dialect),
+            quote_ident(&table.physical_name, ctx.dialect),
         )
         .unwrap();
         render_where(&root.args, table, table_alias, schema, ctx)?;
@@ -480,12 +713,13 @@ fn render_inner_select(
         )
         .unwrap();
         ctx.sql.push_str(&order_by);
+        number_rows(select_end, &order_by, ctx);
     } else {
         write!(
             ctx.sql,
             " FROM {}.{} {table_alias}",
-            quote_ident(&table.physical_schema),
-            quote_ident(&table.physical_name),
+            quote_ident(&table.physical_schema, ctx.dialect),
+            quote_ident(&table.physical_name, ctx.dialect),
         )
         .unwrap();
         let joins = render_order_joins(
@@ -497,15 +731,19 @@ fn render_inner_select(
             ctx,
         )?;
         render_where(&root.args, table, table_alias, schema, ctx)?;
+        let ob_start = ctx.sql.len();
         render_order_by(&root.args, &joins, table, table_alias, schema, ctx)?;
+        let order_by = ctx.sql[ob_start..].to_string();
+        number_rows(select_end, &order_by, ctx);
     }
     render_limit_offset(&root.args, &root.alias, ctx);
     Ok(())
 }
 
-/// The column the window form of `distinct_on` numbers rows by. Quoted and
-/// prefixed so it cannot be a column of the table.
-const DISTINCT_ROW_NUMBER: &str = "\"__vision_graphql_rn\"";
+/// The column the window form of `distinct_on` numbers rows by. Prefixed so
+/// it cannot be a column of the table; unquoted, so it is spelled the same
+/// whatever the dialect quotes identifiers with.
+const DISTINCT_ROW_NUMBER: &str = "__vision_graphql_rn";
 
 /// The `distinct_on` columns, comma-separated and qualified.
 fn render_distinct_on_columns(
@@ -526,7 +764,12 @@ fn render_distinct_on_columns(
         check_distinct_applies(col, ctx.dialect, || {
             format!("{path}.distinct_on.{col_name}")
         })?;
-        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+        write!(
+            ctx.sql,
+            "{table_alias}.{}",
+            quote_ident(&col.physical_name, ctx.dialect)
+        )
+        .unwrap();
     }
     Ok(())
 }
@@ -649,7 +892,10 @@ pub(crate) fn render_bool_expr(
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             check_cmp_applies(*op, col, ctx.dialect)?;
-            let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+            let lhs = format!(
+                "{table_alias}.{}",
+                quote_ident(&col.physical_name, ctx.dialect)
+            );
             render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
@@ -674,7 +920,10 @@ pub(crate) fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let qualified = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+            let qualified = format!(
+                "{table_alias}.{}",
+                quote_ident(&col.physical_name, ctx.dialect)
+            );
             render_is_null(&qualified, column, is_null, ctx)
         }
         BoolExpr::InList {
@@ -692,7 +941,10 @@ pub(crate) fn render_bool_expr(
                 return Ok(());
             }
             let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
-            let lhs = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+            let lhs = format!(
+                "{table_alias}.{}",
+                quote_ident(&col.physical_name, ctx.dialect)
+            );
             write!(
                 ctx.sql,
                 "{}",
@@ -717,8 +969,8 @@ pub(crate) fn render_bool_expr(
             write!(
                 ctx.sql,
                 "{}.{} {remote_alias}",
-                quote_ident(&target.physical_schema),
-                quote_ident(&target.physical_name),
+                quote_ident(&target.physical_schema, ctx.dialect),
+                quote_ident(&target.physical_name, ctx.dialect),
             )
             .unwrap();
             ctx.sql.push_str(" WHERE ");
@@ -741,8 +993,8 @@ pub(crate) fn render_bool_expr(
                 write!(
                     ctx.sql,
                     "{remote_alias}.{} = {table_alias}.{}",
-                    quote_ident(&r.physical_name),
-                    quote_ident(&l.physical_name),
+                    quote_ident(&r.physical_name, ctx.dialect),
+                    quote_ident(&l.physical_name, ctx.dialect),
                 )
                 .unwrap();
             }
@@ -853,8 +1105,8 @@ fn render_relation_subquery(
                 write!(
                     ctx.sql,
                     "{remote_alias}.{} AS {}",
-                    quote_ident(&col.physical_name),
-                    quote_ident(fa)
+                    quote_ident(&col.physical_name, ctx.dialect),
+                    quote_ident(fa, ctx.dialect)
                 )
                 .unwrap();
             }
@@ -869,7 +1121,7 @@ fn render_relation_subquery(
                 })?;
                 let err_path = format!("{parent_path}.{alias}.{fa}");
                 let expr = render_json_path_expr(&remote_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, "{expr} AS {}", quote_ident(fa)).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(fa, ctx.dialect)).unwrap();
             }
             Field::Relation {
                 name: cname,
@@ -915,6 +1167,7 @@ fn render_relation_subquery(
             }
         }
     }
+    let select_end = ctx.sql.len();
     let visible_cte = match (
         ctx.inserted_ctes.get(&rel.target_table),
         ctx.current_mutation_cte.as_deref(),
@@ -931,8 +1184,8 @@ fn render_relation_subquery(
         Some(cte_alias) => cte_alias,
         None => format!(
             "{}.{}",
-            quote_ident(&target.physical_schema),
-            quote_ident(&target.physical_name)
+            quote_ident(&target.physical_schema, ctx.dialect),
+            quote_ident(&target.physical_name, ctx.dialect)
         ),
     };
     let ob_path = format!("{rel_path}.order_by");
@@ -974,6 +1227,7 @@ fn render_relation_subquery(
         )
         .unwrap();
         ctx.sql.push_str(&order_by);
+        number_rows(select_end, &order_by, ctx);
     } else {
         write!(ctx.sql, " FROM {source} {remote_alias}").unwrap();
         let joins =
@@ -989,15 +1243,21 @@ fn render_relation_subquery(
             &rel_path,
             ctx,
         )?;
+        let ob_start = ctx.sql.len();
         render_relation_order_by(args, &joins, target, &remote_alias, schema, &ob_path, ctx)?;
+        let order_by = ctx.sql[ob_start..].to_string();
+        // One row needs no numbering.
+        if matches!(rel.kind, crate::schema::RelKind::Array) {
+            number_rows(select_end, &order_by, ctx);
+        }
     }
 
     if let Some(limit) = args.limit.as_ref() {
         render_count(limit, "LIMIT", &format!("{parent_path}.{alias}.limit"), ctx);
     } else if matches!(rel.kind, crate::schema::RelKind::Object) {
         ctx.sql.push_str(" LIMIT 1");
-    } else if args.offset.is_some() && ctx.dialect.offset_needs_limit() {
-        ctx.sql.push_str(" LIMIT -1");
+    } else if let (true, Some(no_limit)) = (args.offset.is_some(), ctx.dialect.no_limit()) {
+        write!(ctx.sql, " LIMIT {no_limit}").unwrap();
     }
     if let Some(offset) = args.offset.as_ref() {
         render_count(
@@ -1008,9 +1268,14 @@ fn render_relation_subquery(
         );
     }
 
-    ctx.sql.push_str(") ");
-    ctx.sql.push_str(&row_alias);
-    ctx.sql.push(')');
+    match rel.kind {
+        crate::schema::RelKind::Array => {
+            write!(ctx.sql, "{}", ctx.dialect.rows_list_close(&row_alias)).unwrap();
+        }
+        crate::schema::RelKind::Object => {
+            write!(ctx.sql, ") {row_alias})").unwrap();
+        }
+    }
 
     Ok(())
 }
@@ -1055,8 +1320,8 @@ fn render_relation_where(
         write!(
             ctx.sql,
             "{remote_alias}.{} = {parent_alias}.{}",
-            quote_ident(&r.physical_name),
-            quote_ident(&l.physical_name),
+            quote_ident(&r.physical_name, ctx.dialect),
+            quote_ident(&l.physical_name, ctx.dialect),
         )
         .unwrap();
     }
@@ -1095,9 +1360,33 @@ fn render_relation_order_by(
         if i > 0 {
             ctx.sql.push_str(", ");
         }
-        render_order_by_expr(ob, joined, target, remote_alias, schema, ob_path, ctx)?;
-        render_order_dir(ob, ctx);
+        render_order_term(ob, joined, target, remote_alias, schema, ob_path, ctx)?;
     }
+    Ok(())
+}
+
+/// One `ORDER BY` term: the expression, then its direction and null order
+/// in the dialect's spelling. The expression is rendered into place and
+/// then handed to the dialect as text, because MySQL has to repeat it
+/// (`expr IS NULL, expr`) — and re-rendering it would push its binds twice.
+fn render_order_term(
+    ob: &crate::ast::OrderBy,
+    joined: Option<&str>,
+    table: &Table,
+    table_alias: &str,
+    schema: &Schema,
+    path_ctx: &str,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let start = ctx.sql.len();
+    render_order_by_expr(ob, joined, table, table_alias, schema, path_ctx, ctx)?;
+    let expr = ctx.sql.split_off(start);
+    write!(
+        ctx.sql,
+        "{}",
+        ctx.dialect.order_term(&expr, ob.direction, ob.nulls)
+    )
+    .unwrap();
     Ok(())
 }
 
@@ -1131,7 +1420,7 @@ fn render_relation_aggregate_field(
         parent_path,
         ctx,
     )?;
-    write!(ctx.sql, " AS {}", quote_ident(alias)).unwrap();
+    write!(ctx.sql, " AS {}", quote_ident(alias, ctx.dialect)).unwrap();
     Ok(())
 }
 
@@ -1158,17 +1447,8 @@ fn render_relation_field(
         parent_path,
         ctx,
     )?;
-    write!(ctx.sql, " AS {}", quote_ident(alias)).unwrap();
+    write!(ctx.sql, " AS {}", quote_ident(alias, ctx.dialect)).unwrap();
     Ok(())
-}
-
-/// `ASC` / `DESC`, plus an explicit `NULLS FIRST|LAST` when the caller asked for
-/// one. Omitting it leaves PostgreSQL's default, which is asymmetric:
-/// `ASC` sorts NULLs last, `DESC` sorts them first — so `DESC NULLS LAST` has to
-/// be requested, it is not what plain `desc` gives you.
-fn render_order_dir(ob: &crate::ast::OrderBy, ctx: &mut RenderCtx) {
-    ctx.sql
-        .push_str(ctx.dialect.order_dir(ob.direction, ob.nulls));
 }
 
 /// One object-relation hop of an `order_by` path, resolved.
@@ -1230,8 +1510,8 @@ fn walk_order_path<'a>(
             })?;
             conds.push(format!(
                 "{a}.{} = {cur_alias}.{}",
-                quote_ident(&rcol.physical_name),
-                quote_ident(&lcol.physical_name)
+                quote_ident(&rcol.physical_name, ctx.dialect),
+                quote_ident(&lcol.physical_name, ctx.dialect)
             ));
         }
 
@@ -1240,8 +1520,8 @@ fn walk_order_path<'a>(
             target,
             qualified: format!(
                 "{}.{}",
-                quote_ident(&target.physical_schema),
-                quote_ident(&target.physical_name)
+                quote_ident(&target.physical_schema, ctx.dialect),
+                quote_ident(&target.physical_name, ctx.dialect)
             ),
             conds,
             filter: hop.filter.as_ref(),
@@ -1322,7 +1602,7 @@ fn render_order_joins(
         out.push(Some(format!(
             "{}.{}",
             leaf.alias,
-            quote_ident(&col.physical_name)
+            quote_ident(&col.physical_name, ctx.dialect)
         )));
     }
     Ok(out)
@@ -1377,7 +1657,12 @@ fn render_order_by_expr(
                 path: format!("{path_ctx}.{}", ob.column),
                 message: format!("unknown column '{}' on '{}'", ob.column, table.exposed_name),
             })?;
-        write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+        write!(
+            ctx.sql,
+            "{table_alias}.{}",
+            quote_ident(&col.physical_name, ctx.dialect)
+        )
+        .unwrap();
         return Ok(());
     }
 
@@ -1393,7 +1678,7 @@ fn render_order_by_expr(
         ctx.sql,
         "(SELECT {}.{} FROM {} AS {}",
         leaf.alias,
-        quote_ident(&col.physical_name),
+        quote_ident(&col.physical_name, ctx.dialect),
         first.qualified,
         first.alias
     )
@@ -1452,8 +1737,8 @@ fn render_order_by(
 fn render_limit_offset(args: &QueryArgs, path: &str, ctx: &mut RenderCtx) {
     if let Some(limit) = args.limit.as_ref() {
         render_count(limit, "LIMIT", &format!("{path}.limit"), ctx);
-    } else if args.offset.is_some() && ctx.dialect.offset_needs_limit() {
-        ctx.sql.push_str(" LIMIT -1");
+    } else if let (true, Some(no_limit)) = (args.offset.is_some(), ctx.dialect.no_limit()) {
+        write!(ctx.sql, " LIMIT {no_limit}").unwrap();
     }
     if let Some(offset) = args.offset.as_ref() {
         render_count(offset, "OFFSET", &format!("{path}.offset"), ctx);
@@ -1556,8 +1841,8 @@ fn render_optional(
         None => {}
     }
     let qualified = match alias {
-        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name)),
-        None => quote_ident(&col.physical_name),
+        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name, ctx.dialect)),
+        None => quote_ident(&col.physical_name, ctx.dialect),
     };
     let path = || format!("where.{column}");
     match inner {
@@ -1766,7 +2051,10 @@ fn render_json_path_expr(
         });
     }
     let n = ctx.push_fixed(ctx.dialect.json_path_bind(path));
-    let col_sql = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+    let col_sql = format!(
+        "{table_alias}.{}",
+        quote_ident(&col.physical_name, ctx.dialect)
+    );
     let expr = ctx.dialect.json_path(&col_sql, n).to_string();
     Ok(expr)
 }
@@ -1781,7 +2069,7 @@ fn render_response_typenames(names: &[String], table: &Table, ctx: &mut RenderCt
         write!(
             ctx.sql,
             ", '{}', {}",
-            escape_string_literal(alias),
+            escape_string_literal(alias, ctx.dialect),
             ctx.dialect
                 .text_literal(&crate::type_names::mutation_response(table))
         )
@@ -1794,7 +2082,7 @@ fn render_typename_select(table: &Table, alias: &str, ctx: &mut RenderCtx) {
         ctx.sql,
         "{} AS {}",
         ctx.dialect.text_literal(crate::type_names::row(table)),
-        quote_ident(alias)
+        quote_ident(alias, ctx.dialect)
     )
     .unwrap();
 }
@@ -1832,8 +2120,8 @@ fn render_by_pk(
                 write!(
                     ctx.sql,
                     "{inner_alias}.{} AS {}",
-                    quote_ident(&col.physical_name),
-                    quote_ident(alias)
+                    quote_ident(&col.physical_name, ctx.dialect),
+                    quote_ident(alias, ctx.dialect)
                 )
                 .unwrap();
             }
@@ -1848,7 +2136,7 @@ fn render_by_pk(
                 })?;
                 let err_path = format!("{}.{}", root.alias, alias);
                 let expr = render_json_path_expr(&inner_alias, col, path, &err_path, ctx)?;
-                write!(ctx.sql, "{expr} AS {}", quote_ident(alias)).unwrap();
+                write!(ctx.sql, "{expr} AS {}", quote_ident(alias, ctx.dialect)).unwrap();
             }
             Field::Relation {
                 name,
@@ -1897,8 +2185,8 @@ fn render_by_pk(
     write!(
         ctx.sql,
         " FROM {}.{} {inner_alias} WHERE ",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
     for (i, (col_name, value)) in pk.iter().enumerate() {
@@ -1914,7 +2202,7 @@ fn render_by_pk(
         write!(
             ctx.sql,
             "{inner_alias}.{} = {ph}",
-            quote_ident(&col.physical_name)
+            quote_ident(&col.physical_name, ctx.dialect)
         )
         .unwrap();
     }
@@ -2186,8 +2474,8 @@ fn render_insert_cte_recursive(
         write!(
             ctx.sql,
             "{cte} AS (SELECT * FROM {}.{} WHERE FALSE)",
-            quote_ident(&table.physical_schema),
-            quote_ident(&table.physical_name),
+            quote_ident(&table.physical_schema, ctx.dialect),
+            quote_ident(&table.physical_name, ctx.dialect),
         )
         .unwrap();
         ctx.inserted_ctes
@@ -2301,7 +2589,7 @@ fn render_insert_cte_recursive(
     }
     write!(ctx.sql, ") AS t({ord_col_name}").unwrap();
     for exposed in &cols {
-        write!(ctx.sql, ", {}", quote_ident(exposed)).unwrap();
+        write!(ctx.sql, ", {}", quote_ident(exposed, ctx.dialect)).unwrap();
     }
     ctx.sql.push_str(")), ");
 
@@ -2311,8 +2599,8 @@ fn render_insert_cte_recursive(
     write!(
         ctx.sql,
         "{cte} AS (INSERT INTO {}.{} (",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
 
@@ -2323,7 +2611,8 @@ fn render_insert_cte_recursive(
         }
         first = false;
         let col = table.find_column(exposed).unwrap();
-        ctx.sql.push_str(&quote_ident(&col.physical_name));
+        ctx.sql
+            .push_str(&quote_ident(&col.physical_name, ctx.dialect));
     }
     // FK columns from parent_link (Phase 2's array-child case).
     if let Some((_, rel, _)) = parent_link {
@@ -2341,7 +2630,8 @@ fn render_insert_cte_recursive(
                         table.exposed_name
                     ),
                 })?;
-            ctx.sql.push_str(&quote_ident(&col.physical_name));
+            ctx.sql
+                .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
     }
     // FK columns from object relations (Phase 3A).
@@ -2361,7 +2651,8 @@ fn render_insert_cte_recursive(
                         table.exposed_name
                     ),
                 })?;
-            ctx.sql.push_str(&quote_ident(&col.physical_name));
+            ctx.sql
+                .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
     }
     ctx.sql.push(')');
@@ -2374,7 +2665,7 @@ fn render_insert_cte_recursive(
             ctx.sql.push_str(", ");
         }
         first_sel = false;
-        write!(ctx.sql, "c.{}", quote_ident(exposed)).unwrap();
+        write!(ctx.sql, "c.{}", quote_ident(exposed, ctx.dialect)).unwrap();
     }
     // FK from parent_link (array-child case).
     if let Some((_, rel, parent_table)) = parent_link {
@@ -2392,7 +2683,12 @@ fn render_insert_cte_recursive(
                         parent_table.exposed_name
                     ),
                 })?;
-            write!(ctx.sql, "p.{}", quote_ident(&pcol.physical_name)).unwrap();
+            write!(
+                ctx.sql,
+                "p.{}",
+                quote_ident(&pcol.physical_name, ctx.dialect)
+            )
+            .unwrap();
         }
     }
     // FK from each object relation (Phase 3A). Alias for each object-ord join
@@ -2419,7 +2715,12 @@ fn render_insert_cte_recursive(
                         obj_target.exposed_name
                     ),
                 })?;
-            write!(ctx.sql, "o_{rel_name}.{}", quote_ident(&tcol.physical_name)).unwrap();
+            write!(
+                ctx.sql,
+                "o_{rel_name}.{}",
+                quote_ident(&tcol.physical_name, ctx.dialect)
+            )
+            .unwrap();
         }
     }
 
@@ -2547,7 +2848,7 @@ fn render_on_conflict(
     write!(
         ctx.sql,
         " ON CONFLICT ON CONSTRAINT {} ",
-        quote_ident(&oc.constraint)
+        quote_ident(&oc.constraint, ctx.dialect)
     )
     .unwrap();
     if oc.update_columns.is_empty() {
@@ -2577,8 +2878,8 @@ fn render_on_conflict(
             write!(
                 ctx.sql,
                 "DO UPDATE SET {pk_phys} = {tbl}.{pk_phys}",
-                pk_phys = quote_ident(&pk_col.physical_name),
-                tbl = quote_ident(&table.physical_name),
+                pk_phys = quote_ident(&pk_col.physical_name, ctx.dialect),
+                tbl = quote_ident(&table.physical_name, ctx.dialect),
             )
             .unwrap();
         } else {
@@ -2597,8 +2898,8 @@ fn render_on_conflict(
             write!(
                 ctx.sql,
                 "{} = EXCLUDED.{}",
-                quote_ident(&col.physical_name),
-                quote_ident(&col.physical_name),
+                quote_ident(&col.physical_name, ctx.dialect),
+                quote_ident(&col.physical_name, ctx.dialect),
             )
             .unwrap();
         }
@@ -2610,7 +2911,7 @@ fn render_on_conflict(
         // post-image.) Columns are qualified with the target table's name: the
         // insert's `INSERT … SELECT … FROM c` keeps the source relation `c` (and
         // `excluded`) in scope here, so a bare column would be ambiguous.
-        let tref = quote_ident(&table.physical_name);
+        let tref = quote_ident(&table.physical_name, ctx.dialect);
         match (oc.where_.as_ref(), scope_check) {
             (Some(user), Some(scope)) => {
                 ctx.sql.push_str(" WHERE (");
@@ -2649,8 +2950,8 @@ fn render_update_cte(
     write!(
         ctx.sql,
         "{cte} AS (UPDATE {}.{} SET ",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
     render_set_clause(table, set, cte, ctx)?;
@@ -2679,8 +2980,8 @@ fn render_update_by_pk_cte(
     write!(
         ctx.sql,
         "{cte} AS (UPDATE {}.{} SET ",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
     render_set_clause(table, set, cte, ctx)?;
@@ -2707,8 +3008,8 @@ fn render_delete_cte(
     write!(
         ctx.sql,
         "{cte} AS (DELETE FROM {}.{} WHERE ",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
     render_bool_expr_no_alias(where_, table, schema, ctx)?;
@@ -2731,8 +3032,8 @@ fn render_delete_by_pk_cte(
     write!(
         ctx.sql,
         "{cte} AS (DELETE FROM {}.{} WHERE ",
-        quote_ident(&table.physical_schema),
-        quote_ident(&table.physical_name),
+        quote_ident(&table.physical_schema, ctx.dialect),
+        quote_ident(&table.physical_name, ctx.dialect),
     )
     .unwrap();
     render_pk_predicate(table, pk, scope, cte, None, schema, ctx)?;
@@ -2760,7 +3061,7 @@ pub(crate) fn render_set_clause(
         write!(
             ctx.sql,
             "{} = {}",
-            quote_ident(&col.physical_name),
+            quote_ident(&col.physical_name, ctx.dialect),
             ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
@@ -2796,7 +3097,7 @@ pub(crate) fn render_pk_predicate(
         write!(
             ctx.sql,
             "{} = {}",
-            quote_ident(&col.physical_name),
+            quote_ident(&col.physical_name, ctx.dialect),
             ctx.dialect.param(n, &col.ty)
         )
         .unwrap();
@@ -2844,7 +3145,7 @@ fn render_mutation_output_for_inner(
                 path: alias.clone(),
                 message: format!("unknown table '{table}'"),
             })?;
-            write!(ctx.sql, "'{}', ", escape_string_literal(alias)).unwrap();
+            write!(ctx.sql, "'{}', ", escape_string_literal(alias, ctx.dialect)).unwrap();
             if *one {
                 ctx.sql.push_str("(SELECT ");
                 if returning.is_empty() {
@@ -2911,7 +3212,7 @@ fn render_mutation_output_for_inner(
             write!(
                 ctx.sql,
                 "'{}', {}",
-                escape_string_literal(alias),
+                escape_string_literal(alias, ctx.dialect),
                 ctx.dialect.json_object_open()
             )
             .unwrap();
@@ -2941,7 +3242,12 @@ fn render_mutation_output_for_inner(
                 path: alias.clone(),
                 message: format!("unknown table '{table}'"),
             })?;
-            write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
+            write!(
+                ctx.sql,
+                "'{}', (SELECT ",
+                escape_string_literal(alias, ctx.dialect)
+            )
+            .unwrap();
             if selection.is_empty() {
                 ctx.sql.push_str(ctx.dialect.empty_json_object());
             } else {
@@ -2963,7 +3269,7 @@ fn render_mutation_output_for_inner(
             write!(
                 ctx.sql,
                 "'{}', {}",
-                escape_string_literal(alias),
+                escape_string_literal(alias, ctx.dialect),
                 ctx.dialect.json_object_open()
             )
             .unwrap();
@@ -2993,7 +3299,12 @@ fn render_mutation_output_for_inner(
                 path: alias.clone(),
                 message: format!("unknown table '{table}'"),
             })?;
-            write!(ctx.sql, "'{}', (SELECT ", escape_string_literal(alias)).unwrap();
+            write!(
+                ctx.sql,
+                "'{}', (SELECT ",
+                escape_string_literal(alias, ctx.dialect)
+            )
+            .unwrap();
             if selection.is_empty() {
                 ctx.sql.push_str(ctx.dialect.empty_json_object());
             } else {
@@ -3083,7 +3394,8 @@ fn render_aggregate_object(
     // scalar subquery, which Postgres rejects outright at two rows and answers
     // with null at zero. So when nothing reads the rows, do not read them.
     // `nodes` on a source of its own does not need the shared one.
-    let needs_source = (nodes.is_some() && nodes_limit.is_none())
+    let nodes_own_source = nodes_limit.is_some() || ctx.dialect.nodes_need_own_source();
+    let needs_source = (nodes.is_some() && !nodes_own_source)
         || ops
             .iter()
             .any(|s| !matches!(s.op, crate::ast::AggOp::Typename));
@@ -3098,7 +3410,7 @@ fn render_aggregate_object(
         write!(
             ctx.sql,
             "'{}', {}",
-            escape_string_literal(alias),
+            escape_string_literal(alias, ctx.dialect),
             ctx.dialect
                 .text_literal(&crate::type_names::aggregate(table))
         )
@@ -3128,12 +3440,15 @@ fn render_aggregate_object(
         match nodes_limit {
             // A cap meant for `nodes` alone cannot ride on the shared source —
             // the same `LIMIT` would decide what `count` counted — so `nodes`
-            // reads its own.
-            Some(limit) => {
+            // reads its own. So does a dialect whose ordered aggregation is a
+            // window function, which cannot sit beside `count(*)`.
+            _ if nodes_limit.is_some() || ctx.dialect.nodes_need_own_source() => {
                 let node_alias = ctx.next_alias("t");
                 let mut node_args = args.clone();
-                node_args.limit = Some(limit.clone());
-                write!(ctx.sql, "'nodes', (SELECT {}", ctx.dialect.json_agg_open()).unwrap();
+                if let Some(limit) = nodes_limit {
+                    node_args.limit = Some(limit.clone());
+                }
+                write!(ctx.sql, "'nodes', {}", ctx.dialect.nodes_list_open()).unwrap();
                 render_json_build_object_for_nodes(
                     node_fields,
                     &node_alias,
@@ -3142,7 +3457,7 @@ fn render_aggregate_object(
                     schema,
                     ctx,
                 )?;
-                write!(ctx.sql, "{} FROM (", ctx.dialect.json_agg_close()).unwrap();
+                write!(ctx.sql, "{}", ctx.dialect.nodes_list_mid(&node_alias)).unwrap();
                 render_aggregate_source(
                     &node_args,
                     &[],
@@ -3153,9 +3468,9 @@ fn render_aggregate_object(
                     schema,
                     ctx,
                 )?;
-                write!(ctx.sql, ") {node_alias})").unwrap();
+                write!(ctx.sql, "{}", ctx.dialect.nodes_list_close(&node_alias)).unwrap();
             }
-            None => {
+            _ => {
                 write!(ctx.sql, "'nodes', {}", ctx.dialect.json_agg_open()).unwrap();
                 render_json_build_object_for_nodes(
                     node_fields,
@@ -3173,7 +3488,19 @@ fn render_aggregate_object(
     ctx.sql.push(')');
     if needs_source {
         ctx.sql.push_str(" FROM (");
-        render_aggregate_source(args, ops, nodes, table, path, correlation, schema, ctx)?;
+        // With `nodes` on a source of their own this one feeds the
+        // functions only, which read no `nodes` columns.
+        let shared_nodes = if nodes_own_source { None } else { nodes };
+        render_aggregate_source(
+            args,
+            ops,
+            shared_nodes,
+            table,
+            path,
+            correlation,
+            schema,
+            ctx,
+        )?;
         ctx.sql.push_str(") ");
         ctx.sql.push_str(&inner_alias);
     }
@@ -3248,7 +3575,7 @@ fn render_agg_op(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::AggOp;
-    let key = escape_string_literal(&sel.alias);
+    let key = escape_string_literal(&sel.alias, ctx.dialect);
     match &sel.op {
         AggOp::Count { columns, distinct } => {
             // The parser refuses this pairing; the builder can still construct
@@ -3260,15 +3587,21 @@ fn render_agg_op(
                     message: "'distinct' needs 'columns' to be distinct on".into(),
                 });
             }
-            if columns.len() > 1 && !ctx.dialect.counts_tuples() {
-                return Err(Error::Unsupported {
-                    message: format!(
-                        "count over several columns is not available on {:?}: count one \
-                         column, or count(*)",
-                        ctx.dialect
-                    ),
-                });
-            }
+            let tuple = if columns.len() > 1 {
+                let Some(wrap) = ctx.dialect.count_tuple(*distinct) else {
+                    return Err(Error::Unsupported {
+                        message: format!(
+                            "count over several columns{} is not available on {:?}: count \
+                             one column, or count(*)",
+                            if *distinct { "" } else { " without distinct" },
+                            ctx.dialect
+                        ),
+                    });
+                };
+                Some(wrap)
+            } else {
+                None
+            };
             write!(ctx.sql, "'{key}', count(").unwrap();
             if columns.is_empty() {
                 ctx.sql.push('*');
@@ -3279,8 +3612,8 @@ fn render_agg_op(
                 // More than one column counts the tuple: a row constructor is
                 // NULL only when every field is, which is the reading that makes
                 // `count(DISTINCT (a, b))` mean distinct pairs.
-                if columns.len() > 1 {
-                    ctx.sql.push('(');
+                if let Some((open, _)) = tuple {
+                    ctx.sql.push_str(open);
                 }
                 for (i, exposed) in columns.iter().enumerate() {
                     if i > 0 {
@@ -3295,10 +3628,15 @@ fn render_agg_op(
                             format!("aggregate.{}", sel.alias)
                         })?;
                     }
-                    write!(ctx.sql, "{table_alias}.{}", quote_ident(&col.physical_name)).unwrap();
+                    write!(
+                        ctx.sql,
+                        "{table_alias}.{}",
+                        quote_ident(&col.physical_name, ctx.dialect)
+                    )
+                    .unwrap();
                 }
-                if columns.len() > 1 {
-                    ctx.sql.push(')');
+                if let Some((_, close)) = tuple {
+                    ctx.sql.push_str(close);
                 }
             }
             ctx.sql.push(')');
@@ -3370,7 +3708,7 @@ fn render_agg_func(
                 write!(
                     ctx.sql,
                     "'{}', {}",
-                    escape_string_literal(alias),
+                    escape_string_literal(alias, ctx.dialect),
                     ctx.dialect
                         .text_literal(&crate::type_names::agg_op_fields(table, pg_func))
                 )
@@ -3401,11 +3739,18 @@ fn render_agg_func(
                         ),
                     });
                 }
+                // Through `value_as_json` as a column is: `max` of a
+                // timestamp is a timestamp, and comes back spelled the way
+                // the column would be.
+                let agg = format!(
+                    "{pg_func}({table_alias}.{})",
+                    quote_ident(&col.physical_name, ctx.dialect)
+                );
                 write!(
                     ctx.sql,
-                    "'{}', {pg_func}({table_alias}.{})",
-                    escape_string_literal(&c.alias),
-                    quote_ident(&col.physical_name)
+                    "'{}', {}",
+                    escape_string_literal(&c.alias, ctx.dialect),
+                    ctx.dialect.value_as_json(agg, json_kind(&col.ty))
                 )
                 .unwrap();
             }
@@ -3434,7 +3779,7 @@ pub(crate) fn render_json_build_object_for_nodes(
                 write!(
                     ctx.sql,
                     "'{}', {}",
-                    escape_string_literal(alias),
+                    escape_string_literal(alias, ctx.dialect),
                     ctx.dialect.text_literal(crate::type_names::row(table))
                 )
                 .unwrap();
@@ -3449,11 +3794,14 @@ pub(crate) fn render_json_build_object_for_nodes(
                 // arrive from the typed builder, where they are arbitrary
                 // strings — unescaped, one apostrophe breaks the statement and
                 // a crafted one rewrites it.
-                let value = format!("{table_alias}.{}", quote_ident(&col.physical_name));
+                let value = format!(
+                    "{table_alias}.{}",
+                    quote_ident(&col.physical_name, ctx.dialect)
+                );
                 write!(
                     ctx.sql,
                     "'{}', {}",
-                    escape_string_literal(alias),
+                    escape_string_literal(alias, ctx.dialect),
                     ctx.dialect.value_as_json(value, json_kind(&col.ty))
                 )
                 .unwrap();
@@ -3472,7 +3820,7 @@ pub(crate) fn render_json_build_object_for_nodes(
                 write!(
                     ctx.sql,
                     "'{}', {}",
-                    escape_string_literal(alias),
+                    escape_string_literal(alias, ctx.dialect),
                     ctx.dialect.value_as_json(expr, JsonKind::Json)
                 )
                 .unwrap();
@@ -3483,7 +3831,12 @@ pub(crate) fn render_json_build_object_for_nodes(
                 args,
                 selection,
             } => {
-                write!(ctx.sql, "'{}', ", escape_string_literal(rel_alias)).unwrap();
+                write!(
+                    ctx.sql,
+                    "'{}', ",
+                    escape_string_literal(rel_alias, ctx.dialect)
+                )
+                .unwrap();
                 render_relation_subquery(
                     name,
                     rel_alias,
@@ -3505,7 +3858,12 @@ pub(crate) fn render_json_build_object_for_nodes(
                 typenames,
                 nodes_limit,
             } => {
-                write!(ctx.sql, "'{}', ", escape_string_literal(rel_alias)).unwrap();
+                write!(
+                    ctx.sql,
+                    "'{}', ",
+                    escape_string_literal(rel_alias, ctx.dialect)
+                )
+                .unwrap();
                 render_relation_aggregate(
                     name,
                     rel_alias,
@@ -3602,13 +3960,14 @@ fn render_aggregate_source(
             first = false;
             // Qualified: an `order_by` join brings in a table that may have a
             // column of the same name. The output column keeps the bare name.
-            write!(ctx.sql, "{src_alias}.{}", quote_ident(c)).unwrap();
+            write!(ctx.sql, "{src_alias}.{}", quote_ident(c, ctx.dialect)).unwrap();
         }
     }
     // Inside a mutation, a relation reads the CTE holding the rows this
     // statement just wrote — and an aggregate over that relation has to read
     // the same thing, or one response reports a row under `posts` and `count: 0`
     // under `posts_aggregate`.
+    let select_end = ctx.sql.len();
     let visible_cte = correlation.and_then(|c| {
         match (
             ctx.inserted_ctes.get(&c.rel.target_table),
@@ -3627,8 +3986,8 @@ fn render_aggregate_source(
         None => write!(
             ctx.sql,
             " FROM {}.{} {src_alias}",
-            quote_ident(&table.physical_schema),
-            quote_ident(&table.physical_name),
+            quote_ident(&table.physical_schema, ctx.dialect),
+            quote_ident(&table.physical_name, ctx.dialect),
         )
         .unwrap(),
     }
@@ -3668,9 +4027,9 @@ fn render_aggregate_source(
             write!(
                 ctx.sql,
                 "{src_alias}.{} = {}.{}",
-                quote_ident(&r.physical_name),
+                quote_ident(&r.physical_name, ctx.dialect),
                 c.parent_alias,
-                quote_ident(&l.physical_name),
+                quote_ident(&l.physical_name, ctx.dialect),
             )
             .unwrap();
         }
@@ -3683,13 +4042,23 @@ fn render_aggregate_source(
     // `ob.column`, so an `order_by` through a relation silently sorted by the
     // source table's column of that name, and `NULLS FIRST|LAST` never
     // rendered at all.
-    if !args.order_by.is_empty() {
+    // A source read by the aggregate functions alone has nothing to order,
+    // on a dialect where `nodes` never share it: the sort — and the window
+    // that numbers the rows — would serve `count(*)`. PostgreSQL and SQLite
+    // keep the ORDER BY, as their statement text has always had it. A limit
+    // or an offset still needs the order to mean anything.
+    let ordered = nodes.is_some()
+        || args.limit.is_some()
+        || args.offset.is_some()
+        || !ctx.dialect.nodes_need_own_source();
+    let ob_start = ctx.sql.len();
+    if ordered && !args.order_by.is_empty() {
         ctx.sql.push_str(" ORDER BY ");
         for (i, ob) in args.order_by.iter().enumerate() {
             if i > 0 {
                 ctx.sql.push_str(", ");
             }
-            render_order_by_expr(
+            render_order_term(
                 ob,
                 joins[i].as_deref(),
                 table,
@@ -3698,8 +4067,11 @@ fn render_aggregate_source(
                 &ob_path,
                 ctx,
             )?;
-            render_order_dir(ob, ctx);
         }
+    }
+    let order_by = ctx.sql[ob_start..].to_string();
+    if nodes.is_some() {
+        number_rows(select_end, &order_by, ctx);
     }
     render_limit_offset(args, path, ctx);
     Ok(())
@@ -3758,7 +4130,7 @@ pub(crate) fn render_bool_expr_no_alias(
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             check_cmp_applies(*op, col, ctx.dialect)?;
-            let lhs = quote_ident(&col.physical_name);
+            let lhs = quote_ident(&col.physical_name, ctx.dialect);
             render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
         }
         BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
@@ -3783,7 +4155,12 @@ pub(crate) fn render_bool_expr_no_alias(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            render_is_null(&quote_ident(&col.physical_name), column, is_null, ctx)
+            render_is_null(
+                &quote_ident(&col.physical_name, ctx.dialect),
+                column,
+                is_null,
+                ctx,
+            )
         }
         BoolExpr::InList {
             column,
@@ -3800,7 +4177,7 @@ pub(crate) fn render_bool_expr_no_alias(
                 return Ok(());
             }
             let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
-            let lhs = quote_ident(&col.physical_name);
+            let lhs = quote_ident(&col.physical_name, ctx.dialect);
             write!(
                 ctx.sql,
                 "{}",
@@ -3827,8 +4204,8 @@ pub(crate) fn render_bool_expr_no_alias(
             write!(
                 ctx.sql,
                 "EXISTS (SELECT 1 FROM {}.{} {remote_alias} WHERE ",
-                quote_ident(&target.physical_schema),
-                quote_ident(&target.physical_name),
+                quote_ident(&target.physical_schema, ctx.dialect),
+                quote_ident(&target.physical_name, ctx.dialect),
             )
             .unwrap();
             for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
@@ -3850,9 +4227,9 @@ pub(crate) fn render_bool_expr_no_alias(
                 write!(
                     ctx.sql,
                     "{remote_alias}.{} = {}.{}",
-                    quote_ident(&r.physical_name),
-                    quote_ident(&table.physical_name),
-                    quote_ident(&l.physical_name),
+                    quote_ident(&r.physical_name, ctx.dialect),
+                    quote_ident(&table.physical_name, ctx.dialect),
+                    quote_ident(&l.physical_name, ctx.dialect),
                 )
                 .unwrap();
             }
@@ -5841,6 +6218,131 @@ mod tests {
             "must correlate through the relation, got: {sql}"
         );
         assert!(sql.contains(") DESC NULLS LAST"), "got: {sql}");
+    }
+
+    #[test]
+    fn key_order_puts_objects_back_in_selection_order() {
+        use super::KeyOrder;
+        let order = KeyOrder::Object(vec![
+            (
+                "users".into(),
+                KeyOrder::List(Box::new(KeyOrder::Object(vec![
+                    ("name".into(), KeyOrder::Any),
+                    ("id".into(), KeyOrder::Any),
+                    ("meta".into(), KeyOrder::Any),
+                    (
+                        "posts".into(),
+                        KeyOrder::List(Box::new(KeyOrder::Object(vec![
+                            ("title".into(), KeyOrder::Any),
+                            ("id".into(), KeyOrder::Any),
+                        ]))),
+                    ),
+                    (
+                        "best".into(),
+                        KeyOrder::Object(vec![("title".into(), KeyOrder::Any)]),
+                    ),
+                ]))),
+            ),
+            ("count".into(), KeyOrder::Any),
+        ]);
+        // As MySQL returns it: keys by length, then alphabetically, and a
+        // JSON column whose own keys must stay as stored.
+        let mut v = serde_json::json!({
+            "count": 3,
+            "users": [
+                {"id": 1, "best": null, "meta": {"zz": 1, "a": 2}, "name": "Ann",
+                 "posts": [{"id": 9, "title": "t"}]},
+                {"id": 2, "best": {"title": "b"}, "meta": null, "name": "bob", "posts": []}
+            ]
+        });
+        order.apply(&mut v);
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"users":[{"name":"Ann","id":1,"meta":{"zz":1,"a":2},"posts":[{"title":"t","id":9}],"best":null},{"name":"bob","id":2,"meta":null,"posts":[],"best":{"title":"b"}}],"count":3}"#
+        );
+    }
+
+    /// The MySQL dialect, pinned as text, as the SQLite one is below. The
+    /// semantics are checked against a real MySQL in `tests/mysql_read.rs`.
+    mod mysql {
+        use crate::dialect::Dialect;
+        use crate::parser::{lower_with, parse_document, Bindings};
+        use crate::schema::{ColumnType, Relation, Schema, Table};
+
+        fn schema() -> Schema {
+            Schema::builder()
+                .dialect(Dialect::MySql)
+                .table(
+                    Table::new("users", "app", "users")
+                        .column("id", "id", ColumnType::Int8, false)
+                        .column("name", "name", ColumnType::Varchar, false)
+                        .column("active", "active", ColumnType::Bool, false)
+                        .column("meta", "meta", ColumnType::Jsonb, true)
+                        .column("score", "score", ColumnType::Numeric, true)
+                        .column("created_at", "created_at", ColumnType::Timestamp, true)
+                        .column("seen_at", "seen_at", ColumnType::TimestampTz, true)
+                        .primary_key(&["id"])
+                        .relation("posts", Relation::array("posts").on([("id", "user_id")])),
+                )
+                .table(
+                    Table::new("posts", "app", "posts")
+                        .column("id", "id", ColumnType::Int8, false)
+                        .column("user_id", "user_id", ColumnType::Int8, false)
+                        .column("title", "title", ColumnType::Text, false)
+                        .column("views", "views", ColumnType::Int4, false)
+                        .column("published", "published", ColumnType::Bool, true)
+                        .primary_key(&["id"])
+                        .relation("user", Relation::object("users").on([("user_id", "id")])),
+                )
+                .build()
+        }
+
+        fn render(source: &str) -> (String, Vec<crate::types::BindSpec>) {
+            let doc = parse_document(source).unwrap();
+            let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
+            super::super::render(&op, &schema(), Dialect::MySql).unwrap()
+        }
+
+        #[test]
+        fn nested_list_is_a_window_aggregate_over_numbered_rows() {
+            let (sql, binds) = render(
+                r#"query($ids: [bigint!]!, $q: String!, $s: numeric @optional) {
+                    users(where: {id: {_in: $ids}, name: {_ilike: $q}, score: {_gte: $s}}, order_by: {score: asc}, offset: 2) {
+                        id name active meta score created_at seen_at first: meta(path: "tags.0")
+                        posts(order_by: {title: desc}, limit: 3) { title published user { name } }
+                    }
+                }"#,
+            );
+            insta::assert_snapshot!(sql);
+            // `$ids`, `$q`, the path of `first`, and `$s` twice (`IS NULL OR`) —
+            // bound twice, because the placeholders are anonymous.
+            assert_eq!(binds.len(), 5);
+            assert!(!sql.contains("?1"), "numbered placeholder survived: {sql}");
+        }
+
+        #[test]
+        fn distinct_on_is_a_window_over_a_derived_table() {
+            let (sql, _) = render(
+                "{ posts(distinct_on: [user_id], where: {views: {_gt: 1}}, order_by: [{user_id: asc}, {views: desc_nulls_last}], limit: 5) { user_id title published } }",
+            );
+            insta::assert_snapshot!(sql);
+        }
+
+        #[test]
+        fn aggregate_reads_nodes_from_a_source_of_their_own() {
+            let (sql, _) = render(
+                "query($ids: [bigint!] @optional) { posts_aggregate(where: {id: {_in: $ids}}, order_by: {views: desc}) { aggregate { count(columns: [user_id, views], distinct: true) sum { views } max { title } } nodes { title published } } }",
+            );
+            insta::assert_snapshot!(sql);
+        }
+
+        #[test]
+        fn by_pk_typename_and_jsonb_operators() {
+            let (sql, _) = render(
+                r#"{ users_by_pk(id: 1) { __typename name active } keyed: users(where: {meta: {_has_key: "a", _contains: {b: 1}, _has_keys_any: ["x", "y"]}}) { id } }"#,
+            );
+            insta::assert_snapshot!(sql);
+        }
     }
 
     /// The SQLite dialect, pinned as text: a compiled statement is reused by

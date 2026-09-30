@@ -863,3 +863,91 @@ schema = "audit"
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("in-memory"));
 }
+
+/// The MySQL commands, end to end, against the server `MYSQL_TEST_URL` names
+/// (or a container). What SQLite's twin checks, where MySQL differs: the
+/// database the URL names is the one schema, the labels are the scalars the
+/// engine publishes, `--schema` is refused.
+#[cfg(feature = "mysql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_generate_diff_and_sdl() {
+    let db = common::mysql::fresh_db().await;
+    common::mysql::run_ddl(
+        &db.pool,
+        r#"
+CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL, secret TEXT, active TINYINT(1) NOT NULL DEFAULT 1, picture BLOB);
+CREATE TABLE posts (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(100) NOT NULL, user_id INT NOT NULL, views INT NOT NULL DEFAULT 0, CONSTRAINT posts_user_fk FOREIGN KEY (user_id) REFERENCES users(id));
+"#,
+    )
+    .await;
+    let url = db.url.as_str();
+    let bin = env!("CARGO_BIN_EXE_vision-gql");
+
+    let out = Command::new(bin)
+        .args(["generate", "--url", url])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let toml = String::from_utf8(out.stdout).unwrap();
+    assert!(toml.contains(".users ─"), "{toml}");
+    assert!(toml.contains(".posts ─"), "{toml}");
+    assert!(toml.contains("id (Int, PK)"), "{toml}");
+    assert!(toml.contains("active (Boolean"), "{toml}");
+    assert!(!toml.contains("int4"), "{toml}");
+
+    let out = Command::new(bin)
+        .args(["sdl", "--url", url, "--output", "-"])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sdl = String::from_utf8(out.stdout).unwrap();
+    assert!(sdl.contains("insert_users"), "{sdl}");
+    assert!(sdl.contains("user_id: Int!"), "{sdl}");
+    assert!(sdl.contains("stddev"), "{sdl}");
+
+    let overlay = write_temp_toml(
+        "mysql_clean.toml",
+        r#"
+[tables.users]
+hide_columns = ["secret"]
+"#,
+    );
+    let out = Command::new(bin)
+        .args([
+            "diff",
+            "--url",
+            url,
+            "--config",
+            overlay.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // BLOB has no mapping and is left out — said so, not hidden.
+    assert_eq!(report["skipped_columns"][0]["column"], "picture");
+    assert_eq!(report["table_warnings"].as_array().unwrap().len(), 0);
+
+    // --schema is PostgreSQL's; on MySQL any value is refused.
+    let out = Command::new(bin)
+        .args(["generate", "--url", url, "--schema", "public"])
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--schema does not apply to MySQL"));
+}

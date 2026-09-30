@@ -1,8 +1,8 @@
 //! What the engine asks of a database driver.
 //!
 //! [`Engine`](crate::Engine) is generic over a [`Backend`], which is one of
-//! sqlx's database marker types: `sqlx::Postgres`, or `sqlx::Sqlite` behind
-//! the `sqlite` feature. The trait is sealed:
+//! sqlx's database marker types: `sqlx::Postgres`, `sqlx::Sqlite` behind the
+//! `sqlite` feature, or `sqlx::MySql` behind the `mysql` feature. The trait is sealed:
 //! a backend is a renderer dialect plus an execution model, both of which live
 //! in this crate, so it is not something a caller implements — it is what a
 //! caller *picks*, by the pool they hand the engine.
@@ -112,5 +112,33 @@ impl Backend for sqlx::Sqlite {
         inputs: &crate::types::Inputs<'_>,
     ) -> impl Future<Output = Result<Value>> + Send {
         crate::executor::sqlite::execute_plan(conn, plan, inputs)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl sealed::Sealed for sqlx::MySql {}
+
+#[cfg(feature = "mysql")]
+impl Backend for sqlx::MySql {
+    const DIALECT: Dialect = Dialect::MySql;
+
+    fn verify_pool(pool: &sqlx::Pool<Self>) -> impl Future<Output = Result<()>> + Send {
+        crate::mysql::verify(pool)
+    }
+
+    fn execute_conn(
+        conn: &mut sqlx::MySqlConnection,
+        sql: &str,
+        binds: &[Bind],
+    ) -> impl Future<Output = Result<Value>> + Send {
+        crate::executor::mysql::execute_on(conn, sql, binds)
+    }
+
+    fn execute_plan(
+        conn: &mut sqlx::MySqlConnection,
+        plan: &crate::plan::MutationPlan,
+        inputs: &crate::types::Inputs<'_>,
+    ) -> impl Future<Output = Result<Value>> + Send {
+        crate::executor::mysql::execute_plan(conn, plan, inputs)
     }
 }

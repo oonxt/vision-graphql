@@ -44,14 +44,15 @@ enum Cmd {
 
 #[derive(ClapArgs, Debug)]
 struct CommonDb {
-    /// Connection URL: `postgres://…`, or `sqlite://path/to/file.db`. Falls
-    /// back to $DATABASE_URL if not set.
+    /// Connection URL: `postgres://…`, `mysql://user:pass@host/db`, or
+    /// `sqlite://path/to/file.db`. Falls back to $DATABASE_URL if not set.
     #[arg(long)]
     url: Option<String>,
 
     /// Comma-separated Postgres schemas to introspect; `public` when not
     /// given. The first one owns the bare table names; later ones are exposed
-    /// prefixed (`audit_orders`). Not for SQLite, which has one schema.
+    /// prefixed (`audit_orders`). Not for SQLite, which has one schema, nor
+    /// MySQL, which introspects the database the URL names.
     #[arg(long = "schema", value_delimiter = ',')]
     schemas: Option<Vec<String>>,
 

@@ -1,0 +1,6 @@
+---
+source: src/sql.rs
+assertion_line: 6336
+expression: sql
+---
+SELECT JSON_OBJECT('posts_aggregate', (SELECT JSON_OBJECT('aggregate', JSON_OBJECT('count', count(DISTINCT t0.`user_id`, t0.`views`), 'sum', JSON_OBJECT('views', sum(t0.`views`)), 'max', JSON_OBJECT('title', max(t0.`title`))), 'nodes', COALESCE((SELECT JSON_ARRAYAGG(JSON_OBJECT('title', t1.`title`, 'published', CASE WHEN t1.`published` IS NULL THEN NULL WHEN t1.`published` THEN CAST('true' AS JSON) ELSE CAST('false' AS JSON) END)) OVER (ORDER BY t1.__vision_graphql_ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT s2.`published`, s2.`title`, ROW_NUMBER() OVER (ORDER BY s2.`views` IS NULL DESC, s2.`views` DESC) AS __vision_graphql_ord FROM `app`.`posts` s2 WHERE (CAST(? AS JSON) IS NULL OR s2.`id` IN (SELECT jt.v FROM JSON_TABLE(?, '$[*]' COLUMNS (v BIGINT PATH '$')) AS jt)) ORDER BY s2.`views` IS NULL DESC, s2.`views` DESC) t1 LIMIT 1), JSON_ARRAY())) FROM (SELECT s3.`title`, s3.`user_id`, s3.`views` FROM `app`.`posts` s3 WHERE (CAST(? AS JSON) IS NULL OR s3.`id` IN (SELECT jt.v FROM JSON_TABLE(?, '$[*]' COLUMNS (v BIGINT PATH '$')) AS jt))) t0)) AS result

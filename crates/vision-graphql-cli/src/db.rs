@@ -1,10 +1,12 @@
-//! One connection per URL scheme, and one introspection over both.
+//! One connection per URL scheme, and one introspection over all of them.
 //!
 //! The CLI's three database commands differ in what they do with what
 //! introspection found, not in how they find it. This is the one place that
 //! decides which database a URL names and asks it for its tables.
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "mysql")]
+use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::SqlitePoolOptions;
 use vision_graphql::schema::introspect::{introspect_schemas, IntrospectedDb};
@@ -26,20 +28,23 @@ pub struct Source {
 enum Pool {
     Postgres(sqlx::PgPool),
     Sqlite(sqlx::SqlitePool),
+    #[cfg(feature = "mysql")]
+    MySql(sqlx::MySqlPool),
 }
 
 /// What introspection found, whichever database it was.
 pub struct Found {
     pub db: IntrospectedDb,
     pub dialect: Dialect,
-    /// SQLite tables that are not `STRICT`; empty for PostgreSQL.
+    /// SQLite tables that are not `STRICT`; empty for the others.
     pub loosely_typed: Vec<String>,
 }
 
 impl Found {
     /// The schema builder the engine would build from this — the same one
-    /// `Schema::introspect` / `Schema::introspect_sqlite` return — so what
-    /// the CLI derives (SDL, warnings) is what the engine publishes.
+    /// `Schema::introspect` / `Schema::introspect_sqlite` /
+    /// `Schema::introspect_mysql` return — so what the CLI derives (SDL,
+    /// warnings) is what the engine publishes.
     pub fn into_builder(self) -> SchemaBuilder {
         build_from_introspection(self.db)
             .dialect(self.dialect)
@@ -49,6 +54,10 @@ impl Found {
 
 fn is_sqlite(url: &str) -> bool {
     url.starts_with("sqlite:")
+}
+
+fn is_mysql(url: &str) -> bool {
+    url.starts_with("mysql:")
 }
 
 pub fn connect(url: &str) -> Result<Source> {
@@ -70,6 +79,19 @@ pub fn connect(url: &str) -> Result<Source> {
                 .max_connections(1)
                 .connect_lazy_with(opts),
         )
+    } else if is_mysql(url) {
+        #[cfg(not(feature = "mysql"))]
+        bail!("this vision-gql was built without MySQL support (the `mysql` feature)");
+        #[cfg(feature = "mysql")]
+        {
+            let opts = vision_graphql::mysql::connect_options(url)
+                .with_context(|| format!("parsing connection URL {redacted}"))?;
+            Pool::MySql(
+                MySqlPoolOptions::new()
+                    .max_connections(2)
+                    .connect_lazy_with(opts),
+            )
+        }
     } else {
         let opts: PgConnectOptions = url
             .parse()
@@ -85,8 +107,9 @@ pub fn connect(url: &str) -> Result<Source> {
 
 impl Source {
     /// Introspect. `schemas` is `--schema` as given — `None` when it was not:
-    /// PostgreSQL then reads `public`, and SQLite, whose file has one schema,
-    /// refuses any value rather than ignoring it.
+    /// PostgreSQL then reads `public`; SQLite, whose file has one schema, and
+    /// MySQL, which reads the database the URL names, refuse any value rather
+    /// than ignoring it.
     pub async fn introspect(&self, schemas: Option<&[String]>) -> Result<Found> {
         match &self.pool {
             Pool::Postgres(pool) => {
@@ -117,6 +140,23 @@ impl Source {
                     db: found.db,
                     dialect: Dialect::Sqlite,
                     loosely_typed: found.loosely_typed,
+                })
+            }
+            #[cfg(feature = "mysql")]
+            Pool::MySql(pool) => {
+                if schemas.is_some() {
+                    bail!(
+                        "--schema does not apply to MySQL: the database the URL names is \
+                         introspected (mysql://user:pass@host/name)"
+                    );
+                }
+                let db = vision_graphql::schema::introspect_mysql::introspect(pool)
+                    .await
+                    .with_context(|| format!("introspect failed against {}", self.redacted))?;
+                Ok(Found {
+                    db,
+                    dialect: Dialect::MySql,
+                    loosely_typed: Vec::new(),
                 })
             }
         }

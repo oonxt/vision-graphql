@@ -1,9 +1,10 @@
 ---
 source: src/plan.rs
+assertion_line: 1756
 expression: p.text()
 ---
 UPDATE "main"."users" SET "name" = ?1 WHERE ("active" = ?2 AND "id" = ?3) RETURNING json_object('__rowid', rowid, 'id', "id", 'name', "name", 'active', CASE WHEN "active" IS NULL THEN NULL WHEN "active" = 1 THEN json('true') WHEN "active" = 0 THEN json('false') ELSE json('not a boolean') END, 'meta', json("meta"))
 SELECT count(*) FROM "main"."users" t0 WHERE t0.rowid IN (SELECT value FROM json_each(?1)) AND NOT (t0."id" = ?2)
-SELECT json_group_array(json_object('title', t1."title", 'user', (SELECT json_object('name', r3."name") FROM (SELECT t2."name" AS "name" FROM "main"."users" t2 WHERE t2."id" = t1."user_id" AND t2."id" = ?1 LIMIT 1) r3))) FROM (SELECT t0.* FROM "main"."posts" t0 WHERE (t0."id" = ?2 AND TRUE) ORDER BY t0.rowid) t1
+SELECT (SELECT json_group_array(json_object('title', t1."title", 'user', (SELECT json_object('name', r3."name") FROM (SELECT t2."name" AS "name" FROM "main"."users" t2 WHERE t2."id" = t1."user_id" AND t2."id" = ?1 LIMIT 1) r3))) FROM (SELECT t0.* FROM "main"."posts" t0 WHERE (t0."id" = ?2 AND TRUE) ORDER BY t0.rowid) t1)
 DELETE FROM "main"."posts" WHERE ("id" = ?1 AND TRUE) RETURNING json_object('__rowid', rowid)
-SELECT json_group_array(json_object('name', t0."name")) FROM (SELECT x.* FROM "main"."users" x JOIN json_each(?1) je ON x.rowid = je.value ORDER BY je.key) t0
+SELECT (SELECT json_group_array(json_object('name', t0."name")) FROM (SELECT x.* FROM "main"."users" x JOIN json_each(?1) je ON x.rowid = je.value ORDER BY je.key) t0)
