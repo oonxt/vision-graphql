@@ -1476,7 +1476,11 @@ mod tests {
         let compiled = super::CompiledQuery {
             shapes: vec![super::Shape {
                 pinned: Default::default(),
-                rendered: crate::sql::Rendered::Statement { sql, specs },
+                rendered: crate::sql::Rendered::Statement {
+                    sql,
+                    specs,
+                    keys: None,
+                },
             }],
             contract: super::VariableContract::default(),
             root_alias: None,

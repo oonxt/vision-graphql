@@ -70,6 +70,8 @@ pub mod error;
 pub mod executor;
 pub mod introspection;
 pub mod limits;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 pub mod parse_cache;
 pub mod parser;
 pub mod persisted;

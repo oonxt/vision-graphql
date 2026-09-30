@@ -234,6 +234,8 @@ macro_rules! connection_targets {
 connection_targets!(Postgres, sqlx::PgConnection);
 #[cfg(feature = "sqlite")]
 connection_targets!(sqlx::Sqlite, sqlx::SqliteConnection);
+#[cfg(feature = "mysql")]
+connection_targets!(sqlx::MySql, sqlx::MySqlConnection);
 
 pub struct Engine<DB: Backend = Postgres> {
     pool: Pool<DB>,
@@ -827,7 +829,7 @@ async fn run_rendered<DB: Backend, R: Run<DB>>(
     what: &'static str,
 ) -> Result<Value> {
     match rendered {
-        Rendered::Statement { sql, specs } => {
+        Rendered::Statement { sql, specs, keys } => {
             let binds = crate::types::resolve_binds(specs, inputs)?;
             tracing::debug!(
                 target: "vision_graphql::engine",
@@ -837,7 +839,11 @@ async fn run_rendered<DB: Backend, R: Run<DB>>(
                 executor = target.name(),
                 what
             );
-            target.run(sql, &binds).await
+            let mut value = target.run(sql, &binds).await?;
+            if let Some(keys) = keys {
+                keys.apply(&mut value);
+            }
+            Ok(value)
         }
         Rendered::Plan(plan) => {
             tracing::debug!(

@@ -631,6 +631,13 @@ impl<'a> Builder<'a> {
         self.schema.table(&type_names::aggregate(t)).is_some()
     }
 
+    /// Whether the table gets mutation fields and the input types they take:
+    /// a base table, on a dialect the engine writes to. What is published
+    /// is what the renderer implements, in both directions.
+    fn writable(&self, t: &Table) -> bool {
+        !t.read_only && self.schema.dialect().supports_mutations()
+    }
+
     /// Every type derived from one table.
     fn table_types(&mut self, t: &Table) {
         self.row_object(t);
@@ -640,7 +647,7 @@ impl<'a> Builder<'a> {
         self.bool_exp(t);
         self.order_by_input(t);
         self.select_column_enum(t);
-        if !t.read_only {
+        if self.writable(t) {
             self.mutation_inputs(t);
             self.add(TypeDef::Object {
                 name: type_names::mutation_response(t),
@@ -1086,7 +1093,7 @@ impl<'a> Builder<'a> {
             tables.iter().map(|t| t.exposed_name.as_str()).collect();
         let mut fields = Vec::new();
         for t in tables {
-            if t.read_only {
+            if !self.writable(t) {
                 continue;
             }
             let row = type_names::row(t).to_string();

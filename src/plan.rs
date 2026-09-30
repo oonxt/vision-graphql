@@ -333,11 +333,11 @@ impl<'a> Builder<'a> {
         r
     }
 
-    fn qualified(table: &Table) -> String {
+    fn qualified(&self, table: &Table) -> String {
         format!(
             "{}.{}",
-            quote_ident(&table.physical_schema),
-            quote_ident(&table.physical_name)
+            quote_ident(&table.physical_schema, self.dialect),
+            quote_ident(&table.physical_name, self.dialect)
         )
     }
 
@@ -349,9 +349,11 @@ impl<'a> Builder<'a> {
             write!(
                 sql,
                 ", '{}', {}",
-                escape_string_literal(&col.exposed_name),
-                self.dialect
-                    .value_as_json(quote_ident(&col.physical_name), json_kind(&col.ty))
+                escape_string_literal(&col.exposed_name, self.dialect),
+                self.dialect.value_as_json(
+                    quote_ident(&col.physical_name, self.dialect),
+                    json_kind(&col.ty)
+                )
             )
             .unwrap();
         }
@@ -437,7 +439,7 @@ impl<'a> Builder<'a> {
             } => {
                 let t = self.table(table, &alias)?;
                 let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "UPDATE {} SET ", Self::qualified(t)).unwrap();
+                write!(s.ctx.sql, "UPDATE {} SET ", self.qualified(t)).unwrap();
                 render_set_clause(t, set, &alias, &mut s.ctx)?;
                 s.ctx.sql.push_str(" WHERE ");
                 render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
@@ -467,7 +469,7 @@ impl<'a> Builder<'a> {
             } => {
                 let t = self.table(table, &alias)?;
                 let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "UPDATE {} SET ", Self::qualified(t)).unwrap();
+                write!(s.ctx.sql, "UPDATE {} SET ", self.qualified(t)).unwrap();
                 render_set_clause(t, set, &alias, &mut s.ctx)?;
                 s.ctx.sql.push_str(" WHERE ");
                 render_pk_predicate(t, pk, scope.as_ref(), &alias, None, self.schema, &mut s.ctx)?;
@@ -506,7 +508,7 @@ impl<'a> Builder<'a> {
                     )?)
                 };
                 let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "DELETE FROM {} WHERE ", Self::qualified(t)).unwrap();
+                write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
                 render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
                 Self::returning_rowid(&mut s.ctx.sql);
                 let cap = self.write(s);
@@ -537,7 +539,7 @@ impl<'a> Builder<'a> {
                     )?)
                 };
                 let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "DELETE FROM {} WHERE ", Self::qualified(t)).unwrap();
+                write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
                 render_pk_predicate(t, pk, scope.as_ref(), &alias, None, self.schema, &mut s.ctx)?;
                 Self::returning_rowid(&mut s.ctx.sql);
                 let cap = self.write(s);
@@ -573,7 +575,7 @@ impl<'a> Builder<'a> {
         write!(
             s.ctx.sql,
             "SELECT count(*) FROM {} {t} WHERE {t}.rowid IN (SELECT value FROM json_each(?{n})) AND NOT (",
-            Self::qualified(table)
+            self.qualified(table)
         )
         .unwrap();
         render_bool_expr(check, table, &t, self.schema, &mut s.ctx)?;
@@ -657,7 +659,7 @@ impl<'a> Builder<'a> {
         // top-level object — a child, or a row an object relation points at.
         let nested = parent.is_some() || depth > 0;
         let mut s = Stmt::new(self.dialect);
-        write!(s.ctx.sql, "INSERT INTO {} (", Self::qualified(table)).unwrap();
+        write!(s.ctx.sql, "INSERT INTO {} (", self.qualified(table)).unwrap();
         let mut values = String::new();
         let mut first = true;
         let mut sep = |sql: &mut String, values: &mut String| {
@@ -673,7 +675,9 @@ impl<'a> Builder<'a> {
                 message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
             })?;
             sep(&mut s.ctx.sql, &mut values);
-            s.ctx.sql.push_str(&quote_ident(&col.physical_name));
+            s.ctx
+                .sql
+                .push_str(&quote_ident(&col.physical_name, self.dialect));
             let n = s
                 .ctx
                 .push_scalar(v, &col.ty, || format!("{path}.{exposed}"))?;
@@ -700,7 +704,9 @@ impl<'a> Builder<'a> {
                         ),
                     })?;
                 sep(&mut s.ctx.sql, &mut values);
-                s.ctx.sql.push_str(&quote_ident(&ccol.physical_name));
+                s.ctx
+                    .sql
+                    .push_str(&quote_ident(&ccol.physical_name, self.dialect));
                 let n = s.captured(
                     PlanBind::Captured {
                         capture: parent_cap,
@@ -727,7 +733,9 @@ impl<'a> Builder<'a> {
                 _ => unreachable!("object-relation keys are captured"),
             };
             sep(&mut s.ctx.sql, &mut values);
-            s.ctx.sql.push_str(&quote_ident(&col.physical_name));
+            s.ctx
+                .sql
+                .push_str(&quote_ident(&col.physical_name, self.dialect));
             let n = s.captured(bind, of);
             write!(values, "{}", self.dialect.param(n, &col.ty)).unwrap();
         }
@@ -824,10 +832,12 @@ impl<'a> Builder<'a> {
                     oc.constraint, table.exposed_name
                 ),
             })?;
-            s.ctx.sql.push_str(&quote_ident(&col.physical_name));
+            s.ctx
+                .sql
+                .push_str(&quote_ident(&col.physical_name, self.dialect));
         }
         s.ctx.sql.push_str(") ");
-        let tref = quote_ident(&table.physical_name);
+        let tref = quote_ident(&table.physical_name, self.dialect);
         if oc.update_columns.is_empty() {
             if nested {
                 let pk_name = table.primary_key.first().ok_or_else(|| Error::Validate {
@@ -847,7 +857,7 @@ impl<'a> Builder<'a> {
                 write!(
                     s.ctx.sql,
                     "DO UPDATE SET {pk} = {tref}.{pk}",
-                    pk = quote_ident(&pk_col.physical_name)
+                    pk = quote_ident(&pk_col.physical_name, self.dialect)
                 )
                 .unwrap();
             } else {
@@ -867,8 +877,8 @@ impl<'a> Builder<'a> {
             write!(
                 s.ctx.sql,
                 "{} = excluded.{}",
-                quote_ident(&col.physical_name),
-                quote_ident(&col.physical_name)
+                quote_ident(&col.physical_name, self.dialect),
+                quote_ident(&col.physical_name, self.dialect)
             )
             .unwrap();
         }
@@ -917,7 +927,7 @@ impl<'a> Builder<'a> {
         write!(
             s.ctx.sql,
             " FROM (SELECT x.* FROM {} x JOIN json_each(?{n}) je ON x.rowid = je.value ORDER BY je.key) {alias}",
-            Self::qualified(table)
+            self.qualified(table)
         )
         .unwrap();
         if one {
@@ -952,7 +962,7 @@ impl<'a> Builder<'a> {
         write!(
             s.ctx.sql,
             " FROM (SELECT {inner}.* FROM {} {inner} WHERE ",
-            Self::qualified(table)
+            self.qualified(table)
         )
         .unwrap();
         match picks {

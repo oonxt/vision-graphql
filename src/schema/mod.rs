@@ -6,6 +6,8 @@
 
 pub mod config;
 pub mod introspect;
+#[cfg(feature = "mysql")]
+pub mod introspect_mysql;
 #[cfg(feature = "sqlite")]
 pub mod introspect_sqlite;
 pub mod merge;
@@ -603,6 +605,20 @@ impl Schema {
         Ok(crate::schema::introspect_sqlite::introspect(pool)
             .await?
             .into_builder())
+    }
+
+    /// Introspect a MySQL database and return a ready-to-customize builder,
+    /// with [`SchemaBuilder::dialect`] set to MySQL.
+    ///
+    /// Refuses a server or a pool the engine's SQL would misbehave on — see
+    /// [`crate::mysql::verify`]. The tables are those of the database the
+    /// connection is on; see [`crate::schema::introspect_mysql`] for how
+    /// MySQL's types and keys are read.
+    #[cfg(feature = "mysql")]
+    pub async fn introspect_mysql(pool: &sqlx::MySqlPool) -> crate::error::Result<SchemaBuilder> {
+        let db = crate::schema::introspect_mysql::introspect(pool).await?;
+        Ok(crate::schema::merge::build_from_introspection(db)
+            .dialect(crate::dialect::Dialect::MySql))
     }
 }
 

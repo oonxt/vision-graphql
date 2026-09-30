@@ -48,11 +48,16 @@ toml = "1"
 # a build without it would need every default and every doc example gated.
 # SQLite is additive.
 sqlite = ["sqlx/sqlite"]
+# MySQL 8 is additive too. `mysql-rsa` is not optional: MySQL 8 defaults to
+# `caching_sha2_password`, whose first handshake on a connection without TLS
+# exchanges the password under the server's RSA key; without it every
+# plain-TCP connection is refused at login.
+mysql = ["sqlx/mysql", "sqlx/mysql-rsa"]
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
 pretty_assertions = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "sync", "time"] }
 criterion = { version = "0.8", features = ["html_reports"] }
