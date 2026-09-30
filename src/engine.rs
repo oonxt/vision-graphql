@@ -853,7 +853,11 @@ async fn run_rendered<DB: Backend, R: Run<DB>>(
                 executor = target.name(),
                 what
             );
-            target.run_plan(plan, inputs).await
+            let mut value = target.run_plan(plan, inputs).await?;
+            if let Some(keys) = &plan.keys {
+                keys.apply(&mut value);
+            }
+            Ok(value)
         }
     }
 }

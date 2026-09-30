@@ -135,7 +135,7 @@ fn key_order_of_query(roots: &[RootField], schema: &Schema) -> KeyOrder {
 
 /// The [`KeyOrder`] of a row selection: the fields in order, a relation
 /// under its own shape.
-fn key_order_of_fields(selection: &[Field], table: &Table, schema: &Schema) -> KeyOrder {
+pub(crate) fn key_order_of_fields(selection: &[Field], table: &Table, schema: &Schema) -> KeyOrder {
     KeyOrder::Object(
         selection
             .iter()
@@ -265,13 +265,11 @@ pub fn render_any(op: &Operation, schema: &Schema, dialect: Dialect) -> Result<R
                 keys = Some(key_order_of_query(roots, schema));
             }
         }
-        // Not yet: the plan identifies rows by rowid and reads them back with
-        // RETURNING, neither of which MySQL has. Refused here, before the
-        // plan renders SQLite's spelling for a database that would run some
-        // of it.
+        // Refused here, before a plan renders one dialect's spelling for a
+        // database that would run some of it.
         Operation::Mutation(_) if !dialect.supports_mutations() => {
             return Err(Error::Unsupported {
-                message: format!("mutations are not available on {dialect:?} yet"),
+                message: format!("mutations are not available on {dialect:?}"),
             });
         }
         Operation::Mutation(fields) if dialect.mutations_by_plan() => {
@@ -6321,17 +6319,6 @@ mod tests {
                 r#"{ users_by_pk(id: 1) { __typename name active } keyed: users(where: {meta: {_has_key: "a", _contains: {b: 1}, _has_keys_any: ["x", "y"]}}) { id } }"#,
             );
             insta::assert_snapshot!(sql);
-        }
-
-        #[test]
-        fn a_mutation_is_refused_for_now() {
-            let doc = parse_document(r#"mutation { insert_posts(objects: [{user_id: 1, title: "t", views: 0}]) { affected_rows } }"#).unwrap();
-            let op = lower_with(&doc, Bindings::symbolic(), None, &schema()).unwrap();
-            let err = super::super::render(&op, &schema(), Dialect::MySql).unwrap_err();
-            assert!(
-                matches!(err, crate::error::Error::Unsupported { .. }),
-                "{err:?}"
-            );
         }
     }
 

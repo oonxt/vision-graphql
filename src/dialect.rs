@@ -66,7 +66,7 @@
 //!   default collations, so `_like` names a binary collation on its pattern.
 
 use crate::schema::ColumnType;
-use crate::types::{Bind, BindSpec};
+use crate::types::Bind;
 use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter, Write as _};
 
@@ -229,7 +229,7 @@ pub(crate) const ORDER_NUMBER: &str = "__vision_graphql_ord";
 /// The MySQL type `JSON_TABLE` reads a bound list's elements as: what an
 /// `_in` compares the column against. `TEXT` rather than `CHAR(n)`, which
 /// truncates a longer element and then matches nothing, silently.
-fn mysql_json_table_type(ty: &ColumnType) -> &'static str {
+pub(crate) fn mysql_json_table_type(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Bool => "TINYINT",
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => "BIGINT",
@@ -946,14 +946,21 @@ impl Dialect {
         }
     }
 
-    /// Whether the engine writes to this database at all. MySQL: not yet —
-    /// the plan identifies rows by rowid and reads them back with
-    /// `RETURNING`, neither of which MySQL has — so no mutation field is
-    /// published for it and the renderer refuses one reached anyway.
+    /// `INSERT INTO t` of a row of defaults: what follows the table name.
+    pub(crate) fn insert_defaults(self) -> &'static str {
+        match self {
+            Dialect::Postgres | Dialect::Sqlite => " DEFAULT VALUES",
+            Dialect::MySql => " () VALUES ()",
+        }
+    }
+
+    /// Whether the engine writes to this database at all: a dialect that
+    /// says no gets no mutation field published, and the renderer refuses
+    /// one reached anyway. Every dialect the crate ships says yes; the seam
+    /// is where a new one starts.
     pub(crate) fn supports_mutations(self) -> bool {
         match self {
-            Dialect::Postgres | Dialect::Sqlite => true,
-            Dialect::MySql => false,
+            Dialect::Postgres | Dialect::Sqlite | Dialect::MySql => true,
         }
     }
 
@@ -996,7 +1003,7 @@ impl Dialect {
 /// A `?` inside a string literal or a quoted identifier is text, not a
 /// placeholder, and is left alone: a response key or a type name the
 /// renderer quoted could spell one.
-pub(crate) fn anonymise_placeholders(sql: &str, specs: &[BindSpec]) -> (String, Vec<BindSpec>) {
+pub(crate) fn anonymise_placeholders<T: Clone>(sql: &str, specs: &[T]) -> (String, Vec<T>) {
     let mut out = String::with_capacity(sql.len());
     let mut binds = Vec::with_capacity(specs.len());
     let bytes = sql.as_bytes();
@@ -1133,7 +1140,7 @@ mod tests {
 
     #[test]
     fn anonymising_repeats_a_reused_placeholder_and_skips_literals() {
-        use crate::types::Bind;
+        use crate::types::BindSpec;
         let specs = vec![
             BindSpec::Fixed(Bind::Int8(1)),
             BindSpec::Fixed(Bind::Text("two".into())),

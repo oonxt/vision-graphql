@@ -1,7 +1,7 @@
 //! Execute a rendered statement against SQLite.
 
 use crate::error::{Error, Result};
-use crate::plan::{MutationPlan, PlanBind, ResponseShape, Step, ROWID_KEY};
+use crate::plan::{MutationPlan, PlanBind, ResponseShape, RowsFrom, Step, ROWID_KEY};
 use crate::types::{json_to_bind, Bind, Inputs, NullOf};
 use serde_json::Value;
 use sqlx::sqlite::Sqlite;
@@ -78,7 +78,15 @@ async fn run_plan(
                 sql,
                 binds,
                 capture,
+                rows,
             } => {
+                // Every SQLite write returns its rows; the other forms are
+                // MySQL's, and the plan is built for one dialect.
+                if !matches!(rows, RowsFrom::Statement) {
+                    return Err(Error::Schema(
+                        "internal: a plan step without RETURNING reached the SQLite backend".into(),
+                    ));
+                }
                 // A child of a parent that inserted nothing (DO NOTHING on a
                 // conflict) is not inserted, as the join to an empty parent
                 // CTE inserts nothing on PostgreSQL.
@@ -217,12 +225,15 @@ fn resolve_plan_binds(
                 };
                 json_to_bind(row.get(column).unwrap_or(&Value::Null), ty)
             }
-            PlanBind::Rowids(captures) => Ok(Bind::Int8Array(
+            PlanBind::Keys(captures) => Ok(Bind::Int8Array(
                 captures
                     .iter()
                     .flat_map(|c| captured[*c].iter())
                     .map(|row| row.get(ROWID_KEY).and_then(Value::as_i64))
                     .collect(),
+            )),
+            PlanBind::LastInsertId => Err(Error::Schema(
+                "internal: a LAST_INSERT_ID bind reached the SQLite backend".into(),
             )),
         })
         .collect()

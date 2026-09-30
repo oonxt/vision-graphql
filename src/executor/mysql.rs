@@ -1,7 +1,8 @@
 //! Execute a rendered statement against MySQL.
 
 use crate::error::{Error, Result};
-use crate::types::{Bind, NullOf};
+use crate::plan::{MutationPlan, PlanBind, ResponseShape, RowsFrom, Step, KEY_KEY};
+use crate::types::{json_to_bind, Bind, Inputs, NullOf};
 use serde_json::Value;
 use sqlx::mysql::MySql;
 
@@ -31,17 +32,218 @@ where
     Ok(json.0)
 }
 
-/// Run a [`MutationPlan`](crate::plan::MutationPlan). Not yet: the renderer
-/// refuses a mutation for this dialect before a plan exists, so this is
-/// unreachable until it does.
+/// Run a [`MutationPlan`] on a connection and assemble its response.
+///
+/// Opens a transaction on the connection — a savepoint, when the connection
+/// is already in one — and commits it at the end; an error anywhere drops it
+/// unfinished, which sqlx rolls back, so a scope violation on the third
+/// statement undoes the first two and nothing outside the plan.
 pub async fn execute_plan(
-    _conn: &mut sqlx::MySqlConnection,
-    _plan: &crate::plan::MutationPlan,
-    _inputs: &crate::types::Inputs<'_>,
+    conn: &mut sqlx::MySqlConnection,
+    plan: &MutationPlan,
+    inputs: &Inputs<'_>,
 ) -> Result<Value> {
-    Err(Error::Unsupported {
-        message: "mutations are not available on MySQL yet".into(),
-    })
+    use sqlx::Acquire;
+    let mut tx = conn.begin().await?;
+    let out = run_plan(&mut tx, plan, inputs).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+async fn run_plan(
+    conn: &mut sqlx::MySqlConnection,
+    plan: &MutationPlan,
+    inputs: &Inputs<'_>,
+) -> Result<Value> {
+    let mut captured: Vec<Vec<Value>> = vec![Vec::new(); plan.captures];
+    let mut reads: Vec<Value> = vec![Value::Null; plan.reads];
+    for step in &plan.steps {
+        match step {
+            Step::Write {
+                sql,
+                binds,
+                capture,
+                rows,
+            } => {
+                // A child of a parent that inserted nothing (a conditional
+                // insert that found its row) is not inserted, as the join to
+                // an empty parent CTE inserts nothing on PostgreSQL.
+                let orphan = binds.iter().any(|b| {
+                    matches!(b, PlanBind::Captured { capture, .. } if captured[*capture].is_empty())
+                });
+                if orphan {
+                    continue;
+                }
+                let binds = resolve_plan_binds(binds, inputs, &captured, None)?;
+                captured[*capture] = match rows {
+                    RowsFrom::Statement => fetch_rows(&mut *conn, sql, &binds).await?,
+                    RowsFrom::Count => {
+                        let done = execute(&mut *conn, sql, &binds).await?;
+                        vec![Value::Null; done.rows_affected() as usize]
+                    }
+                    RowsFrom::Readback {
+                        sql: read_sql,
+                        binds: read_binds,
+                    } => {
+                        let done = execute(&mut *conn, sql, &binds).await?;
+                        if done.rows_affected() == 0 {
+                            Vec::new()
+                        } else {
+                            let last = Some(done.last_insert_id());
+                            let binds = resolve_plan_binds(read_binds, inputs, &captured, last)?;
+                            fetch_rows(&mut *conn, read_sql, &binds).await?
+                        }
+                    }
+                };
+            }
+            Step::Check {
+                sql,
+                binds,
+                table,
+                action,
+            } => {
+                let binds = resolve_plan_binds(binds, inputs, &captured, None)?;
+                let outside = fetch_count(&mut *conn, sql, &binds).await?;
+                if outside > 0 {
+                    return Err(Error::ScopeViolation {
+                        table: table.clone(),
+                        rows: outside,
+                        action: (*action).to_string(),
+                    });
+                }
+            }
+            Step::Read { sql, binds, into } => {
+                let binds = resolve_plan_binds(binds, inputs, &captured, None)?;
+                reads[*into] = fetch_json(&mut *conn, sql, &binds)
+                    .await?
+                    .unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    for field in &plan.fields {
+        let value = match &field.shape {
+            ResponseShape::Batch {
+                captures,
+                returning,
+                typenames,
+            } => {
+                let affected: usize = captures.iter().map(|c| captured[*c].len()).sum();
+                let mut obj = serde_json::Map::new();
+                obj.insert("affected_rows".into(), Value::from(affected));
+                let rows = match returning {
+                    Some(select) => {
+                        let binds = resolve_plan_binds(&select.binds, inputs, &captured, None)?;
+                        fetch_json(&mut *conn, &select.sql, &binds)
+                            .await?
+                            .unwrap_or_else(|| Value::Array(Vec::new()))
+                    }
+                    None => Value::Array(Vec::new()),
+                };
+                obj.insert("returning".into(), rows);
+                for (key, name) in typenames {
+                    obj.insert(key.clone(), Value::String(name.clone()));
+                }
+                Value::Object(obj)
+            }
+            ResponseShape::One { capture, returning } => {
+                if captured[*capture].is_empty() {
+                    Value::Null
+                } else {
+                    match returning {
+                        Some(select) => {
+                            let binds = resolve_plan_binds(&select.binds, inputs, &captured, None)?;
+                            fetch_json(&mut *conn, &select.sql, &binds)
+                                .await?
+                                .unwrap_or(Value::Null)
+                        }
+                        None => Value::Object(serde_json::Map::new()),
+                    }
+                }
+            }
+            ResponseShape::Deleted {
+                capture,
+                read,
+                typenames,
+                one,
+            } => {
+                let affected = captured[*capture].len();
+                let rows = read.map(|r| reads[r].clone());
+                if *one {
+                    if affected == 0 {
+                        Value::Null
+                    } else {
+                        rows.unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+                    }
+                } else {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("affected_rows".into(), Value::from(affected));
+                    obj.insert(
+                        "returning".into(),
+                        rows.unwrap_or_else(|| Value::Array(Vec::new())),
+                    );
+                    for (key, name) in typenames {
+                        obj.insert(key.clone(), Value::String(name.clone()));
+                    }
+                    Value::Object(obj)
+                }
+            }
+        };
+        out.insert(field.alias.clone(), value);
+    }
+    Ok(Value::Object(out))
+}
+
+/// The parameters of one plan statement, from the request and from what
+/// earlier statements captured. `last_insert_id` is the write's, for the
+/// read-back that follows it.
+fn resolve_plan_binds(
+    binds: &[PlanBind],
+    inputs: &Inputs<'_>,
+    captured: &[Vec<Value>],
+    last_insert_id: Option<u64>,
+) -> Result<Vec<Bind>> {
+    binds
+        .iter()
+        .map(|b| match b {
+            PlanBind::Spec(spec) => spec.resolve(inputs),
+            PlanBind::Captured {
+                capture,
+                column,
+                ty,
+            } => {
+                let rows = &captured[*capture];
+                // Zero rows never reach here: the statement is skipped. More
+                // than one cannot happen for a single-row write.
+                let [row] = rows.as_slice() else {
+                    return Err(Error::Schema(format!(
+                        "internal: a nested insert expected one parent row and found {}",
+                        rows.len()
+                    )));
+                };
+                json_to_bind(row.get(column).unwrap_or(&Value::Null), ty)
+            }
+            PlanBind::Keys(captures) => {
+                let keys: Vec<Value> = captures
+                    .iter()
+                    .flat_map(|c| captured[*c].iter())
+                    .map(|row| row.get(KEY_KEY).cloned().unwrap_or(Value::Null))
+                    .collect();
+                Ok(Bind::Text(Value::Array(keys).to_string()))
+            }
+            PlanBind::LastInsertId => match last_insert_id {
+                Some(id) => i64::try_from(id).map(Bind::Int8).map_err(|_| {
+                    Error::Decode(format!(
+                        "LAST_INSERT_ID() {id} does not fit a signed integer"
+                    ))
+                }),
+                None => Err(Error::Schema(
+                    "internal: a LAST_INSERT_ID bind outside a read-back".into(),
+                )),
+            },
+        })
+        .collect()
 }
 
 fn bind_all<'q>(
@@ -75,4 +277,65 @@ fn bind_all<'q>(
         };
     }
     q
+}
+
+/// A statement that returns nothing: what it did.
+async fn execute(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<sqlx::mysql::MySqlQueryResult> {
+    bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .execute(conn)
+        .await
+        .map_err(Error::Database)
+}
+
+/// Every row of a statement returning one JSON object per row.
+async fn fetch_rows(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Vec<Value>> {
+    use sqlx::Row;
+    let rows = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_all(conn)
+        .await
+        .map_err(Error::Database)?;
+    rows.iter()
+        .map(|r| {
+            let json: sqlx::types::Json<Value> = r.try_get(0)?;
+            Ok(json.0)
+        })
+        .collect()
+}
+
+async fn fetch_count(conn: &mut sqlx::MySqlConnection, sql: &str, binds: &[Bind]) -> Result<i64> {
+    use sqlx::Row;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_one(conn)
+        .await
+        .map_err(Error::Database)?;
+    Ok(row.try_get::<i64, _>(0)?)
+}
+
+/// One JSON value, or none when the statement yields no row (`LIMIT 1` over
+/// nothing).
+async fn fetch_json(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Option<Value>> {
+    use sqlx::Row;
+    let row = bind_all(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+        .fetch_optional(conn)
+        .await
+        .map_err(Error::Database)?;
+    match row {
+        Some(r) => {
+            let json: Option<sqlx::types::Json<Value>> = r.try_get(0)?;
+            Ok(json.map(|j| j.0))
+        }
+        None => Ok(None),
+    }
 }

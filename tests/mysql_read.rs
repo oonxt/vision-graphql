@@ -1,9 +1,6 @@
-//! The MySQL backend, read-only, against a real MySQL.
-//!
-//! **Set `MYSQL_TEST_URL` and this costs milliseconds per test.** Every test
-//! then gets a fresh database on one server. Without it, each test starts a
-//! `mysql:8.4` container through testcontainers, which works and costs a
-//! minute. CI sets the variable against a service container.
+//! The MySQL backend, read-only, against a real MySQL. Set `MYSQL_TEST_URL`
+//! to a server and every test takes a database of its own on it; see
+//! `tests/common/mysql.rs`.
 //!
 //! Every assertion here is about the *response*, not the SQL text: the things
 //! MySQL does differently by default are semantic — booleans as `0`/`1`,
@@ -13,153 +10,12 @@
 
 #![cfg(feature = "mysql")]
 
+mod common;
+
+use common::mysql::{fresh_db, run_ddl, TestDb};
 use serde_json::{json, Value};
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
-use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-use testcontainers_modules::mysql::Mysql;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-use tokio::sync::OnceCell;
 use vision_graphql::ast::{BoolExpr, CmpOp};
 use vision_graphql::{Dialect, Engine, Error, Query, Schema, ScopeSet};
-
-const MYSQL_IMAGE_TAG: &str = "8.4";
-
-/// A database, and whatever has to stay alive for it to answer.
-struct TestDb {
-    pool: MySqlPool,
-    db_name: Option<String>,
-    admin_url: Option<String>,
-    _container: Option<ContainerAsync<Mysql>>,
-}
-
-impl Drop for TestDb {
-    fn drop(&mut self) {
-        let (Some(name), Some(admin)) = (self.db_name.take(), self.admin_url.take()) else {
-            return;
-        };
-        let outcome = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build a runtime to drop the test database");
-            rt.block_on(async {
-                let admin = MySqlPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&admin)
-                    .await?;
-                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE `{name}`")))
-                    .execute(&admin)
-                    .await?;
-                admin.close().await;
-                Ok::<_, sqlx::Error>(())
-            })
-        })
-        .join();
-        if let Ok(Err(e)) = outcome {
-            eprintln!("warning: test database was not removed: {e}");
-        }
-    }
-}
-
-static SHARED: OnceCell<Option<String>> = OnceCell::const_new();
-static NEXT_DB: AtomicU32 = AtomicU32::new(0);
-
-async fn shared_admin_url() -> Option<&'static String> {
-    SHARED
-        .get_or_init(|| async { std::env::var("MYSQL_TEST_URL").ok() })
-        .await
-        .as_ref()
-}
-
-async fn start_container() -> ContainerAsync<Mysql> {
-    let mut last = String::new();
-    for attempt in 0..6 {
-        match Mysql::default().with_tag(MYSQL_IMAGE_TAG).start().await {
-            Ok(c) => return c,
-            Err(e) => {
-                last = e.to_string();
-                tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
-            }
-        }
-    }
-    panic!(
-        "could not start mysql after several tries: {last}\n\
-         Set MYSQL_TEST_URL to a running MySQL to skip containers entirely."
-    );
-}
-
-async fn fresh_db() -> TestDb {
-    match shared_admin_url().await {
-        Some(admin_url) => {
-            static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let run = RUN.get_or_init(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("the clock is past 1970")
-                    .as_nanos() as u64
-            });
-            let name = format!(
-                "t{}_{:x}_{}",
-                std::process::id(),
-                run % 0xffff_ffff,
-                NEXT_DB.fetch_add(1, Ordering::Relaxed)
-            );
-            let admin = MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(admin_url)
-                .await
-                .expect("connect to MYSQL_TEST_URL");
-            sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{name}`")))
-                .execute(&admin)
-                .await
-                .expect("create the test database");
-            admin.close().await;
-            let opts = MySqlConnectOptions::from_str(admin_url)
-                .expect("parse MYSQL_TEST_URL")
-                .database(&name);
-            let pool = MySqlPoolOptions::new()
-                .max_connections(4)
-                .connect_with(opts)
-                .await
-                .expect("connect to the test database");
-            TestDb {
-                pool,
-                db_name: Some(name),
-                admin_url: Some(admin_url.clone()),
-                _container: None,
-            }
-        }
-        None => {
-            let container = start_container().await;
-            let mut port = None;
-            for attempt in 0..20 {
-                match container.get_host_port_ipv4(3306).await {
-                    Ok(p) => {
-                        port = Some(p);
-                        break;
-                    }
-                    Err(_) => tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await,
-                }
-            }
-            let port = port.expect("container port never appeared");
-            let url = format!("mysql://root@127.0.0.1:{port}/test");
-            let pool = MySqlPoolOptions::new()
-                .max_connections(4)
-                .connect(&url)
-                .await
-                .expect("connect to the test database");
-            TestDb {
-                pool,
-                db_name: None,
-                admin_url: None,
-                _container: Some(container),
-            }
-        }
-    }
-}
 
 const DDL: &str = r#"
 CREATE TABLE users (
@@ -201,16 +57,6 @@ INSERT INTO posts (id, user_id, title, views, published) VALUES
     (4, 3, 'omega', 30, 1);
 INSERT INTO tags (id, post_id, label) VALUES (1, 2, 'x'), (2, 2, 'y'), (3, 4, 'z');
 "#;
-
-/// Run `ddl`, one statement at a time.
-async fn run_ddl(pool: &MySqlPool, ddl: &str) {
-    for stmt in ddl.split(";\n").map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(stmt.to_string()))
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
-    }
-}
 
 async fn db() -> TestDb {
     let db = fresh_db().await;
@@ -869,23 +715,20 @@ async fn scope_holds() {
 async fn what_is_published_is_what_is_implemented() {
     let (e, _db) = engine().await;
     let ts = e.schema().type_system();
-    // Not yet: no mutation is implemented, so none is published.
-    assert!(ts.mutation_root().is_none());
+    assert!(ts.mutation_root().is_some());
     let sdl = vision_graphql::sdl::render(ts);
-    assert!(!sdl.contains("insert_"), "{sdl}");
+    assert!(sdl.contains("insert_users"), "{sdl}");
     assert!(sdl.contains("stddev"), "{sdl}");
     assert!(sdl.contains("_ilike"), "{sdl}");
     assert!(sdl.contains("_has_key"), "{sdl}");
     assert!(sdl.contains("distinct_on"), "{sdl}");
-    // And refused when reached anyway.
-    let row: std::collections::BTreeMap<String, Value> = [
-        ("user_id".to_string(), json!(1)),
-        ("title".to_string(), json!("t")),
-    ]
-    .into_iter()
-    .collect();
+    // What the type system cannot withhold is refused when reached: a count
+    // of several columns without `distinct` has no MySQL spelling.
     let err = e
-        .run(vision_graphql::Mutation::insert("posts", vec![row]))
+        .query(
+            "{ posts_aggregate { aggregate { count(columns: [title, views]) } } }",
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");

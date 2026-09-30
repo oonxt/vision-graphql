@@ -1,9 +1,10 @@
 ---
 source: src/plan.rs
+assertion_line: 1646
 expression: p.text()
 ---
 INSERT INTO "main"."users" ("name") VALUES (?1) RETURNING json_object('__rowid', rowid, 'id', "id", 'name', "name", 'active', CASE WHEN "active" IS NULL THEN NULL WHEN "active" = 1 THEN json('true') WHEN "active" = 0 THEN json('false') ELSE json('not a boolean') END, 'meta', json("meta"))
 INSERT INTO "main"."posts" ("title", "user_id") VALUES (?1, ?2) RETURNING json_object('__rowid', rowid, 'id', "id", 'user_id', "user_id", 'title', "title")
 INSERT INTO "main"."posts" ("title", "user_id") VALUES (?1, ?2) RETURNING json_object('__rowid', rowid, 'id', "id", 'user_id', "user_id", 'title', "title")
 INSERT INTO "main"."users" ("name") VALUES (?1) RETURNING json_object('__rowid', rowid, 'id', "id", 'name', "name", 'active', CASE WHEN "active" IS NULL THEN NULL WHEN "active" = 1 THEN json('true') WHEN "active" = 0 THEN json('false') ELSE json('not a boolean') END, 'meta', json("meta"))
-SELECT json_group_array(json_object('id', t0."id", 'posts', (SELECT json_group_array(json_object('title', r2."title")) FROM (SELECT t1."title" AS "title" FROM "main"."posts" t1 WHERE t1."user_id" = t0."id" AND t1."title" = ?2) r2))) FROM (SELECT x.* FROM "main"."users" x JOIN json_each(?1) je ON x.rowid = je.value ORDER BY je.key) t0
+SELECT (SELECT json_group_array(json_object('id', t0."id", 'posts', (SELECT json_group_array(json_object('title', r2."title")) FROM (SELECT t1."title" AS "title" FROM "main"."posts" t1 WHERE t1."user_id" = t0."id" AND t1."title" = ?2) r2))) FROM (SELECT x.* FROM "main"."users" x JOIN json_each(?1) je ON x.rowid = je.value ORDER BY je.key) t0)

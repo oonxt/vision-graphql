@@ -23,6 +23,9 @@
 
 #![allow(dead_code)] // each test binary uses a different part of this
 
+#[cfg(feature = "mysql")]
+pub mod mysql;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
