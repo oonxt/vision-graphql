@@ -138,6 +138,18 @@ The SQLite suites (`tests/sqlite_read.rs`, `tests/sqlite_write.rs`, the CLI's
 file it removes when done. They run with `--all-features`, which the gates
 above pass.
 
+The MySQL suites (`tests/mysql_read.rs`, `tests/mysql_write.rs`, the CLI's
+`mysql_*` e2e) need a MySQL the same way the PostgreSQL suite needs a server:
+
+```
+docker run --rm -d --name vg-mysql -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=vg -p 53306:3306 mysql:8.4
+export MYSQL_TEST_URL=mysql://root:root@127.0.0.1:53306/vg
+```
+
+Without `MYSQL_TEST_URL` each test starts a `mysql:8.4` container. Docker Hub
+is not reachable directly from this machine; pull through a mirror
+(`docker pull docker.m.daocloud.io/library/mysql:8.4` and tag it `mysql:8.4`).
+
 Without `TEST_DATABASE_URL` each test starts a container of its own through
 testcontainers, which works — the start is retried now — but costs a minute for
 the suite. CI sets the variable against a service container and starts none.

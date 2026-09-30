@@ -3,6 +3,38 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Added
+
+- **MySQL backend** (`mysql` feature): `Engine<sqlx::MySql>`,
+  `Schema::introspect_mysql`, `mysql::connect_options` / `mysql::verify`, and
+  `vision-gql` on a `mysql://` URL. Queries, aggregates, JSON path reads, the
+  jsonb operators, scoped execution, compiled statements and mutations, on
+  MySQL 8.0.19 or later; MariaDB is refused. What MySQL does differently by
+  default is answered as PostgreSQL would, and each answer is checked against
+  a real MySQL: a `JSON_ARRAYAGG` that keeps no order (every ordered list is
+  a window over numbered rows), a `JSON_OBJECT` that sorts keys (the response
+  is put back in selection order), a `TINYINT(1)` that is `0`/`1`, a
+  `DATETIME` spelled without its `T`, a `TIMESTAMP` in the session's zone, a
+  `LIKE` that ignores case, NULLs that sort first, a `DECIMAL` that compares
+  as a double against a string. Mutations run as a plan of statements in one
+  transaction, as on SQLite, with rows identified by primary key and read back
+  after each write (MySQL has no `RETURNING`). Refused rather than
+  approximated: `count(columns: [a, b])` without `distinct`, an `on_conflict`
+  `where`, a mutation on a table without a primary key, an insert that leaves
+  out a generated key that is not `AUTO_INCREMENT`. The README's *MySQL*
+  table records every difference.
+
+### Changed
+
+- **`__vision_graphql_rn`**, the column the window form of `distinct_on`
+  numbers rows by, is no longer quoted in the rendered SQL. Same rows; a
+  compiled statement's text on SQLite changes by two characters.
+- The `plan` module's read-back of a mutation's `returning` rows is wrapped as
+  a scalar subquery (`SELECT (SELECT json_group_array(…) …)`) so one shape
+  serves both backends. Same rows.
+
 ## 0.25.1 — 2026-09-28
 
 ### Fixed

@@ -1,9 +1,9 @@
 //! # vision-graphql
 //!
-//! A Hasura-style GraphQL-to-SQL query engine for PostgreSQL and SQLite (the
-//! `sqlite` feature; see [`backend`]). Accepts GraphQL query strings or
-//! typed Rust builders and returns `serde_json::Value` in Hasura's data
-//! shape.
+//! A Hasura-style GraphQL-to-SQL query engine for PostgreSQL, SQLite (the
+//! `sqlite` feature) and MySQL (the `mysql` feature; see [`backend`]).
+//! Accepts GraphQL query strings or typed Rust builders and returns
+//! `serde_json::Value` in Hasura's data shape.
 //!
 //! ## Quick start
 //!
@@ -54,10 +54,11 @@
 //!   time and [`Engine::execute`] runs it with any variables — see
 //!   [`compiled`]. Parsing is cached across requests either way
 //!   ([`parse_cache`]).
-//! - Two backends: PostgreSQL, and SQLite behind the `sqlite` feature. The
-//!   engine is generic over a sealed [`Backend`]; the SQL it renders is per
-//!   [`Dialect`] ([`dialect`]), and a SQLite mutation runs as a plan of
-//!   statements in one transaction ([`plan`]). What one backend cannot do is
+//! - Three backends: PostgreSQL, SQLite behind the `sqlite` feature, MySQL
+//!   behind the `mysql` feature. The engine is generic over a sealed
+//!   [`Backend`]; the SQL it renders is per [`Dialect`] ([`dialect`]), and a
+//!   SQLite or MySQL mutation runs as a plan of statements in one
+//!   transaction ([`plan`]). What one backend cannot do is
 //!   not published for it, and refused with [`Error::Unsupported`] if reached.
 
 pub mod ast;

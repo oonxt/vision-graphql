@@ -112,15 +112,17 @@ and left, not forgotten.
 | Nested insert / relation `returning` from the typed builder | The GraphQL path has both. |
 | Computed fields, subscriptions | Not planned. |
 | On SQLite: `stddev`/`var` aggregates, `count(columns: [a, b])`, `WITHOUT ROWID` tables, `on_conflict` on a row of defaults | Not published where the type system can withhold them, refused with `UNSUPPORTED` otherwise. See [Backends](#backends). |
+| On MySQL: `count(columns: [a, b])` without `distinct`, an `on_conflict` `where`, a mutation on a table without a primary key, an insert that leaves out a generated key that is not `AUTO_INCREMENT` | Refused with `UNSUPPORTED`. See [MySQL](#mysql). |
 
 ## Backends
 
 `Engine<DB>` is generic over the database it runs on; the parameter is inferred
 from the pool and defaults to PostgreSQL, so `Engine::new(pg_pool, schema)` is
-what it always was. SQLite is behind the `sqlite` cargo feature.
+what it always was. SQLite is behind the `sqlite` cargo feature, MySQL behind
+`mysql`.
 
 ```toml
-vision-graphql = { version = "0.25", features = ["sqlite"] }
+vision-graphql = { version = "0.26", features = ["sqlite", "mysql"] }
 ```
 
 ```rust
@@ -134,6 +136,19 @@ let pool = sqlx::sqlite::SqlitePoolOptions::new()
     .await?;
 let schema = Schema::introspect_sqlite(&pool).await?.build();
 let engine = Engine::new(pool, schema); // Engine<sqlx::Sqlite>
+# Ok(()) }
+```
+
+```rust
+# #[cfg(feature = "mysql")]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use vision_graphql::{Engine, Schema};
+
+let pool = sqlx::mysql::MySqlPoolOptions::new()
+    .connect_with(vision_graphql::mysql::connect_options("mysql://app:secret@db/app")?)
+    .await?;
+let schema = Schema::introspect_mysql(&pool).await?.build();
+let engine = Engine::new(pool, schema); // Engine<sqlx::MySql>
 # Ok(()) }
 ```
 
@@ -172,6 +187,36 @@ anyway gets `Error::Unsupported` (`UNSUPPORTED`).
 | `count(columns: [a, b])` | Refused: SQLite rejects a row value as an aggregate's argument, and there is no other one-expression spelling of distinct pairs. One column, or `count(*)`. |
 | `vision-gql` CLI | `generate`, `diff` and `sdl` take a `sqlite://` URL. `diff` reports skipped columns (`NUMERIC`, `BLOB`, untyped) as on PostgreSQL; a table that is not `STRICT` is warned about. |
 | Version | 3.38 or later (`->`, built-in JSON functions); checked at introspection and before the engine's first statement. sqlx bundles 3.51. |
+
+
+### MySQL
+
+Everything below is implemented against a real MySQL 8.4 in
+`tests/mysql_read.rs` and `tests/mysql_write.rs`. MySQL 8.0.19 or later;
+MariaDB is refused (its JSON is text, and it has no `JSON_TABLE`).
+
+| Area | On MySQL |
+|---|---|
+| Lists, `_by_pk`, nested relations, relation filters, `order_by` at every level, `limit` / `offset`, `distinct_on`, `_aggregate` with every function, `__typename`, JSON path reads, the jsonb operators, variables, `@choices` / `@optional`, compiled statements, persisted queries, scoped execution, transactions and the `_on` twins, mutations | Implemented. |
+| Ordered lists | `JSON_ARRAYAGG` takes no `ORDER BY` and does not keep a derived table's order (it happens to when a `LIMIT` forces the table to be materialised, which is worse than never). Every ordered list is rendered as a window: the rows are numbered under the `ORDER BY` asked for and aggregated in that order. `nodes` under an aggregate read a source of their own, since a window cannot sit beside `count(*)`. |
+| Response key order | `JSON_OBJECT` sorts an object's keys (by length, then name). The engine puts every object of the response back in selection order after decoding, at every level; the keys *inside* a JSON column are the column's, and stay as MySQL stores them (which is how `jsonb` stores them too). |
+| `order_by` without `nulls_first` / `nulls_last` | PostgreSQL's defaults (`asc` → nulls last, `desc` → nulls first), spelled as a leading `col IS NULL` term: MySQL's own default is the reverse and it has no `NULLS FIRST`. |
+| `_in` / `_nin` | One placeholder holding the list as JSON, read by `JSON_TABLE` typed as the column; a compiled statement's text is independent of the list's length. |
+| Placeholders | MySQL's are anonymous, so a parameter the statement uses twice (`@optional`) is bound twice; `CompiledQuery::variables` still lists it once. |
+| `_like` / `_nlike` | `LIKE … COLLATE utf8mb4_bin`: MySQL's default collations ignore case, PostgreSQL's `LIKE` does not. The connection's character set has to be `utf8mb4`, which sqlx sets. |
+| `_ilike` / `_nilike` | `LOWER(x) LIKE LOWER(y)`, with MySQL's Unicode case folding. |
+| Booleans | `TINYINT(1)` — what `BOOLEAN` declares — is published as `Boolean` and comes back as a JSON boolean (MySQL's own reading: not zero). Any other `TINYINT` is an integer. |
+| Timestamps | `DATETIME` is `timestamp` and comes back as ISO 8601 (`2026-01-02T03:04:05`, the fraction when there is one). `TIMESTAMP` is `timestamptz`: stored as UTC, read back in the session's zone, and rendered converted to UTC with its offset (`…+00:00`) — `mysql::verify` refuses a pool whose session zone `CONVERT_TZ` cannot convert. |
+| `DECIMAL` | `numeric`, exact: a bound operand is cast to `DECIMAL(65,30)` so the comparison is not done in doubles. |
+| `JSON` | Published as `jsonb`: MySQL's JSON is binary, normalised and compared structurally, which is what `jsonb` means here; `_eq`, `_in` and the jsonb operators apply. `_has_key` and friends answer as PostgreSQL's `?`, `?\|`, `?&` do — an object's keys, an array's string elements, a string itself. |
+| Unsigned integers | `Int8` whatever the width. A `BIGINT UNSIGNED` value above `i64::MAX` reaches the response intact (it is a JSON number) and cannot be bound as a filter value. |
+| `ENUM` | Text. `SET`, `BIT`, the binary and blob types and the spatial types are left out of the schema and recorded as skipped columns. |
+| `count(columns: [a, b])` | `distinct: true` is `COUNT(DISTINCT a, b)`; without it MySQL has no spelling for the count of pairs, and it is refused. |
+| Mutations | Implemented as a **sequence of statements in one transaction** (`vision_graphql::plan`), with rows identified by **primary key** — a table written through the engine must have one; `insert`, `update` and a `delete` with `returning` on a table without one are refused, a bare `delete` counts. An insert is followed by a read of the row it wrote (MySQL has no `RETURNING`): by the key the object supplied, the key its parent lent it, or `LAST_INSERT_ID()` for a single integer key it left out — any other generated key (a `CHAR(36)` with `DEFAULT (UUID())`, say) has to be supplied. An update selects the keys of the rows it will touch first (`FOR UPDATE`), updates them by key and reads them back, so `affected_rows` counts matched rows as PostgreSQL does. Atomic on the pool, in `Engine::transaction`, and inside a caller's transaction through the `_on` twins (a savepoint). |
+| Mutations: what differs | As on SQLite: later fields of one mutation see earlier fields' writes, `returning { relation }` sees every related row, a column an object leaves out gets its default. An `AUTO_INCREMENT` value MySQL handed to a write that then conflicted or rolled back is never handed out again, so ids after such a write are not contiguous. |
+| `on_conflict` | `ON DUPLICATE KEY UPDATE … = new.…`, which MySQL fires on **any** unique key, not only the constraint named (the name is checked to exist). A top-level `update_columns: []` is an insert conditional on no row with the constraint's values existing: nothing inserted, nothing counted, no children, as `DO NOTHING`. A nested `update_columns: []` is a no-op update, and the existing row's key is read back for its dependants (`LAST_INSERT_ID(key)`). An `on_conflict` `where` is refused: MySQL has nothing that leaves a conflicting row unreturned when the condition fails. |
+| `vision-gql` CLI | `generate`, `diff` and `sdl` take a `mysql://user:pass@host/db` URL and introspect the database it names; `--schema` is refused. |
+| Version | 8.0.19 or later (`JSON_TABLE`, the window form of `JSON_ARRAYAGG`, the `AS new` alias of an upsert); checked at introspection and before the engine's first statement, as is `sql_mode` (`NO_BACKSLASH_ESCAPES` is refused: the rendered SQL escapes a backslash in a literal as `\\`). |
 
 ## JSON/JSONB path reads
 
@@ -478,14 +523,14 @@ overlay files against a live database.
 ```bash
 cargo install vision-graphql-cli
 vision-gql generate --url postgres://localhost/myapp > schema.toml
-vision-gql diff     --url postgres://localhost/myapp --config schema.toml
+vision-gql diff     --url mysql://app:secret@localhost/myapp --config schema.toml
 vision-gql validate schema.toml
 vision-gql sdl      --url sqlite://app.db --output schema.graphql
 ```
 
-The URL picks the database: `postgres://…`, or `sqlite://path/to/file.db`
-(the file must exist; `--schema` is PostgreSQL's and is refused for SQLite,
-which has one schema).
+The URL picks the database: `postgres://…`, `mysql://user:pass@host/db`, or
+`sqlite://path/to/file.db` (the file must exist). `--schema` is PostgreSQL's:
+SQLite has one schema, and MySQL introspects the database the URL names.
 
 `generate` produces a fully-commented starter file; uncomment any stanza to
 override defaults from introspection. `diff` checks the overlay's references

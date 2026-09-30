@@ -13,6 +13,12 @@ repository = "https://github.com/oonxt/vision-graphql"
 name = "vision-gql"
 path = "src/main.rs"
 
+[features]
+default = ["mysql"]
+# MySQL support is a feature so the binary can be built without the driver;
+# on by default, as the published binary has it.
+mysql = ["vision-graphql/mysql", "sqlx/mysql", "sqlx/mysql-rsa"]
+
 [dependencies]
 vision-graphql      = { path = "../..", version = "0.25.1", features = ["sqlite"] }
 clap                = { version = "4", features = ["derive"] }
@@ -39,4 +45,4 @@ time                = { version = "0.3", features = ["formatting"] }
 tokio                  = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 insta                  = "1"
 testcontainers         = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
