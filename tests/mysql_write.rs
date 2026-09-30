@@ -208,6 +208,29 @@ async fn nested_inserts_in_both_directions() {
         v["insert_posts_one"],
         json!({"user_id": 1, "user": {"name": "Ann"}})
     );
+    // The same with the key supplied: a no-op update on the key itself,
+    // which MySQL reports as a row found (sqlx asks for found rows, not
+    // changed rows), so the row is read back and lent.
+    let v = q(
+        &e,
+        r#"mutation { insert_posts_one(object: {title: "for Ann again", user: {data: {id: 1, name: "Ann"}, on_conflict: {constraint: users_pkey, update_columns: []}}}) { user_id user { name } } }"#,
+    )
+    .await;
+    assert_eq!(
+        v["insert_posts_one"],
+        json!({"user_id": 1, "user": {"name": "Ann"}})
+    );
+    // And a nested upsert that updates: the row is read back by the key
+    // the object supplied.
+    let v = q(
+        &e,
+        r#"mutation { insert_posts_one(object: {title: "for bob", user: {data: {id: 2, name: "bob", active: true}, on_conflict: {constraint: users_pkey, update_columns: [active]}}}) { user_id user { name active } } }"#,
+    )
+    .await;
+    assert_eq!(
+        v["insert_posts_one"],
+        json!({"user_id": 2, "user": {"name": "bob", "active": true}})
+    );
     assert_eq!(count(&e, "users").await, 5);
     // A composite key: the parent lends one half, the object gives the other.
     let v = q(

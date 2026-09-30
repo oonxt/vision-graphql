@@ -1430,11 +1430,14 @@ impl<'a> Builder<'a> {
             });
         }
         s.ctx.sql.push_str(" AS new ON DUPLICATE KEY UPDATE ");
+        // Qualified by table: beside the `new` row alias a bare column name
+        // is ambiguous to MySQL.
+        let tref = quote_ident(&table.physical_name, self.dialect);
         let mut first = true;
         for (k, source) in key {
             if matches!(source, KeyBind::Plan(PlanBind::LastInsertId)) {
                 let pk = quote_ident(&k.physical_name, self.dialect);
-                write!(s.ctx.sql, "{pk} = LAST_INSERT_ID({pk})").unwrap();
+                write!(s.ctx.sql, "{tref}.{pk} = LAST_INSERT_ID({tref}.{pk})").unwrap();
                 first = false;
             }
         }
@@ -1448,14 +1451,14 @@ impl<'a> Builder<'a> {
             }
             first = false;
             let c = quote_ident(&col.physical_name, self.dialect);
-            write!(s.ctx.sql, "{c} = new.{c}").unwrap();
+            write!(s.ctx.sql, "{tref}.{c} = new.{c}").unwrap();
         }
         if first {
             // A nested no-op with its key supplied: the row is left as it
             // is, and read back by that key.
             let (k, _) = key.first().expect("a key has a column");
             let pk = quote_ident(&k.physical_name, self.dialect);
-            write!(s.ctx.sql, "{pk} = {pk}").unwrap();
+            write!(s.ctx.sql, "{tref}.{pk} = {tref}.{pk}").unwrap();
         }
         Ok(())
     }
