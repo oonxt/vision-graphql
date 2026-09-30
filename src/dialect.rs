@@ -109,6 +109,8 @@ pub(crate) enum JsonKind {
     /// A timestamp with a zone, which MySQL prints in the session's zone
     /// with no offset to say so.
     TimestampTz,
+    /// A time of day, whose fraction MySQL prints to six digits.
+    Time,
 }
 
 /// The [`JsonKind`] of a column's values.
@@ -118,6 +120,7 @@ pub(crate) fn json_kind(ty: &ColumnType) -> JsonKind {
         ColumnType::Json | ColumnType::Jsonb => JsonKind::Json,
         ColumnType::Timestamp => JsonKind::Timestamp,
         ColumnType::TimestampTz => JsonKind::TimestampTz,
+        ColumnType::Time => JsonKind::Time,
         _ => JsonKind::Plain,
     }
 }
@@ -247,6 +250,16 @@ pub(crate) fn mysql_json_table_type(ty: &ColumnType) -> &'static str {
     }
 }
 
+/// The fraction of a second as PostgreSQL's JSON spells it: nothing when it
+/// is zero, else `.` and the digits with trailing zeros dropped (`.5`, not
+/// `.500000`).
+fn mysql_fraction(value: &str) -> String {
+    format!(
+        "IF(MICROSECOND({value}) = 0, '', CONCAT('.', TRIM(TRAILING '0' FROM \
+         DATE_FORMAT({value}, '%f'))))"
+    )
+}
+
 /// A MySQL `DATETIME`/`TIMESTAMP` as the ISO 8601 string PostgreSQL's JSON
 /// carries: `T` between date and time, the fraction only when there is one,
 /// and for a `TIMESTAMP` — stored as UTC, read back in the session's zone —
@@ -262,9 +275,20 @@ fn mysql_iso_timestamp(f: &mut Formatter<'_>, expr: &dyn Display, zoned: bool) -
     };
     write!(
         f,
-        "CASE WHEN {expr} IS NULL THEN NULL WHEN MICROSECOND({value}) = 0 THEN \
-         DATE_FORMAT({value}, '%Y-%m-%dT%H:%i:%s{suffix}') ELSE \
-         DATE_FORMAT({value}, '%Y-%m-%dT%H:%i:%s.%f{suffix}') END"
+        "CASE WHEN {expr} IS NULL THEN NULL ELSE CONCAT(DATE_FORMAT({value}, \
+         '%Y-%m-%dT%H:%i:%s'), {}, '{suffix}') END",
+        mysql_fraction(&value)
+    )
+}
+
+/// A MySQL `TIME` as PostgreSQL's JSON spells one: `09:00:00`, the fraction
+/// only when there is one.
+fn mysql_iso_time(f: &mut Formatter<'_>, expr: &dyn Display) -> fmt::Result {
+    let value = expr.to_string();
+    write!(
+        f,
+        "CASE WHEN {expr} IS NULL THEN NULL ELSE CONCAT(TIME_FORMAT({value}, '%H:%i:%s'), {}) END",
+        mysql_fraction(&value)
     )
 }
 
@@ -466,16 +490,17 @@ impl Dialect {
                             CmpOp::Contains => write!(f, "JSON_CONTAINS({lhs}, {rhs})"),
                             CmpOp::ContainedIn => write!(f, "JSON_CONTAINS({rhs}, {lhs})"),
                             // `?` on an object asks about its keys, on an
-                            // array about its string elements, on a string
-                            // about the string itself; anything else is
-                            // false, and a null is null.
+                            // array about its top-level string elements
+                            // (MEMBER OF, where JSON_CONTAINS would look
+                            // inside nested elements too), on a string about
+                            // the string itself; anything else is false, and
+                            // a null is null.
                             CmpOp::HasKey => write!(
                                 f,
                                 "CASE WHEN {lhs} IS NULL THEN NULL \
                                  WHEN JSON_TYPE({lhs}) = 'OBJECT' THEN \
                                  JSON_CONTAINS_PATH({lhs}, 'one', CONCAT('$.', JSON_QUOTE({rhs}))) \
-                                 WHEN JSON_TYPE({lhs}) = 'ARRAY' THEN \
-                                 JSON_CONTAINS({lhs}, JSON_QUOTE({rhs})) \
+                                 WHEN JSON_TYPE({lhs}) = 'ARRAY' THEN ({rhs} MEMBER OF({lhs})) \
                                  WHEN JSON_TYPE({lhs}) = 'STRING' THEN JSON_UNQUOTE({lhs}) = {rhs} \
                                  ELSE FALSE END"
                             ),
@@ -488,12 +513,17 @@ impl Dialect {
                                  WHEN JSON_TYPE({lhs}) = 'STRING' THEN JSON_CONTAINS({rhs}, {lhs}) \
                                  ELSE FALSE END"
                             ),
+                            // Every key: the object's keys are a flat list,
+                            // JSON_CONTAINS serves; an array's top-level
+                            // elements are asked one key at a time.
                             CmpOp::HasKeysAll => write!(
                                 f,
                                 "CASE WHEN {lhs} IS NULL THEN NULL \
                                  WHEN JSON_TYPE({lhs}) = 'OBJECT' THEN \
                                  JSON_CONTAINS(JSON_KEYS({lhs}), {rhs}) \
-                                 WHEN JSON_TYPE({lhs}) = 'ARRAY' THEN JSON_CONTAINS({lhs}, {rhs}) \
+                                 WHEN JSON_TYPE({lhs}) = 'ARRAY' THEN NOT EXISTS (SELECT 1 FROM \
+                                 JSON_TABLE({rhs}, '$[*]' COLUMNS (k JSON PATH '$')) AS jk \
+                                 WHERE NOT (jk.k MEMBER OF({lhs}))) \
                                  WHEN JSON_TYPE({lhs}) = 'STRING' THEN \
                                  JSON_CONTAINS(JSON_ARRAY({lhs}), {rhs}) \
                                  ELSE FALSE END"
@@ -532,7 +562,10 @@ impl Dialect {
     ) -> impl Display + 'a {
         Fragment(move |f: &mut Formatter<'_>| match (self, kind) {
             (Dialect::Postgres, _)
-            | (Dialect::Sqlite, JsonKind::Plain | JsonKind::Timestamp | JsonKind::TimestampTz)
+            | (
+                Dialect::Sqlite,
+                JsonKind::Plain | JsonKind::Timestamp | JsonKind::TimestampTz | JsonKind::Time,
+            )
             | (Dialect::MySql, JsonKind::Plain | JsonKind::Json) => write!(f, "{expr}"),
             (Dialect::Sqlite, JsonKind::Json) => write!(f, "json({expr})"),
             // Anything but 0, 1 and NULL is a value the column's declared
@@ -555,6 +588,7 @@ impl Dialect {
             ),
             (Dialect::MySql, JsonKind::Timestamp) => mysql_iso_timestamp(f, &expr, false),
             (Dialect::MySql, JsonKind::TimestampTz) => mysql_iso_timestamp(f, &expr, true),
+            (Dialect::MySql, JsonKind::Time) => mysql_iso_time(f, &expr),
         })
     }
 

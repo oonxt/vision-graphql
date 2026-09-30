@@ -26,6 +26,7 @@ CREATE TABLE users (
     meta JSON,
     created_at DATETIME(6),
     seen_at TIMESTAMP(6) NULL,
+    opens_at TIME(3),
     big BIGINT UNSIGNED,
     picture BLOB,
     flags SET('a','b'),
@@ -46,10 +47,11 @@ CREATE TABLE tags (
     CONSTRAINT tags_post_fk FOREIGN KEY (post_id) REFERENCES posts(id)
 );
 CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1;
-INSERT INTO users (id, name, active, score, meta, created_at, seen_at, big) VALUES
-    (1, 'Ann',  1, 9.50, '{"tags":["a","b"],"n":{"k":2}}', '2026-01-01 00:00:00', '2026-01-01 00:00:00', 18446744073709551615),
-    (2, 'bob',  0, NULL, NULL,                              '2026-01-02 00:00:00.5', NULL, NULL),
-    (3, 'Cara', 1, 7.25, '{"tags":[]}',                     NULL,                    NULL, 7);
+INSERT INTO users (id, name, active, score, meta, created_at, seen_at, opens_at, big) VALUES
+    (1, 'Ann',  1, 9.50, '{"tags":["a","b"],"n":{"k":2}}', '2026-01-01 00:00:00', '2026-01-01 00:00:00', '09:00:00.5', 18446744073709551615),
+    (2, 'bob',  0, NULL, NULL,                              '2026-01-02 00:00:00.5', NULL, '09:00:00', NULL),
+    (3, 'Cara', 1, 7.25, '{"tags":[]}',                     NULL,                    NULL, NULL, 7);
+CREATE TABLE ev (id INT NOT NULL, tag VARBINARY(16) NOT NULL, n INT, PRIMARY KEY (id, tag), UNIQUE KEY ev_n_tag (n, tag), UNIQUE KEY ev_n (n));
 INSERT INTO posts (id, user_id, title, views, published) VALUES
     (1, 1, 'zeta',  10, 1),
     (2, 1, 'alpha', 30, 0),
@@ -102,7 +104,7 @@ async fn introspection_reads_tables_types_keys_and_relations() {
     let schema = Schema::introspect_mysql(&db.pool).await.unwrap().build();
     assert_eq!(schema.dialect(), Dialect::MySql);
     let names: Vec<&str> = schema.tables().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["active_users", "posts", "tags", "users"]);
+    assert_eq!(names, ["active_users", "ev", "posts", "tags", "users"]);
 
     let users = schema.table("users").unwrap();
     assert_eq!(users.primary_key, ["id"]);
@@ -114,6 +116,15 @@ async fn introspection_reads_tables_types_keys_and_relations() {
     assert_eq!(ty("created_at"), ColumnType::Timestamp);
     assert_eq!(ty("seen_at"), ColumnType::TimestampTz);
     assert_eq!(ty("big"), ColumnType::Int8);
+    assert_eq!(ty("opens_at"), ColumnType::Time);
+    // A key over a column the engine leaves out is no key: `ev` has no
+    // primary key here and no `_by_pk`, and only the unique key whose
+    // columns are all in the schema.
+    let ev = schema.table("ev").unwrap();
+    assert!(ev.primary_key.is_empty());
+    assert!(ev.find_column("tag").is_none());
+    assert_eq!(ev.unique_constraints.keys().collect::<Vec<_>>(), ["ev_n"]);
+    assert!(!vision_graphql::sdl::render(schema.type_system()).contains("ev_by_pk"));
     // BLOB and SET have no mapping and are left out — findably.
     assert!(users.find_column("picture").is_none());
     assert!(users.find_column("flags").is_none());
@@ -138,6 +149,7 @@ async fn introspection_reads_tables_types_keys_and_relations() {
     assert_eq!(
         skipped,
         [
+            ("tag".to_string(), "varbinary(16)".to_string()),
             ("picture".to_string(), "blob".to_string()),
             ("flags".to_string(), "set('a','b')".to_string())
         ]
@@ -149,20 +161,23 @@ async fn scalars_come_back_with_their_json_types() {
     let (e, _db) = engine().await;
     let v = q(
         &e,
-        "{ users(order_by: {id: asc}) { id name active score meta created_at seen_at big } }",
+        "{ users(order_by: {id: asc}) { id name active score meta created_at seen_at opens_at big } }",
     )
     .await;
+    // Times as PostgreSQL's JSON spells them: `T`, the fraction only when
+    // there is one and without trailing zeros, UTC with its offset.
     assert_eq!(
         v["users"],
         json!([
             {"id": 1, "name": "Ann", "active": true, "score": 9.5,
              "meta": {"tags": ["a", "b"], "n": {"k": 2}},
              "created_at": "2026-01-01T00:00:00", "seen_at": "2026-01-01T00:00:00+00:00",
-             "big": 18446744073709551615u64},
+             "opens_at": "09:00:00.5", "big": 18446744073709551615u64},
             {"id": 2, "name": "bob", "active": false, "score": null,
-             "meta": null, "created_at": "2026-01-02T00:00:00.500000", "seen_at": null, "big": null},
+             "meta": null, "created_at": "2026-01-02T00:00:00.5", "seen_at": null,
+             "opens_at": "09:00:00", "big": null},
             {"id": 3, "name": "Cara", "active": true, "score": 7.25,
-             "meta": {"tags": []}, "created_at": null, "seen_at": null, "big": 7}
+             "meta": {"tags": []}, "created_at": null, "seen_at": null, "opens_at": null, "big": 7}
         ])
     );
 }
@@ -439,7 +454,7 @@ async fn aggregates() {
     .await;
     assert_eq!(
         v["users_aggregate"]["aggregate"]["max"],
-        json!({"created_at": "2026-01-02T00:00:00.500000", "seen_at": "2026-01-01T00:00:00+00:00"})
+        json!({"created_at": "2026-01-02T00:00:00.5", "seen_at": "2026-01-01T00:00:00+00:00"})
     );
 }
 
@@ -539,7 +554,8 @@ INSERT INTO departments VALUES
   (2, 'neuro',  '{"is_mdt": false, "tags": ["b"]}'),
   (3, 'ortho',  '{"note": "x"}'),
   (4, 'admin',  NULL),
-  (5, 'labs',   '["a", "b"]');
+  (5, 'labs',   '["a", "b"]'),
+  (6, 'deep',   '[["a"], {"k": "a"}, "b"]');
 "#,
     )
     .await;
@@ -553,11 +569,18 @@ INSERT INTO departments VALUES
             &[2, 3],
         ),
         (r#"{extra: {_has_key: "tags"}}"#, &[1, 2]),
+        // A key test on an array is about its top-level string elements:
+        // the "a" nested inside row 6 does not count, as it would not for
+        // PostgreSQL's `?`.
         (r#"{extra: {_has_key: "a"}}"#, &[5]),
+        (r#"{extra: {_has_key: "b"}}"#, &[5, 6]),
         (r#"{extra: {_has_keys_any: ["note", "level"]}}"#, &[1, 3]),
+        (r#"{extra: {_has_keys_any: ["a"]}}"#, &[5]),
         (r#"{extra: {_has_keys_all: ["is_mdt", "tags"]}}"#, &[1, 2]),
+        (r#"{extra: {_has_keys_all: ["a", "b"]}}"#, &[5]),
+        (r#"{extra: {_has_keys_all: ["b"]}}"#, &[5, 6]),
         (r#"{extra: {_has_keys_any: []}}"#, &[]),
-        (r#"{extra: {_has_keys_all: []}}"#, &[1, 2, 3, 5]),
+        (r#"{extra: {_has_keys_all: []}}"#, &[1, 2, 3, 5, 6]),
         (
             r#"{_and: [{extra: {_has_key: "tags"}}, {_not: {extra: {_contains: {is_mdt: true}}}}], name: {_like: "n%"}}"#,
             &[2],

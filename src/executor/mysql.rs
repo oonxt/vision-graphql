@@ -91,7 +91,22 @@ async fn run_plan(
                         } else {
                             let last = Some(done.last_insert_id());
                             let binds = resolve_plan_binds(read_binds, inputs, &captured, last)?;
-                            fetch_rows(&mut *conn, read_sql, &binds).await?
+                            let rows = fetch_rows(&mut *conn, read_sql, &binds).await?;
+                            // One write, one row. Two means the object
+                            // conflicted with two rows by two keys and
+                            // MySQL updated one of them — a state
+                            // PostgreSQL would have refused to enter.
+                            if rows.len() > 1 {
+                                return Err(Error::Unsupported {
+                                    message: format!(
+                                        "an upsert matched {} rows by different unique keys; \
+                                         MySQL updated one where PostgreSQL would have refused \
+                                         the insert — resolve the conflict first",
+                                        rows.len()
+                                    ),
+                                });
+                            }
+                            rows
                         }
                     }
                 };

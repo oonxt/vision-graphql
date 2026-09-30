@@ -37,7 +37,11 @@
 //! MySQL names every primary key `PRIMARY`; it is registered as
 //! `<table>_pkey`, PostgreSQL's default, so an `on_conflict` written
 //! against PostgreSQL says the same word here. Every unique index is a
-//! unique constraint to `information_schema`, and is recorded as one.
+//! unique constraint to `information_schema`, and is recorded as one. A key
+//! with a column the engine leaves out is left out whole — a table whose
+//! primary key includes a `VARBINARY` has no primary key here, and no
+//! `_by_pk` and no mutations that need one — because part of a key does
+//! not identify a row.
 //!
 //! [`SchemaBuilder`]: crate::schema::SchemaBuilder
 
@@ -176,22 +180,36 @@ pub async fn introspect(pool: &MySqlPool) -> Result<IntrospectedDb> {
     .bind(&schema)
     .fetch_all(pool)
     .await?;
+    // Gathered whole, then kept only when every column of the key is in the
+    // schema: a key with a column left out is not the key — rows would be
+    // identified, read back and upserted by part of it, and several rows
+    // would answer to one.
+    let mut partial: std::collections::BTreeSet<(String, String)> = Default::default();
     for k in &keys {
         let tbl: String = k.try_get("tbl")?;
         let name: String = k.try_get("name")?;
         let kind: String = k.try_get("kind")?;
         let col: String = k.try_get("col")?;
-        let Some(table) = db.tables.get_mut(&(schema.clone(), tbl)) else {
+        let Some(table) = db.tables.get_mut(&(schema.clone(), tbl.clone())) else {
             continue;
         };
-        // A key over a column the engine left out pins nothing it can name.
         if !table.columns.iter().any(|c| c.name == col) {
+            partial.insert((tbl, name));
             continue;
         }
         if kind == "PRIMARY KEY" {
             table.primary_key.push(col);
         } else {
             table.unique_constraints.entry(name).or_default().push(col);
+        }
+    }
+    for (tbl, name) in partial {
+        if let Some(table) = db.tables.get_mut(&(schema.clone(), tbl)) {
+            if name == "PRIMARY" {
+                table.primary_key.clear();
+            } else {
+                table.unique_constraints.remove(&name);
+            }
         }
     }
     for table in db.tables.values_mut() {

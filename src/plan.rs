@@ -672,9 +672,34 @@ impl<'a> Builder<'a> {
         )
         .unwrap();
         pred(&x, &mut s.ctx)?;
-        s.ctx.sql.push_str(" FOR UPDATE");
+        // `OF`: only this table's rows, not those of a table a relation
+        // filter read on the way, as PostgreSQL's UPDATE locks only its
+        // target rows.
+        write!(s.ctx.sql, " FOR UPDATE OF {x}").unwrap();
         let cap = self.write(s);
         Ok((cap, keys))
+    }
+
+    /// Refuse a `_set` on a key column on a dialect that identifies rows by
+    /// key: the rows are picked by key before the update, and guarded, read
+    /// back and returned by that key after it — a key that changed under
+    /// them would make every one of those a miss, silently.
+    fn refuse_key_change(
+        &self,
+        table: &Table,
+        set: &std::collections::BTreeMap<String, Val>,
+        path: &str,
+    ) -> Result<()> {
+        if let Some(col) = table.primary_key.iter().find(|pk| set.contains_key(*pk)) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "{path}._set.{col}: a primary key column cannot be updated on {:?}, which \
+                     identifies the rows of an update by their key",
+                    self.dialect
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn field(&mut self, mf: &MutationField) -> Result<FieldResponse> {
@@ -740,6 +765,7 @@ impl<'a> Builder<'a> {
             } => {
                 let t = self.table(table, &alias)?;
                 let cap = if self.by_key() {
+                    self.refuse_key_change(t, set, &alias)?;
                     let schema = self.schema;
                     let (cap, keys) = self.pick_for_update(
                         t,
@@ -781,6 +807,7 @@ impl<'a> Builder<'a> {
             } => {
                 let t = self.table(table, &alias)?;
                 let cap = if self.by_key() {
+                    self.refuse_key_change(t, set, &alias)?;
                     let schema = self.schema;
                     let (cap, keys) = self.pick_for_update(
                         t,
@@ -840,10 +867,21 @@ impl<'a> Builder<'a> {
                         &alias,
                     )?)
                 };
-                let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
-                render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
-                let cap = self.delete(s);
+                let cap = if self.by_key() {
+                    let schema = self.schema;
+                    let (cap, keys) = self.pick_for_update(
+                        t,
+                        |x, ctx| render_bool_expr(where_, t, x, schema, ctx),
+                        &alias,
+                    )?;
+                    self.delete_by_keys(t, cap, &keys);
+                    cap
+                } else {
+                    let mut s = Stmt::new(self.dialect);
+                    write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
+                    render_bool_expr_no_alias(where_, t, self.schema, &mut s.ctx)?;
+                    self.delete(s)
+                };
                 ResponseShape::Deleted {
                     capture: cap,
                     read,
@@ -870,10 +908,31 @@ impl<'a> Builder<'a> {
                         &alias,
                     )?)
                 };
-                let mut s = Stmt::new(self.dialect);
-                write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
-                render_pk_predicate(t, pk, scope.as_ref(), &alias, None, self.schema, &mut s.ctx)?;
-                let cap = self.delete(s);
+                let cap = if self.by_key() {
+                    let schema = self.schema;
+                    let (cap, keys) = self.pick_for_update(
+                        t,
+                        |x, ctx| {
+                            render_pk_predicate(t, pk, scope.as_ref(), &alias, Some(x), schema, ctx)
+                        },
+                        &alias,
+                    )?;
+                    self.delete_by_keys(t, cap, &keys);
+                    cap
+                } else {
+                    let mut s = Stmt::new(self.dialect);
+                    write!(s.ctx.sql, "DELETE FROM {} WHERE ", self.qualified(t)).unwrap();
+                    render_pk_predicate(
+                        t,
+                        pk,
+                        scope.as_ref(),
+                        &alias,
+                        None,
+                        self.schema,
+                        &mut s.ctx,
+                    )?;
+                    self.delete(s)
+                };
                 ResponseShape::Deleted {
                     capture: cap,
                     read,
@@ -885,14 +944,28 @@ impl<'a> Builder<'a> {
         Ok(FieldResponse { alias, shape })
     }
 
-    /// A `DELETE`, counted: SQLite returns the rowids, MySQL the number.
+    /// A `DELETE … RETURNING rowid` (SQLite): the rows, counted.
     fn delete(&mut self, mut s: Stmt) -> usize {
-        if self.by_key() {
-            self.push_write(s, RowsFrom::Count)
-        } else {
-            Self::returning_rowid(&mut s.ctx.sql);
-            self.write(s)
-        }
+        Self::returning_rowid(&mut s.ctx.sql);
+        self.write(s)
+    }
+
+    /// `DELETE … WHERE <the keys captured under `cap`>` (MySQL). The rows
+    /// were picked and locked already, so the count is theirs; and a
+    /// `where` that reaches this table through a relation filter would put
+    /// the target in its own FROM, which MySQL refuses (error 1093), where
+    /// a list of keys is just a list.
+    fn delete_by_keys(&mut self, table: &Table, cap: usize, keys: &[&Column]) {
+        let mut s = Stmt::new(self.dialect);
+        let n = s.captured(PlanBind::Keys(vec![cap]), NullOf::Text);
+        write!(
+            s.ctx.sql,
+            "DELETE FROM {} WHERE {}",
+            self.qualified(table),
+            self.keys_predicate(None, n, keys)
+        )
+        .unwrap();
+        self.push_write(s, RowsFrom::Count);
     }
 
     /// `UPDATE … WHERE <the keys captured under `cap`>` (MySQL): the rows
@@ -1111,7 +1184,12 @@ impl<'a> Builder<'a> {
         // A top-level DO NOTHING on MySQL is an insert conditional on no
         // conflicting row: the one spelling that inserts nothing, counts
         // nothing and returns nothing, as PostgreSQL's does. (INSERT IGNORE
-        // would also ignore a foreign key it cannot satisfy.)
+        // would also ignore a foreign key it cannot satisfy.) The probe reads
+        // the table whole, scope or no scope — deliberately: the conflict is
+        // with any row, and PostgreSQL's DO NOTHING tells the caller the same
+        // thing through `affected_rows` (0: a row with these values exists
+        // somewhere). A scoped probe would insert into the conflict instead
+        // and report a duplicate key, which says it louder.
         let conditional = match on_conflict {
             Some(oc) if self.by_key() && oc.update_columns.is_empty() && !nested => Some(oc),
             _ => None,
@@ -1187,7 +1265,32 @@ impl<'a> Builder<'a> {
                 self.write(s)
             }
             Some(key) => {
-                let readback = self.readback(table, &key, path)?;
+                // An upsert may have touched the row the named constraint
+                // finds rather than the row the object's key names: read
+                // back by either, and by the constraint's columns only when
+                // the object set every one of them (a column it did not set
+                // is NULL, which conflicts with nothing).
+                let by_constraint = match (on_conflict, conditional) {
+                    (Some(oc), None) => {
+                        let cols = self.conflict_columns(oc, table, path)?;
+                        let sources: Option<Vec<(&Column, KeyBind)>> = cols
+                            .iter()
+                            .map(|c| {
+                                values
+                                    .iter()
+                                    .find(|(v, _)| v.exposed_name == c.exposed_name)
+                                    .map(|(_, src)| (*c, src.clone()))
+                            })
+                            .collect();
+                        sources.filter(|s| {
+                            !s.iter().all(|(c, _)| {
+                                key.iter().any(|(k, _)| k.exposed_name == c.exposed_name)
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+                let readback = self.readback(table, &key, by_constraint.as_deref(), path)?;
                 self.push_write(s, readback)
             }
         };
@@ -1257,25 +1360,44 @@ impl<'a> Builder<'a> {
             .collect()
     }
 
-    /// The read of the row an insert wrote, by its key.
-    fn readback(&self, table: &Table, key: &[(&Column, KeyBind)], path: &str) -> Result<RowsFrom> {
+    /// The read of the row an insert wrote, by its key — or, for an upsert,
+    /// by the named constraint's columns as well. Two rows answering (the
+    /// object conflicted on both keys, and MySQL updated one of them where
+    /// PostgreSQL would have refused the insert) is the executor's error.
+    fn readback(
+        &self,
+        table: &Table,
+        key: &[(&Column, KeyBind)],
+        or_by: Option<&[(&Column, KeyBind)]>,
+        path: &str,
+    ) -> Result<RowsFrom> {
         let mut s = Stmt::new(self.dialect);
         let keys: Vec<&Column> = key.iter().map(|(k, _)| *k).collect();
         write!(s.ctx.sql, "SELECT {}", self.key_object(None, &keys)).unwrap();
         self.columns_as_json(table, None, &mut s.ctx.sql);
         write!(s.ctx.sql, ") FROM {} WHERE ", self.qualified(table)).unwrap();
-        for (i, (k, source)) in key.iter().enumerate() {
-            if i > 0 {
-                s.ctx.sql.push_str(" AND ");
+        let equalities = |s: &mut Stmt, cols: &[(&Column, KeyBind)]| -> Result<()> {
+            s.ctx.sql.push('(');
+            for (i, (k, source)) in cols.iter().enumerate() {
+                if i > 0 {
+                    s.ctx.sql.push_str(" AND ");
+                }
+                let n = s.bind_from(source, &k.ty, &format!("{path}.{}", k.exposed_name))?;
+                write!(
+                    s.ctx.sql,
+                    "{} = {}",
+                    quote_ident(&k.physical_name, self.dialect),
+                    self.dialect.param(n, &k.ty)
+                )
+                .unwrap();
             }
-            let n = s.bind_from(source, &k.ty, &format!("{path}.{}", k.exposed_name))?;
-            write!(
-                s.ctx.sql,
-                "{} = {}",
-                quote_ident(&k.physical_name, self.dialect),
-                self.dialect.param(n, &k.ty)
-            )
-            .unwrap();
+            s.ctx.sql.push(')');
+            Ok(())
+        };
+        equalities(&mut s, key)?;
+        if let Some(cols) = or_by {
+            s.ctx.sql.push_str(" OR ");
+            equalities(&mut s, cols)?;
         }
         let (sql, binds) = s.finish();
         Ok(RowsFrom::Readback { sql, binds })

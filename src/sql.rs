@@ -3488,7 +3488,19 @@ fn render_aggregate_object(
     ctx.sql.push(')');
     if needs_source {
         ctx.sql.push_str(" FROM (");
-        render_aggregate_source(args, ops, nodes, table, path, correlation, schema, ctx)?;
+        // With `nodes` on a source of their own this one feeds the
+        // functions only, which read no `nodes` columns.
+        let shared_nodes = if nodes_own_source { None } else { nodes };
+        render_aggregate_source(
+            args,
+            ops,
+            shared_nodes,
+            table,
+            path,
+            correlation,
+            schema,
+            ctx,
+        )?;
         ctx.sql.push_str(") ");
         ctx.sql.push_str(&inner_alias);
     }
@@ -4030,8 +4042,17 @@ fn render_aggregate_source(
     // `ob.column`, so an `order_by` through a relation silently sorted by the
     // source table's column of that name, and `NULLS FIRST|LAST` never
     // rendered at all.
+    // A source read by the aggregate functions alone has nothing to order,
+    // on a dialect where `nodes` never share it: the sort — and the window
+    // that numbers the rows — would serve `count(*)`. PostgreSQL and SQLite
+    // keep the ORDER BY, as their statement text has always had it. A limit
+    // or an offset still needs the order to mean anything.
+    let ordered = nodes.is_some()
+        || args.limit.is_some()
+        || args.offset.is_some()
+        || !ctx.dialect.nodes_need_own_source();
     let ob_start = ctx.sql.len();
-    if !args.order_by.is_empty() {
+    if ordered && !args.order_by.is_empty() {
         ctx.sql.push_str(" ORDER BY ");
         for (i, ob) in args.order_by.iter().enumerate() {
             if i > 0 {
@@ -4049,7 +4070,9 @@ fn render_aggregate_source(
         }
     }
     let order_by = ctx.sql[ob_start..].to_string();
-    number_rows(select_end, &order_by, ctx);
+    if nodes.is_some() {
+        number_rows(select_end, &order_by, ctx);
+    }
     render_limit_offset(args, path, ctx);
     Ok(())
 }

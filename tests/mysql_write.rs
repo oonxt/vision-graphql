@@ -321,6 +321,81 @@ async fn on_conflict_by_constraint_name_and_by_pkey() {
 }
 
 #[tokio::test]
+async fn a_key_cannot_change_under_an_update() {
+    let (e, _db) = engine().await;
+    // The rows are picked, guarded and read back by key; a key that moved
+    // would make every one of those a miss. Refused, not missed.
+    for src in [
+        r#"mutation { update_posts(where: {id: {_eq: 1}}, _set: {id: 99}) { affected_rows } }"#,
+        r#"mutation { update_posts_by_pk(pk_columns: {id: 1}, _set: {id: 99, views: 1}) { id } }"#,
+    ] {
+        let err = e.query(src, None).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{src}: {err}");
+        assert!(err.to_string().contains("_set.id"), "{src}: {err}");
+    }
+    let v = q(&e, "{ posts_by_pk(id: 1) { views } }").await;
+    assert_eq!(v["posts_by_pk"]["views"], json!(10));
+}
+
+#[tokio::test]
+async fn an_upsert_reads_back_the_row_the_constraint_found() {
+    let (e, _db) = engine().await;
+    // The object names a key of its own, but conflicts on the constraint:
+    // MySQL updates Ann (id 1), and that is the row read back.
+    let v = q(
+        &e,
+        r#"mutation { insert_users(objects: [{id: 5, name: "Ann", active: false}], on_conflict: {constraint: users_name_key, update_columns: [active]}) { affected_rows returning { id name active } } }"#,
+    )
+    .await;
+    assert_eq!(
+        v["insert_users"],
+        json!({"affected_rows": 1, "returning": [{"id": 1, "name": "Ann", "active": false}]})
+    );
+    assert_eq!(count(&e, "users").await, 2);
+    // And nested: the pointing row gets the key of the row that was found.
+    let v = q(
+        &e,
+        r#"mutation { insert_posts_one(object: {title: "t", user: {data: {id: 7, name: "bob"}, on_conflict: {constraint: users_name_key, update_columns: []}}}) { user_id } }"#,
+    )
+    .await;
+    assert_eq!(v["insert_posts_one"], json!({"user_id": 2}));
+    // Conflicting on two keys at once — id 2 is bob's, the name is Ann's —
+    // MySQL updates one of them; PostgreSQL would refuse. Refused here too,
+    // after the fact, and undone.
+    let err = e
+        .query(
+            r#"mutation { insert_users(objects: [{id: 2, name: "Ann", active: false}], on_conflict: {constraint: users_name_key, update_columns: [active]}) { affected_rows } }"#,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+    assert!(err.to_string().contains("different unique keys"), "{err}");
+    let v = q(&e, "{ users(order_by: {id: asc}) { id active } }").await;
+    assert_eq!(
+        v["users"],
+        json!([{"id": 1, "active": false}, {"id": 2, "active": false}])
+    );
+}
+
+#[tokio::test]
+async fn a_delete_may_filter_through_its_own_table() {
+    let (e, _db) = engine().await;
+    // MySQL refuses a DELETE whose subquery reads the target table (error
+    // 1093); the rows are picked by key first, so the filter is a SELECT's.
+    let v = q(
+        &e,
+        r#"mutation { delete_tags(where: {post: {tags: {label: {_eq: "x"}}}}) { affected_rows returning { label } } }"#,
+    )
+    .await;
+    assert_eq!(
+        v["delete_tags"],
+        json!({"affected_rows": 1, "returning": [{"label": "x"}]})
+    );
+    assert_eq!(count(&e, "tags").await, 0);
+}
+
+#[tokio::test]
 async fn update_and_update_by_pk() {
     let (e, _db) = engine().await;
     let v = q(
@@ -690,21 +765,15 @@ async fn a_view_is_read_only_and_what_is_published_is_implemented() {
     let sdl = vision_graphql::sdl::render(ts);
     assert!(sdl.contains("insert_users"), "{sdl}");
     // A table without a primary key gets its mutation fields — the schema
-    // is dialect-neutral there — and what needs a key to find its rows
-    // again is refused on use; a delete that only counts is not.
+    // is dialect-neutral there — and every one is refused on use: rows are
+    // found again by key, and there is none.
     for src in [
         r#"mutation { insert_log(objects: [{line: "a"}]) { affected_rows } }"#,
         r#"mutation { update_log(where: {line: {_eq: "a"}}, _set: {line: "b"}) { affected_rows } }"#,
-        r#"mutation { delete_log(where: {line: {_eq: "a"}}) { affected_rows returning { line } } }"#,
+        r#"mutation { delete_log(where: {line: {_eq: "a"}}) { affected_rows } }"#,
     ] {
         let err = e.query(src, None).await.unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{src}: {err}");
         assert!(err.to_string().contains("primary key"), "{src}: {err}");
     }
-    let v = q(
-        &e,
-        r#"mutation { delete_log(where: {line: {_eq: "a"}}) { affected_rows } }"#,
-    )
-    .await;
-    assert_eq!(v["delete_log"]["affected_rows"], json!(0));
 }
