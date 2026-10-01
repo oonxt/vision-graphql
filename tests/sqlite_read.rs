@@ -1005,3 +1005,54 @@ async fn retain_tables_removes_a_table_and_every_way_into_it() {
         json!({"release_notes": [{"id": 1, "version": "0001"}]})
     );
 }
+
+/// A list with `limit` / `offset` picks its page in a derived table before
+/// the projection runs — on SQLite the select list is evaluated before the
+/// sort, so without it every relation subquery ran for every matching row.
+/// What the page holds is decided inside it: the order through a relation,
+/// `distinct_on`, and the scope predicate.
+#[tokio::test]
+async fn a_page_is_picked_before_the_projection() {
+    let e = engine().await;
+    let v = q(
+        &e,
+        "{ users(order_by: {id: desc}, limit: 1, offset: 2) { name posts(order_by: {views: desc}, offset: 1) { title tags { label } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["users"],
+        json!([{"name": "Ann", "posts": [{"title": "zeta", "tags": []}]}])
+    );
+    // Through the pinned relation: case-sensitive, so bob > Cara > Ann.
+    let v = q(
+        &e,
+        "{ posts(order_by: [{user: {name: desc}}, {id: asc}], limit: 2, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(v["posts"], json!([{"title": "omega"}, {"title": "zeta"}]));
+    // The distinct rows are paged: one post per user, the second user's.
+    let v = q(
+        &e,
+        "{ posts(distinct_on: [user_id], order_by: [{user_id: asc}, {views: desc}], limit: 1, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(v["posts"], json!([{"title": "mid"}]));
+    // The scope predicate is inside the page: a hidden row is not skipped
+    // over by the offset.
+    let scoped = e.scoped(ScopeSet::new().allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Neq,
+            value: json!(1).into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ users(order_by: {id: asc}, limit: 1, offset: 1) { name } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["users"], json!([{"name": "Cara"}]));
+}

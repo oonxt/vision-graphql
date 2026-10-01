@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: sql
+---
+SELECT json_object('posts', (SELECT json_group_array(json_object('title', r1."title")) FROM (SELECT t0."title" AS "title" FROM (SELECT t0.* FROM (SELECT t0.*, (SELECT ob2."name" FROM "main"."users" AS ob2 WHERE ob2."id" = t0."user_id" LIMIT 1) AS __vision_graphql_ob1, row_number() OVER (PARTITION BY t0."user_id" ORDER BY t0."user_id" ASC NULLS LAST, (SELECT ob2."name" FROM "main"."users" AS ob2 WHERE ob2."id" = t0."user_id" LIMIT 1) DESC NULLS FIRST) AS __vision_graphql_rn FROM "main"."posts" t0 WHERE t0."views" > ?1) t0 WHERE t0.__vision_graphql_rn = 1 ORDER BY t0."user_id" ASC NULLS LAST, t0.__vision_graphql_ob1 DESC NULLS FIRST LIMIT 2 OFFSET 1) t0 ORDER BY t0."user_id" ASC NULLS LAST, t0.__vision_graphql_ob1 DESC NULLS FIRST) r1)) AS result

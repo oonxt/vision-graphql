@@ -831,3 +831,55 @@ async fn a_persisted_unsupported_query_keeps_its_code() {
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
     assert_eq!(err.code(), vision_graphql::ErrorCode::Unsupported);
 }
+
+/// A list with `limit` / `offset` picks its page in a derived table before
+/// the projection runs — MySQL evaluates the select list before its filesort,
+/// so without it every relation subquery ran for every matching row. What the
+/// page holds is decided inside it: the order through a relation,
+/// `distinct_on`, and the scope predicate; and the page's rows are still
+/// numbered for the aggregation above them.
+#[tokio::test]
+async fn a_page_is_picked_before_the_projection() {
+    let (e, _db) = engine().await;
+    let v = q(
+        &e,
+        "{ users(order_by: {id: desc}, limit: 1, offset: 2) { name posts(order_by: {views: desc}, offset: 1) { title tags { label } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["users"],
+        json!([{"name": "Ann", "posts": [{"title": "zeta", "tags": []}]}])
+    );
+    // Through the pinned relation: the collation ignores case, Cara > bob > Ann.
+    let v = q(
+        &e,
+        "{ posts(order_by: [{user: {name: desc}}, {id: asc}], limit: 2, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["mid", "zeta"]);
+    // The distinct rows are paged: one post per user, the second user's.
+    let v = q(
+        &e,
+        "{ posts(distinct_on: [user_id], order_by: [{user_id: asc}, {views: desc}], limit: 1, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["mid"]);
+    // The scope predicate is inside the page: a hidden row is not skipped
+    // over by the offset.
+    let scoped = e.scoped(ScopeSet::new().allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Neq,
+            value: json!(1).into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ users(order_by: {id: asc}, limit: 1, offset: 1) { name } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&v), ["Cara"]);
+}

@@ -216,7 +216,7 @@ MariaDB is refused (its JSON is text, and it has no `JSON_TABLE`).
 | Mutations: what differs | As on SQLite: later fields of one mutation see earlier fields' writes, `returning { relation }` sees every related row, a column an object leaves out gets its default. An `AUTO_INCREMENT` value MySQL handed to a write that then conflicted or rolled back is never handed out again, so ids after such a write are not contiguous. |
 | `on_conflict` | `ON DUPLICATE KEY UPDATE … = new.…`, which MySQL fires on **any** unique key, not only the constraint named (the name is checked to exist). The row is read back by the object's key or by the constraint's columns, whichever found it; an object that conflicts with two rows by two keys — which PostgreSQL refuses — is refused after the fact and undone. A top-level `update_columns: []` is an insert conditional on no row with the constraint's values existing: nothing inserted, nothing counted, no children, as `DO NOTHING` (the probe reads the table whole, as PostgreSQL's `DO NOTHING` does; `affected_rows` tells the caller the same thing either way). A nested `update_columns: []` is a no-op update, and the existing row's key is read back for its dependants (`LAST_INSERT_ID(key)`). An `on_conflict` `where` is refused: MySQL has nothing that leaves a conflicting row unreturned when the condition fails. |
 | `_set` on a primary key column | Refused: the rows of an update are picked, guarded and read back by their key. |
-| `order_by` through a relation no key pins | The correlated subquery is evaluated up to four times per row (twice for the NULL order, twice more to number the rows). Keyed relations are joined and cost one lookup. |
+| `order_by` through a relation no key pins | The correlated subquery is evaluated up to four times per row (twice for the NULL order, twice more to number the rows); in a list with `limit` / `offset`, three times inside the page, and the levels above read the result as a column. Keyed relations are joined and cost one lookup. |
 | `vision-gql` CLI | `generate`, `diff` and `sdl` take a `mysql://user:pass@host/db` URL and introspect the database it names; `--schema` is refused. |
 | Version | 8.0.19 or later (`JSON_TABLE`, the window form of `JSON_ARRAYAGG`, the `AS new` alias of an upsert); checked at introspection and before the engine's first statement, as is `sql_mode` (`NO_BACKSLASH_ESCAPES` is refused: the rendered SQL escapes a backslash in a literal as `\\`). |
 
@@ -261,6 +261,25 @@ Two things follow from where the arrows join:
   query. `Engine::with_parse_cache_capacity(pool, schema, 0)` turns it off.
 - **Variables bind at the end, not during lowering**, so a query can be
   compiled once and run many times — see below.
+
+And one thing about the shape of the SQL. A list with a `limit` or an
+`offset` — at the root or as an array relation — picks its page in a derived
+table of its own before anything else is evaluated:
+
+```sql
+SELECT t0."id", (SELECT … FROM "hospitals" … WHERE … = t0."hospital_id") AS "hospital", …
+FROM (SELECT t0.* FROM "orders" t0 WHERE … ORDER BY t0."updated_at" DESC LIMIT 50 OFFSET 5000) t0
+ORDER BY t0."updated_at" DESC
+```
+
+The inner query holds the `WHERE` (scope predicates included), the
+`order_by`, `distinct_on`, `LIMIT` and `OFFSET`, and nothing else; the
+relation subqueries run over the page's rows only. In the one-level form the
+database evaluates them for every row `OFFSET` skips — a page at offset 5000
+ran each of them 5050 times. An `order_by` through a relation is evaluated
+inside the page, where it decides which rows are in it, and carried out as a
+column the outer `ORDER BY` reads. A list without `limit` or `offset` reads
+the table directly.
 
 ## Compile once, execute many
 
