@@ -295,6 +295,34 @@ impl Table {
         self.columns_by_exposed.get(exposed)
     }
 
+    /// A column a relation's mapping names, or the error both mutation
+    /// renderers raise when the schema and the mapping disagree. `role` is
+    /// the column's part in the mapping: `FK`, `parent`, `target`.
+    pub(crate) fn mapped_column(
+        &self,
+        column: &str,
+        role: &str,
+        path: &str,
+    ) -> crate::error::Result<&Column> {
+        self.find_column(column)
+            .ok_or_else(|| crate::error::Error::Validate {
+                path: path.to_string(),
+                message: format!(
+                    "mapped {role} column '{column}' missing on '{}'",
+                    self.exposed_name
+                ),
+            })
+    }
+
+    /// A relation by name, or the error every renderer raises.
+    pub(crate) fn relation_named(&self, name: &str, path: &str) -> crate::error::Result<&Relation> {
+        self.find_relation(name)
+            .ok_or_else(|| crate::error::Error::Validate {
+                path: path.to_string(),
+                message: format!("unknown relation '{name}' on '{}'", self.exposed_name),
+            })
+    }
+
     pub fn find_relation(&self, name: &str) -> Option<&Relation> {
         self.relations_by_name.get(name)
     }
