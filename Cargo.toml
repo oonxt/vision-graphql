@@ -3,7 +3,7 @@ members = [".", "crates/vision-graphql-cli"]
 
 [package]
 name = "vision-graphql"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 description = "Hasura-style GraphQL-to-SQL query engine for PostgreSQL, SQLite and MySQL — one SQL per request via JSON aggregation."
 license = "MIT OR Apache-2.0"
