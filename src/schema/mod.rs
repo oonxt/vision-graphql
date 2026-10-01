@@ -46,10 +46,6 @@ pub enum ColumnType {
     },
 }
 
-/// The name this enum had while PostgreSQL was the only backend.
-#[deprecated(since = "0.24.0", note = "renamed to `ColumnType`")]
-pub type PgType = ColumnType;
-
 impl ColumnType {
     /// Whether arithmetic applies: `sum`, `avg`, `stddev` and the rest are
     /// only defined over numbers, and PostgreSQL has no `sum(text)` to call.
