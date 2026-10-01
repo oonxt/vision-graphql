@@ -555,36 +555,6 @@ fn row_shape(selection: &[Field], table: &Table, dialect: Dialect) -> Vec<(Strin
         .collect()
 }
 
-/// A column a relation's mapping names, resolved — with the error both
-/// mutation renderers raise when the schema and the mapping disagree.
-/// `role` is the column's part in the mapping: `FK`, `parent`, `target`.
-pub(crate) fn mapped_column<'a>(
-    table: &'a Table,
-    column: &str,
-    role: &str,
-    path: &str,
-) -> Result<&'a crate::schema::Column> {
-    table.find_column(column).ok_or_else(|| Error::Validate {
-        path: path.to_string(),
-        message: format!(
-            "mapped {role} column '{column}' missing on '{}'",
-            table.exposed_name
-        ),
-    })
-}
-
-/// A relation of `table` by name, or the error every renderer raises.
-pub(crate) fn relation_named<'a>(
-    table: &'a Table,
-    name: &str,
-    path: &str,
-) -> Result<&'a crate::schema::Relation> {
-    table.find_relation(name).ok_or_else(|| Error::Validate {
-        path: path.to_string(),
-        message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
-    })
-}
-
 /// Refuse two selection fields answering to one response key.
 ///
 /// The parser merges duplicates (or refuses the unmergeable) before they get
@@ -1119,6 +1089,14 @@ fn render_cmp(
     Ok(())
 }
 
+/// A column as a `where` writes it: under `qualifier`, or bare.
+fn qualify(col: &crate::schema::Column, qualifier: Option<&str>, dialect: Dialect) -> String {
+    match qualifier {
+        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name, dialect)),
+        None => quote_ident(&col.physical_name, dialect).to_string(),
+    }
+}
+
 /// A `where` over `table`, every column qualified with `table_alias`.
 pub(crate) fn render_bool_expr(
     expr: &crate::ast::BoolExpr,
@@ -1154,10 +1132,8 @@ fn render_bool_expr_in(
     ctx: &mut RenderCtx,
 ) -> Result<()> {
     use crate::ast::BoolExpr;
-    let qualified = |col: &crate::schema::Column, dialect: Dialect| match qualifier {
-        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name, dialect)),
-        None => quote_ident(&col.physical_name, dialect).to_string(),
-    };
+    let qualified =
+        |col: &crate::schema::Column, dialect: Dialect| qualify(col, qualifier, dialect);
     match expr {
         BoolExpr::And(parts) => render_bool_list(parts, "AND", table, qualifier, schema, ctx),
         BoolExpr::Or(parts) => {
@@ -2071,10 +2047,7 @@ fn render_optional(
         BoolExpr::InList { .. } => check_cmp_applies(crate::ast::CmpOp::Eq, col, ctx.dialect)?,
         _ => {}
     }
-    let render_plain = |ctx: &mut RenderCtx| match alias {
-        Some(a) => render_bool_expr(inner, table, a, schema, ctx),
-        None => render_bool_expr_no_alias(inner, table, schema, ctx),
-    };
+    let render_plain = |ctx: &mut RenderCtx| render_bool_expr_in(inner, table, alias, schema, ctx);
     match operand.as_lit() {
         Some(v) if v.is_null() => {
             ctx.sql.push_str("TRUE");
@@ -2083,10 +2056,7 @@ fn render_optional(
         Some(_) => return render_plain(ctx),
         None => {}
     }
-    let qualified = match alias {
-        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name, ctx.dialect)),
-        None => quote_ident(&col.physical_name, ctx.dialect),
-    };
+    let qualified = qualify(col, alias, ctx.dialect);
     let path = || format!("where.{column}");
     match inner {
         BoolExpr::Compare { op, value, .. } => {
@@ -2744,7 +2714,7 @@ fn render_insert_cte_recursive(
     }
 
     for rel_name in &object_rel_names {
-        let rel = relation_named(table, rel_name, cte)?;
+        let rel = table.relation_named(rel_name, cte)?;
         // Gather the N object-rows (one per parent row), in parent ord order.
         let child_rows: Vec<crate::ast::InsertObject> = objects
             .iter()
@@ -2851,7 +2821,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = mapped_column(table, child_col, "FK", cte)?;
+            let col = table.mapped_column(child_col, "FK", cte)?;
             ctx.sql
                 .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
@@ -2864,7 +2834,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = mapped_column(table, parent_fk_col, "FK", cte)?;
+            let col = table.mapped_column(parent_fk_col, "FK", cte)?;
             ctx.sql
                 .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
@@ -2888,7 +2858,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let pcol = mapped_column(parent_table, parent_col, "parent", cte)?;
+            let pcol = parent_table.mapped_column(parent_col, "parent", cte)?;
             write!(
                 ctx.sql,
                 "p.{}",
@@ -2912,7 +2882,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let tcol = mapped_column(obj_target, target_col, "target", cte)?;
+            let tcol = obj_target.mapped_column(target_col, "target", cte)?;
             write!(
                 ctx.sql,
                 "o_{rel_name}.{}",
@@ -2994,7 +2964,7 @@ fn render_insert_cte_recursive(
         }
 
         for (rel_name, (child_ords, child_rows)) in per_relation {
-            let rel = relation_named(table, rel_name, cte)?;
+            let rel = table.relation_named(rel_name, cte)?;
             // Find the first parent row that has this array relation; read its on_conflict.
             // Array relations can be present in some parent rows and absent in others
             // (unlike object relations which are batch-uniform), so we scan all parents.

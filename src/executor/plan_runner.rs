@@ -25,29 +25,42 @@ pub(crate) struct Done {
     pub last_insert_id: Option<u64>,
 }
 
-/// The part of running a plan that is one driver's.
+/// The part of running a plan that is one driver's. Every method is
+/// answered, none defaulted: a driver added later has to say how it binds
+/// a list and what its writes return, or it does not compile.
 pub(crate) trait PlanBackend: Database {
+    /// The database's name, for an error that names what it did. (`NAME`
+    /// is sqlx's, on `Database`.)
+    const DATABASE: &'static str;
+
+    /// Whether every write of a plan built for this driver returns its
+    /// rows (`RETURNING`), so a step that counts or reads back instead
+    /// ([`RowsFrom::Count`], [`RowsFrom::Readback`]) is another driver's
+    /// and is refused before it runs — on such a step the captured rows
+    /// would have no keys, and the scope check after it would bind nulls
+    /// and find nothing outside.
+    const WRITES_RETURN_ROWS: bool;
+
     /// The driver's error, as the engine reports it.
     fn map_error(e: sqlx::Error) -> Error;
 
-    /// A bound list, as the driver receives it. Neither SQLite nor MySQL
-    /// has an array type: JSON text, read back by `json_each` /
-    /// `JSON_TABLE` in the statement, is what keeps `_in` one placeholder
-    /// whatever the list's length.
-    fn list<T: serde::Serialize>(items: &[Option<T>]) -> String {
-        serde_json::to_string(items).expect("a list of scalars serialises")
-    }
+    /// A bound list, as the driver receives it; see [`json_list`].
+    fn list<T: serde::Serialize>(items: &[Option<T>]) -> String;
 
     /// The keys of the rows earlier writes captured, bound for a statement
     /// that reads them back ([`PlanBind::Keys`]).
     fn keys<'a>(rows: impl Iterator<Item = &'a Value>) -> Bind;
 
-    /// [`PlanBind::LastInsertId`]: the key the write before handed out, or
-    /// a refusal where the driver (or the plan built for it) has none.
-    fn last_insert_id(id: Option<u64>) -> Result<Bind>;
-
     /// What the driver's result of a statement without rows says.
     fn done(result: Self::QueryResult) -> Done;
+}
+
+/// A bound list as JSON text. Neither SQLite nor MySQL has an array type:
+/// JSON, read back by `json_each` / `JSON_TABLE` in the statement, is what
+/// keeps `_in` one placeholder whatever the list's length. Each driver
+/// names this as its [`PlanBackend::list`] rather than inheriting it.
+pub(crate) fn json_list<T: serde::Serialize>(items: &[Option<T>]) -> String {
+    serde_json::to_string(items).expect("a list of scalars serialises")
 }
 
 /// Bind every parameter of `binds` onto `q`, in order.
@@ -180,6 +193,12 @@ where
                     if orphan {
                         continue;
                     }
+                    if DB::WRITES_RETURN_ROWS && !matches!(rows, RowsFrom::Statement) {
+                        return Err(Error::Schema(format!(
+                            "internal: a plan step without RETURNING reached the {} backend",
+                            DB::DATABASE
+                        )));
+                    }
                     let binds = Self::resolve_plan_binds(binds, inputs, &captured, None)?;
                     captured[*capture] = match rows {
                         RowsFrom::Statement => Self::fetch_rows(&mut *conn, sql, &binds).await?,
@@ -211,9 +230,10 @@ where
                                     return Err(Error::Unsupported {
                                         message: format!(
                                             "an upsert matched {} rows by different unique keys; \
-                                             MySQL updated one where PostgreSQL would have refused \
+                                             {} updated one where PostgreSQL would have refused \
                                              the insert — resolve the conflict first",
-                                            rows.len()
+                                            rows.len(),
+                                            DB::DATABASE
                                         ),
                                     });
                                 }
@@ -359,7 +379,19 @@ where
                 PlanBind::Keys(captures) => {
                     Ok(DB::keys(captures.iter().flat_map(|c| captured[*c].iter())))
                 }
-                PlanBind::LastInsertId => DB::last_insert_id(last_insert_id),
+                // The key the write before handed out; none means the plan
+                // asked for one outside a read-back, or on a driver whose
+                // writes return their rows and never hand one out.
+                PlanBind::LastInsertId => match last_insert_id {
+                    Some(id) => i64::try_from(id).map(Bind::Int8).map_err(|_| {
+                        Error::Decode(format!(
+                            "LAST_INSERT_ID() {id} does not fit a signed integer"
+                        ))
+                    }),
+                    None => Err(Error::Schema(
+                        "internal: a LAST_INSERT_ID bind with no key handed out".into(),
+                    )),
+                },
             })
             .collect()
     }
@@ -417,5 +449,66 @@ where
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(all(test, feature = "sqlite", feature = "mysql"))]
+mod tests {
+    use crate::dialect::Dialect;
+    use crate::parser::{lower_with, parse_document, Bindings};
+    use crate::schema::{ColumnType, Schema, Table};
+    use crate::types::Inputs;
+    use sqlx::Connection as _;
+
+    /// A plan built for MySQL — whose insert is a write and a read-back,
+    /// not a `RETURNING` — handed to SQLite is refused before its first
+    /// statement runs. On a driver whose writes return their rows such a
+    /// step would capture rows without keys, and the scope check after it
+    /// would bind nulls and find nothing outside. The direction of the guard
+    /// is the point: MySQL's own plans run such steps on every write
+    /// (`tests/mysql_write.rs`).
+    #[tokio::test]
+    async fn a_write_without_returning_is_refused_where_writes_return_rows() {
+        let schema = Schema::builder()
+            .dialect(Dialect::MySql)
+            .table(
+                Table::new("users", "vg", "users")
+                    .column("id", "id", ColumnType::Int8, false)
+                    .column("name", "name", ColumnType::Text, false)
+                    .primary_key(&["id"]),
+            )
+            .build();
+        let doc = parse_document(
+            r#"mutation { insert_users(objects: [{id: 1, name: "x"}]) { affected_rows } }"#,
+        )
+        .unwrap();
+        let op = lower_with(&doc, Bindings::symbolic(), None, &schema).unwrap();
+        let crate::ast::Operation::Mutation(fields) = op else {
+            panic!("a mutation")
+        };
+        let plan = crate::plan::build(&fields, &schema, Dialect::MySql).unwrap();
+        assert!(
+            plan.steps.iter().any(|s| matches!(
+                s,
+                crate::plan::Step::Write {
+                    rows: crate::plan::RowsFrom::Readback { .. },
+                    ..
+                }
+            )),
+            "{}",
+            plan.text()
+        );
+
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let err = super::Runner::<sqlx::Sqlite>::execute_plan(&mut conn, &plan, &Inputs::none())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a plan step without RETURNING reached the SQLite backend"),
+            "{err}"
+        );
     }
 }

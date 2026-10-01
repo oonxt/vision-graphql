@@ -1,6 +1,6 @@
 //! Execute a rendered statement against SQLite.
 
-use super::plan_runner::{Done, PlanBackend, Runner};
+use super::plan_runner::{json_list, Done, PlanBackend, Runner};
 use crate::error::{Error, Result};
 use crate::plan::{MutationPlan, ROWID_KEY};
 use crate::types::{Bind, Inputs};
@@ -28,6 +28,11 @@ pub async fn execute_plan(
 }
 
 impl PlanBackend for Sqlite {
+    const DATABASE: &'static str = "SQLite";
+    /// Every SQLite write has `RETURNING`; a plan built for it never
+    /// counts or reads back.
+    const WRITES_RETURN_ROWS: bool = true;
+
     /// `json('…')` on a non-JSON literal is the one way the rendered SQL can
     /// raise, and it raises exactly when a column holds a value its declared
     /// type does not admit (see `Dialect::value_as_json`). SQLite's message is
@@ -44,20 +49,16 @@ impl PlanBackend for Sqlite {
         }
     }
 
+    fn list<T: serde::Serialize>(items: &[Option<T>]) -> String {
+        json_list(items)
+    }
+
     /// Rows are identified by `rowid`, bound as one list.
     fn keys<'a>(rows: impl Iterator<Item = &'a Value>) -> Bind {
         Bind::Int8Array(
             rows.map(|row| row.get(ROWID_KEY).and_then(Value::as_i64))
                 .collect(),
         )
-    }
-
-    /// Every SQLite write returns its rows; a plan built for SQLite never
-    /// reads a key back.
-    fn last_insert_id(_id: Option<u64>) -> Result<Bind> {
-        Err(Error::Schema(
-            "internal: a LAST_INSERT_ID bind reached the SQLite backend".into(),
-        ))
     }
 
     fn done(result: sqlx::sqlite::SqliteQueryResult) -> Done {

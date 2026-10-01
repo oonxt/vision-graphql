@@ -495,17 +495,6 @@ impl ExecutionLimits {
         self.nested_insert_predicates(objects.iter_mut(), reads, 0)
     }
 
-    /// The unconditional bound on insert-tree nesting.
-    ///
-    /// This walk runs on every request, configured ceilings or none, and it is
-    /// the first thing that recurses over a builder-supplied insert tree — so
-    /// like the fragment-chain bound, it must refuse the depth before
-    /// descending it: a stack overflow aborts the process, and no configured
-    /// `max_table_reads` fires from inside one.
-    fn check_insert_depth(depth: usize) -> Result<()> {
-        check_insert_depth(depth, "objects")
-    }
-
     /// The per-relation read counting, over references — a value recursion here
     /// cloned every nested subtree once per level, just to count it.
     fn count_nested_inserts(
@@ -516,7 +505,7 @@ impl ExecutionLimits {
     ) -> Result<()> {
         use std::collections::BTreeMap;
 
-        Self::check_insert_depth(depth)?;
+        check_insert_depth(depth, "objects")?;
         let mut children: BTreeMap<(&str, bool), Vec<&crate::ast::InsertObject>> = BTreeMap::new();
         for o in objects {
             for (name, nested) in &o.nested_arrays {
@@ -555,7 +544,7 @@ impl ExecutionLimits {
     ) -> Result<()> {
         use std::collections::BTreeMap;
 
-        Self::check_insert_depth(depth)?;
+        check_insert_depth(depth, "objects")?;
         let mut arrays: BTreeMap<&str, Vec<&mut crate::ast::NestedArrayInsert>> = BTreeMap::new();
         let mut objs: BTreeMap<&str, Vec<&mut crate::ast::NestedObjectInsert>> = BTreeMap::new();
         for o in objects {

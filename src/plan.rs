@@ -80,9 +80,8 @@ use crate::dialect::{
 use crate::error::{Error, Result};
 use crate::schema::{Column, ColumnType, Relation, Schema, Table};
 use crate::sql::{
-    mapped_column, relation_named, render_bool_expr, render_bool_expr_no_alias,
-    render_conflict_action, render_json_build_object_for_nodes, render_pk_predicate,
-    render_set_clause, RenderCtx,
+    render_bool_expr, render_bool_expr_no_alias, render_conflict_action,
+    render_json_build_object_for_nodes, render_pk_predicate, render_set_clause, RenderCtx,
 };
 use crate::types::{Bind, BindSpec, NullOf};
 use std::fmt::Write as _;
@@ -1059,7 +1058,7 @@ impl<'a> Builder<'a> {
         // Object relations first: this row's foreign keys are their keys.
         let mut from_objects: Vec<(String, PlanBind)> = Vec::new();
         for (rel_name, noi) in &obj.nested_objects {
-            let rel = relation_named(table, rel_name, path)?;
+            let rel = table.relation_named(rel_name, path)?;
             let target = self.table(&rel.target_table, path)?;
             let cap = self.insert_object(
                 target,
@@ -1072,7 +1071,7 @@ impl<'a> Builder<'a> {
                 all,
             )?;
             for (parent_col, target_col) in &rel.mapping {
-                let tcol = mapped_column(target, target_col, "target", path)?;
+                let tcol = target.mapped_column(target_col, "target", path)?;
                 from_objects.push((
                     parent_col.clone(),
                     PlanBind::Captured {
@@ -1099,8 +1098,8 @@ impl<'a> Builder<'a> {
         }
         if let Some((parent_cap, rel, parent_table)) = parent {
             for (parent_col, child_col) in &rel.mapping {
-                let ccol = mapped_column(table, child_col, "FK", path)?;
-                let pcol = mapped_column(parent_table, parent_col, "parent", path)?;
+                let ccol = table.mapped_column(child_col, "FK", path)?;
+                let pcol = parent_table.mapped_column(parent_col, "parent", path)?;
                 values.push((
                     ccol,
                     KeyBind::Plan(PlanBind::Captured {
@@ -1112,7 +1111,7 @@ impl<'a> Builder<'a> {
             }
         }
         for (parent_col, bind) in from_objects {
-            let col = mapped_column(table, &parent_col, "FK", path)?;
+            let col = table.mapped_column(&parent_col, "FK", path)?;
             values.push((col, KeyBind::Plan(bind)));
         }
 

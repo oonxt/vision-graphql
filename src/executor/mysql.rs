@@ -1,6 +1,6 @@
 //! Execute a rendered statement against MySQL.
 
-use super::plan_runner::{Done, PlanBackend, Runner};
+use super::plan_runner::{json_list, Done, PlanBackend, Runner};
 use crate::error::{Error, Result};
 use crate::plan::{MutationPlan, KEY_KEY};
 use crate::types::{Bind, Inputs};
@@ -28,8 +28,16 @@ pub async fn execute_plan(
 }
 
 impl PlanBackend for MySql {
+    const DATABASE: &'static str = "MySQL";
+    /// No `RETURNING`: a write is counted, or read back by key.
+    const WRITES_RETURN_ROWS: bool = false;
+
     fn map_error(e: sqlx::Error) -> Error {
         Error::Database(e)
+    }
+
+    fn list<T: serde::Serialize>(items: &[Option<T>]) -> String {
+        json_list(items)
     }
 
     /// Rows are identified by primary key — one value or a tuple — bound as
@@ -39,19 +47,6 @@ impl PlanBackend for MySql {
             .map(|row| row.get(KEY_KEY).cloned().unwrap_or(Value::Null))
             .collect();
         Bind::Text(Value::Array(keys).to_string())
-    }
-
-    fn last_insert_id(id: Option<u64>) -> Result<Bind> {
-        match id {
-            Some(id) => i64::try_from(id).map(Bind::Int8).map_err(|_| {
-                Error::Decode(format!(
-                    "LAST_INSERT_ID() {id} does not fit a signed integer"
-                ))
-            }),
-            None => Err(Error::Schema(
-                "internal: a LAST_INSERT_ID bind outside a read-back".into(),
-            )),
-        }
     }
 
     fn done(result: sqlx::mysql::MySqlQueryResult) -> Done {
