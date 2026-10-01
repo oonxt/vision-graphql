@@ -253,3 +253,30 @@ async fn a_compiled_page_moves_with_its_variables() {
     assert_eq!(names(&third, "users"), ["u05", "u06"]);
     assert_eq!(titles(&third["users"][1]["posts"]), ["u06-p1"]);
 }
+
+/// A bind inside the copied order term — the scope predicate on the
+/// unpinned hop — and one in the `where` either side of it: each reaches the
+/// database as its own value, however many times the text mentions it.
+#[tokio::test]
+async fn a_bind_inside_a_copied_order_term_binds_in_place() {
+    let (engine, _db) = setup().await;
+    // The scope hides users 8..10 as namesakes (and as roots); below it the
+    // namesake is the row itself, so the order is by name descending.
+    let scope = ScopeSet::new().allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Lt,
+            value: json!(8).into(),
+        },
+    );
+    let v = engine
+        .scoped(scope)
+        .query(
+            "{ users(where: {id: {_gt: 1}}, order_by: [{namesake: {name: desc}}, {id: asc}], limit: 3, offset: 2) { name } }",
+            None,
+        )
+        .await
+        .expect("scoped page through an unpinned hop runs");
+    assert_eq!(names(&v, "users"), ["u05", "u04", "u03"]);
+}

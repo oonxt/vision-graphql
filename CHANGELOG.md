@@ -25,7 +25,16 @@ release commits; entries from 0.13.0 on are written as the work lands.
   (`tests/integration_paging.rs` asserts the loop count). A list without
   `limit` or `offset`, an object relation, a `_by_pk` and an `_aggregate`
   render as before. A compiled statement's text changes for every paged
-  list.
+  list, and for a `distinct_on` list on SQLite and MySQL, where an
+  `order_by` through a keyed relation inside the window is now the `LEFT
+  JOIN` it is everywhere else (the join's column is carried out the same
+  way) rather than a correlated subquery per row.
+
+### Changed
+
+- An error in a root list's `order_by` reports its path as
+  `<root>.order_by.<term>`, as the list's `limit`, `offset` and
+  `distinct_on` always have, instead of the bare `order_by.<term>`.
 
 ## 0.26.0 — 2026-09-30
 

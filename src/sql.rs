@@ -678,7 +678,7 @@ fn render_inner_select(
         }
     }
     let select_end = ctx.sql.len();
-    let source = format!(
+    let from = format!(
         "{}.{}",
         quote_ident(&table.physical_schema, ctx.dialect),
         quote_ident(&table.physical_name, ctx.dialect),
@@ -686,23 +686,18 @@ fn render_inner_select(
     render_list_source(
         &root.args,
         shape,
-        table,
-        table_alias,
-        &source,
-        &mut |ctx| render_where(&root.args, table, table_alias, schema, ctx),
-        &ListPaths {
-            order_by: "order_by",
-            count: &root.alias,
-            distinct: &root.alias,
+        &ListSource {
+            table,
+            alias: table_alias,
+            from: &from,
+            path: &root.alias,
+            selection,
         },
+        &mut |ctx| render_where(&root.args, table, table_alias, schema, ctx),
         select_end,
         schema,
         ctx,
-    )?;
-    if !shape.paged {
-        render_limit_offset(&root.args, &root.alias, ctx);
-    }
-    Ok(())
+    )
 }
 
 /// Which of the three shapes a list of rows renders in.
@@ -742,11 +737,18 @@ impl ListShape {
     }
 }
 
-/// The error paths a list's clauses report under.
-struct ListPaths<'a> {
-    order_by: &'a str,
-    count: &'a str,
-    distinct: &'a str,
+/// A list's rows: the table under its alias, and what is read from them.
+struct ListSource<'a> {
+    table: &'a Table,
+    alias: &'a str,
+    /// `"schema"."table"`, or the alias of the CTE standing in for it.
+    from: &'a str,
+    /// The path the list's arguments report errors under: the root alias,
+    /// or `parent.alias` for a relation.
+    path: &'a str,
+    /// The projection over the rows, for a derived table to know which
+    /// columns to carry.
+    selection: &'a [Field],
 }
 
 /// The column an `order_by` term that walks a relation is carried out of
@@ -754,17 +756,86 @@ struct ListPaths<'a> {
 /// and unquoted, like [`DISTINCT_ROW_NUMBER`].
 const ORDER_EXPORT: &str = "__vision_graphql_ob";
 
+/// `DISTINCT ON (cols) ` where the dialect spells `distinct_on` inline; the
+/// caller renders the window form elsewhere.
+fn render_distinct_prefix(
+    args: &QueryArgs,
+    src: &ListSource<'_>,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    match ctx.dialect.distinct_on() {
+        crate::dialect::DistinctOn::Inline(open) => {
+            ctx.sql.push_str(open);
+            render_distinct_on_columns(&args.distinct_on, src.table, src.alias, src.path, ctx)?;
+            ctx.sql.push_str(") ");
+            Ok(())
+        }
+        crate::dialect::DistinctOn::Window => Ok(()),
+    }
+}
+
+/// The columns a derived table over `src` carries for the levels above it:
+/// what the projection reads — a selected column, the local side of a
+/// relation's mapping — and what the outer `ORDER BY` sorts on, each once.
+/// Not `alias.*`: the page is sorted and, on MySQL, materialised, and a wide
+/// row the projection reads three columns of would travel whole. A column
+/// the schema does not have is left out, not refused: the projection names
+/// it in its own error. Empty — `{ __typename }` alone — falls back to `*`.
+fn render_page_columns<'a>(src: &ListSource<'a>, args: &QueryArgs, ctx: &mut RenderCtx) {
+    let table: &'a Table = src.table;
+    let physical = |name: &str| table.find_column(name).map(|c| c.physical_name.as_str());
+    let mut cols: Vec<&'a str> = Vec::new();
+    let mut add = |name: Option<&'a str>| {
+        if let Some(c) = name {
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+    };
+    for field in src.selection {
+        match field {
+            Field::Typename { .. } => {}
+            Field::Column { column, .. } | Field::JsonPath { column, .. } => add(physical(column)),
+            Field::Relation { name, .. } | Field::RelationAggregate { name, .. } => {
+                if let Some(rel) = table.find_relation(name) {
+                    for (local, _) in &rel.mapping {
+                        add(physical(local));
+                    }
+                }
+            }
+        }
+    }
+    for d in &args.distinct_on {
+        add(physical(d));
+    }
+    for ob in &args.order_by {
+        if ob.path.is_empty() {
+            add(physical(&ob.column));
+        }
+    }
+    if cols.is_empty() {
+        write!(ctx.sql, "{}.*", src.alias).unwrap();
+        return;
+    }
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
+        }
+        write!(ctx.sql, "{}.{}", src.alias, quote_ident(c, ctx.dialect)).unwrap();
+    }
+}
+
 /// Everything after a list's select list: the `FROM`, and the `WHERE`,
 /// `ORDER BY`, `LIMIT` and `OFFSET` of its arguments, in the list's
-/// [shape](ListShape). The select list ends at `select_end`; `source` is the
-/// table (or the CTE standing in for it) and `where_` renders the `WHERE`,
-/// correlation included, so a relation and a root share this.
+/// [shape](ListShape). The select list ends at `select_end`; `where_`
+/// renders the `WHERE`, correlation included, so a relation and a root
+/// share this.
 ///
 /// A list with neither `limit` nor `offset` reads the table in the
-/// projection's own `FROM`. Any other list reads a derived table that
-/// carries every column of the table under the same alias, so the
-/// projection — the correlated subqueries for its relations above all —
-/// renders exactly as it does without one:
+/// projection's own `FROM`. Any other list reads a derived table under the
+/// same alias, carrying the [columns the levels above
+/// read](render_page_columns), so the projection — the correlated subqueries
+/// for its relations above all — renders exactly as it does without one:
 ///
 /// - **Paged.** The derived table holds the `WHERE` (the scope predicate
 ///   with it), the joins and `ORDER BY`, the `LIMIT` and the `OFFSET`, and
@@ -789,84 +860,101 @@ const ORDER_EXPORT: &str = "__vision_graphql_ob";
 /// [`ORDER_EXPORT`] column that every `ORDER BY` above refers to. A join is
 /// not visible from outside its derived table, and re-rendering the subquery
 /// would evaluate it again for every row of the page.
-#[allow(clippy::too_many_arguments)]
 fn render_list_source(
     args: &QueryArgs,
     shape: ListShape,
-    table: &Table,
-    alias: &str,
-    source: &str,
+    src: &ListSource<'_>,
     where_: &mut dyn FnMut(&mut RenderCtx) -> Result<()>,
-    paths: &ListPaths<'_>,
     select_end: usize,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    let order_by = if !shape.windowed && !shape.paged {
-        write!(ctx.sql, " FROM {source} {alias}").unwrap();
-        let joins = render_order_joins(&args.order_by, table, alias, schema, paths.order_by, ctx)?;
+    let ListSource { table, alias, .. } = *src;
+    let ob_path = format!("{}.order_by", src.path);
+    // The scan of the table: `FROM`, the order joins, the `WHERE`, the
+    // `ORDER BY`. Answers where the `ORDER BY` starts and, per term of
+    // `order_by`, the expression it sorts on.
+    let mut scan = |ctx: &mut RenderCtx| -> Result<(usize, Vec<String>)> {
+        write!(ctx.sql, " FROM {} {alias}", src.from).unwrap();
+        let joins = render_order_joins(&args.order_by, table, alias, schema, &ob_path, ctx)?;
         where_(ctx)?;
         let ob_start = ctx.sql.len();
-        render_relation_order_by(args, &joins, table, alias, schema, paths.order_by, ctx)?;
+        let exprs = render_relation_order_by(args, &joins, table, alias, schema, &ob_path, ctx)?;
+        Ok((ob_start, exprs))
+    };
+
+    let order_by = if !shape.windowed && !shape.paged {
+        let (ob_start, _) = scan(ctx)?;
         ctx.sql[ob_start..].to_string()
     } else {
+        // The relation terms, as the levels above the scan read them. Which
+        // terms there are is known now; what they are comes out of the scan.
+        let above: Vec<Option<String>> = args
+            .order_by
+            .iter()
+            .enumerate()
+            .map(|(i, ob)| (!ob.path.is_empty()).then(|| format!("{alias}.{ORDER_EXPORT}{i}")))
+            .collect();
+        let exports_above = || {
+            above.iter().flatten().fold(String::new(), |mut s, e| {
+                write!(s, ", {e}").unwrap();
+                s
+            })
+        };
+
         ctx.sql.push_str(" FROM (");
         if shape.windowed && shape.paged {
-            write!(ctx.sql, "SELECT {alias}.* FROM (").unwrap();
+            ctx.sql.push_str("SELECT ");
+            render_page_columns(src, args, ctx);
+            write!(ctx.sql, "{} FROM (", exports_above()).unwrap();
         }
         ctx.sql.push_str("SELECT ");
         if shape.distinct && !shape.windowed {
-            ctx.sql.push_str("DISTINCT ON (");
-            render_distinct_on_columns(&args.distinct_on, table, alias, paths.distinct, ctx)?;
-            ctx.sql.push_str(") ");
+            render_distinct_prefix(args, src, ctx)?;
         }
-        write!(ctx.sql, "{alias}.*").unwrap();
+        render_page_columns(src, args, ctx);
         let exports_at = ctx.sql.len();
-        let exprs = if shape.windowed {
+        let window_at = if shape.windowed {
             ctx.sql.push_str(", row_number() OVER (PARTITION BY ");
-            render_distinct_on_columns(&args.distinct_on, table, alias, paths.distinct, ctx)?;
-            // No joins inside a window's ORDER BY: a relation term stays a
-            // correlated subquery.
-            let exprs =
-                render_relation_order_by(args, &[], table, alias, schema, paths.order_by, ctx)?;
-            write!(ctx.sql, ") AS {DISTINCT_ROW_NUMBER} FROM {source} {alias}").unwrap();
-            where_(ctx)?;
-            exprs
+            render_distinct_on_columns(&args.distinct_on, table, alias, src.path, ctx)?;
+            let at = ctx.sql.len();
+            write!(ctx.sql, ") AS {DISTINCT_ROW_NUMBER}").unwrap();
+            Some(at)
         } else {
-            write!(ctx.sql, " FROM {source} {alias}").unwrap();
-            let joins =
-                render_order_joins(&args.order_by, table, alias, schema, paths.order_by, ctx)?;
-            where_(ctx)?;
-            let exprs =
-                render_relation_order_by(args, &joins, table, alias, schema, paths.order_by, ctx)?;
-            render_limit_offset(args, paths.count, ctx);
-            exprs
+            None
         };
+        let (ob_start, exprs) = scan(ctx)?;
+        match window_at {
+            // The window orders by what the scan just rendered: moved into
+            // the `OVER`, after the joins it may read, which are only known
+            // once rendered. Placeholders are numbered, so text may move.
+            Some(at) => {
+                let order_by = ctx.sql.split_off(ob_start);
+                ctx.sql.insert_str(at, &order_by);
+            }
+            None => render_limit_offset(args, src.path, ctx),
+        }
         // The relation terms, copied into the select list as exports. A
         // copy of rendered text binds the same (numbered) parameters, so
         // nothing is pushed twice; see `number_rows`.
         let mut exports = String::new();
-        let mut above: Vec<Option<String>> = Vec::with_capacity(args.order_by.len());
-        for (i, ob) in args.order_by.iter().enumerate() {
-            if ob.path.is_empty() {
-                above.push(None);
-                continue;
+        for (i, expr) in exprs.iter().enumerate() {
+            if above[i].is_some() {
+                write!(exports, ", {expr} AS {ORDER_EXPORT}{i}").unwrap();
             }
-            write!(exports, ", {} AS {ORDER_EXPORT}{i}", exprs[i]).unwrap();
-            above.push(Some(format!("{alias}.{ORDER_EXPORT}{i}")));
         }
         ctx.sql.insert_str(exports_at, &exports);
         write!(ctx.sql, ") {alias}").unwrap();
         if shape.windowed {
             write!(ctx.sql, " WHERE {alias}.{DISTINCT_ROW_NUMBER} = 1").unwrap();
             if shape.paged {
-                render_relation_order_by(args, &above, table, alias, schema, paths.order_by, ctx)?;
-                render_limit_offset(args, paths.count, ctx);
+                render_relation_order_by(args, &above, table, alias, schema, &ob_path, ctx)?;
+                render_limit_offset(args, src.path, ctx);
                 write!(ctx.sql, ") {alias}").unwrap();
             }
         }
         let ob_start = ctx.sql.len();
-        render_relation_order_by(args, &above, table, alias, schema, paths.order_by, ctx)?;
+        render_relation_order_by(args, &above, table, alias, schema, &ob_path, ctx)?;
         ctx.sql[ob_start..].to_string()
     };
     // One row needs no numbering.
@@ -1331,9 +1419,13 @@ fn render_relation_subquery(
     render_list_source(
         args,
         list_shape,
-        target,
-        &remote_alias,
-        &source,
+        &ListSource {
+            table: target,
+            alias: &remote_alias,
+            from: &source,
+            path: &rel_path,
+            selection,
+        },
         &mut |ctx| {
             render_relation_where(
                 args,
@@ -1347,23 +1439,19 @@ fn render_relation_subquery(
                 ctx,
             )
         },
-        &ListPaths {
-            order_by: &format!("{rel_path}.order_by"),
-            count: &rel_path,
-            distinct: &rel_path,
-        },
         select_end,
         schema,
         ctx,
     )?;
 
+    // An object relation reads one row and is never paged: its `LIMIT 1`,
+    // or the limit and offset it was given, go here. An array relation with
+    // either is paged, and its page carries both; without, it has neither.
     if !list_shape.paged {
         if let Some(limit) = args.limit.as_ref() {
             render_count(limit, "LIMIT", &format!("{rel_path}.limit"), ctx);
-        } else if matches!(rel.kind, crate::schema::RelKind::Object) {
+        } else if !many {
             ctx.sql.push_str(" LIMIT 1");
-        } else if let (true, Some(no_limit)) = (args.offset.is_some(), ctx.dialect.no_limit()) {
-            write!(ctx.sql, " LIMIT {no_limit}").unwrap();
         }
         if let Some(offset) = args.offset.as_ref() {
             render_count(offset, "OFFSET", &format!("{rel_path}.offset"), ctx);
@@ -4957,7 +5045,7 @@ mod tests {
         insta::assert_snapshot!(sql);
         assert!(
             sql.contains(
-                r#" FROM (SELECT t0.* FROM "public"."users" t0 ORDER BY t0."name" ASC LIMIT 50 OFFSET 5000) t0 ORDER BY t0."name" ASC) r1"#
+                r#" FROM (SELECT t0."id", t0."name" FROM "public"."users" t0 ORDER BY t0."name" ASC LIMIT 50 OFFSET 5000) t0 ORDER BY t0."name" ASC) r1"#
             ),
             "{sql}"
         );
@@ -4989,7 +5077,7 @@ mod tests {
         insta::assert_snapshot!(joined);
         assert!(
             joined.contains(
-                r#"FROM (SELECT t0.*, ob2."name" AS __vision_graphql_ob0 FROM "public"."posts" t0 LEFT JOIN "public"."users" AS ob2 ON ob2."id" = t0."user_id" ORDER BY ob2."name" DESC NULLS LAST, t0."id" ASC LIMIT 10 OFFSET 20) t0 ORDER BY t0.__vision_graphql_ob0 DESC NULLS LAST, t0."id" ASC) r1"#
+                r#"FROM (SELECT t0."id", ob2."name" AS __vision_graphql_ob0 FROM "public"."posts" t0 LEFT JOIN "public"."users" AS ob2 ON ob2."id" = t0."user_id" ORDER BY ob2."name" DESC NULLS LAST, t0."id" ASC LIMIT 10 OFFSET 20) t0 ORDER BY t0.__vision_graphql_ob0 DESC NULLS LAST, t0."id" ASC) r1"#
             ),
             "{joined}"
         );
@@ -5024,7 +5112,7 @@ mod tests {
         );
         assert!(
             sql.contains(
-                r#" FROM (SELECT DISTINCT ON (t0."user_id") t0.* FROM "public"."posts" t0 ORDER BY t0."user_id" ASC, t0."id" DESC LIMIT 5 OFFSET 5) t0 ORDER BY t0."user_id" ASC, t0."id" DESC) r1"#
+                r#" FROM (SELECT DISTINCT ON (t0."user_id") t0."id", t0."user_id" FROM "public"."posts" t0 ORDER BY t0."user_id" ASC, t0."id" DESC LIMIT 5 OFFSET 5) t0 ORDER BY t0."user_id" ASC, t0."id" DESC) r1"#
             ),
             "{sql}"
         );
@@ -6626,8 +6714,10 @@ mod tests {
         /// `distinct_on` and a page, with an `order_by` through a relation:
         /// the window numbers the rows, the level above picks the page from
         /// the kept ones, the projection runs over the page, and the
-        /// relation term is evaluated once, in the window's derived table,
-        /// and read as a column by the two `ORDER BY`s above it.
+        /// relation term is evaluated once, in the window's derived table —
+        /// as a join, since the hop is pinned and the levels above read the
+        /// exported column, not the join — and read by the two `ORDER BY`s
+        /// above it.
         #[test]
         fn a_windowed_page_carries_its_relation_order_out() {
             let (sql, binds) = render(
@@ -6635,7 +6725,8 @@ mod tests {
             );
             insta::assert_snapshot!(sql);
             assert_eq!(binds.len(), 1, "{sql}");
-            assert_eq!(sql.matches("(SELECT ob").count(), 2, "{sql}");
+            assert!(!sql.contains("(SELECT ob"), "{sql}");
+            assert_eq!(sql.matches("LEFT JOIN").count(), 1, "{sql}");
             assert_eq!(
                 sql.matches("t0.__vision_graphql_ob1 DESC").count(),
                 2,
