@@ -122,7 +122,7 @@ what it always was. SQLite is behind the `sqlite` cargo feature, MySQL behind
 `mysql`.
 
 ```toml
-vision-graphql = { version = "0.26", features = ["sqlite", "mysql"] }
+vision-graphql = { version = "0.27", features = ["sqlite", "mysql"] }
 ```
 
 ```rust

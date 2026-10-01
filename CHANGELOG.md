@@ -30,6 +30,13 @@ release commits; entries from 0.13.0 on are written as the work lands.
   JOIN` it is everywhere else (the join's column is carried out the same
   way) rather than a correlated subquery per row.
 
+### Removed
+
+- **`schema::PgType`**, deprecated since 0.24.0 as the old name of
+  `ColumnType`, and **`executor::execute`**, deprecated since 0.22.0 in
+  favour of `execute_on`, which takes a pool as it takes any executor.
+  Both were kept for the one version they promised.
+
 ### Changed
 
 - An error in a root list's `order_by` reports its path as
