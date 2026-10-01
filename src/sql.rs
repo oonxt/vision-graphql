@@ -555,6 +555,36 @@ fn row_shape(selection: &[Field], table: &Table, dialect: Dialect) -> Vec<(Strin
         .collect()
 }
 
+/// A column a relation's mapping names, resolved — with the error both
+/// mutation renderers raise when the schema and the mapping disagree.
+/// `role` is the column's part in the mapping: `FK`, `parent`, `target`.
+pub(crate) fn mapped_column<'a>(
+    table: &'a Table,
+    column: &str,
+    role: &str,
+    path: &str,
+) -> Result<&'a crate::schema::Column> {
+    table.find_column(column).ok_or_else(|| Error::Validate {
+        path: path.to_string(),
+        message: format!(
+            "mapped {role} column '{column}' missing on '{}'",
+            table.exposed_name
+        ),
+    })
+}
+
+/// A relation of `table` by name, or the error every renderer raises.
+pub(crate) fn relation_named<'a>(
+    table: &'a Table,
+    name: &str,
+    path: &str,
+) -> Result<&'a crate::schema::Relation> {
+    table.find_relation(name).ok_or_else(|| Error::Validate {
+        path: path.to_string(),
+        message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
+    })
+}
+
 /// Refuse two selection fields answering to one response key.
 ///
 /// The parser merges duplicates (or refuses the unmergeable) before they get
@@ -1089,6 +1119,7 @@ fn render_cmp(
     Ok(())
 }
 
+/// A `where` over `table`, every column qualified with `table_alias`.
 pub(crate) fn render_bool_expr(
     expr: &crate::ast::BoolExpr,
     table: &Table,
@@ -1096,17 +1127,47 @@ pub(crate) fn render_bool_expr(
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
+    render_bool_expr_in(expr, table, Some(table_alias), schema, ctx)
+}
+
+/// A `where` over `table` with no alias to qualify by: `UPDATE`, `DELETE`
+/// and `ON CONFLICT` target the table by name. A relation filter inside
+/// correlates its `EXISTS` back through the table's physical name.
+pub(crate) fn render_bool_expr_no_alias(
+    expr: &crate::ast::BoolExpr,
+    table: &Table,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    render_bool_expr_in(expr, table, None, schema, ctx)
+}
+
+/// The one renderer behind both: `qualifier` is the alias a column is
+/// written under, or none for a bare column. Kept as one function on
+/// purpose — it was two copies of eleven arms that differed in the
+/// qualification alone, and every fix had to be made twice.
+fn render_bool_expr_in(
+    expr: &crate::ast::BoolExpr,
+    table: &Table,
+    qualifier: Option<&str>,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
     use crate::ast::BoolExpr;
+    let qualified = |col: &crate::schema::Column, dialect: Dialect| match qualifier {
+        Some(a) => format!("{a}.{}", quote_ident(&col.physical_name, dialect)),
+        None => quote_ident(&col.physical_name, dialect).to_string(),
+    };
     match expr {
-        BoolExpr::And(parts) => render_bool_list(parts, "AND", table, table_alias, schema, ctx),
+        BoolExpr::And(parts) => render_bool_list(parts, "AND", table, qualifier, schema, ctx),
         BoolExpr::Or(parts) => {
             refuse_optional_under(parts, "`_or`")?;
-            render_bool_list(parts, "OR", table, table_alias, schema, ctx)
+            render_bool_list(parts, "OR", table, qualifier, schema, ctx)
         }
         BoolExpr::Not(inner) => {
             refuse_optional_under(std::iter::once(inner.as_ref()), "`_not`")?;
             ctx.sql.push_str("(NOT ");
-            render_bool_expr(inner, table, table_alias, schema, ctx)?;
+            render_bool_expr_in(inner, table, qualifier, schema, ctx)?;
             ctx.sql.push(')');
             Ok(())
         }
@@ -1116,13 +1177,10 @@ pub(crate) fn render_bool_expr(
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
             check_cmp_applies(*op, col, ctx.dialect)?;
-            let lhs = format!(
-                "{table_alias}.{}",
-                quote_ident(&col.physical_name, ctx.dialect)
-            );
+            let lhs = qualified(col, ctx.dialect);
             render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
         }
-        BoolExpr::Optional(inner) => render_optional(inner, table, Some(table_alias), schema, ctx),
+        BoolExpr::Optional(inner) => render_optional(inner, table, qualifier, schema, ctx),
         BoolExpr::Const(b) => {
             ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
             Ok(())
@@ -1144,11 +1202,7 @@ pub(crate) fn render_bool_expr(
                 path: format!("where.{column}"),
                 message: format!("unknown column '{column}' on '{}'", table.exposed_name),
             })?;
-            let qualified = format!(
-                "{table_alias}.{}",
-                quote_ident(&col.physical_name, ctx.dialect)
-            );
-            render_is_null(&qualified, column, is_null, ctx)
+            render_is_null(&qualified(col, ctx.dialect), column, is_null, ctx)
         }
         BoolExpr::InList {
             column,
@@ -1165,10 +1219,7 @@ pub(crate) fn render_bool_expr(
                 return Ok(());
             }
             let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
-            let lhs = format!(
-                "{table_alias}.{}",
-                quote_ident(&col.physical_name, ctx.dialect)
-            );
+            let lhs = qualified(col, ctx.dialect);
             write!(
                 ctx.sql,
                 "{}",
@@ -1189,15 +1240,19 @@ pub(crate) fn render_bool_expr(
                     message: format!("relation target table '{}' missing", rel.target_table),
                 })?;
             let remote_alias = ctx.next_alias("e");
-            ctx.sql.push_str("EXISTS (SELECT 1 FROM ");
             write!(
                 ctx.sql,
-                "{}.{} {remote_alias}",
+                "EXISTS (SELECT 1 FROM {}.{} {remote_alias} WHERE ",
                 quote_ident(&target.physical_schema, ctx.dialect),
                 quote_ident(&target.physical_name, ctx.dialect),
             )
             .unwrap();
-            ctx.sql.push_str(" WHERE ");
+            // The outer row, as the subquery sees it: by alias, or by the
+            // table's own name where there is none.
+            let outer = match qualifier {
+                Some(a) => a.to_string(),
+                None => quote_ident(&table.physical_name, ctx.dialect).to_string(),
+            };
             for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
                 if i > 0 {
                     ctx.sql.push_str(" AND ");
@@ -1216,7 +1271,7 @@ pub(crate) fn render_bool_expr(
                     })?;
                 write!(
                     ctx.sql,
-                    "{remote_alias}.{} = {table_alias}.{}",
+                    "{remote_alias}.{} = {outer}.{}",
                     quote_ident(&r.physical_name, ctx.dialect),
                     quote_ident(&l.physical_name, ctx.dialect),
                 )
@@ -1234,7 +1289,7 @@ fn render_bool_list(
     parts: &[crate::ast::BoolExpr],
     joiner: &str,
     table: &Table,
-    table_alias: &str,
+    qualifier: Option<&str>,
     schema: &Schema,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
@@ -1248,7 +1303,7 @@ fn render_bool_list(
         if i > 0 {
             write!(ctx.sql, " {joiner} ").unwrap();
         }
-        render_bool_expr(p, table, table_alias, schema, ctx)?;
+        render_bool_expr_in(p, table, qualifier, schema, ctx)?;
     }
     ctx.sql.push(')');
     Ok(())
@@ -2641,15 +2696,7 @@ fn render_insert_cte_recursive(
     // The unconditional bound on insert-tree nesting, at the point every
     // entry point passes: the walk in ExecutionLimits short-circuits when the
     // limits are unbounded, and a stack overflow here aborts the process.
-    if depth > crate::limits::DEFAULT_MAX_DEPTH {
-        return Err(Error::Validate {
-            path: "objects".into(),
-            message: format!(
-                "nested inserts nest deeper than the limit of {}",
-                crate::limits::DEFAULT_MAX_DEPTH
-            ),
-        });
-    }
+    crate::limits::check_insert_depth(depth, "objects")?;
 
     let table = schema.table(table_name).ok_or_else(|| Error::Validate {
         path: cte.into(),
@@ -2697,12 +2744,7 @@ fn render_insert_cte_recursive(
     }
 
     for rel_name in &object_rel_names {
-        let rel = table
-            .find_relation(rel_name)
-            .ok_or_else(|| Error::Validate {
-                path: cte.into(),
-                message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
-            })?;
+        let rel = relation_named(table, rel_name, cte)?;
         // Gather the N object-rows (one per parent row), in parent ord order.
         let child_rows: Vec<crate::ast::InsertObject> = objects
             .iter()
@@ -2809,15 +2851,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = table
-                .find_column(child_col)
-                .ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!(
-                        "mapped FK column '{child_col}' missing on '{}'",
-                        table.exposed_name
-                    ),
-                })?;
+            let col = mapped_column(table, child_col, "FK", cte)?;
             ctx.sql
                 .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
@@ -2830,15 +2864,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first = false;
-            let col = table
-                .find_column(parent_fk_col)
-                .ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!(
-                        "mapped FK column '{parent_fk_col}' missing on '{}'",
-                        table.exposed_name
-                    ),
-                })?;
+            let col = mapped_column(table, parent_fk_col, "FK", cte)?;
             ctx.sql
                 .push_str(&quote_ident(&col.physical_name, ctx.dialect));
         }
@@ -2862,15 +2888,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let pcol = parent_table
-                .find_column(parent_col)
-                .ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!(
-                        "mapped parent column '{parent_col}' missing on '{}'",
-                        parent_table.exposed_name
-                    ),
-                })?;
+            let pcol = mapped_column(parent_table, parent_col, "parent", cte)?;
             write!(
                 ctx.sql,
                 "p.{}",
@@ -2894,15 +2912,7 @@ fn render_insert_cte_recursive(
                 ctx.sql.push_str(", ");
             }
             first_sel = false;
-            let tcol = obj_target
-                .find_column(target_col)
-                .ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!(
-                        "mapped target column '{target_col}' missing on '{}'",
-                        obj_target.exposed_name
-                    ),
-                })?;
+            let tcol = mapped_column(obj_target, target_col, "target", cte)?;
             write!(
                 ctx.sql,
                 "o_{rel_name}.{}",
@@ -2984,12 +2994,7 @@ fn render_insert_cte_recursive(
         }
 
         for (rel_name, (child_ords, child_rows)) in per_relation {
-            let rel = table
-                .find_relation(rel_name)
-                .ok_or_else(|| Error::Validate {
-                    path: cte.into(),
-                    message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
-                })?;
+            let rel = relation_named(table, rel_name, cte)?;
             // Find the first parent row that has this array relation; read its on_conflict.
             // Array relations can be present in some parent rows and absent in others
             // (unlike object relations which are batch-uniform), so we scan all parents.
@@ -3039,85 +3044,107 @@ fn render_on_conflict(
         quote_ident(&oc.constraint, ctx.dialect)
     )
     .unwrap();
+    render_conflict_action(
+        oc,
+        table,
+        scope_check,
+        nested_context,
+        "on_conflict",
+        "EXCLUDED",
+        schema,
+        ctx,
+    )
+}
+
+/// What follows the conflict target: `DO NOTHING`, or `DO UPDATE SET …`
+/// with its `WHERE`. Shared by the one-statement form (PostgreSQL's `ON
+/// CONFLICT ON CONSTRAINT`) and the plan's (SQLite's `ON CONFLICT (cols)`),
+/// which spell the target differently and everything after it the same.
+/// `excluded` is the proposed row's name as the caller spells it, and
+/// `path` is where an error reports.
+///
+/// A nested `DO NOTHING` is rewritten to `DO UPDATE SET pk = table.pk` — a
+/// true no-op referencing the existing row's value, not `EXCLUDED.pk`,
+/// which would set it to the proposed sequence id — so `RETURNING` includes
+/// the conflicting row and the dependants that follow still find their
+/// parent.
+///
+/// The `where` the document gave and the scope predicate are combined in
+/// the `DO UPDATE`'s `WHERE`, where both reference the *existing* row: the
+/// scope predicate is a pre-image filter, so a conflicting row outside scope
+/// fails it and is skipped rather than overwritten (the post-insert guard
+/// still checks the resulting row). Columns are qualified with the table's
+/// name: the insert's source relation and `excluded` are in scope here, and
+/// a bare column would be ambiguous.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_conflict_action(
+    oc: &crate::ast::OnConflict,
+    table: &Table,
+    scope_check: Option<&crate::ast::BoolExpr>,
+    nested: bool,
+    path: &str,
+    excluded: &str,
+    schema: &Schema,
+    ctx: &mut RenderCtx,
+) -> Result<()> {
+    let tref = quote_ident(&table.physical_name, ctx.dialect);
     if oc.update_columns.is_empty() {
-        if nested_context {
-            // Rewrite DO NOTHING → DO UPDATE SET pk = table.pk (a true no-op
-            // referencing the existing row's value; NOT EXCLUDED.pk which
-            // would change the value to the proposed sequence id) so RETURNING
-            // includes conflict rows and the downstream ROW_NUMBER() ord
-            // correlation stays 1:1 with input.
+        if nested {
             let pk_name = table.primary_key.first().ok_or_else(|| Error::Validate {
-                path: "on_conflict".into(),
+                path: path.to_string(),
                 message: format!(
                     "nested DO NOTHING on-conflict requires a primary key on table '{}'",
                     table.exposed_name
                 ),
             })?;
             let pk_col = table.find_column(pk_name).ok_or_else(|| Error::Validate {
-                path: "on_conflict".into(),
+                path: path.to_string(),
                 message: format!(
                     "primary key column '{pk_name}' missing on '{}'",
                     table.exposed_name
                 ),
             })?;
-            // Reference the table's own column (not EXCLUDED) so the update
-            // is a true no-op: the existing PK value is preserved. Using
-            // EXCLUDED.pk would set it to the new-row's serial value instead.
             write!(
                 ctx.sql,
-                "DO UPDATE SET {pk_phys} = {tbl}.{pk_phys}",
-                pk_phys = quote_ident(&pk_col.physical_name, ctx.dialect),
-                tbl = quote_ident(&table.physical_name, ctx.dialect),
+                "DO UPDATE SET {pk} = {tref}.{pk}",
+                pk = quote_ident(&pk_col.physical_name, ctx.dialect),
             )
             .unwrap();
         } else {
             ctx.sql.push_str("DO NOTHING");
         }
-    } else {
-        ctx.sql.push_str("DO UPDATE SET ");
-        for (i, exposed) in oc.update_columns.iter().enumerate() {
-            if i > 0 {
-                ctx.sql.push_str(", ");
-            }
-            let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-                path: format!("on_conflict.update_columns.{exposed}"),
-                message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
-            })?;
-            write!(
-                ctx.sql,
-                "{} = EXCLUDED.{}",
-                quote_ident(&col.physical_name, ctx.dialect),
-                quote_ident(&col.physical_name, ctx.dialect),
-            )
-            .unwrap();
+        return Ok(());
+    }
+    ctx.sql.push_str("DO UPDATE SET ");
+    for (i, exposed) in oc.update_columns.iter().enumerate() {
+        if i > 0 {
+            ctx.sql.push_str(", ");
         }
-        // Combine the user's optional DO UPDATE WHERE with the scope predicate.
-        // In a DO UPDATE these reference the *existing* (target) row, so the
-        // scope predicate acts as a pre-image filter: a conflicting row outside
-        // scope fails the WHERE and is skipped rather than overwritten. (The
-        // post-insert guard still checks the resulting row, covering the
-        // post-image.) Columns are qualified with the target table's name: the
-        // insert's `INSERT … SELECT … FROM c` keeps the source relation `c` (and
-        // `excluded`) in scope here, so a bare column would be ambiguous.
-        let tref = quote_ident(&table.physical_name, ctx.dialect);
-        match (oc.where_.as_ref(), scope_check) {
-            (Some(user), Some(scope)) => {
-                ctx.sql.push_str(" WHERE (");
-                render_bool_expr(user, table, &tref, schema, ctx)?;
-                ctx.sql.push_str(") AND (");
-                render_bool_expr(scope, table, &tref, schema, ctx)?;
-                ctx.sql.push(')');
-            }
-            (Some(user), None) => {
-                ctx.sql.push_str(" WHERE ");
-                render_bool_expr(user, table, &tref, schema, ctx)?;
-            }
-            (None, Some(scope)) => {
-                ctx.sql.push_str(" WHERE ");
-                render_bool_expr(scope, table, &tref, schema, ctx)?;
-            }
-            (None, None) => {}
+        let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
+            path: format!("{path}.update_columns.{exposed}"),
+            message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
+        })?;
+        write!(
+            ctx.sql,
+            "{} = {excluded}.{}",
+            quote_ident(&col.physical_name, ctx.dialect),
+            quote_ident(&col.physical_name, ctx.dialect),
+        )
+        .unwrap();
+    }
+    match (oc.where_.as_ref(), scope_check) {
+        (Some(user), Some(scope)) => {
+            ctx.sql.push_str(" WHERE (");
+            render_bool_expr(user, table, &tref, schema, ctx)?;
+            ctx.sql.push_str(") AND (");
+            render_bool_expr(scope, table, &tref, schema, ctx)?;
+            ctx.sql.push(')');
         }
+        (Some(expr), None) | (None, Some(expr)) => {
+            ctx.sql.push_str(" WHERE ");
+            render_bool_expr(expr, table, &tref, schema, ctx)?;
+        }
+        (None, None) => {}
     }
     Ok(())
 }
@@ -4263,170 +4290,6 @@ fn render_aggregate_source(
     }
     render_limit_offset(args, path, ctx);
     Ok(())
-}
-
-#[allow(clippy::only_used_in_recursion)]
-pub(crate) fn render_bool_expr_no_alias(
-    expr: &crate::ast::BoolExpr,
-    table: &Table,
-    schema: &Schema,
-    ctx: &mut RenderCtx,
-) -> Result<()> {
-    use crate::ast::BoolExpr;
-    match expr {
-        BoolExpr::And(parts) => {
-            if parts.is_empty() {
-                ctx.sql.push_str("TRUE");
-                return Ok(());
-            }
-            ctx.sql.push('(');
-            for (i, p) in parts.iter().enumerate() {
-                if i > 0 {
-                    ctx.sql.push_str(" AND ");
-                }
-                render_bool_expr_no_alias(p, table, schema, ctx)?;
-            }
-            ctx.sql.push(')');
-            Ok(())
-        }
-        BoolExpr::Or(parts) => {
-            refuse_optional_under(parts, "`_or`")?;
-            if parts.is_empty() {
-                ctx.sql.push_str("FALSE");
-                return Ok(());
-            }
-            ctx.sql.push('(');
-            for (i, p) in parts.iter().enumerate() {
-                if i > 0 {
-                    ctx.sql.push_str(" OR ");
-                }
-                render_bool_expr_no_alias(p, table, schema, ctx)?;
-            }
-            ctx.sql.push(')');
-            Ok(())
-        }
-        BoolExpr::Not(inner) => {
-            refuse_optional_under(std::iter::once(inner.as_ref()), "`_not`")?;
-            ctx.sql.push_str("(NOT ");
-            render_bool_expr_no_alias(inner, table, schema, ctx)?;
-            ctx.sql.push(')');
-            Ok(())
-        }
-        BoolExpr::Compare { column, op, value } => {
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            check_cmp_applies(*op, col, ctx.dialect)?;
-            let lhs = quote_ident(&col.physical_name, ctx.dialect);
-            render_cmp(&lhs, &col.ty, *op, value, || format!("where.{column}"), ctx)
-        }
-        BoolExpr::Optional(inner) => render_optional(inner, table, None, schema, ctx),
-        BoolExpr::Const(b) => {
-            ctx.sql.push_str(if *b { "TRUE" } else { "FALSE" });
-            Ok(())
-        }
-        BoolExpr::ValueCompare {
-            left,
-            op,
-            right,
-            pg,
-        } => render_value_compare(left, *op, right, pg, ctx),
-        BoolExpr::ValueInList {
-            value,
-            values,
-            pg,
-            negated,
-        } => render_value_in_list(value, values, pg, *negated, ctx),
-        BoolExpr::IsNull { column, is_null } => {
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            render_is_null(
-                &quote_ident(&col.physical_name, ctx.dialect),
-                column,
-                is_null,
-                ctx,
-            )
-        }
-        BoolExpr::InList {
-            column,
-            values,
-            negated,
-        } => {
-            let col = table.find_column(column).ok_or_else(|| Error::Validate {
-                path: format!("where.{column}"),
-                message: format!("unknown column '{column}' on '{}'", table.exposed_name),
-            })?;
-            check_cmp_applies(crate::ast::CmpOp::Eq, col, ctx.dialect)?;
-            if is_empty_literal_list(values) {
-                ctx.sql.push_str(if *negated { "TRUE" } else { "FALSE" });
-                return Ok(());
-            }
-            let n = ctx.push_array(values, &col.ty, || format!("where.{column}"))?;
-            let lhs = quote_ident(&col.physical_name, ctx.dialect);
-            write!(
-                ctx.sql,
-                "{}",
-                ctx.dialect.in_list(&lhs, n, &col.ty, *negated)
-            )
-            .unwrap();
-            Ok(())
-        }
-        BoolExpr::Relation { name, inner } => {
-            // No table alias here (UPDATE/DELETE/ON CONFLICT target the table by
-            // name), so correlate the EXISTS back to it via the table's physical
-            // name rather than an alias.
-            let rel = table.find_relation(name).ok_or_else(|| Error::Validate {
-                path: format!("where.{name}"),
-                message: format!("unknown relation '{name}' on '{}'", table.exposed_name),
-            })?;
-            let target = schema
-                .table(&rel.target_table)
-                .ok_or_else(|| Error::Validate {
-                    path: format!("where.{name}"),
-                    message: format!("relation target table '{}' missing", rel.target_table),
-                })?;
-            let remote_alias = ctx.next_alias("e");
-            write!(
-                ctx.sql,
-                "EXISTS (SELECT 1 FROM {}.{} {remote_alias} WHERE ",
-                quote_ident(&target.physical_schema, ctx.dialect),
-                quote_ident(&target.physical_name, ctx.dialect),
-            )
-            .unwrap();
-            for (i, (local_col, remote_col)) in rel.mapping.iter().enumerate() {
-                if i > 0 {
-                    ctx.sql.push_str(" AND ");
-                }
-                let l = table
-                    .find_column(local_col)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("where.{name}"),
-                        message: format!("relation mapping: unknown local column '{local_col}'"),
-                    })?;
-                let r = target
-                    .find_column(remote_col)
-                    .ok_or_else(|| Error::Validate {
-                        path: format!("where.{name}"),
-                        message: format!("relation mapping: unknown remote column '{remote_col}'"),
-                    })?;
-                write!(
-                    ctx.sql,
-                    "{remote_alias}.{} = {}.{}",
-                    quote_ident(&r.physical_name, ctx.dialect),
-                    quote_ident(&table.physical_name, ctx.dialect),
-                    quote_ident(&l.physical_name, ctx.dialect),
-                )
-                .unwrap();
-            }
-            ctx.sql.push_str(" AND ");
-            render_bool_expr(inner, target, &remote_alias, schema, ctx)?;
-            ctx.sql.push(')');
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]

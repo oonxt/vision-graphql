@@ -2,6 +2,8 @@
 
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(any(feature = "sqlite", feature = "mysql"))]
+mod plan_runner;
 mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;

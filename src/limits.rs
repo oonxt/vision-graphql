@@ -53,6 +53,21 @@ pub struct ParseLimits {
 /// See [`ParseLimits::max_depth`].
 pub const DEFAULT_MAX_DEPTH: usize = 64;
 
+/// Refuse an insert tree nested past [`DEFAULT_MAX_DEPTH`], before
+/// descending it. Every recursion over a client-supplied insert tree — the
+/// limits walk, the scope rewrite, both mutation renderers — asks this at
+/// its top: a stack overflow aborts the process, and no check downstream
+/// fires from inside one.
+pub(crate) fn check_insert_depth(depth: usize, path: &str) -> Result<()> {
+    if depth > DEFAULT_MAX_DEPTH {
+        return Err(Error::Validate {
+            path: path.to_string(),
+            message: format!("nested inserts nest deeper than the limit of {DEFAULT_MAX_DEPTH}"),
+        });
+    }
+    Ok(())
+}
+
 /// See [`ParseLimits::max_bytes`].
 pub const DEFAULT_MAX_BYTES: usize = 128 * 1024;
 
@@ -488,15 +503,7 @@ impl ExecutionLimits {
     /// descending it: a stack overflow aborts the process, and no configured
     /// `max_table_reads` fires from inside one.
     fn check_insert_depth(depth: usize) -> Result<()> {
-        if depth > DEFAULT_MAX_DEPTH {
-            return Err(Error::Validate {
-                path: "objects".into(),
-                message: format!(
-                    "nested inserts nest deeper than the limit of {DEFAULT_MAX_DEPTH}"
-                ),
-            });
-        }
-        Ok(())
+        check_insert_depth(depth, "objects")
     }
 
     /// The per-relation read counting, over references — a value recursion here

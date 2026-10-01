@@ -80,8 +80,9 @@ use crate::dialect::{
 use crate::error::{Error, Result};
 use crate::schema::{Column, ColumnType, Relation, Schema, Table};
 use crate::sql::{
-    render_bool_expr, render_bool_expr_no_alias, render_json_build_object_for_nodes,
-    render_pk_predicate, render_set_clause, RenderCtx,
+    mapped_column, relation_named, render_bool_expr, render_bool_expr_no_alias,
+    render_conflict_action, render_json_build_object_for_nodes, render_pk_predicate,
+    render_set_clause, RenderCtx,
 };
 use crate::types::{Bind, BindSpec, NullOf};
 use std::fmt::Write as _;
@@ -1053,25 +1054,12 @@ impl<'a> Builder<'a> {
         depth: usize,
         all: &mut Vec<usize>,
     ) -> Result<usize> {
-        if depth > crate::limits::DEFAULT_MAX_DEPTH {
-            return Err(Error::Validate {
-                path: path.to_string(),
-                message: format!(
-                    "nested inserts nest deeper than the limit of {}",
-                    crate::limits::DEFAULT_MAX_DEPTH
-                ),
-            });
-        }
+        crate::limits::check_insert_depth(depth, path)?;
 
         // Object relations first: this row's foreign keys are their keys.
         let mut from_objects: Vec<(String, PlanBind)> = Vec::new();
         for (rel_name, noi) in &obj.nested_objects {
-            let rel = table
-                .find_relation(rel_name)
-                .ok_or_else(|| Error::Validate {
-                    path: path.to_string(),
-                    message: format!("unknown relation '{rel_name}' on '{}'", table.exposed_name),
-                })?;
+            let rel = relation_named(table, rel_name, path)?;
             let target = self.table(&rel.target_table, path)?;
             let cap = self.insert_object(
                 target,
@@ -1084,15 +1072,7 @@ impl<'a> Builder<'a> {
                 all,
             )?;
             for (parent_col, target_col) in &rel.mapping {
-                let tcol = target
-                    .find_column(target_col)
-                    .ok_or_else(|| Error::Validate {
-                        path: path.to_string(),
-                        message: format!(
-                            "mapped target column '{target_col}' missing on '{}'",
-                            target.exposed_name
-                        ),
-                    })?;
+                let tcol = mapped_column(target, target_col, "target", path)?;
                 from_objects.push((
                     parent_col.clone(),
                     PlanBind::Captured {
@@ -1119,24 +1099,8 @@ impl<'a> Builder<'a> {
         }
         if let Some((parent_cap, rel, parent_table)) = parent {
             for (parent_col, child_col) in &rel.mapping {
-                let ccol = table
-                    .find_column(child_col)
-                    .ok_or_else(|| Error::Validate {
-                        path: path.to_string(),
-                        message: format!(
-                            "mapped FK column '{child_col}' missing on '{}'",
-                            table.exposed_name
-                        ),
-                    })?;
-                let pcol = parent_table
-                    .find_column(parent_col)
-                    .ok_or_else(|| Error::Validate {
-                        path: path.to_string(),
-                        message: format!(
-                            "mapped parent column '{parent_col}' missing on '{}'",
-                            parent_table.exposed_name
-                        ),
-                    })?;
+                let ccol = mapped_column(table, child_col, "FK", path)?;
+                let pcol = mapped_column(parent_table, parent_col, "parent", path)?;
                 values.push((
                     ccol,
                     KeyBind::Plan(PlanBind::Captured {
@@ -1148,15 +1112,7 @@ impl<'a> Builder<'a> {
             }
         }
         for (parent_col, bind) in from_objects {
-            let col = table
-                .find_column(&parent_col)
-                .ok_or_else(|| Error::Validate {
-                    path: path.to_string(),
-                    message: format!(
-                        "mapped FK column '{parent_col}' missing on '{}'",
-                        table.exposed_name
-                    ),
-                })?;
+            let col = mapped_column(table, &parent_col, "FK", path)?;
             values.push((col, KeyBind::Plan(bind)));
         }
 
@@ -1464,66 +1420,16 @@ impl<'a> Builder<'a> {
                 .push_str(&quote_ident(&col.physical_name, self.dialect));
         }
         s.ctx.sql.push_str(") ");
-        let tref = quote_ident(&table.physical_name, self.dialect);
-        if oc.update_columns.is_empty() {
-            if nested {
-                let pk_name = table.primary_key.first().ok_or_else(|| Error::Validate {
-                    path: format!("{path}.on_conflict"),
-                    message: format!(
-                        "nested DO NOTHING on-conflict requires a primary key on table '{}'",
-                        table.exposed_name
-                    ),
-                })?;
-                let pk_col = table.find_column(pk_name).ok_or_else(|| Error::Validate {
-                    path: format!("{path}.on_conflict"),
-                    message: format!(
-                        "primary key column '{pk_name}' missing on '{}'",
-                        table.exposed_name
-                    ),
-                })?;
-                write!(
-                    s.ctx.sql,
-                    "DO UPDATE SET {pk} = {tref}.{pk}",
-                    pk = quote_ident(&pk_col.physical_name, self.dialect)
-                )
-                .unwrap();
-            } else {
-                s.ctx.sql.push_str("DO NOTHING");
-            }
-            return Ok(());
-        }
-        s.ctx.sql.push_str("DO UPDATE SET ");
-        for (i, exposed) in oc.update_columns.iter().enumerate() {
-            if i > 0 {
-                s.ctx.sql.push_str(", ");
-            }
-            let col = table.find_column(exposed).ok_or_else(|| Error::Validate {
-                path: format!("{path}.on_conflict.update_columns.{exposed}"),
-                message: format!("unknown column '{exposed}' on '{}'", table.exposed_name),
-            })?;
-            write!(
-                s.ctx.sql,
-                "{} = excluded.{}",
-                quote_ident(&col.physical_name, self.dialect),
-                quote_ident(&col.physical_name, self.dialect)
-            )
-            .unwrap();
-        }
-        match (oc.where_.as_ref(), scope_check) {
-            (Some(user), Some(scope)) => {
-                s.ctx.sql.push_str(" WHERE (");
-                render_bool_expr(user, table, &tref, self.schema, &mut s.ctx)?;
-                s.ctx.sql.push_str(") AND (");
-                render_bool_expr(scope, table, &tref, self.schema, &mut s.ctx)?;
-                s.ctx.sql.push(')');
-            }
-            (Some(expr), None) | (None, Some(expr)) => {
-                s.ctx.sql.push_str(" WHERE ");
-                render_bool_expr(expr, table, &tref, self.schema, &mut s.ctx)?;
-            }
-            (None, None) => {}
-        }
-        Ok(())
+        render_conflict_action(
+            oc,
+            table,
+            scope_check,
+            nested,
+            &format!("{path}.on_conflict"),
+            "excluded",
+            self.schema,
+            &mut s.ctx,
+        )
     }
 
     /// `AS new ON DUPLICATE KEY UPDATE …` (MySQL), for an upsert or a nested
