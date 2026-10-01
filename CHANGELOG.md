@@ -3,6 +3,39 @@
 Notable changes per release. Versions before 0.13.0 are reconstructed from the
 release commits; entries from 0.13.0 on are written as the work lands.
 
+## Unreleased
+
+### Fixed
+
+- **A list with `limit` / `offset` picks its page before its relations are
+  evaluated.** The relation subqueries of a list sat in the select list of
+  the query that carried `LIMIT` / `OFFSET`, and PostgreSQL evaluates that
+  select list for every row `OFFSET` then skips (SQLite and MySQL for every
+  row that passes the `WHERE`, before the sort): a page of 50 orders at
+  offset 5000 with four relations ran each subquery 5050 times — thirty
+  seconds, where the same page selecting only `id` took a third of one. A
+  list with a `limit` or an `offset`, at the root or as an array relation,
+  now reads a derived table that holds the `WHERE` (the scope predicate with
+  it), the `order_by`, `distinct_on`, `LIMIT` and `OFFSET`, and nothing
+  else; the projection runs over the rows of that page only, and the outer
+  query orders them again. An `order_by` through a relation is evaluated
+  inside the page — it decides which rows are in it — once, and carried out
+  as a `__vision_graphql_ob<n>` column the outer `ORDER BY` reads. The same
+  rows in the same order; the plan reads each relation once per page row
+  (`tests/integration_paging.rs` asserts the loop count). A list without
+  `limit` or `offset`, an object relation, a `_by_pk` and an `_aggregate`
+  render as before. A compiled statement's text changes for every paged
+  list, and for a `distinct_on` list on SQLite and MySQL, where an
+  `order_by` through a keyed relation inside the window is now the `LEFT
+  JOIN` it is everywhere else (the join's column is carried out the same
+  way) rather than a correlated subquery per row.
+
+### Changed
+
+- An error in a root list's `order_by` reports its path as
+  `<root>.order_by.<term>`, as the list's `limit`, `offset` and
+  `distinct_on` always have, instead of the bare `order_by.<term>`.
+
 ## 0.26.0 — 2026-09-30
 
 ### Added

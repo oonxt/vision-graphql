@@ -223,6 +223,16 @@ impl<F: Fn(&mut Formatter<'_>) -> fmt::Result> Display for Fragment<F> {
     }
 }
 
+/// How a dialect spells `distinct_on`; see [`Dialect::distinct_on`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DistinctOn {
+    /// The text that opens the select list, before the distinct columns;
+    /// the renderer closes it with `) `.
+    Inline(&'static str),
+    /// No inline spelling: a `row_number()` window over a derived table.
+    Window,
+}
+
 /// The column a dialect that [numbers rows for
 /// order](Dialect::numbers_rows_for_order) adds to a derived table: the
 /// row's position under the `ORDER BY` asked for. Prefixed and unquoted;
@@ -898,13 +908,20 @@ impl Dialect {
         }
     }
 
+    /// How `distinct_on` is spelled: inline, as the `DISTINCT ON (` that
+    /// opens the select list, or — for want of one — as a `row_number()`
+    /// window over a derived table that keeps the first row of each group.
+    pub(crate) fn distinct_on(self) -> DistinctOn {
+        match self {
+            Dialect::Postgres => DistinctOn::Inline("DISTINCT ON ("),
+            Dialect::Sqlite | Dialect::MySql => DistinctOn::Window,
+        }
+    }
+
     /// Whether `distinct_on` has to be spelled as a `row_number()` window
     /// over a derived table, for want of `DISTINCT ON`.
     pub(crate) fn distinct_on_by_window(self) -> bool {
-        match self {
-            Dialect::Postgres => false,
-            Dialect::Sqlite | Dialect::MySql => true,
-        }
+        matches!(self.distinct_on(), DistinctOn::Window)
     }
 
     /// Whether the database has this aggregate function. SQLite ships no

@@ -1,0 +1,5 @@
+---
+source: src/sql.rs
+expression: joined
+---
+SELECT json_build_object('posts', (SELECT coalesce(json_agg(row_to_json(r1)), '[]'::json) FROM (SELECT t0."id" AS "id" FROM (SELECT t0."id", ob2."name" AS __vision_graphql_ob0 FROM "public"."posts" t0 LEFT JOIN "public"."users" AS ob2 ON ob2."id" = t0."user_id" ORDER BY ob2."name" DESC NULLS LAST, t0."id" ASC LIMIT 10 OFFSET 20) t0 ORDER BY t0.__vision_graphql_ob0 DESC NULLS LAST, t0."id" ASC) r1)) AS result

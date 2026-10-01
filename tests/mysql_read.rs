@@ -831,3 +831,106 @@ async fn a_persisted_unsupported_query_keeps_its_code() {
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
     assert_eq!(err.code(), vision_graphql::ErrorCode::Unsupported);
 }
+
+/// A list with `limit` / `offset` picks its page in a derived table before
+/// the projection runs — MySQL evaluates the select list before its filesort,
+/// so without it every relation subquery ran for every matching row. What the
+/// page holds is decided inside it: the order through a relation,
+/// `distinct_on`, and the scope predicate; and the page's rows are still
+/// numbered for the aggregation above them.
+#[tokio::test]
+async fn a_page_is_picked_before_the_projection() {
+    let (e, _db) = engine().await;
+    let v = q(
+        &e,
+        "{ users(order_by: {id: desc}, limit: 1, offset: 2) { name posts(order_by: {views: desc}, offset: 1) { title tags { label } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["users"],
+        json!([{"name": "Ann", "posts": [{"title": "zeta", "tags": []}]}])
+    );
+    // Through the pinned relation: the collation ignores case, Cara > bob > Ann.
+    let v = q(
+        &e,
+        "{ posts(order_by: [{user: {name: desc}}, {id: asc}], limit: 2, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["mid", "zeta"]);
+    // The distinct rows are paged: one post per user, the second user's.
+    let v = q(
+        &e,
+        "{ posts(distinct_on: [user_id], order_by: [{user_id: asc}, {views: desc}], limit: 1, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(titles_of(&v, "posts"), ["mid"]);
+    // The scope predicate is inside the page: a hidden row is not skipped
+    // over by the offset.
+    let scoped = e.scoped(ScopeSet::new().allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Neq,
+            value: json!(1).into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ users(order_by: {id: asc}, limit: 1, offset: 1) { name } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&v), ["Cara"]);
+}
+
+/// The `order_by` term through a relation is rendered once, in the page's
+/// derived table, and *copied* into the `ORDER BY` beside it. On MySQL the
+/// placeholders are anonymised by position, so a bind inside the copied
+/// text — the scope predicate on an unpinned hop — rests on every mention
+/// binding its own value. `first_tag` is an object relation onto a column
+/// with no unique index, so it stays a correlated subquery.
+#[tokio::test]
+async fn a_bind_inside_a_copied_order_term_binds_in_place() {
+    let db = db().await;
+    let overlay = vision_graphql::schema::config::parse(
+        r#"
+        [[tables.posts.relations]]
+        name = "first_tag"
+        kind = "object"
+        target = "tags"
+        mapping = [["id", "post_id"]]
+        "#,
+    )
+    .unwrap();
+    let schema = Schema::introspect_mysql(&db.pool)
+        .await
+        .unwrap()
+        .apply_config(&overlay)
+        .build();
+    let e = Engine::new(db.pool.clone(), schema);
+    let scoped = e.scoped(ScopeSet::new().unrestricted("posts").allow(
+        "tags",
+        BoolExpr::Compare {
+            column: "label".into(),
+            op: CmpOp::Neq,
+            value: json!("z").into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ posts(where: {views: {_gt: 5}}, order_by: [{first_tag: {label: desc_nulls_last}}, {id: asc}], limit: 2, offset: 1) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&v, "posts"), ["zeta", "mid"]);
+    let v = scoped
+        .query(
+            "{ posts(distinct_on: [user_id], where: {views: {_gt: 5}}, order_by: [{user_id: asc}, {first_tag: {label: desc_nulls_last}}], limit: 2, offset: 1) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&v, "posts"), ["mid", "omega"]);
+}

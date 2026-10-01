@@ -1005,3 +1005,110 @@ async fn retain_tables_removes_a_table_and_every_way_into_it() {
         json!({"release_notes": [{"id": 1, "version": "0001"}]})
     );
 }
+
+/// A list with `limit` / `offset` picks its page in a derived table before
+/// the projection runs — on SQLite the select list is evaluated before the
+/// sort, so without it every relation subquery ran for every matching row.
+/// What the page holds is decided inside it: the order through a relation,
+/// `distinct_on`, and the scope predicate.
+#[tokio::test]
+async fn a_page_is_picked_before_the_projection() {
+    let e = engine().await;
+    let v = q(
+        &e,
+        "{ users(order_by: {id: desc}, limit: 1, offset: 2) { name posts(order_by: {views: desc}, offset: 1) { title tags { label } } } }",
+    )
+    .await;
+    assert_eq!(
+        v["users"],
+        json!([{"name": "Ann", "posts": [{"title": "zeta", "tags": []}]}])
+    );
+    // Through the pinned relation: case-sensitive, so bob > Cara > Ann.
+    let v = q(
+        &e,
+        "{ posts(order_by: [{user: {name: desc}}, {id: asc}], limit: 2, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(v["posts"], json!([{"title": "omega"}, {"title": "zeta"}]));
+    // The distinct rows are paged: one post per user, the second user's.
+    let v = q(
+        &e,
+        "{ posts(distinct_on: [user_id], order_by: [{user_id: asc}, {views: desc}], limit: 1, offset: 1) { title } }",
+    )
+    .await;
+    assert_eq!(v["posts"], json!([{"title": "mid"}]));
+    // The scope predicate is inside the page: a hidden row is not skipped
+    // over by the offset.
+    let scoped = e.scoped(ScopeSet::new().allow(
+        "users",
+        BoolExpr::Compare {
+            column: "id".into(),
+            op: CmpOp::Neq,
+            value: json!(1).into(),
+        },
+    ));
+    let v = scoped
+        .query(
+            "{ users(order_by: {id: asc}, limit: 1, offset: 1) { name } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["users"], json!([{"name": "Cara"}]));
+}
+
+/// The `order_by` term through a relation is rendered once, in the page's
+/// derived table, and *copied* into the `ORDER BY` beside it: a bind inside
+/// the copied text — the scope predicate on an unpinned hop — has to reach
+/// the database once per mention, and in the right place. `first_tag` is an
+/// object relation onto a column with no unique index, so it stays a
+/// correlated subquery; without the scope it would pick either of post 2's
+/// two tags, and post 4's `z` would lead the order.
+#[tokio::test]
+async fn a_bind_inside_a_copied_order_term_binds_in_place() {
+    let pool = pool().await;
+    let overlay = vision_graphql::schema::config::parse(
+        r#"
+        [[tables.posts.relations]]
+        name = "first_tag"
+        kind = "object"
+        target = "tags"
+        mapping = [["id", "post_id"]]
+        "#,
+    )
+    .unwrap();
+    let schema = Schema::introspect_sqlite(&pool)
+        .await
+        .unwrap()
+        .apply_config(&overlay)
+        .build();
+    let e = Engine::new(pool, schema);
+    let scoped = e.scoped(ScopeSet::new().unrestricted("posts").allow(
+        "tags",
+        BoolExpr::Compare {
+            column: "label".into(),
+            op: CmpOp::Neq,
+            value: json!("z").into(),
+        },
+    ));
+    // alpha has a visible tag; omega's is hidden and sorts as NULL with the
+    // untagged. The where's bind and the hop's bind sit either side of the
+    // copied text.
+    let v = scoped
+        .query(
+            "{ posts(where: {views: {_gt: 5}}, order_by: [{first_tag: {label: desc_nulls_last}}, {id: asc}], limit: 2, offset: 1) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["posts"], json!([{"title": "zeta"}, {"title": "mid"}]));
+    // The same through the window form, three levels deep.
+    let v = scoped
+        .query(
+            "{ posts(distinct_on: [user_id], where: {views: {_gt: 5}}, order_by: [{user_id: asc}, {first_tag: {label: desc_nulls_last}}], limit: 2, offset: 1) { title } }",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["posts"], json!([{"title": "mid"}, {"title": "omega"}]));
+}
